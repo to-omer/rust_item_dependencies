@@ -53,7 +53,7 @@ fn run() -> Result<(), String> {
     let repository_root = tools_directory
         .parent()
         .ok_or_else(|| "cannot locate the repository root".to_owned())?;
-    let generated = repository_root.join("target/rust-item-dependencies");
+    let generated = repository_root.join("target/rid");
     let rust_source = generated.join("rustc");
     fs::create_dir_all(&generated)
         .map_err(|error| format!("cannot create {}: {error}", generated.display()))?;
