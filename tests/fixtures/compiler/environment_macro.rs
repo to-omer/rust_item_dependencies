@@ -1,0 +1,4 @@
+fn main() {
+    let _ = env!("RUST_ITEM_DEPENDENCIES_QUALIFICATION_ENV");
+    let _ = option_env!("RUST_ITEM_DEPENDENCIES_QUALIFICATION_OPTION_ENV");
+}

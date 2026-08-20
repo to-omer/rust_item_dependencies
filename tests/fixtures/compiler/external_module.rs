@@ -1,0 +1,4 @@
+mod external;
+
+fn main() {}
+

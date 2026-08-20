@@ -1,0 +1,42 @@
+From b777ce5638cac5f582f03b704441a3315985887a Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Fri, 14 Aug 2026 06:50:00 +0900
+Subject: [PATCH 14/14] rustc: ignore unresolved macro import provenance
+
+---
+ compiler/rustc_resolve/src/lib.rs | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
+index a03cf47d..9b108340 100644
+--- a/compiler/rustc_resolve/src/lib.rs
++++ b/compiler/rustc_resolve/src/lib.rs
+@@ -2387,6 +2387,11 @@ fn record_macro_import_use(
+             return;
+         }
+ 
++        let resolution = binding.res();
++        if matches!(resolution, def::Res::Err) {
++            return;
++        }
++
+         let expansion = invocation.to_expn_id();
+         if !self.macro_invocation_origins.contains_key(&expansion) {
+             self.dcx()
+@@ -2396,11 +2401,10 @@ fn record_macro_import_use(
+         origin.resolved_import_uses.push(MacroResolvedImportUse {
+             path_span,
+             segment_span,
+-            namespace: binding
+-                .res()
++            namespace: resolution
+                 .ns()
+                 .expect("an imported macro path binding must have a namespace"),
+-            target: binding.res().expect_non_local(),
++            target: resolution.expect_non_local(),
+             import_chain,
+         });
+     }
+-- 
+2.55.0
+

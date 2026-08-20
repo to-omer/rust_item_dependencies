@@ -1,0 +1,19 @@
+# Add one git-format-patch filename per line after its observer qualification passes.
+0001-patch-abi.patch
+0002-input-boundary.patch
+0003-build-attestation.patch
+0004-import-provenance.patch
+0005-expansion-origin.patch
+0006-macro-import-provenance.patch
+0007-rustc-expose-codegen-selection-and-projection-proofs.patch
+0008-rustc-expose-associated-item-resolution-proofs.patch
+0009-rustc-expose-typed-monomorphization-dependencies.patch
+0010-rustc-expose-macro-invocation-dependency-owners.patch
+0011-rustc-expose-finalized-typeck-impl-dependencies.patch
+0012-rustc-complete-cached-codegen-projection-proofs.patch
+0013-rustc-preserve-desugared-associated-path-arguments.patch
+0014-rustc-ignore-unresolved-macro-import-provenance.patch
+0015-reconcile-resolved-projection-evidence-in-codegen-proofs.patch
+0016-ignore-bound-projection-only-dependency-origins.patch
+0017-ignore-unresolved-imported-path-provenance.patch
+0018-rustc-expose-selected-declarative-macro-rules.patch

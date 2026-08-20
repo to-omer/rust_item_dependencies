@@ -1,0 +1,472 @@
+From 98d89107e7d34cba785905ed7b63e7ea2cd67fbb Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Tue, 11 Aug 2026 05:25:28 +0900
+Subject: [PATCH] rustc: preserve macro invocation origins
+
+---
+ compiler/rustc_driver_impl/src/lib.rs |  2 +-
+ compiler/rustc_expand/src/expand.rs   | 81 +++++++++++++++++++++++++--
+ compiler/rustc_middle/src/ty/mod.rs   | 52 +++++++++++++++++
+ compiler/rustc_resolve/src/lib.rs     | 10 +++-
+ compiler/rustc_resolve/src/macros.rs  | 60 +++++++++++++++++++-
+ 5 files changed, 195 insertions(+), 10 deletions(-)
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 3e4e3ca9..5e0116c0 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 4;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 5;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_expand/src/expand.rs b/compiler/rustc_expand/src/expand.rs
+index c80ffe62..29b6bbfa 100644
+--- a/compiler/rustc_expand/src/expand.rs
++++ b/compiler/rustc_expand/src/expand.rs
+@@ -372,12 +372,16 @@ pub struct Invocation {
+     pub kind: InvocationKind,
+     pub fragment_kind: AstFragmentKind,
+     pub expansion_data: ExpansionData,
++    /// Expansion whose output contained this invocation when it was collected.
++    pub discovered_in_expansion: LocalExpnId,
+ }
+ 
+ pub enum InvocationKind {
+     Bang {
+         mac: Box<ast::MacCall>,
+         span: Span,
++        /// Span of the AST node before it is replaced by an expansion placeholder.
++        source_span: Span,
+     },
+     Attr {
+         attr: ast::Attribute,
+@@ -428,6 +432,24 @@ pub fn span(&self) -> Span {
+         }
+     }
+ 
++    pub fn node_span(&self) -> Span {
++        match &self.kind {
++            InvocationKind::Bang { source_span, .. } => *source_span,
++            InvocationKind::Attr { attr, item, .. } => attr.span.to(item.span()),
++            InvocationKind::Derive { item, .. } => item.span(),
++            InvocationKind::GlobDelegation { item, .. } => item.span,
++        }
++    }
++
++    pub fn target_span(&self) -> Option<Span> {
++        match &self.kind {
++            InvocationKind::Attr { item, .. } | InvocationKind::Derive { item, .. } => {
++                Some(item.span())
++            }
++            InvocationKind::Bang { .. } | InvocationKind::GlobDelegation { .. } => None,
++        }
++    }
++
+     fn span_mut(&mut self) -> &mut Span {
+         match &mut self.kind {
+             InvocationKind::Bang { span, .. } => span,
+@@ -561,6 +583,7 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
+                                                 id: expn_id,
+                                                 ..self.cx.current_expansion.clone()
+                                             },
++                                            discovered_in_expansion: self.cx.current_expansion.id,
+                                         },
+                                         None,
+                                     ));
+@@ -724,7 +747,7 @@ fn expand_invoc(
+ 
+         let (fragment_kind, span) = (invoc.fragment_kind, invoc.span());
+         ExpandResult::Ready(match invoc.kind {
+-            InvocationKind::Bang { mac, span } => {
++            InvocationKind::Bang { mac, span, source_span } => {
+                 if let SyntaxExtensionKind::Bang(expander) = ext {
+                     match expander.expand(self.cx, span, mac.args.tokens.clone()) {
+                         Ok(tok_result) => {
+@@ -749,7 +772,7 @@ fn expand_invoc(
+                         ExpandResult::Retry(_) => {
+                             // retry the original
+                             return ExpandResult::Retry(Invocation {
+-                                kind: InvocationKind::Bang { mac, span },
++                                kind: InvocationKind::Bang { mac, span, source_span },
+                                 ..invoc
+                             });
+                         }
+@@ -1248,6 +1271,9 @@ fn walk(&mut self, _collector: &mut InvocationCollector<'_, '_>) {
+     fn is_mac_call(&self) -> bool {
+         false
+     }
++    fn mac_call_source_span(&self) -> Span {
++        unreachable!()
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         unreachable!()
+     }
+@@ -1305,6 +1331,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+     fn is_mac_call(&self) -> bool {
+         matches!(self.kind, ItemKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         match self.kind {
+             ItemKind::MacCall(mac) => (mac, self.attrs, AddSemicolon::No),
+@@ -1459,6 +1488,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+     fn is_mac_call(&self) -> bool {
+         matches!(self.wrapped.kind, AssocItemKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.wrapped.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         let item = self.wrapped;
+         match item.kind {
+@@ -1503,6 +1535,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+     fn is_mac_call(&self) -> bool {
+         matches!(self.wrapped.kind, AssocItemKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.wrapped.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         let item = self.wrapped;
+         match item.kind {
+@@ -1547,6 +1582,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+     fn is_mac_call(&self) -> bool {
+         matches!(self.wrapped.kind, AssocItemKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.wrapped.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         let item = self.wrapped;
+         match item.kind {
+@@ -1588,6 +1626,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+     fn is_mac_call(&self) -> bool {
+         matches!(self.kind, ForeignItemKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         match self.kind {
+             ForeignItemKind::MacCall(mac) => (mac, self.attrs, AddSemicolon::No),
+@@ -1768,6 +1809,9 @@ fn is_mac_call(&self) -> bool {
+             StmtKind::Let(..) | StmtKind::Empty => false,
+         }
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         // We pull macro invocations (both attributes and fn-like macro calls) out of their
+         // `StmtKind`s and treat them as statement macro invocations, not as items or expressions.
+@@ -1878,6 +1922,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
+     fn is_mac_call(&self) -> bool {
+         matches!(self.kind, ast::TyKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         match self.kind {
+             TyKind::MacCall(mac) => (mac, AttrVec::new(), AddSemicolon::No),
+@@ -1905,6 +1952,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
+     fn is_mac_call(&self) -> bool {
+         matches!(self.kind, PatKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         match self.kind {
+             PatKind::MacCall(mac) => (mac, AttrVec::new(), AddSemicolon::No),
+@@ -1934,6 +1984,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
+     fn is_mac_call(&self) -> bool {
+         matches!(self.kind, ExprKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         match self.kind {
+             ExprKind::MacCall(mac) => (mac, self.attrs, AddSemicolon::No),
+@@ -1962,6 +2015,9 @@ fn walk_flat_map(mut self, collector: &mut InvocationCollector<'_, '_>) -> Self:
+     fn is_mac_call(&self) -> bool {
+         matches!(self.wrapped.kind, ast::ExprKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.wrapped.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         let node = self.wrapped;
+         match node.kind {
+@@ -1999,6 +2055,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
+     fn is_mac_call(&self) -> bool {
+         matches!(self.wrapped.kind, ast::ExprKind::MacCall(..))
+     }
++    fn mac_call_source_span(&self) -> Span {
++        self.wrapped.span
++    }
+     fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
+         let node = self.wrapped;
+         match node.kind {
+@@ -2127,17 +2186,23 @@ fn collect(&mut self, fragment_kind: AstFragmentKind, kind: InvocationKind) -> A
+                     depth: self.cx.current_expansion.depth + 1,
+                     ..self.cx.current_expansion.clone()
+                 },
++                discovered_in_expansion: self.cx.current_expansion.id,
+             },
+             None,
+         ));
+         placeholder(fragment_kind, NodeId::placeholder_from_expn_id(expn_id), vis)
+     }
+ 
+-    fn collect_bang(&mut self, mac: Box<ast::MacCall>, kind: AstFragmentKind) -> AstFragment {
++    fn collect_bang(
++        &mut self,
++        mac: Box<ast::MacCall>,
++        kind: AstFragmentKind,
++        source_span: Span,
++    ) -> AstFragment {
+         // cache the macro call span so that it can be
+         // easily adjusted for incremental compilation
+         let span = mac.span();
+-        self.collect(kind, InvocationKind::Bang { mac, span })
++        self.collect(kind, InvocationKind::Bang { mac, span, source_span })
+     }
+ 
+     fn collect_attr(
+@@ -2357,9 +2422,11 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
+                     }
+                 },
+                 None if node.is_mac_call() => {
++                    let source_span = node.mac_call_source_span();
+                     let (mac, attrs, add_semicolon) = node.take_mac_call();
+                     self.check_attributes(&attrs, &mac);
+-                    let mut res = self.collect_bang(mac, Node::KIND).make_ast::<Node>();
++                    let mut res =
++                        self.collect_bang(mac, Node::KIND, source_span).make_ast::<Node>();
+                     Node::post_flat_map_node_collect_bang(&mut res, add_semicolon);
+                     res
+                 }
+@@ -2447,11 +2514,13 @@ fn visit_node<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode
+                     }
+                 },
+                 None if node.is_mac_call() => {
++                    let source_span = node.mac_call_source_span();
+                     let n = mem::replace(node, Node::dummy());
+                     let (mac, attrs, _) = n.take_mac_call();
+                     self.check_attributes(&attrs, &mac);
+ 
+-                    *node = self.collect_bang(mac, Node::KIND).make_ast::<Node>().into()
++                    *node =
++                        self.collect_bang(mac, Node::KIND, source_span).make_ast::<Node>().into()
+                 }
+                 None if node.delegation().is_some() => unreachable!(),
+                 None => {
+diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
+index 3bfd1be9..b46955ac 100644
+--- a/compiler/rustc_middle/src/ty/mod.rs
++++ b/compiler/rustc_middle/src/ty/mod.rs
+@@ -189,6 +189,8 @@ pub struct ResolverGlobalCtxt {
+     /// These records preserve the source owner and use site before resolver
+     /// output is lowered into body-wide used-import sets.
+     pub resolved_import_uses: Vec<ResolvedImportUse>,
++    /// Macro invocations after their path and expansion data have been finalized.
++    pub macro_invocation_origins: UnordMap<ExpnId, MacroInvocationOrigin>,
+     pub module_children: LocalDefIdMap<Vec<ModChild>>,
+     pub ambig_module_children: LocalDefIdMap<Vec<AmbigModChild>>,
+     pub glob_map: FxIndexMap<LocalDefId, FxIndexSet<Symbol>>,
+@@ -220,6 +222,56 @@ pub struct ResolvedImportUse {
+     pub import_chain: Vec<Reexport>,
+ }
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash)]
++pub enum MacroInvocationFragmentKind {
++    OptExpr,
++    MethodReceiverExpr,
++    Expr,
++    Pat,
++    Ty,
++    Stmts,
++    Items,
++    TraitItems,
++    ImplItems,
++    TraitImplItems,
++    ForeignItems,
++    Arms,
++    ExprFields,
++    PatFields,
++    GenericParams,
++    Params,
++    FieldDefs,
++    Variants,
++    WherePredicates,
++    Crate,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash)]
++pub enum MacroImplementationKind {
++    Builtin,
++    Declarative,
++    Procedural,
++    Legacy,
++    InertAttribute,
++    GlobDelegation,
++}
++
++#[derive(Clone, Debug, StableHash)]
++pub struct MacroInvocationOrigin {
++    /// Expansion whose output contained this invocation when it was collected.
++    pub discovered_in_expansion: ExpnId,
++    /// Span of the unexpanded AST node that contained the invocation.
++    ///
++    /// For a written statement or item macro this includes its trailing semicolon.
++    /// Nested generated invocations retain their expansion context in this span.
++    /// Outer attributes and comments are owned by the source inventory, not this span.
++    pub invocation_node_span: Span,
++    /// Target item for attribute and derive invocations.
++    pub target_span: Option<Span>,
++    pub fragment_kind: MacroInvocationFragmentKind,
++    pub implementation_kind: MacroImplementationKind,
++}
++
+ #[derive(Debug)]
+ pub struct PerOwnerResolverData<'tcx> {
+     pub node_id_to_def_id: NodeMap<LocalDefId> = Default::default(),
+diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
+index e5cfcfc0..8a915528 100644
+--- a/compiler/rustc_resolve/src/lib.rs
++++ b/compiler/rustc_resolve/src/lib.rs
+@@ -65,8 +65,9 @@
+ use rustc_middle::middle::privacy::EffectiveVisibilities;
+ use rustc_middle::query::Providers;
+ use rustc_middle::ty::{
+-    self, DelegationInfo, MainDefinition, PerOwnerResolverData, RegisteredTools, ResolvedImportUse,
+-    ResolverAstLowering, ResolverGlobalCtxt, TyCtxt, TyCtxtFeed, Visibility,
++    self, DelegationInfo, MacroInvocationOrigin, MainDefinition, PerOwnerResolverData,
++    RegisteredTools, ResolvedImportUse, ResolverAstLowering, ResolverGlobalCtxt, TyCtxt,
++    TyCtxtFeed, Visibility,
+ };
+ use rustc_middle::{bug, span_bug};
+ use rustc_session::config::CrateType;
+@@ -1369,6 +1370,9 @@ pub struct Resolver<'ra, 'tcx> {
+     /// Finalized import/re-export provenance for semantic, non-macro paths.
+     resolved_import_uses: Vec<ResolvedImportUse> = Vec::new(),
+ 
++    /// Exact source origins for successfully resolved macro invocations.
++    macro_invocation_origins: UnordMap<ExpnId, MacroInvocationOrigin> = Default::default(),
++
+     /// `CrateNum` resolutions of `extern crate` items.
+     extern_crate_map: UnordMap<LocalDefId, CrateNum> = Default::default(),
+     module_children: LocalDefIdMap<Vec<ModChild>> = Default::default(),
+@@ -1945,6 +1949,7 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+         let extern_crate_map = self.extern_crate_map;
+         let maybe_unused_trait_imports = self.maybe_unused_trait_imports;
+         let resolved_import_uses = self.resolved_import_uses;
++        let macro_invocation_origins = self.macro_invocation_origins;
+         let glob_map = self.glob_map;
+         let main_def = self.main_def;
+         let confused_type_with_std_module = self.confused_type_with_std_module;
+@@ -1975,6 +1980,7 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+             glob_map,
+             maybe_unused_trait_imports,
+             resolved_import_uses,
++            macro_invocation_origins,
+             main_def,
+             trait_impls: self.trait_impls,
+             proc_macros,
+diff --git a/compiler/rustc_resolve/src/macros.rs b/compiler/rustc_resolve/src/macros.rs
+index 9747ebd4..78ac5096 100644
+--- a/compiler/rustc_resolve/src/macros.rs
++++ b/compiler/rustc_resolve/src/macros.rs
+@@ -21,7 +21,10 @@
+ use rustc_hir::def_id::{CrateNum, DefId, LocalDefId};
+ use rustc_hir::{Attribute, StabilityLevel};
+ use rustc_middle::middle::stability;
+-use rustc_middle::ty::{RegisteredTools, TyCtxt};
++use rustc_middle::ty::{
++    MacroImplementationKind, MacroInvocationFragmentKind, MacroInvocationOrigin, RegisteredTools,
++    TyCtxt,
++};
+ use rustc_session::Session;
+ use rustc_session::diagnostics::feature_err;
+ use rustc_session::lint::builtin::{
+@@ -120,6 +123,48 @@ fn fast_print_path(path: &ast::Path) -> Symbol {
+     }
+ }
+ 
++fn macro_invocation_fragment_kind(kind: AstFragmentKind) -> MacroInvocationFragmentKind {
++    match kind {
++        AstFragmentKind::OptExpr => MacroInvocationFragmentKind::OptExpr,
++        AstFragmentKind::MethodReceiverExpr => MacroInvocationFragmentKind::MethodReceiverExpr,
++        AstFragmentKind::Expr => MacroInvocationFragmentKind::Expr,
++        AstFragmentKind::Pat => MacroInvocationFragmentKind::Pat,
++        AstFragmentKind::Ty => MacroInvocationFragmentKind::Ty,
++        AstFragmentKind::Stmts => MacroInvocationFragmentKind::Stmts,
++        AstFragmentKind::Items => MacroInvocationFragmentKind::Items,
++        AstFragmentKind::TraitItems => MacroInvocationFragmentKind::TraitItems,
++        AstFragmentKind::ImplItems => MacroInvocationFragmentKind::ImplItems,
++        AstFragmentKind::TraitImplItems => MacroInvocationFragmentKind::TraitImplItems,
++        AstFragmentKind::ForeignItems => MacroInvocationFragmentKind::ForeignItems,
++        AstFragmentKind::Arms => MacroInvocationFragmentKind::Arms,
++        AstFragmentKind::ExprFields => MacroInvocationFragmentKind::ExprFields,
++        AstFragmentKind::PatFields => MacroInvocationFragmentKind::PatFields,
++        AstFragmentKind::GenericParams => MacroInvocationFragmentKind::GenericParams,
++        AstFragmentKind::Params => MacroInvocationFragmentKind::Params,
++        AstFragmentKind::FieldDefs => MacroInvocationFragmentKind::FieldDefs,
++        AstFragmentKind::Variants => MacroInvocationFragmentKind::Variants,
++        AstFragmentKind::WherePredicates => MacroInvocationFragmentKind::WherePredicates,
++        AstFragmentKind::Crate => MacroInvocationFragmentKind::Crate,
++    }
++}
++
++fn macro_implementation_kind(ext: &SyntaxExtension) -> MacroImplementationKind {
++    if ext.builtin_name.is_some() {
++        return MacroImplementationKind::Builtin;
++    }
++    match &ext.kind {
++        SyntaxExtensionKind::MacroRules(_) => MacroImplementationKind::Declarative,
++        SyntaxExtensionKind::Bang(_)
++        | SyntaxExtensionKind::Attr(_)
++        | SyntaxExtensionKind::Derive(_) => MacroImplementationKind::Procedural,
++        SyntaxExtensionKind::LegacyBang(_)
++        | SyntaxExtensionKind::LegacyAttr(_)
++        | SyntaxExtensionKind::LegacyDerive(_) => MacroImplementationKind::Legacy,
++        SyntaxExtensionKind::NonMacroAttr => MacroImplementationKind::InertAttribute,
++        SyntaxExtensionKind::GlobDelegation(_) => MacroImplementationKind::GlobDelegation,
++    }
++}
++
+ const PREDEFINED_TOOLS: &[Symbol] =
+     &[sym::clippy, sym::rustfmt, sym::diagnostic, sym::miri, sym::rust_analyzer];
+ 
+@@ -356,6 +401,19 @@ fn resolve_macro_invocation(
+             )
+         });
+ 
++        let expn_id = invoc_id.to_expn_id();
++        let origin = MacroInvocationOrigin {
++            discovered_in_expansion: invoc.discovered_in_expansion.to_expn_id(),
++            invocation_node_span: invoc.node_span(),
++            target_span: invoc.target_span(),
++            fragment_kind: macro_invocation_fragment_kind(invoc.fragment_kind),
++            implementation_kind: macro_implementation_kind(&ext),
++        };
++        if self.macro_invocation_origins.try_insert(expn_id, origin).is_err() {
++            self.dcx()
++                .bug("a resolved macro invocation must have exactly one source-origin record");
++        }
++
+         Ok(Arc::clone(ext))
+     }
+ 
+-- 
+2.55.0
+

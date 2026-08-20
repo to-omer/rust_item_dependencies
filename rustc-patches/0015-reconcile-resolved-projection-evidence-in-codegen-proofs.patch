@@ -1,0 +1,176 @@
+From eb86416ced4906f48ea5df2e8117af0d5cbf2087 Mon Sep 17 00:00:00 2001
+From: to-omer <48119218+to-omer@users.noreply.github.com>
+Date: Fri, 14 Aug 2026 08:12:25 +0900
+Subject: [PATCH 15/16] Reconcile resolved projection evidence in codegen
+ proofs
+
+---
+ .../src/traits/codegen_proof.rs               | 41 ++++++++----
+ .../auxiliary/selection-proof-trace-input.rs  | 18 +++++
+ tests/ui-fulldeps/selection-proof-trace.rs    | 66 +++++++++++++++++++
+ 3 files changed, 112 insertions(+), 13 deletions(-)
+
+diff --git a/compiler/rustc_trait_selection/src/traits/codegen_proof.rs b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
+index 59ecf0f6..d8faa22a 100644
+--- a/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
++++ b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
+@@ -314,22 +314,37 @@ pub fn finish(
+         if self.incomplete || self.muted != 0 {
+             return Err(CodegenSelectionProofError::IncompleteObservation);
+         }
+-        let projections = self
+-            .projections
+-            .iter()
+-            .map(|projection| {
+-                Some(CodegenProjectionTrace {
++        let mut projections = Vec::<CodegenProjectionTrace<'tcx>>::new();
++        let mut pending_projection_owners = Vec::new();
++        for projection in &self.projections {
++            let (param_env, alias) =
++                infcx.resolve_vars_if_possible((projection.param_env, projection.projection));
++            if (param_env, alias).has_non_region_infer() {
++                return Err(CodegenSelectionProofError::IncompleteObservation);
++            }
++            match (&projection.source, &projection.result) {
++                (Some(source), Some(result)) => projections.push(CodegenProjectionTrace {
+                     owners: projection.owners.clone(),
+-                    param_env: projection.param_env,
+-                    projection: projection.projection,
+-                    source: projection.source.clone()?,
++                    param_env,
++                    projection: alias,
++                    source: source.clone(),
+                     selected_trait_node: projection.selected_trait_node,
+                     selected_projection_item: projection.selected_projection_item,
+-                    result: projection.result.clone()?,
+-                })
+-            })
+-            .collect::<Option<Vec<_>>>()
+-            .ok_or(CodegenSelectionProofError::IncompleteObservation)?;
++                    result: result.clone(),
++                }),
++                (None, None) => {
++                    pending_projection_owners.push(((param_env, alias), &projection.owners))
++                }
++                _ => return Err(CodegenSelectionProofError::IncompleteObservation),
++            }
++        }
++        for (key, owners) in pending_projection_owners {
++            let complete = projections
++                .iter_mut()
++                .find(|candidate| (candidate.param_env, candidate.projection) == key)
++                .ok_or(CodegenSelectionProofError::IncompleteObservation)?;
++            complete.owners.extend_from_slice(owners);
++        }
+         let trace = CodegenSolverTrace {
+             root: self.root,
+             obligations: self.obligations.clone(),
+diff --git a/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
+index 72918153..d5fc6d93 100644
+--- a/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
++++ b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
+@@ -21,6 +21,24 @@ trait Supply {
+ type Callback = fn() -> Value;
+ type IteratorMap = std::iter::Map<std::ops::Range<i32>, fn(i32) -> i32>;
+ 
++trait ExtendMap {
++    type Key;
++}
++
++struct ExtendConcrete;
++
++impl ExtendMap for ExtendConcrete {
++    type Key = u8;
++}
++
++struct ExtendContainer<M, A>(std::marker::PhantomData<(M, A)>);
++
++impl<M: ExtendMap, A> Extend<M::Key> for ExtendContainer<M, A> {
++    fn extend<I: IntoIterator<Item = M::Key>>(&mut self, _: I) {}
++}
++
++type ExtendTarget = ExtendContainer<ExtendConcrete, ()>;
++
+ impl Other for Source {
+     type X = Value;
+ }
+diff --git a/tests/ui-fulldeps/selection-proof-trace.rs b/tests/ui-fulldeps/selection-proof-trace.rs
+index 2fe8b0dc..683c7c69 100644
+--- a/tests/ui-fulldeps/selection-proof-trace.rs
++++ b/tests/ui-fulldeps/selection-proof-trace.rs
+@@ -303,6 +303,72 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+         ));
+         assert!(iterator_item_projection.selected_projection_item.is_some());
+ 
++        // Resolving the selected impl may first observe an associated type through inference and
++        // then observe the same projection after inference resolves. The proof must reconcile the
++        // speculative owner with the complete projection evidence.
++        let extend_target = named_def(tcx, "ExtendTarget", DefKind::TyAlias);
++        let extend_target_ty = tcx.type_of(extend_target).instantiate_identity().skip_norm_wip();
++        let extend_map = named_def(tcx, "ExtendMap", DefKind::Trait);
++        let extend_concrete = named_def(tcx, "ExtendConcrete", DefKind::Struct);
++        let extend_map_impl = impl_for_adt(tcx, extend_map, extend_concrete);
++        let extend_map_key = associated_item(tcx, extend_map, "Key");
++        let extend_map_key_impl = tcx.impl_item_implementor_ids(extend_map_impl)[&extend_map_key];
++        let extend_trait = tcx
++            .all_traits_including_private()
++            .find(|&def_id| tcx.def_path_str(def_id) == "std::iter::Extend")
++            .unwrap();
++        let extend_key = typing_env
++            .as_query_input(ty::TraitRef::new(tcx, extend_trait, [extend_target_ty, tcx.types.u8]));
++        let extend_proof = tcx.codegen_selection_proof(extend_key).unwrap();
++        assert_eq!(extend_proof.top_source, *tcx.codegen_select_candidate(extend_key).unwrap());
++        let extend_owned = extend_proof.clone();
++        let extend_warm = tcx.codegen_selection_proof(extend_key).unwrap();
++        assert!(std::ptr::eq(extend_proof, extend_warm));
++        assert_eq!(extend_owned, *extend_warm);
++        let extend_map_projection = extend_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == extend_map_key)
++            .unwrap();
++        assert!(matches!(
++            extend_map_projection.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(ref data))
++                if data.impl_def_id == extend_map_impl
++        ));
++        assert_eq!(extend_map_projection.selected_projection_item, Some(extend_map_key_impl));
++        let owner_predicates: Vec<_> = extend_map_projection
++            .owners
++            .iter()
++            .map(|owner| extend_proof.trace.obligations[owner.0 as usize].predicate)
++            .collect();
++        assert_eq!(owner_predicates.len(), 2, "{:#?}", extend_proof.trace);
++        assert!(owner_predicates.iter().any(|predicate| {
++            predicate.as_trait_clause().is_some_and(|predicate| {
++                predicate.skip_binder().trait_ref
++                    == ty::TraitRef::new(
++                        tcx,
++                        extend_trait,
++                        [extend_target_ty, tcx.types.u8],
++                    )
++            })
++        }));
++        let extend_concrete_ty =
++            tcx.type_of(extend_concrete).instantiate_identity().skip_norm_wip();
++        let expected_projection = ty::AliasTerm::new_from_def_id(
++            tcx,
++            extend_map_key,
++            tcx.mk_args(&[extend_concrete_ty.into()]),
++        );
++        assert!(owner_predicates.iter().any(|predicate| {
++            predicate.as_projection_clause().is_some_and(|predicate| {
++                predicate.no_bound_vars().is_some_and(|predicate| {
++                    predicate.projection_term == expected_projection
++                        && predicate.term.expect_ty() == tcx.types.u8
++                })
++            })
++        }));
++
+         // The selected HeaderOnly impl has a projection in its header. This inner projection must
+         // come from the original committed rematch, not from speculative candidate search.
+         let header = named_def(tcx, "Header", DefKind::Trait);
+-- 
+2.55.0
+

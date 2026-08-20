@@ -1,0 +1,2973 @@
+From 12c0fc7a014bd1bf4ccba9508970480ac2ec6fd8 Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Tue, 11 Aug 2026 09:54:42 +0900
+Subject: [PATCH 7/9] rustc: expose codegen selection and projection proofs
+
+---
+ compiler/rustc_driver_impl/src/lib.rs         |    2 +-
+ compiler/rustc_middle/src/arena.rs            |    2 +
+ compiler/rustc_middle/src/queries.rs          |   17 +-
+ compiler/rustc_middle/src/query/erase.rs      |    2 +
+ compiler/rustc_middle/src/query/keys.rs       |   16 +
+ compiler/rustc_middle/src/traits/mod.rs       |  121 +-
+ .../src/traits/codegen_proof.rs               |  656 ++++++++++
+ .../src/traits/engine.rs                      |   19 +
+ .../src/traits/fulfill.rs                     |  121 +-
+ .../rustc_trait_selection/src/traits/mod.rs   |    1 +
+ .../src/traits/project.rs                     |  115 +-
+ .../src/traits/select/mod.rs                  |   74 +-
+ compiler/rustc_traits/src/codegen.rs          |   56 +-
+ compiler/rustc_traits/src/lib.rs              |    1 +
+ .../src/normalize_projection_ty.rs            |   85 +-
+ .../auxiliary/selection-proof-trace-input.rs  |  168 +++
+ tests/ui-fulldeps/selection-proof-trace.rs    | 1071 +++++++++++++++++
+ 17 files changed, 2507 insertions(+), 20 deletions(-)
+ create mode 100644 compiler/rustc_trait_selection/src/traits/codegen_proof.rs
+ create mode 100644 tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
+ create mode 100644 tests/ui-fulldeps/selection-proof-trace.rs
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index f218ca65..9c92bd5e 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 6;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 7;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_middle/src/arena.rs b/compiler/rustc_middle/src/arena.rs
+index ef943d70..06369bdc 100644
+--- a/compiler/rustc_middle/src/arena.rs
++++ b/compiler/rustc_middle/src/arena.rs
+@@ -113,6 +113,8 @@
+     used_trait_imports: rustc_data_structures::unord::UnordSet<rustc_hir::def_id::LocalDefId>,
+     is_late_bound_map: rustc_data_structures::fx::FxIndexSet<rustc_hir::ItemLocalId>,
+     impl_source: rustc_middle::traits::ImplSource<'tcx, ()>,
++    codegen_projection_proof: rustc_middle::traits::CodegenProjectionProof<'tcx>,
++    codegen_selection_proof: rustc_middle::traits::CodegenSelectionProof<'tcx>,
+ 
+     dep_kind_vtable: rustc_middle::dep_graph::DepKindVTable<'tcx>,
+ 
+diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
+index ca1cd2f4..e7391774 100644
+--- a/compiler/rustc_middle/src/queries.rs
++++ b/compiler/rustc_middle/src/queries.rs
+@@ -107,8 +107,9 @@
+     OutlivesBound,
+ };
+ use crate::traits::{
+-    CodegenObligationError, DynCompatibilityViolation, EvaluationResult, ImplSource,
+-    ObligationCause, OverflowError, WellFormedLoc, solve, specialization_graph,
++    CodegenObligationError, CodegenProjectionProof, CodegenProjectionProofError,
++    CodegenSelectionProof, CodegenSelectionProofError, DynCompatibilityViolation, EvaluationResult,
++    ImplSource, ObligationCause, OverflowError, WellFormedLoc, solve, specialization_graph,
+ };
+ use crate::ty::fast_reject::SimplifiedType;
+ use crate::ty::layout::ValidityRequirement;
+@@ -1602,6 +1603,18 @@
+         desc { "computing candidate for `{}`", key.value }
+     }
+ 
++    query codegen_selection_proof(
++        key: PseudoCanonicalInput<'tcx, ty::TraitRef<'tcx>>
++    ) -> Result<&'tcx CodegenSelectionProof<'tcx>, CodegenSelectionProofError> {
++        desc { "computing old-solver selected proof for `{}`", key.value }
++    }
++
++    query codegen_projection_proof(
++        key: PseudoCanonicalInput<'tcx, ty::AliasTerm<'tcx>>
++    ) -> Result<&'tcx CodegenProjectionProof<'tcx>, CodegenProjectionProofError> {
++        desc { "computing old-solver projection proof for `{}`", key.value }
++    }
++
+     /// Return all `impl` blocks in the current crate.
+     query all_local_trait_impls(_: ()) -> &'tcx rustc_data_structures::fx::FxIndexMap<DefId, Vec<LocalDefId>> {
+         desc { "finding local trait impls" }
+diff --git a/compiler/rustc_middle/src/query/erase.rs b/compiler/rustc_middle/src/query/erase.rs
+index 9a6ab273..08892529 100644
+--- a/compiler/rustc_middle/src/query/erase.rs
++++ b/compiler/rustc_middle/src/query/erase.rs
+@@ -200,6 +200,8 @@ impl Erasable for $ty {
+     Result<&'_ TokenStream, ()>,
+     Result<&'_ rustc_target::callconv::FnAbi<'_, Ty<'_>>, &'_ ty::layout::FnAbiError<'_>>,
+     Result<&'_ traits::ImplSource<'_, ()>, traits::CodegenObligationError>,
++    Result<&'_ traits::CodegenProjectionProof<'_>, traits::CodegenProjectionProofError>,
++    Result<&'_ traits::CodegenSelectionProof<'_>, traits::CodegenSelectionProofError>,
+     Result<&'_ ty::List<Ty<'_>>, ty::util::AlwaysRequiresDrop>,
+     Result<(&'_ Steal<thir::Thir<'_>>, thir::ExprId), ErrorGuaranteed>,
+     Result<(&'_ [Spanned<MonoItem<'_>>], &'_ [Spanned<MonoItem<'_>>]), NormalizationErrorInMono>,
+diff --git a/compiler/rustc_middle/src/query/keys.rs b/compiler/rustc_middle/src/query/keys.rs
+index a660b4b5..8c4447a3 100644
+--- a/compiler/rustc_middle/src/query/keys.rs
++++ b/compiler/rustc_middle/src/query/keys.rs
+@@ -302,6 +302,22 @@ fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+     }
+ }
+ 
++impl<'tcx> QueryKey for ty::AliasTerm<'tcx> {
++    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
++        let def_id = match self.kind {
++            ty::AliasTermKind::ProjectionTy { def_id }
++            | ty::AliasTermKind::ProjectionConst { def_id }
++            | ty::AliasTermKind::InherentTy { def_id }
++            | ty::AliasTermKind::InherentConst { def_id }
++            | ty::AliasTermKind::OpaqueTy { def_id }
++            | ty::AliasTermKind::FreeTy { def_id }
++            | ty::AliasTermKind::FreeConst { def_id }
++            | ty::AliasTermKind::AnonConst { def_id } => def_id,
++        };
++        tcx.def_span(def_id)
++    }
++}
++
+ impl<'tcx, T: QueryKey> QueryKey for ty::PseudoCanonicalInput<'tcx, T> {
+     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+         self.value.default_span(tcx)
+diff --git a/compiler/rustc_middle/src/traits/mod.rs b/compiler/rustc_middle/src/traits/mod.rs
+index a119424f..ca11c181 100644
+--- a/compiler/rustc_middle/src/traits/mod.rs
++++ b/compiler/rustc_middle/src/traits/mod.rs
+@@ -1003,7 +1003,8 @@ pub enum AssocConstViolation {
+ }
+ 
+ /// These are the error cases for `codegen_select_candidate`.
+-#[derive(Copy, Clone, Debug, Hash, StableHash, Encodable, Decodable)]
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash, Encodable, Decodable)]
++#[derive(TypeVisitable, TypeFoldable)]
+ pub enum CodegenObligationError {
+     /// Ambiguity can happen when monomorphizing during trans
+     /// expands to some humongous type that never occurred
+@@ -1019,3 +1020,121 @@ pub enum CodegenObligationError {
+     /// during impl WF checking.
+     UnconstrainedParam(ErrorGuaranteed),
+ }
++
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++/// A dense, query-local index. It is assigned after structurally stable obligation sorting; users
++/// must still treat the referenced obligation, not the numeric value, as the semantic identity.
++pub struct CodegenProofNodeId(pub u32);
++
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub struct CodegenProofObligation<'tcx> {
++    pub param_env: ty::ParamEnv<'tcx>,
++    pub predicate: ty::Predicate<'tcx>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub struct CodegenSelectionProof<'tcx> {
++    pub top_source: ImplSource<'tcx, ()>,
++    pub trace: CodegenSolverTrace<'tcx>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub struct CodegenProjectionProof<'tcx> {
++    pub normalized_term: ty::Term<'tcx>,
++    pub trace: CodegenSolverTrace<'tcx>,
++}
++
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash)]
++pub enum CodegenProjectionProofError {
++    UnsupportedAliasKind,
++    NormalizationFailed,
++    IncompleteObservation,
++    ResultMismatch,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub struct CodegenSolverTrace<'tcx> {
++    pub root: CodegenProofNodeId,
++    pub obligations: Vec<CodegenProofObligation<'tcx>>,
++    pub trait_selections: Vec<CodegenTraitSelectionTrace<'tcx>>,
++    pub projections: Vec<CodegenProjectionTrace<'tcx>>,
++    pub fulfillments: Vec<CodegenFulfillmentTrace>,
++    pub cycles: Vec<CodegenCycleTrace>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub struct CodegenTraitSelectionTrace<'tcx> {
++    pub node: CodegenProofNodeId,
++    pub source: ImplSource<'tcx, ()>,
++    pub nested: Vec<CodegenProofNodeId>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub struct CodegenProjectionTrace<'tcx> {
++    /// Every obligation whose committed proof used this projection.
++    ///
++    /// A projection cache entry may be reused by more than one obligation, so a
++    /// single owner would lose dependency edges on cache hits.
++    pub owners: Vec<CodegenProofNodeId>,
++    pub param_env: ty::ParamEnv<'tcx>,
++    pub projection: ty::AliasTerm<'tcx>,
++    pub source: CodegenProjectionSource<'tcx>,
++    /// The committed trait selection observed for an impl-backed projection.
++    pub selected_trait_node: Option<CodegenProofNodeId>,
++    /// The exact impl or trait associated item selected by specialization.
++    pub selected_projection_item: Option<DefId>,
++    pub result: CodegenProjectionTraceResult<'tcx>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub enum CodegenProjectionSource<'tcx> {
++    ParamEnv(ty::PolyProjectionPredicate<'tcx>),
++    TraitDef(ty::PolyProjectionPredicate<'tcx>),
++    Object(ty::PolyProjectionPredicate<'tcx>),
++    Selected(ImplSource<'tcx, ()>),
++    /// No applicable projection candidate exists. The solver keeps the input alias rigid and
++    /// creates no nested obligations.
++    NoApplicableCandidate,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub enum CodegenProjectionTraceResult<'tcx> {
++    Progress { raw_term: ty::Term<'tcx>, nested: Vec<CodegenProofNodeId> },
++    NoProgress(ty::Term<'tcx>),
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub struct CodegenFulfillmentTrace {
++    pub node: CodegenProofNodeId,
++    pub nested: Vec<CodegenProofNodeId>,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub struct CodegenCycleTrace {
++    pub nodes: Vec<CodegenProofNodeId>,
++    pub coinductive: bool,
++}
++
++#[derive(Copy, Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeVisitable, TypeFoldable)]
++pub enum CodegenSelectionProofError {
++    Selection(CodegenObligationError),
++    IncompleteObservation,
++}
++
++impl From<CodegenObligationError> for CodegenSelectionProofError {
++    fn from(error: CodegenObligationError) -> Self {
++        CodegenSelectionProofError::Selection(error)
++    }
++}
+diff --git a/compiler/rustc_trait_selection/src/traits/codegen_proof.rs b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
+new file mode 100644
+index 00000000..0c332374
+--- /dev/null
++++ b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
+@@ -0,0 +1,656 @@
++use std::cell::RefCell;
++use std::rc::Rc;
++
++use rustc_data_structures::fingerprint::Fingerprint;
++use rustc_data_structures::fx::FxHashMap;
++use rustc_data_structures::stable_hash::{StableHash, StableHasher};
++use rustc_infer::infer::InferCtxt;
++use rustc_middle::traits::{
++    CodegenCycleTrace, CodegenFulfillmentTrace, CodegenProjectionSource, CodegenProjectionTrace,
++    CodegenProjectionTraceResult, CodegenProofNodeId, CodegenProofObligation,
++    CodegenSelectionProofError, CodegenSolverTrace, CodegenTraitSelectionTrace, ImplSource,
++};
++use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt, Upcast};
++use rustc_span::def_id::DefId;
++
++pub type SharedCodegenProofRecorder<'tcx> = Rc<RefCell<CodegenProofRecorder<'tcx>>>;
++
++#[derive(Copy, Clone)]
++struct ProjectionId(u32);
++
++#[derive(Clone)]
++struct PendingProjection<'tcx> {
++    owners: Vec<CodegenProofNodeId>,
++    param_env: ty::ParamEnv<'tcx>,
++    projection: ty::AliasTerm<'tcx>,
++    source: Option<CodegenProjectionSource<'tcx>>,
++    selected_trait_node: Option<CodegenProofNodeId>,
++    selected_projection_item: Option<DefId>,
++    result: Option<CodegenProjectionTraceResult<'tcx>>,
++}
++
++#[derive(Clone)]
++pub struct CodegenProofRecorder<'tcx> {
++    root: CodegenProofNodeId,
++    node_ids: FxHashMap<(ty::ParamEnv<'tcx>, ty::Predicate<'tcx>), CodegenProofNodeId>,
++    obligations: Vec<CodegenProofObligation<'tcx>>,
++    projection_ids: FxHashMap<(ty::ParamEnv<'tcx>, ty::AliasTerm<'tcx>), ProjectionId>,
++    projections: Vec<PendingProjection<'tcx>>,
++    trait_selections: Vec<CodegenTraitSelectionTrace<'tcx>>,
++    fulfillments: Vec<CodegenFulfillmentTrace>,
++    cycles: Vec<CodegenCycleTrace>,
++    current_owner: Option<CodegenProofNodeId>,
++    incomplete: bool,
++    muted: usize,
++}
++
++impl<'tcx> CodegenProofRecorder<'tcx> {
++    pub fn shared(
++        param_env: ty::ParamEnv<'tcx>,
++        predicate: ty::Predicate<'tcx>,
++    ) -> SharedCodegenProofRecorder<'tcx> {
++        let root = CodegenProofNodeId(0);
++        Rc::new(RefCell::new(Self {
++            root,
++            node_ids: FxHashMap::from_iter([((param_env, predicate), root)]),
++            obligations: vec![CodegenProofObligation { param_env, predicate }],
++            projection_ids: FxHashMap::default(),
++            projections: Vec::new(),
++            trait_selections: Vec::new(),
++            fulfillments: Vec::new(),
++            cycles: Vec::new(),
++            current_owner: Some(root),
++            incomplete: false,
++            muted: 0,
++        }))
++    }
++
++    pub(crate) fn is_recording(&self) -> bool {
++        self.muted == 0
++    }
++
++    pub(crate) fn mute(&mut self) {
++        self.muted += 1;
++    }
++
++    pub(crate) fn unmute(&mut self) {
++        self.muted = self.muted.checked_sub(1).expect("unbalanced codegen proof mute");
++    }
++
++    pub(crate) fn mark_incomplete(&mut self) {
++        if self.is_recording() {
++            self.incomplete = true;
++        }
++    }
++
++    pub(crate) fn set_current_owner(
++        &mut self,
++        owner: Option<CodegenProofNodeId>,
++    ) -> Option<CodegenProofNodeId> {
++        std::mem::replace(&mut self.current_owner, owner)
++    }
++
++    pub(crate) fn node_for(
++        &mut self,
++        obligation: CodegenProofObligation<'tcx>,
++    ) -> CodegenProofNodeId {
++        let key = (obligation.param_env, obligation.predicate);
++        if let Some(&id) = self.node_ids.get(&key) {
++            return id;
++        }
++        let id = CodegenProofNodeId(self.obligations.len().try_into().unwrap());
++        self.node_ids.insert(key, id);
++        self.obligations.push(obligation);
++        id
++    }
++
++    pub(crate) fn record_selection(
++        &mut self,
++        obligation: CodegenProofObligation<'tcx>,
++        source: ImplSource<'tcx, CodegenProofObligation<'tcx>>,
++    ) {
++        if !self.is_recording() {
++            return;
++        }
++        let Some(&node) = self.node_ids.get(&(obligation.param_env, obligation.predicate)) else {
++            self.incomplete = true;
++            return;
++        };
++        let nested = source
++            .borrow_nested_obligations()
++            .iter()
++            .copied()
++            .map(|obligation| self.node_for(obligation))
++            .collect();
++        let selection = CodegenTraitSelectionTrace { node, source: source.map(|_| ()), nested };
++        match self.trait_selections.iter().find(|existing| existing.node == node) {
++            Some(existing) if existing == &selection => {}
++            Some(_) => {
++                self.incomplete = true;
++            }
++            None => self.trait_selections.push(selection),
++        }
++    }
++
++    pub(crate) fn observe_projection(
++        &mut self,
++        param_env: ty::ParamEnv<'tcx>,
++        projection: ty::AliasTerm<'tcx>,
++    ) {
++        self.projection_for(param_env, projection);
++    }
++
++    pub(crate) fn projection_has_result(
++        &self,
++        param_env: ty::ParamEnv<'tcx>,
++        projection: ty::AliasTerm<'tcx>,
++    ) -> bool {
++        self.projection_ids
++            .get(&(param_env, projection))
++            .is_some_and(|id| self.projections[id.0 as usize].result.is_some())
++    }
++
++    fn projection_for(
++        &mut self,
++        param_env: ty::ParamEnv<'tcx>,
++        projection: ty::AliasTerm<'tcx>,
++    ) -> Option<ProjectionId> {
++        if !self.is_recording() {
++            return None;
++        }
++        let Some(owner) = self.current_owner else {
++            self.incomplete = true;
++            return None;
++        };
++        let key = (param_env, projection);
++        if let Some(&id) = self.projection_ids.get(&key) {
++            let owners = &mut self.projections[id.0 as usize].owners;
++            if !owners.contains(&owner) {
++                owners.push(owner);
++            }
++            return Some(id);
++        }
++        let id = ProjectionId(self.projections.len().try_into().unwrap());
++        self.projection_ids.insert(key, id);
++        self.projections.push(PendingProjection {
++            owners: vec![owner],
++            param_env,
++            projection,
++            source: None,
++            selected_trait_node: None,
++            selected_projection_item: None,
++            result: None,
++        });
++        Some(id)
++    }
++
++    pub(crate) fn record_projection_selected_trait(
++        &mut self,
++        param_env: ty::ParamEnv<'tcx>,
++        projection: ty::AliasTerm<'tcx>,
++        obligation: CodegenProofObligation<'tcx>,
++    ) {
++        if !self.is_recording() {
++            return;
++        }
++        let node = self.node_for(obligation);
++        let Some(id) = self.projection_for(param_env, projection) else { return };
++        let entry = &mut self.projections[id.0 as usize];
++        match entry.selected_trait_node {
++            None => entry.selected_trait_node = Some(node),
++            Some(existing) if existing == node => {}
++            Some(_) => self.incomplete = true,
++        }
++    }
++
++    pub(crate) fn record_projection_leaf(
++        &mut self,
++        param_env: ty::ParamEnv<'tcx>,
++        projection: ty::AliasTerm<'tcx>,
++        selected_projection_item: DefId,
++    ) {
++        if !self.is_recording() {
++            return;
++        }
++        let Some(id) = self.projection_for(param_env, projection) else { return };
++        let entry = &mut self.projections[id.0 as usize];
++        match entry.selected_projection_item {
++            None => entry.selected_projection_item = Some(selected_projection_item),
++            Some(existing) if existing == selected_projection_item => {}
++            Some(_) => {
++                self.incomplete = true;
++            }
++        }
++    }
++
++    pub(crate) fn record_projection_progress(
++        &mut self,
++        param_env: ty::ParamEnv<'tcx>,
++        projection: ty::AliasTerm<'tcx>,
++        source: CodegenProjectionSource<'tcx>,
++        raw_term: ty::Term<'tcx>,
++        nested: impl IntoIterator<Item = CodegenProofObligation<'tcx>>,
++    ) {
++        if !self.is_recording() {
++            return;
++        }
++        let Some(id) = self.projection_for(param_env, projection) else { return };
++        let nested = nested.into_iter().map(|obligation| self.node_for(obligation)).collect();
++        let result = CodegenProjectionTraceResult::Progress { raw_term, nested };
++        let entry = &mut self.projections[id.0 as usize];
++        match (&entry.source, &entry.result) {
++            (None, None) => {
++                entry.source = Some(source);
++                entry.result = Some(result);
++            }
++            (Some(old_source), Some(old_result))
++                if old_source == &source && old_result == &result => {}
++            _ => {
++                self.incomplete = true;
++            }
++        }
++    }
++
++    pub(crate) fn record_projection_no_progress(
++        &mut self,
++        param_env: ty::ParamEnv<'tcx>,
++        projection: ty::AliasTerm<'tcx>,
++        source: CodegenProjectionSource<'tcx>,
++        term: ty::Term<'tcx>,
++    ) {
++        if !self.is_recording() {
++            return;
++        }
++        let Some(id) = self.projection_for(param_env, projection) else { return };
++        let result = CodegenProjectionTraceResult::NoProgress(term);
++        let entry = &mut self.projections[id.0 as usize];
++        match (&entry.source, &entry.result) {
++            (None, None) => {
++                entry.source = Some(source);
++                entry.result = Some(result);
++            }
++            (Some(old_source), Some(old_result))
++                if old_source == &source && old_result == &result => {}
++            _ => {
++                self.incomplete = true;
++            }
++        }
++    }
++
++    pub(crate) fn record_fulfillment(
++        &mut self,
++        obligation: CodegenProofObligation<'tcx>,
++        nested: impl IntoIterator<Item = CodegenProofObligation<'tcx>>,
++    ) {
++        if !self.is_recording() {
++            return;
++        }
++        let node = self.node_for(obligation);
++        let nested = nested.into_iter().map(|obligation| self.node_for(obligation)).collect();
++        self.fulfillments.push(CodegenFulfillmentTrace { node, nested });
++    }
++
++    pub(crate) fn record_cycle(
++        &mut self,
++        cycle: impl IntoIterator<Item = CodegenProofObligation<'tcx>>,
++        coinductive: bool,
++    ) {
++        if !self.is_recording() {
++            return;
++        }
++        let nodes = cycle
++            .into_iter()
++            .map(|obligation| {
++                let key = (obligation.param_env, obligation.predicate);
++                match self.node_ids.get(&key) {
++                    Some(&node) => node,
++                    None => {
++                        self.incomplete = true;
++                        self.node_for(obligation)
++                    }
++                }
++            })
++            .collect();
++        self.cycles.push(CodegenCycleTrace { nodes, coinductive });
++    }
++
++    pub fn finish(
++        &self,
++        tcx: TyCtxt<'tcx>,
++        infcx: &InferCtxt<'tcx>,
++    ) -> Result<CodegenSolverTrace<'tcx>, CodegenSelectionProofError> {
++        if self.incomplete || self.muted != 0 {
++            return Err(CodegenSelectionProofError::IncompleteObservation);
++        }
++        let projections = self
++            .projections
++            .iter()
++            .map(|projection| {
++                Some(CodegenProjectionTrace {
++                    owners: projection.owners.clone(),
++                    param_env: projection.param_env,
++                    projection: projection.projection,
++                    source: projection.source.clone()?,
++                    selected_trait_node: projection.selected_trait_node,
++                    selected_projection_item: projection.selected_projection_item,
++                    result: projection.result.clone()?,
++                })
++            })
++            .collect::<Option<Vec<_>>>()
++            .ok_or(CodegenSelectionProofError::IncompleteObservation)?;
++        let trace = CodegenSolverTrace {
++            root: self.root,
++            obligations: self.obligations.clone(),
++            trait_selections: self.trait_selections.clone(),
++            projections,
++            fulfillments: self.fulfillments.clone(),
++            cycles: self.cycles.clone(),
++        };
++        let trace = tcx.erase_and_anonymize_regions(infcx.resolve_vars_if_possible(trace));
++        if trace.has_non_region_infer() {
++            return Err(CodegenSelectionProofError::IncompleteObservation);
++        }
++        canonicalize_trace(tcx, trace)
++    }
++}
++
++fn canonicalize_trace<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    mut trace: CodegenSolverTrace<'tcx>,
++) -> Result<CodegenSolverTrace<'tcx>, CodegenSelectionProofError> {
++    let mut obligation_ids = FxHashMap::default();
++    let mut obligations = Vec::new();
++    let mut remap = Vec::with_capacity(trace.obligations.len());
++    for obligation in std::mem::take(&mut trace.obligations) {
++        let node = if let Some(&node) = obligation_ids.get(&obligation) {
++            node
++        } else {
++            let node = CodegenProofNodeId(
++                obligations
++                    .len()
++                    .try_into()
++                    .map_err(|_| CodegenSelectionProofError::IncompleteObservation)?,
++            );
++            obligation_ids.insert(obligation, node);
++            obligations.push(obligation);
++            node
++        };
++        remap.push(node);
++    }
++    let hashes: Vec<Fingerprint> = tcx.with_stable_hashing_context(|mut hcx| {
++        obligations
++            .iter()
++            .map(|obligation| {
++                let mut hasher = StableHasher::new();
++                obligation.stable_hash(&mut hcx, &mut hasher);
++                hasher.finish()
++            })
++            .collect()
++    });
++    let mut order: Vec<_> = (0..obligations.len()).collect();
++    order.sort_by_key(|&index| hashes[index]);
++    if order.windows(2).any(|pair| {
++        hashes[pair[0]] == hashes[pair[1]] && obligations[pair[0]] != obligations[pair[1]]
++    }) {
++        return Err(CodegenSelectionProofError::IncompleteObservation);
++    }
++    let mut stable_ids = vec![CodegenProofNodeId(0); obligations.len()];
++    for (stable_index, &old_index) in order.iter().enumerate() {
++        stable_ids[old_index] = CodegenProofNodeId(
++            stable_index
++                .try_into()
++                .map_err(|_| CodegenSelectionProofError::IncompleteObservation)?,
++        );
++    }
++    for node in &mut remap {
++        *node = remap_node(&stable_ids, *node)?;
++    }
++    obligations = order.into_iter().map(|index| obligations[index]).collect();
++    trace.root = remap_node(&remap, trace.root)?;
++    trace.obligations = obligations;
++
++    for selection in &mut trace.trait_selections {
++        selection.node = remap_node(&remap, selection.node)?;
++        remap_nodes(&remap, &mut selection.nested)?;
++    }
++    let mut trait_selections: Vec<CodegenTraitSelectionTrace<'tcx>> = Vec::new();
++    for selection in std::mem::take(&mut trace.trait_selections) {
++        if let Some(existing) =
++            trait_selections.iter().find(|existing| existing.node == selection.node)
++        {
++            if existing != &selection {
++                return Err(CodegenSelectionProofError::IncompleteObservation);
++            }
++        } else {
++            trait_selections.push(selection);
++        }
++    }
++    trace.trait_selections = trait_selections;
++
++    for projection in &mut trace.projections {
++        remap_nodes(&remap, &mut projection.owners)?;
++        if let Some(node) = &mut projection.selected_trait_node {
++            *node = remap_node(&remap, *node)?;
++        }
++        projection.owners.sort_by_key(|node| node.0);
++        projection.owners.dedup();
++        if let CodegenProjectionTraceResult::Progress { nested, .. } = &mut projection.result {
++            remap_nodes(&remap, nested)?;
++        }
++    }
++    let mut projections: Vec<CodegenProjectionTrace<'tcx>> = Vec::new();
++    for mut projection in std::mem::take(&mut trace.projections) {
++        if let Some(existing) = projections.iter_mut().find(|existing| {
++            existing.param_env == projection.param_env
++                && existing.projection == projection.projection
++        }) {
++            if existing.source != projection.source
++                || existing.selected_trait_node != projection.selected_trait_node
++                || existing.selected_projection_item != projection.selected_projection_item
++                || existing.result != projection.result
++            {
++                return Err(CodegenSelectionProofError::IncompleteObservation);
++            }
++            existing.owners.append(&mut projection.owners);
++            existing.owners.sort_by_key(|node| node.0);
++            existing.owners.dedup();
++        } else {
++            projections.push(projection);
++        }
++    }
++    trace.projections = projections;
++
++    for fulfillment in &mut trace.fulfillments {
++        fulfillment.node = remap_node(&remap, fulfillment.node)?;
++        remap_nodes(&remap, &mut fulfillment.nested)?;
++    }
++    let mut fulfillments: Vec<CodegenFulfillmentTrace> = Vec::new();
++    for mut fulfillment in std::mem::take(&mut trace.fulfillments) {
++        if let Some(existing) =
++            fulfillments.iter_mut().find(|existing| existing.node == fulfillment.node)
++        {
++            existing.nested.append(&mut fulfillment.nested);
++            existing.nested.sort_by_key(|node| node.0);
++            existing.nested.dedup();
++        } else {
++            fulfillments.push(fulfillment);
++        }
++    }
++    trace.fulfillments = fulfillments;
++
++    for cycle in &mut trace.cycles {
++        remap_nodes(&remap, &mut cycle.nodes)?;
++    }
++    dedup_preserving_order(&mut trace.cycles);
++
++    validate_reachability(tcx, &trace)?;
++    Ok(trace)
++}
++
++fn remap_node(
++    remap: &[CodegenProofNodeId],
++    node: CodegenProofNodeId,
++) -> Result<CodegenProofNodeId, CodegenSelectionProofError> {
++    remap.get(node.0 as usize).copied().ok_or(CodegenSelectionProofError::IncompleteObservation)
++}
++
++fn remap_nodes(
++    remap: &[CodegenProofNodeId],
++    nodes: &mut Vec<CodegenProofNodeId>,
++) -> Result<(), CodegenSelectionProofError> {
++    for node in &mut *nodes {
++        *node = remap_node(remap, *node)?;
++    }
++    let mut deduped = Vec::with_capacity(nodes.len());
++    for node in std::mem::take(nodes) {
++        if !deduped.contains(&node) {
++            deduped.push(node);
++        }
++    }
++    *nodes = deduped;
++    Ok(())
++}
++
++fn dedup_preserving_order<T: PartialEq>(values: &mut Vec<T>) {
++    let mut deduped = Vec::with_capacity(values.len());
++    for value in std::mem::take(values) {
++        if !deduped.contains(&value) {
++            deduped.push(value);
++        }
++    }
++    *values = deduped;
++}
++
++fn validate_reachability<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    trace: &CodegenSolverTrace<'tcx>,
++) -> Result<(), CodegenSelectionProofError> {
++    if trace.projections.iter().any(|projection| {
++        matches!(projection.source, CodegenProjectionSource::Selected(ImplSource::UserDefined(_)))
++            != projection.selected_projection_item.is_some()
++    }) {
++        return Err(CodegenSelectionProofError::IncompleteObservation);
++    }
++    if trace.cycles.iter().any(|cycle| !cycle.coinductive) {
++        return Err(CodegenSelectionProofError::IncompleteObservation);
++    }
++    for projection in &trace.projections {
++        if matches!(projection.source, CodegenProjectionSource::NoApplicableCandidate)
++            && (!matches!(
++                projection.result,
++                CodegenProjectionTraceResult::NoProgress(term)
++                    if term == projection.projection.to_term(tcx, ty::IsRigid::No)
++            ))
++        {
++            return Err(CodegenSelectionProofError::IncompleteObservation);
++        }
++        match (&projection.source, projection.selected_trait_node) {
++            (CodegenProjectionSource::Selected(source), Some(node)) => {
++                let expected = CodegenProofObligation {
++                    param_env: projection.param_env,
++                    predicate: ty::Binder::dummy(projection.projection.trait_ref(tcx)).upcast(tcx),
++                };
++                if trace.obligations.get(node.0 as usize) != Some(&expected)
++                    || trace
++                        .trait_selections
++                        .iter()
++                        .find(|selection| selection.node == node)
++                        .map(|selection| &selection.source)
++                        != Some(source)
++                {
++                    return Err(CodegenSelectionProofError::IncompleteObservation);
++                }
++            }
++            (CodegenProjectionSource::Selected(_), None)
++            | (CodegenProjectionSource::ParamEnv(_), Some(_))
++            | (CodegenProjectionSource::TraitDef(_), Some(_))
++            | (CodegenProjectionSource::Object(_), Some(_))
++            | (CodegenProjectionSource::NoApplicableCandidate, Some(_)) => {
++                return Err(CodegenSelectionProofError::IncompleteObservation);
++            }
++            (CodegenProjectionSource::ParamEnv(_), None)
++            | (CodegenProjectionSource::TraitDef(_), None)
++            | (CodegenProjectionSource::Object(_), None)
++            | (CodegenProjectionSource::NoApplicableCandidate, None) => {}
++        }
++    }
++
++    let mut reached = vec![false; trace.obligations.len()];
++    let root = reached
++        .get_mut(trace.root.0 as usize)
++        .ok_or(CodegenSelectionProofError::IncompleteObservation)?;
++    *root = true;
++
++    let mut changed = true;
++    while changed {
++        changed = false;
++        for selection in &trace.trait_selections {
++            if is_reached(&reached, selection.node)? {
++                changed |= mark_reached(&mut reached, &selection.nested)?;
++            }
++        }
++        for projection in &trace.projections {
++            let used = projection.owners.iter().try_fold(false, |used, &owner| {
++                Ok::<_, CodegenSelectionProofError>(used || is_reached(&reached, owner)?)
++            })?;
++            if used
++                && let CodegenProjectionTraceResult::Progress { nested, .. } = &projection.result
++            {
++                changed |= mark_reached(&mut reached, nested)?;
++            }
++            if used && let Some(node) = projection.selected_trait_node {
++                changed |= mark_reached(&mut reached, &[node])?;
++            }
++        }
++        for fulfillment in &trace.fulfillments {
++            if is_reached(&reached, fulfillment.node)? {
++                changed |= mark_reached(&mut reached, &fulfillment.nested)?;
++            }
++        }
++        for cycle in &trace.cycles {
++            let connected = cycle.nodes.iter().try_fold(false, |seen, &node| {
++                Ok::<_, CodegenSelectionProofError>(seen || is_reached(&reached, node)?)
++            })?;
++            if connected {
++                changed |= mark_reached(&mut reached, &cycle.nodes)?;
++            }
++        }
++    }
++
++    if !reached.into_iter().all(|reached| reached) {
++        return Err(CodegenSelectionProofError::IncompleteObservation);
++    }
++
++    for index in 0..trace.obligations.len() {
++        let node = CodegenProofNodeId(index.try_into().unwrap());
++        let has_transition = trace.trait_selections.iter().any(|fact| fact.node == node)
++            || trace.fulfillments.iter().any(|fact| fact.node == node)
++            || trace.cycles.iter().any(|cycle| cycle.nodes.contains(&node));
++        if !has_transition {
++            return Err(CodegenSelectionProofError::IncompleteObservation);
++        }
++    }
++    Ok(())
++}
++
++fn is_reached(
++    reached: &[bool],
++    node: CodegenProofNodeId,
++) -> Result<bool, CodegenSelectionProofError> {
++    reached.get(node.0 as usize).copied().ok_or(CodegenSelectionProofError::IncompleteObservation)
++}
++
++fn mark_reached(
++    reached: &mut [bool],
++    nodes: &[CodegenProofNodeId],
++) -> Result<bool, CodegenSelectionProofError> {
++    let mut changed = false;
++    for &node in nodes {
++        let slot = reached
++            .get_mut(node.0 as usize)
++            .ok_or(CodegenSelectionProofError::IncompleteObservation)?;
++        changed |= !*slot;
++        *slot = true;
++    }
++    Ok(changed)
++}
+diff --git a/compiler/rustc_trait_selection/src/traits/engine.rs b/compiler/rustc_trait_selection/src/traits/engine.rs
+index 3e6d1462..b891b5a8 100644
+--- a/compiler/rustc_trait_selection/src/traits/engine.rs
++++ b/compiler/rustc_trait_selection/src/traits/engine.rs
+@@ -17,6 +17,7 @@
+ use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, Unnormalized, Upcast, Variance};
+ use thin_vec::ThinVec;
+ 
++use super::codegen_proof::SharedCodegenProofRecorder;
+ use super::{FromSolverError, FulfillmentContext, ScrubbedTraitError, TraitEngine};
+ use crate::error_reporting::InferCtxtErrorExt;
+ use crate::regions::InferCtxtRegionExt;
+@@ -51,6 +52,14 @@ pub fn new(infcx: &InferCtxt<'tcx>) -> Self {
+             FulfillmentEngine::Old(FulfillmentContext::new(infcx))
+         }
+     }
++
++    fn new_with_codegen_proof(
++        infcx: &InferCtxt<'tcx>,
++        recorder: SharedCodegenProofRecorder<'tcx>,
++    ) -> Self {
++        assert!(!infcx.next_trait_solver());
++        FulfillmentEngine::Old(FulfillmentContext::new_with_codegen_proof(infcx, recorder))
++    }
+ }
+ 
+ impl<'tcx, E> TraitEngine<'tcx, E> for FulfillmentEngine<'tcx, E>
+@@ -162,6 +171,16 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx, ScrubbedTraitError<'tcx>> {
+     pub fn new(infcx: &'a InferCtxt<'tcx>) -> Self {
+         Self { infcx, engine: RefCell::new(FulfillmentEngine::new(infcx)) }
+     }
++
++    pub fn new_with_codegen_proof(
++        infcx: &'a InferCtxt<'tcx>,
++        recorder: SharedCodegenProofRecorder<'tcx>,
++    ) -> Self {
++        Self {
++            infcx,
++            engine: RefCell::new(FulfillmentEngine::new_with_codegen_proof(infcx, recorder)),
++        }
++    }
+ }
+ 
+ impl<'a, 'tcx, E> ObligationCtxt<'a, 'tcx, E>
+diff --git a/compiler/rustc_trait_selection/src/traits/fulfill.rs b/compiler/rustc_trait_selection/src/traits/fulfill.rs
+index 3b111ab3..dde9f370 100644
+--- a/compiler/rustc_trait_selection/src/traits/fulfill.rs
++++ b/compiler/rustc_trait_selection/src/traits/fulfill.rs
+@@ -11,6 +11,7 @@
+     TraitEngine, TraitErrors,
+ };
+ use rustc_middle::bug;
++use rustc_middle::traits::CodegenProofObligation;
+ use rustc_middle::ty::abstract_const::NotConstEvaluatable;
+ use rustc_middle::ty::error::{ExpectedFound, TypeError};
+ use rustc_middle::ty::{
+@@ -20,6 +21,7 @@
+ use thin_vec::{ThinVec, thin_vec};
+ use tracing::{debug, debug_span, instrument};
+ 
++use super::codegen_proof::SharedCodegenProofRecorder;
+ use super::effects::{self, HostEffectObligation};
+ use super::project::{self, ProjectAndUnifyResult};
+ use super::select::SelectionContext;
+@@ -68,6 +70,8 @@ pub struct FulfillmentContext<'tcx, E: 'tcx> {
+     /// use the context in exactly this snapshot.
+     usable_in_snapshot: usize,
+ 
++    codegen_proof_recorder: Option<SharedCodegenProofRecorder<'tcx>>,
++
+     _errors: PhantomData<E>,
+ }
+ 
+@@ -99,19 +103,34 @@ pub(super) fn new(infcx: &InferCtxt<'tcx>) -> FulfillmentContext<'tcx, E> {
+         FulfillmentContext {
+             predicates: ObligationForest::new(),
+             usable_in_snapshot: infcx.num_open_snapshots(),
++            codegen_proof_recorder: None,
+             _errors: PhantomData,
+         }
+     }
+ 
++    pub(crate) fn new_with_codegen_proof(
++        infcx: &InferCtxt<'tcx>,
++        recorder: SharedCodegenProofRecorder<'tcx>,
++    ) -> FulfillmentContext<'tcx, E> {
++        let mut context = Self::new(infcx);
++        context.codegen_proof_recorder = Some(recorder);
++        context
++    }
++
+     /// Attempts to select obligations using `selcx`.
+     fn select(&mut self, selcx: SelectionContext<'_, 'tcx>) -> TraitErrors<E> {
+         let span = debug_span!("select", obligation_forest_size = ?self.predicates.len());
+         let _enter = span.enter();
+         let infcx = selcx.infcx;
+ 
+-        // Process pending obligations.
+-        let outcome: Outcome<_, _> =
+-            self.predicates.process_obligations(&mut FulfillProcessor { selcx });
++        // Process pending obligations. The normal hot path keeps using the stock processor.
++        let outcome: Outcome<_, _> = match &self.codegen_proof_recorder {
++            Some(recorder) => self.predicates.process_obligations(&mut TracingFulfillProcessor {
++                inner: FulfillProcessor { selcx },
++                recorder: recorder.clone(),
++            }),
++            None => self.predicates.process_obligations(&mut FulfillProcessor { selcx }),
++        };
+ 
+         // FIXME: if we kept the original cache key, we could mark projection
+         // obligations as complete for the projection cache here.
+@@ -162,7 +181,12 @@ fn collect_remaining_errors(&mut self, infcx: &InferCtxt<'tcx>) -> TraitErrors<E
+     }
+ 
+     fn try_evaluate_obligations(&mut self, infcx: &InferCtxt<'tcx>) -> TraitErrors<E> {
+-        let selcx = SelectionContext::new(infcx);
++        let selcx = match &self.codegen_proof_recorder {
++            Some(recorder) => {
++                SelectionContext::with_codegen_proof_recorder(infcx, recorder.clone())
++            }
++            None => SelectionContext::new(infcx),
++        };
+         self.select(selcx)
+     }
+ 
+@@ -279,6 +303,11 @@ struct FulfillProcessor<'a, 'tcx> {
+     selcx: SelectionContext<'a, 'tcx>,
+ }
+ 
++struct TracingFulfillProcessor<'a, 'tcx> {
++    inner: FulfillProcessor<'a, 'tcx>,
++    recorder: SharedCodegenProofRecorder<'tcx>,
++}
++
+ fn mk_pending<'tcx>(
+     parent: &PredicateObligation<'tcx>,
+     os: PredicateObligations<'tcx>,
+@@ -393,7 +422,8 @@ fn process_obligation(
+ 
+         let infcx = self.selcx.infcx;
+ 
+-        if !infcx.disable_trait_solver_fast_paths()
++        if self.selcx.codegen_proof_recorder().is_none()
++            && !infcx.disable_trait_solver_fast_paths()
+             && sizedness_fast_path(infcx.tcx, obligation.predicate, obligation.param_env)
+         {
+             return ProcessResult::Changed(thin_vec![]);
+@@ -863,6 +893,77 @@ fn process_backedge<'c, I>(
+     }
+ }
+ 
++impl<'a, 'tcx> ObligationProcessor for TracingFulfillProcessor<'a, 'tcx> {
++    type Obligation = PendingPredicateObligation<'tcx>;
++    type Error = FulfillmentErrorCode<'tcx>;
++    type OUT = Outcome<Self::Obligation, Self::Error>;
++
++    fn skippable_obligations<'b>(
++        &'b self,
++        it: impl Iterator<Item = &'b Self::Obligation>,
++    ) -> usize {
++        self.inner.skippable_obligations(it)
++    }
++
++    fn needs_process_obligation(&self, obligation: &Self::Obligation) -> bool {
++        self.inner.needs_process_obligation(obligation)
++    }
++
++    fn process_obligation(
++        &mut self,
++        obligation: &mut Self::Obligation,
++    ) -> ProcessResult<Self::Obligation, Self::Error> {
++        let proof_obligation = CodegenProofObligation {
++            param_env: obligation.obligation.param_env,
++            predicate: self
++                .inner
++                .selcx
++                .infcx
++                .resolve_vars_if_possible(obligation.obligation.predicate),
++        };
++        let previous_owner = {
++            let mut recorder = self.recorder.borrow_mut();
++            let node = recorder.node_for(proof_obligation);
++            recorder.set_current_owner(Some(node))
++        };
++
++        let result = self.inner.process_obligation(obligation);
++        let mut recorder = self.recorder.borrow_mut();
++        match &result {
++            ProcessResult::Changed(nested) => recorder.record_fulfillment(
++                proof_obligation,
++                nested.iter().map(|pending| CodegenProofObligation {
++                    param_env: pending.obligation.param_env,
++                    predicate: pending.obligation.predicate,
++                }),
++            ),
++            ProcessResult::Unchanged | ProcessResult::Error(_) => {}
++        }
++        recorder.set_current_owner(previous_owner);
++        result
++    }
++
++    fn process_backedge<'c, I>(
++        &mut self,
++        cycle: I,
++        marker: PhantomData<&'c Self::Obligation>,
++    ) -> Result<(), Self::Error>
++    where
++        I: Clone + Iterator<Item = &'c Self::Obligation>,
++    {
++        let proof_cycle: Vec<_> = cycle
++            .clone()
++            .map(|pending| CodegenProofObligation {
++                param_env: pending.obligation.param_env,
++                predicate: pending.obligation.predicate,
++            })
++            .collect();
++        let result = self.inner.process_backedge(cycle, marker);
++        self.recorder.borrow_mut().record_cycle(proof_cycle, result.is_ok());
++        result
++    }
++}
++
+ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
+     #[instrument(level = "debug", skip(self, obligation, stalled_on))]
+     fn process_trait_obligation(
+@@ -872,7 +973,10 @@ fn process_trait_obligation(
+         stalled_on: &mut Vec<TyOrConstInferVar>,
+     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
+         let infcx = self.selcx.infcx;
+-        if obligation.predicate.is_global() && !self.selcx.typing_mode().is_coherence() {
++        if self.selcx.codegen_proof_recorder().is_none()
++            && obligation.predicate.is_global()
++            && !self.selcx.typing_mode().is_coherence()
++        {
+             // no type variables present, can use evaluation for better caching.
+             // FIXME: consider caching errors too.
+             if infcx.predicate_must_hold_considering_regions(obligation) {
+@@ -926,7 +1030,10 @@ fn process_projection_obligation(
+     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
+         let tcx = self.selcx.tcx();
+         let infcx = self.selcx.infcx;
+-        if obligation.predicate.is_global() && !self.selcx.typing_mode().is_coherence() {
++        if self.selcx.codegen_proof_recorder().is_none()
++            && obligation.predicate.is_global()
++            && !self.selcx.typing_mode().is_coherence()
++        {
+             // no type variables present, can use evaluation for better caching.
+             // FIXME: consider caching errors too.
+             if infcx.predicate_must_hold_considering_regions(obligation) {
+diff --git a/compiler/rustc_trait_selection/src/traits/mod.rs b/compiler/rustc_trait_selection/src/traits/mod.rs
+index e3653bd3..bc929f36 100644
+--- a/compiler/rustc_trait_selection/src/traits/mod.rs
++++ b/compiler/rustc_trait_selection/src/traits/mod.rs
+@@ -3,6 +3,7 @@
+ //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/traits/resolution.html
+ 
+ pub mod auto_trait;
++pub mod codegen_proof;
+ pub(crate) mod coherence;
+ pub mod const_evaluatable;
+ mod dyn_compatibility;
+diff --git a/compiler/rustc_trait_selection/src/traits/project.rs b/compiler/rustc_trait_selection/src/traits/project.rs
+index 72954c08..5a9f52f0 100644
+--- a/compiler/rustc_trait_selection/src/traits/project.rs
++++ b/compiler/rustc_trait_selection/src/traits/project.rs
+@@ -11,7 +11,10 @@
+ use rustc_infer::infer::resolve::OpportunisticRegionResolver;
+ use rustc_infer::traits::{ObligationCauseCode, PredicateObligations};
+ use rustc_middle::traits::select::OverflowError;
+-use rustc_middle::traits::{BuiltinImplSource, ImplSource, ImplSourceUserDefinedData};
++use rustc_middle::traits::{
++    BuiltinImplSource, CodegenProjectionSource, CodegenProofObligation, ImplSource,
++    ImplSourceUserDefinedData,
++};
+ use rustc_middle::ty::fast_reject::DeepRejectCtxt;
+ use rustc_middle::ty::{
+     self, FieldInfo, Term, Ty, TyCtxt, TypeFoldable, TypeVisitableExt, TypingMode, Unnormalized,
+@@ -310,6 +313,9 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
+     let infcx = selcx.infcx;
+     debug_assert!(!selcx.infcx.next_trait_solver());
+     let projection_term = infcx.resolve_vars_if_possible(projection_term);
++    if let Some(recorder) = selcx.codegen_proof_recorder() {
++        recorder.borrow_mut().observe_projection(param_env, projection_term);
++    }
+     let cache_key = ProjectionCacheKey::new(projection_term, param_env);
+ 
+     // FIXME(#20304) For now, I am caching here, which is good, but it
+@@ -320,6 +326,19 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
+     // bounds. It might be the case that we want two distinct caches,
+     // or else another kind of cache entry.
+     let cache_entry = infcx.inner.borrow_mut().projection_cache().try_start(cache_key);
++    let unobserved_terminal_cache_entry =
++        matches!(
++            &cache_entry,
++            Err(ProjectionCacheEntry::NormalizedTerm { .. }
++                | ProjectionCacheEntry::Ambiguous
++                | ProjectionCacheEntry::Error)
++        ) && selcx.codegen_proof_recorder().is_some_and(|recorder| {
++            let recorder = recorder.borrow();
++            recorder.is_recording() && !recorder.projection_has_result(param_env, projection_term)
++        });
++    if unobserved_terminal_cache_entry && let Some(recorder) = selcx.codegen_proof_recorder() {
++        recorder.borrow_mut().mark_incomplete();
++    }
+     match cache_entry {
+         Ok(()) => debug!("no cache"),
+         Err(ProjectionCacheEntry::Ambiguous) => {
+@@ -703,6 +722,11 @@ fn project<'cx, 'tcx>(
+     }
+ 
+     let mut candidates = ProjectionCandidateSet::None;
++    let proof_recorder = selcx.codegen_proof_recorder().cloned();
++    let proof_checkpoint = proof_recorder.as_ref().map(|recorder| recorder.borrow().clone());
++    if let Some(recorder) = &proof_recorder {
++        recorder.borrow_mut().mute();
++    }
+ 
+     // Make sure that the following procedures are kept in order. ParamEnv
+     // needs to be first because it has highest priority, and Select checks
+@@ -718,17 +742,82 @@ fn project<'cx, 'tcx>(
+         // `assemble_candidates_from_object_ty`).
+         // FIXME(lazy_normalization): Lazy normalization should save us from
+         // having to special case this.
++        if let Some(recorder) = &proof_recorder {
++            recorder.borrow_mut().unmute();
++        }
+     } else {
++        if let Some(recorder) = &proof_recorder {
++            recorder.borrow_mut().unmute();
++        }
+         assemble_candidates_from_impls(selcx, obligation, &mut candidates);
+-    };
++        if !matches!(candidates, ProjectionCandidateSet::Single(ProjectionCandidate::Select(_)))
++            && let (Some(recorder), Some(checkpoint)) = (&proof_recorder, proof_checkpoint)
++        {
++            *recorder.borrow_mut() = checkpoint;
++        }
++    }
+ 
+     match candidates {
+         ProjectionCandidateSet::Single(candidate) => {
+-            confirm_candidate(selcx, obligation, candidate)
++            if matches!(candidate, ProjectionCandidate::Select(_))
++                && let Some(recorder) = selcx.codegen_proof_recorder()
++            {
++                let trait_ref = obligation.predicate.trait_ref(selcx.tcx());
++                recorder.borrow_mut().record_projection_selected_trait(
++                    obligation.param_env,
++                    obligation.predicate,
++                    CodegenProofObligation {
++                        param_env: obligation.param_env,
++                        predicate: ty::Binder::dummy(trait_ref).upcast(selcx.tcx()),
++                    },
++                );
++            }
++            let proof_record = selcx
++                .codegen_proof_recorder()
++                .filter(|recorder| recorder.borrow().is_recording())
++                .cloned()
++                .map(|recorder| (recorder, codegen_projection_source(&candidate)));
++            let result = confirm_candidate(selcx, obligation, candidate);
++            if let Some((recorder, proof_source)) = proof_record {
++                match &result {
++                    Ok(Projected::Progress(progress)) => {
++                        let nested =
++                            progress.obligations.iter().map(|obligation| CodegenProofObligation {
++                                param_env: obligation.param_env,
++                                predicate: obligation.predicate,
++                            });
++                        recorder.borrow_mut().record_projection_progress(
++                            obligation.param_env,
++                            obligation.predicate,
++                            proof_source,
++                            progress.term.skip_normalization(),
++                            nested,
++                        );
++                    }
++                    Ok(Projected::NoProgress(term)) => {
++                        recorder.borrow_mut().record_projection_no_progress(
++                            obligation.param_env,
++                            obligation.predicate,
++                            proof_source,
++                            *term,
++                        );
++                    }
++                    Err(_) => {}
++                }
++            }
++            result
+         }
+         ProjectionCandidateSet::None => {
+             let tcx = selcx.tcx();
+             let term = obligation.predicate.to_term(tcx, ty::IsRigid::No);
++            if let Some(recorder) = selcx.codegen_proof_recorder() {
++                recorder.borrow_mut().record_projection_no_progress(
++                    obligation.param_env,
++                    obligation.predicate,
++                    CodegenProjectionSource::NoApplicableCandidate,
++                    term,
++                );
++            }
+             Ok(Projected::NoProgress(term))
+         }
+         // Error occurred while trying to processing impls.
+@@ -739,6 +828,19 @@ fn project<'cx, 'tcx>(
+     }
+ }
+ 
++fn codegen_projection_source<'tcx>(
++    candidate: &ProjectionCandidate<'tcx>,
++) -> CodegenProjectionSource<'tcx> {
++    match candidate {
++        ProjectionCandidate::ParamEnv(predicate) => CodegenProjectionSource::ParamEnv(*predicate),
++        ProjectionCandidate::TraitDef(predicate) => CodegenProjectionSource::TraitDef(*predicate),
++        ProjectionCandidate::Object(predicate) => CodegenProjectionSource::Object(*predicate),
++        ProjectionCandidate::Select(source) => {
++            CodegenProjectionSource::Selected(source.clone().map(|_| ()))
++        }
++    }
++}
++
+ /// The first thing we have to do is scan through the parameter
+ /// environment to see whether there are any projection predicates
+ /// there that can answer this question.
+@@ -2022,6 +2124,13 @@ fn confirm_impl_candidate<'cx, 'tcx>(
+             )));
+         }
+     };
++    if let Some(recorder) = selcx.codegen_proof_recorder() {
++        recorder.borrow_mut().record_projection_leaf(
++            obligation.param_env,
++            obligation.predicate,
++            assoc_term.item.def_id,
++        );
++    }
+ 
+     // This means that the impl is missing a definition for the
+     // associated type. This is either because the associate item
+diff --git a/compiler/rustc_trait_selection/src/traits/select/mod.rs b/compiler/rustc_trait_selection/src/traits/select/mod.rs
+index 4af20d1a..392bb969 100644
+--- a/compiler/rustc_trait_selection/src/traits/select/mod.rs
++++ b/compiler/rustc_trait_selection/src/traits/select/mod.rs
+@@ -22,6 +22,7 @@
+ use rustc_macros::{TypeFoldable, TypeVisitable};
+ use rustc_middle::bug;
+ use rustc_middle::dep_graph::{DepKind, DepNodeIndex};
++use rustc_middle::traits::CodegenProofObligation;
+ pub use rustc_middle::traits::select::*;
+ use rustc_middle::ty::abstract_const::NotConstEvaluatable;
+ use rustc_middle::ty::error::TypeErrorToStringExt;
+@@ -37,6 +38,7 @@
+ 
+ use self::EvaluationResult::*;
+ use self::SelectionCandidate::*;
++use super::codegen_proof::SharedCodegenProofRecorder;
+ use super::coherence::{self, Conflict};
+ use super::project::ProjectionTermObligation;
+ use super::util::closure_trait_ref_and_return_type;
+@@ -122,6 +124,9 @@ pub struct SelectionContext<'cx, 'tcx> {
+     /// policy. In essence, canonicalized queries need their errors propagated
+     /// rather than immediately reported because we do not have accurate spans.
+     query_mode: TraitQueryMode,
++
++    /// Query-local observer used only by the codegen selection proof query.
++    codegen_proof_recorder: Option<SharedCodegenProofRecorder<'tcx>>,
+ }
+ 
+ // A stack that walks back up the stack frame.
+@@ -197,9 +202,21 @@ pub fn new(infcx: &'cx InferCtxt<'tcx>) -> SelectionContext<'cx, 'tcx> {
+             freshener: TypeFreshener::new(infcx),
+             intercrate_ambiguity_causes: None,
+             query_mode: TraitQueryMode::Standard,
++            codegen_proof_recorder: None,
+         }
+     }
+ 
++    pub fn with_codegen_proof_recorder(
++        infcx: &'cx InferCtxt<'tcx>,
++        recorder: SharedCodegenProofRecorder<'tcx>,
++    ) -> SelectionContext<'cx, 'tcx> {
++        SelectionContext { codegen_proof_recorder: Some(recorder), ..SelectionContext::new(infcx) }
++    }
++
++    pub(crate) fn codegen_proof_recorder(&self) -> Option<&SharedCodegenProofRecorder<'tcx>> {
++        self.codegen_proof_recorder.as_ref()
++    }
++
+     pub fn typing_mode(&self) -> TypingMode<'tcx, CantBeErased> {
+         self.infcx.typing_mode_raw().assert_not_erased()
+     }
+@@ -261,7 +278,16 @@ pub fn poly_select(
+     ) -> SelectionResult<'tcx, Selection<'tcx>> {
+         assert!(!self.infcx.next_trait_solver());
+ 
+-        let candidate = match self.select_from_obligation(obligation) {
++        let candidate_result = if let Some(recorder) = self.codegen_proof_recorder.clone() {
++            recorder.borrow_mut().mute();
++            let result = self.select_from_obligation(obligation);
++            recorder.borrow_mut().unmute();
++            result
++        } else {
++            self.select_from_obligation(obligation)
++        };
++
++        let candidate = match candidate_result {
+             Err(SelectionError::Overflow(OverflowError::Canonical)) => {
+                 // In standard mode, overflow must have been caught and reported
+                 // earlier.
+@@ -277,7 +303,23 @@ pub fn poly_select(
+             Ok(Some(candidate)) => candidate,
+         };
+ 
+-        match self.confirm_candidate(obligation, candidate) {
++        let proof_obligation = CodegenProofObligation {
++            param_env: obligation.param_env,
++            predicate: obligation.predicate.upcast(self.tcx()),
++        };
++        let proof_scope = self.codegen_proof_recorder.clone().and_then(|recorder| {
++            let previous_owner = {
++                let mut state = recorder.borrow_mut();
++                if !state.is_recording() {
++                    return None;
++                }
++                let node = state.node_for(proof_obligation);
++                state.set_current_owner(Some(node))
++            };
++            Some((recorder, previous_owner))
++        });
++
++        let result = match self.confirm_candidate(obligation, candidate) {
+             Err(SelectionError::Overflow(OverflowError::Canonical)) => {
+                 assert!(self.query_mode == TraitQueryMode::Canonical);
+                 Err(SelectionError::Overflow(OverflowError::Canonical))
+@@ -289,7 +331,19 @@ pub fn poly_select(
+                 Err(SelectionError::Unimplemented)
+             }
+             Ok(candidate) => Ok(Some(candidate)),
++        };
++
++        if let Some((recorder, previous_owner)) = proof_scope {
++            if let Ok(Some(source)) = &result {
++                let source = source.clone().map(|nested| CodegenProofObligation {
++                    param_env: nested.param_env,
++                    predicate: nested.predicate,
++                });
++                recorder.borrow_mut().record_selection(proof_obligation, source);
++            }
++            recorder.borrow_mut().set_current_owner(previous_owner);
+         }
++        result
+     }
+ 
+     pub fn select(
+@@ -1341,6 +1395,9 @@ fn check_evaluation_cache(
+     ) -> Option<EvaluationResult> {
+         let infcx = self.infcx;
+         let tcx = infcx.tcx;
++        if self.codegen_proof_recorder.is_some() {
++            return infcx.evaluation_cache.get(&(param_env, trait_pred), tcx);
++        }
+         if self.can_use_global_caches(param_env, trait_pred) {
+             let key = (infcx.typing_env(param_env), trait_pred);
+             if let Some(res) = tcx.evaluation_cache.get(&key, tcx) {
+@@ -1369,6 +1426,10 @@ fn insert_evaluation_cache(
+ 
+         let infcx = self.infcx;
+         let tcx = infcx.tcx;
++        if self.codegen_proof_recorder.is_some() {
++            infcx.evaluation_cache.insert((param_env, trait_pred), dep_node, result);
++            return;
++        }
+         if self.can_use_global_caches(param_env, trait_pred) {
+             debug!(?trait_pred, ?result, "insert_evaluation_cache global");
+             // This may overwrite the cache with the same value
+@@ -1572,6 +1633,10 @@ fn check_candidate_cache(
+         let tcx = infcx.tcx;
+         let pred = cache_fresh_trait_pred.skip_binder();
+ 
++        if self.codegen_proof_recorder.is_some() {
++            return infcx.selection_cache.get(&(param_env, pred), tcx);
++        }
++
+         if self.can_use_global_caches(param_env, cache_fresh_trait_pred) {
+             if let Some(res) = tcx.selection_cache.get(&(infcx.typing_env(param_env), pred), tcx) {
+                 return Some(res);
+@@ -1632,6 +1697,11 @@ fn insert_candidate_cache(
+             return;
+         }
+ 
++        if self.codegen_proof_recorder.is_some() {
++            infcx.selection_cache.insert((param_env, pred), dep_node, candidate);
++            return;
++        }
++
+         if self.can_use_global_caches(param_env, cache_fresh_trait_pred) {
+             if let Err(SelectionError::Overflow(OverflowError::Canonical)) = candidate {
+                 // Don't cache overflow globally; we only produce this in certain modes.
+diff --git a/compiler/rustc_traits/src/codegen.rs b/compiler/rustc_traits/src/codegen.rs
+index e03b67f8..edd1a74a 100644
+--- a/compiler/rustc_traits/src/codegen.rs
++++ b/compiler/rustc_traits/src/codegen.rs
+@@ -5,9 +5,12 @@
+ 
+ use rustc_infer::infer::TyCtxtInferExt;
+ use rustc_middle::bug;
+-use rustc_middle::traits::CodegenObligationError;
+-use rustc_middle::ty::{self, PseudoCanonicalInput, TyCtxt, TypeVisitableExt};
++use rustc_middle::traits::{
++    CodegenObligationError, CodegenSelectionProof, CodegenSelectionProofError,
++};
++use rustc_middle::ty::{self, PseudoCanonicalInput, TyCtxt, TypeVisitableExt, Upcast};
+ use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
++use rustc_trait_selection::traits::codegen_proof::CodegenProofRecorder;
+ use rustc_trait_selection::traits::{
+     ImplSource, Obligation, ObligationCause, ObligationCtxt, ScrubbedTraitError, SelectionContext,
+     SelectionError,
+@@ -91,3 +94,52 @@ pub(crate) fn codegen_select_candidate<'tcx>(
+ 
+     Ok(&*tcx.arena.alloc(impl_source))
+ }
++
++/// Re-runs the old solver in an isolated inference context and records only the committed selected
++/// proof. The compiler-facing, disk-cached selection query above remains unmodified and
++/// authoritative; this observer fails closed if its top-level result differs.
++pub(crate) fn codegen_selection_proof<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    key: PseudoCanonicalInput<'tcx, ty::TraitRef<'tcx>>,
++) -> Result<&'tcx CodegenSelectionProof<'tcx>, CodegenSelectionProofError> {
++    let stock_source =
++        tcx.codegen_select_candidate(key).map_err(CodegenSelectionProofError::Selection)?.clone();
++
++    let PseudoCanonicalInput { typing_env, value: trait_ref } = key;
++    tcx.debug_assert_fully_normalized(typing_env, trait_ref);
++
++    let (infcx, param_env) = tcx.infer_ctxt().ignoring_regions().build_with_typing_env(typing_env);
++    let root_predicate = ty::Binder::dummy(trait_ref).upcast(tcx);
++    let recorder = CodegenProofRecorder::shared(param_env, root_predicate);
++    let mut selcx = SelectionContext::with_codegen_proof_recorder(&infcx, recorder.clone());
++    let obligation = Obligation::new(tcx, ObligationCause::dummy(), param_env, trait_ref);
++    let selection = match selcx.select(&obligation) {
++        Ok(Some(selection)) => selection,
++        Ok(None) | Err(_) => return Err(CodegenSelectionProofError::IncompleteObservation),
++    };
++
++    let ocx = ObligationCtxt::new_with_codegen_proof(&infcx, recorder.clone());
++    let proof_source = selection.map(|obligation| ocx.register_obligation(obligation));
++    if !ocx.evaluate_obligations_error_on_ambiguity().no_errors() {
++        return Err(CodegenSelectionProofError::IncompleteObservation);
++    }
++
++    let proof_source = infcx.resolve_vars_if_possible(proof_source);
++    let proof_source = tcx.erase_and_anonymize_regions(proof_source);
++    if proof_source.has_non_region_infer() || proof_source != stock_source {
++        return Err(CodegenSelectionProofError::IncompleteObservation);
++    }
++
++    let trace = recorder.borrow().finish(tcx, &infcx)?;
++    if trace
++        .trait_selections
++        .iter()
++        .find(|selection| selection.node == trace.root)
++        .map(|selection| &selection.source)
++        != Some(&stock_source)
++    {
++        return Err(CodegenSelectionProofError::IncompleteObservation);
++    }
++
++    Ok(tcx.arena.alloc(CodegenSelectionProof { top_source: stock_source, trace }))
++}
+diff --git a/compiler/rustc_traits/src/lib.rs b/compiler/rustc_traits/src/lib.rs
+index b393cbe2..875fbab3 100644
+--- a/compiler/rustc_traits/src/lib.rs
++++ b/compiler/rustc_traits/src/lib.rs
+@@ -22,6 +22,7 @@ pub fn provide(p: &mut Providers) {
+     normalize_projection_ty::provide(p);
+     normalize_erasing_regions::provide(p);
+     type_op::provide(p);
++    p.codegen_selection_proof = codegen::codegen_selection_proof;
+     p.codegen_select_candidate = codegen::codegen_select_candidate;
+     p.coroutine_hidden_types = coroutine_witnesses::coroutine_hidden_types;
+ }
+diff --git a/compiler/rustc_traits/src/normalize_projection_ty.rs b/compiler/rustc_traits/src/normalize_projection_ty.rs
+index 3710d41d..66f5ab39 100644
+--- a/compiler/rustc_traits/src/normalize_projection_ty.rs
++++ b/compiler/rustc_traits/src/normalize_projection_ty.rs
+@@ -2,16 +2,22 @@
+ use rustc_infer::infer::canonical::{Canonical, QueryResponse};
+ use rustc_infer::traits::PredicateObligations;
+ use rustc_middle::query::Providers;
+-use rustc_middle::ty::{self, ParamEnvAnd, TyCtxt};
++use rustc_middle::traits::{CodegenProjectionProof, CodegenProjectionProofError};
++use rustc_middle::ty::{self, ParamEnvAnd, PseudoCanonicalInput, TyCtxt, TypeVisitableExt, Upcast};
++use rustc_span::DUMMY_SP;
+ use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
+ use rustc_trait_selection::infer::InferCtxtBuilderExt;
++use rustc_trait_selection::traits::codegen_proof::CodegenProofRecorder;
+ use rustc_trait_selection::traits::query::normalize::NormalizationResult;
+ use rustc_trait_selection::traits::query::{CanonicalAliasGoal, NoSolution};
+-use rustc_trait_selection::traits::{self, ObligationCause, ScrubbedTraitError, SelectionContext};
++use rustc_trait_selection::traits::{
++    self, ObligationCause, ObligationCtxt, ScrubbedTraitError, SelectionContext,
++};
+ use tracing::debug;
+ 
+ pub(crate) fn provide(p: &mut Providers) {
+     *p = Providers {
++        codegen_projection_proof,
+         normalize_canonicalized_projection,
+         normalize_canonicalized_free_alias,
+         normalize_canonicalized_inherent_projection,
+@@ -19,6 +25,81 @@ pub(crate) fn provide(p: &mut Providers) {
+     };
+ }
+ 
++fn codegen_projection_proof<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    key: PseudoCanonicalInput<'tcx, ty::AliasTerm<'tcx>>,
++) -> Result<&'tcx CodegenProjectionProof<'tcx>, CodegenProjectionProofError> {
++    let PseudoCanonicalInput { typing_env, value: goal } = key;
++    if !matches!(goal.kind, ty::AliasTermKind::ProjectionTy { .. }) {
++        return Err(CodegenProjectionProofError::UnsupportedAliasKind);
++    }
++    tcx.debug_assert_fully_normalized(typing_env, goal.args);
++
++    let input_term = goal.to_term(tcx, ty::IsRigid::No);
++    let expected_arg = tcx
++        .try_normalize_generic_arg_after_erasing_regions(
++            typing_env.as_query_input(input_term.into_arg()),
++        )
++        .map_err(|_| CodegenProjectionProofError::NormalizationFailed)?;
++    let expected_term = match expected_arg.kind() {
++        ty::GenericArgKind::Type(ty) => ty.into(),
++        ty::GenericArgKind::Const(_) | ty::GenericArgKind::Lifetime(_) => {
++            return Err(CodegenProjectionProofError::ResultMismatch);
++        }
++    };
++
++    let (infcx, param_env) = tcx.infer_ctxt().ignoring_regions().build_with_typing_env(typing_env);
++    let output_ty = infcx.next_ty_var(DUMMY_SP);
++    let root_projection = ty::ProjectionPredicate { projection_term: goal, term: output_ty.into() };
++    let root_predicate = ty::Binder::dummy(root_projection).upcast(tcx);
++    let recorder = CodegenProofRecorder::shared(param_env, root_predicate);
++    let ocx = ObligationCtxt::new_with_codegen_proof(&infcx, recorder.clone());
++    ocx.register_obligation(traits::Obligation::new(
++        tcx,
++        ObligationCause::dummy(),
++        param_env,
++        root_predicate,
++    ));
++    if !ocx.evaluate_obligations_error_on_ambiguity().no_errors() {
++        return Err(CodegenProjectionProofError::NormalizationFailed);
++    }
++
++    let normalized_term: ty::Term<'tcx> = output_ty.into();
++    let normalized_term =
++        tcx.erase_and_anonymize_regions(infcx.resolve_vars_if_possible(normalized_term));
++    if normalized_term.has_non_region_infer() {
++        return Err(CodegenProjectionProofError::IncompleteObservation);
++    }
++    if normalized_term != expected_term {
++        return Err(CodegenProjectionProofError::ResultMismatch);
++    }
++
++    let trace = recorder
++        .borrow()
++        .finish(tcx, &infcx)
++        .map_err(|_| CodegenProjectionProofError::IncompleteObservation)?;
++    let root_obligation = trace
++        .obligations
++        .get(trace.root.0 as usize)
++        .ok_or(CodegenProjectionProofError::IncompleteObservation)?;
++    let root_clause = root_obligation
++        .predicate
++        .as_projection_clause()
++        .ok_or(CodegenProjectionProofError::IncompleteObservation)?;
++    let root_clause = root_clause.skip_binder();
++    if root_clause.projection_term != tcx.erase_and_anonymize_regions(goal)
++        || root_clause.term != normalized_term
++        || !trace.projections.iter().any(|projection| {
++            projection.projection == tcx.erase_and_anonymize_regions(goal)
++                && projection.owners.contains(&trace.root)
++        })
++    {
++        return Err(CodegenProjectionProofError::IncompleteObservation);
++    }
++
++    Ok(tcx.arena.alloc(CodegenProjectionProof { normalized_term, trace }))
++}
++
+ /// If `normalized_term` is a const, returns a `ConstArgHasType` obligation
+ /// to verify that the const value's type matches the alias's declared type.
+ /// Returns `None` if the term is a type rather than a const.
+diff --git a/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
+new file mode 100644
+index 00000000..e7e55142
+--- /dev/null
++++ b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
+@@ -0,0 +1,168 @@
++#![allow(dead_code)]
++
++trait Atom {}
++
++struct Value;
++impl Atom for Value {}
++
++struct Decoy;
++impl Atom for Decoy {}
++
++trait Other {
++    type X;
++}
++
++trait Supply {
++    type Item;
++}
++
++struct Source;
++
++type Callback = fn() -> Value;
++
++impl Other for Source {
++    type X = Value;
++}
++
++impl Supply for Source {
++    type Item = <Source as Other>::X;
++}
++
++trait Header {
++    type Key;
++}
++
++trait HeaderOnly<K> {
++    type Out;
++}
++
++trait Required {}
++
++impl Header for Source {
++    type Key = Value;
++}
++
++impl Required for Value {}
++
++impl HeaderOnly<<Source as Header>::Key> for Source
++where
++    Value: Required,
++{
++    type Out = Value;
++}
++
++trait Numbers {
++    const N: usize;
++}
++
++impl Numbers for Source {
++    const N: usize = 7;
++}
++
++trait HeaderRoot {}
++
++impl HeaderRoot for Source where <Source as HeaderOnly<Value>>::Out: Atom {}
++
++trait Shared {
++    type Out;
++}
++
++impl Shared for Source {
++    type Out = Value;
++}
++
++trait First {}
++trait Second {}
++
++impl First for Source where <Source as Shared>::Out: Atom {}
++impl Second for Source where <Source as Shared>::Out: Atom {}
++
++trait CacheRoot {}
++
++impl CacheRoot for Source where Source: First + Second {}
++
++trait BuiltinRoot {}
++
++impl<T> BuiltinRoot for Wrapper<T> where T: Sized {}
++
++trait ForAll<'a> {}
++
++impl<'a> ForAll<'a> for Source {}
++
++trait HrtbRoot {}
++
++impl<T> HrtbRoot for Wrapper<T> where for<'a> T: ForAll<'a> {}
++
++trait ObjectTrait {
++    type Item;
++}
++
++fn take_object(_: &dyn ObjectTrait<Item = Value>) {}
++
++trait ObjectRoot<T: ?Sized> {}
++
++impl<T: ?Sized> ObjectRoot<T> for Source
++where
++    T: ObjectTrait,
++    T::Item: Atom,
++{
++}
++
++trait ParamBound {}
++
++fn param_owner<T: ParamBound>() {}
++
++trait ParamEnvAssoc {
++    type Out;
++}
++
++trait ParamEnvRoot {}
++
++impl<T: ParamEnvAssoc> ParamEnvRoot for Wrapper<T> where T::Out: Atom {}
++
++fn param_env_owner<T: ParamEnvAssoc<Out = Value>>() {}
++
++trait TraitDefInner {
++    type Out;
++}
++
++trait TraitDefCarrier {
++    type Nested: TraitDefInner<Out = Value>;
++}
++
++trait TraitDefRoot {}
++
++impl<T: TraitDefCarrier> TraitDefRoot for Wrapper<T> where
++    <<T as TraitDefCarrier>::Nested as TraitDefInner>::Out: Atom
++{
++}
++
++fn trait_def_owner<T: TraitDefCarrier>() {}
++
++trait Execute {
++    fn execute(&self) -> usize {
++        1
++    }
++}
++
++struct Wrapper<T>(T);
++
++impl<T> Execute for Wrapper<T>
++where
++    T: Supply,
++    T::Item: Atom,
++{
++}
++
++struct Node(Option<Box<Node>>);
++
++fn assert_send<T: Send>() {}
++
++fn dispatch<T: Execute>(value: &T) -> usize {
++    value.execute()
++}
++
++fn main() {
++    assert_eq!(dispatch(&Wrapper(Source)), 1);
++    assert_send::<Node>();
++}
+diff --git a/tests/ui-fulldeps/selection-proof-trace.rs b/tests/ui-fulldeps/selection-proof-trace.rs
+new file mode 100644
+index 00000000..de531d48
+--- /dev/null
++++ b/tests/ui-fulldeps/selection-proof-trace.rs
+@@ -0,0 +1,1071 @@
++//@ edition: 2024
++//@ run-pass
++//@ run-flags: --sysroot {{sysroot-base}} --edition=2024 {{src-base}}/auxiliary/selection-proof-trace-input.rs
++//@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
++//@ ignore-cross-compile
++//@ ignore-remote
++
++#![feature(rustc_private)]
++
++extern crate rustc_driver;
++extern crate rustc_data_structures;
++extern crate rustc_hir;
++extern crate rustc_interface;
++extern crate rustc_middle;
++extern crate rustc_span;
++
++use std::process::ExitCode;
++use std::sync::{Arc, Mutex};
++
++use rustc_data_structures::fingerprint::Fingerprint;
++use rustc_data_structures::stable_hash::{StableHash, StableHasher};
++use rustc_driver::Compilation;
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::DefId;
++use rustc_interface::interface::Compiler;
++use rustc_middle::traits::{
++    BuiltinImplSource, CodegenProjectionProof, CodegenProjectionProofError,
++    CodegenProjectionSource, CodegenProjectionTraceResult, CodegenSelectionProof,
++    CodegenSolverTrace, ImplSource,
++};
++use rustc_middle::ty::inherent::Term as _;
++use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
++use rustc_span::{Symbol, sym};
++
++fn main() -> ExitCode {
++    rustc_driver::catch_with_exit_code(move || {
++        let args: Vec<_> = std::env::args().collect();
++        let reports = Arc::new(Mutex::new(Vec::new()));
++        for prewarm in [false, true] {
++            rustc_driver::run_compiler(
++                &args,
++                &mut SelectionProofCallbacks { prewarm, reports: reports.clone() },
++            );
++        }
++        let reports = reports.lock().unwrap();
++        assert_eq!(reports.len(), 2);
++        assert_eq!(reports[0], reports[1]);
++    })
++}
++
++struct SelectionProofCallbacks {
++    prewarm: bool,
++    reports: Arc<Mutex<Vec<CanonicalRunReport>>>,
++}
++
++impl rustc_driver::Callbacks for SelectionProofCallbacks {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++
++        let atom = named_def(tcx, "Atom", DefKind::Trait);
++        let other = named_def(tcx, "Other", DefKind::Trait);
++        let supply = named_def(tcx, "Supply", DefKind::Trait);
++        let execute = named_def(tcx, "Execute", DefKind::Trait);
++        let value = named_def(tcx, "Value", DefKind::Struct);
++        let decoy = named_def(tcx, "Decoy", DefKind::Struct);
++        let source = named_def(tcx, "Source", DefKind::Struct);
++        let wrapper = named_def(tcx, "Wrapper", DefKind::Struct);
++
++        let atom_value_impl = impl_for_adt(tcx, atom, value);
++        let atom_decoy_impl = impl_for_adt(tcx, atom, decoy);
++        let other_source_impl = impl_for_adt(tcx, other, source);
++        let supply_source_impl = impl_for_adt(tcx, supply, source);
++        let execute_wrapper_impl = impl_for_adt(tcx, execute, wrapper);
++
++        let source_ty = tcx.type_of(source).instantiate_identity().skip_norm_wip();
++        let wrapper_ty = Ty::new_adt(tcx, tcx.adt_def(wrapper), tcx.mk_args(&[source_ty.into()]));
++        let typing_env = ty::TypingEnv::fully_monomorphized();
++        let trait_ref = ty::TraitRef::new(tcx, execute, [wrapper_ty]);
++        let key = typing_env.as_query_input(trait_ref);
++
++        if self.prewarm {
++            let header_root = named_def(tcx, "HeaderRoot", DefKind::Trait);
++            let cache_root = named_def(tcx, "CacheRoot", DefKind::Trait);
++            let param_env_root = named_def(tcx, "ParamEnvRoot", DefKind::Trait);
++            let param_env_owner = named_def(tcx, "param_env_owner", DefKind::Fn);
++            let param_env_ty = ty::GenericArgs::identity_for_item(tcx, param_env_owner).type_at(0);
++            let param_env_wrapper_ty =
++                Ty::new_adt(tcx, tcx.adt_def(wrapper), tcx.mk_args(&[param_env_ty.into()]));
++            let trait_def_root = named_def(tcx, "TraitDefRoot", DefKind::Trait);
++            let trait_def_owner = named_def(tcx, "trait_def_owner", DefKind::Fn);
++            let trait_def_ty =
++                ty::GenericArgs::identity_for_item(tcx, trait_def_owner).type_at(0);
++            let trait_def_wrapper_ty =
++                Ty::new_adt(tcx, tcx.adt_def(wrapper), tcx.mk_args(&[trait_def_ty.into()]));
++            let node = named_def(tcx, "Node", DefKind::Struct);
++            let node_ty = tcx.type_of(node).instantiate_identity().skip_norm_wip();
++            let send = tcx.get_diagnostic_item(sym::Send).unwrap();
++            let value_ty = tcx.type_of(value).instantiate_identity().skip_norm_wip();
++            let supply_item = associated_item(tcx, supply, "Item");
++            let header_only = named_def(tcx, "HeaderOnly", DefKind::Trait);
++            let header_out = associated_item(tcx, header_only, "Out");
++            for goal in [
++                ty::AliasTerm::new_from_def_id(
++                    tcx,
++                    header_out,
++                    tcx.mk_args(&[source_ty.into(), value_ty.into()]),
++                ),
++                ty::AliasTerm::new_from_def_id(tcx, supply_item, tcx.mk_args(&[source_ty.into()])),
++            ] {
++                stock_normalize(tcx, typing_env, goal);
++            }
++            let param_env_assoc = named_def(tcx, "ParamEnvAssoc", DefKind::Trait);
++            let param_env_out = associated_item(tcx, param_env_assoc, "Out");
++            stock_normalize(
++                tcx,
++                ty::TypingEnv::codegen(tcx, param_env_owner),
++                ty::AliasTerm::new_from_def_id(
++                    tcx,
++                    param_env_out,
++                    tcx.mk_args(&[param_env_ty.into()]),
++                ),
++            );
++            let trait_def_carrier = named_def(tcx, "TraitDefCarrier", DefKind::Trait);
++            let trait_def_nested = associated_item(tcx, trait_def_carrier, "Nested");
++            stock_normalize(
++                tcx,
++                ty::TypingEnv::codegen(tcx, trait_def_owner),
++                ty::AliasTerm::new_from_def_id(
++                    tcx,
++                    trait_def_nested,
++                    tcx.mk_args(&[trait_def_ty.into()]),
++                ),
++            );
++            let object_trait = named_def(tcx, "ObjectTrait", DefKind::Trait);
++            let object_item = associated_item(tcx, object_trait, "Item");
++            let take_object = named_def(tcx, "take_object", DefKind::Fn);
++            let object_sig = tcx.fn_sig(take_object).instantiate_identity().skip_norm_wip();
++            let object_ref = tcx.instantiate_bound_regions_with_erased(object_sig).inputs()[0];
++            let ty::Ref(_, object_ty, _) = *object_ref.kind() else { unreachable!() };
++            stock_normalize(
++                tcx,
++                typing_env,
++                ty::AliasTerm::new_from_def_id(
++                    tcx,
++                    object_item,
++                    tcx.mk_args(&[object_ty.into()]),
++                ),
++            );
++            let callback = named_def(tcx, "Callback", DefKind::TyAlias);
++            let callback_ty = tcx.type_of(callback).instantiate_identity().skip_norm_wip();
++            let fn_once_output = tcx.lang_items().fn_once_output().unwrap();
++            stock_normalize(
++                tcx,
++                typing_env,
++                ty::AliasTerm::new_from_def_id(
++                    tcx,
++                    fn_once_output,
++                    tcx.mk_args(&[callback_ty.into(), tcx.types.unit.into()]),
++                ),
++            );
++            for prewarm_key in [
++                ty::TypingEnv::codegen(tcx, trait_def_owner).as_query_input(ty::TraitRef::new(
++                    tcx,
++                    trait_def_root,
++                    [trait_def_wrapper_ty],
++                )),
++                ty::TypingEnv::codegen(tcx, param_env_owner).as_query_input(ty::TraitRef::new(
++                    tcx,
++                    param_env_root,
++                    [param_env_wrapper_ty],
++                )),
++                typing_env.as_query_input(ty::TraitRef::new(tcx, send, [node_ty])),
++                typing_env.as_query_input(ty::TraitRef::new(tcx, cache_root, [source_ty])),
++                typing_env.as_query_input(ty::TraitRef::new(tcx, header_root, [source_ty])),
++                key,
++            ] {
++                tcx.codegen_select_candidate(prewarm_key).unwrap();
++            }
++        }
++
++        let proof = tcx.codegen_selection_proof(key).unwrap();
++        let cold_owned = proof.clone();
++        let warm_proof = tcx.codegen_selection_proof(key).unwrap();
++        assert!(std::ptr::eq(proof, warm_proof));
++        assert_eq!(cold_owned, *warm_proof);
++        assert_eq!(proof.top_source, *tcx.codegen_select_candidate(key).unwrap());
++        assert_eq!(
++            proof
++                .trace
++                .trait_selections
++                .iter()
++                .find(|selection| selection.node == proof.trace.root)
++                .unwrap()
++                .source,
++            proof.top_source
++        );
++
++        let mut selected_impls: Vec<_> = proof
++            .trace
++            .trait_selections
++            .iter()
++            .filter_map(|selection| match &selection.source {
++                ImplSource::UserDefined(data) => Some(data.impl_def_id),
++                ImplSource::Param(_) | ImplSource::Builtin(..) => None,
++            })
++            .collect();
++        selected_impls.sort_by_key(|def_id| (def_id.krate.as_u32(), def_id.index.as_u32()));
++        selected_impls.dedup();
++        let mut expected_impls =
++            vec![atom_value_impl, execute_wrapper_impl, supply_source_impl, other_source_impl];
++        expected_impls.sort_by_key(|def_id| (def_id.krate.as_u32(), def_id.index.as_u32()));
++        assert_eq!(selected_impls, expected_impls);
++        assert!(!selected_impls.contains(&atom_decoy_impl));
++
++        let supply_item = associated_item(tcx, supply, "Item");
++        let other_x = associated_item(tcx, other, "X");
++        let supply_item_impl = tcx.impl_item_implementor_ids(supply_source_impl)[&supply_item];
++        let other_x_impl = tcx.impl_item_implementor_ids(other_source_impl)[&other_x];
++        assert_eq!(proof.trace.projections.len(), 2, "{:#?}", proof.trace.projections);
++        let supply_projection = proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == supply_item)
++            .unwrap();
++        assert!(matches!(
++            &supply_projection.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(data))
++                if data.impl_def_id == supply_source_impl
++        ));
++        assert_eq!(supply_projection.selected_projection_item, Some(supply_item_impl));
++        assert!(matches!(
++            &supply_projection.result,
++            CodegenProjectionTraceResult::Progress { raw_term, .. }
++                if matches!(raw_term.expect_ty().kind(), ty::Alias(_, alias) if alias.kind.try_to_projection() == Some(other_x))
++        ));
++
++        let other_projection = proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == other_x)
++            .unwrap();
++        assert!(matches!(
++            &other_projection.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(data))
++                if data.impl_def_id == other_source_impl
++        ));
++        assert_eq!(other_projection.selected_projection_item, Some(other_x_impl));
++        assert!(matches!(
++            &other_projection.result,
++            CodegenProjectionTraceResult::Progress { raw_term, .. }
++                if raw_term.expect_ty() == tcx.type_of(value).instantiate_identity().skip_norm_wip()
++        ));
++
++        assert_eq!(supply_projection.owners, vec![proof.trace.root], "{:#?}", proof.trace);
++        assert_eq!(other_projection.owners, vec![proof.trace.root], "{:#?}", proof.trace);
++
++        for projection in [supply_projection, other_projection] {
++            let node = projection.selected_trait_node.unwrap();
++            let selection = proof
++                .trace
++                .trait_selections
++                .iter()
++                .find(|selection| selection.node == node)
++                .unwrap();
++            let obligation = &proof.trace.obligations[node.0 as usize];
++            assert_eq!(selection.source, match &projection.source {
++                CodegenProjectionSource::Selected(source) => source.clone(),
++                _ => unreachable!(),
++            });
++            assert_eq!(
++                obligation.predicate.as_trait_clause().unwrap().def_id(),
++                projection.projection.trait_def_id(tcx)
++            );
++        }
++
++        // The selected HeaderOnly impl has a projection in its header. This inner projection must
++        // come from the original committed rematch, not from speculative candidate search.
++        let header = named_def(tcx, "Header", DefKind::Trait);
++        let header_only = named_def(tcx, "HeaderOnly", DefKind::Trait);
++        let header_root = named_def(tcx, "HeaderRoot", DefKind::Trait);
++        let header_impl = impl_for_adt(tcx, header, source);
++        let header_only_impl = impl_for_adt(tcx, header_only, source);
++        let header_key = associated_item(tcx, header, "Key");
++        let header_out = associated_item(tcx, header_only, "Out");
++        let header_key_impl = tcx.impl_item_implementor_ids(header_impl)[&header_key];
++        let header_out_impl = tcx.impl_item_implementor_ids(header_only_impl)[&header_out];
++        let header_proof = tcx
++            .codegen_selection_proof(
++                typing_env.as_query_input(ty::TraitRef::new(tcx, header_root, [source_ty])),
++            )
++            .unwrap();
++        let header_out_projection = header_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == header_out)
++            .unwrap();
++        let header_key_projection = header_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == header_key)
++            .unwrap();
++        let mut header_projection_items: Vec<_> = header_proof
++            .trace
++            .projections
++            .iter()
++            .map(|projection| projection.projection.expect_projection_def_id())
++            .collect();
++        header_projection_items
++            .sort_by_key(|def_id| (def_id.krate.as_u32(), def_id.index.as_u32()));
++        let mut expected_header_projection_items = vec![header_out, header_key];
++        expected_header_projection_items
++            .sort_by_key(|def_id| (def_id.krate.as_u32(), def_id.index.as_u32()));
++        assert_eq!(header_projection_items, expected_header_projection_items);
++        assert!(matches!(
++            &header_out_projection.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(data))
++                if data.impl_def_id == header_only_impl
++        ));
++        assert_eq!(header_out_projection.selected_projection_item, Some(header_out_impl));
++        assert!(matches!(
++            &header_key_projection.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(data))
++                if data.impl_def_id == header_impl
++        ));
++        assert_eq!(header_key_projection.selected_projection_item, Some(header_key_impl));
++        assert_eq!(header_out_projection.owners, vec![header_proof.trace.root]);
++        assert_eq!(
++            header_key_projection.owners,
++            vec![header_out_projection.selected_trait_node.unwrap()],
++            "{:#?}",
++            header_proof.trace
++        );
++
++        // The same projection is normalized under two committed selection owners. A terminal
++        // cache hit must add the second owner without duplicating the projection fact.
++        let shared = named_def(tcx, "Shared", DefKind::Trait);
++        let first = named_def(tcx, "First", DefKind::Trait);
++        let second = named_def(tcx, "Second", DefKind::Trait);
++        let cache_root = named_def(tcx, "CacheRoot", DefKind::Trait);
++        let shared_impl = impl_for_adt(tcx, shared, source);
++        let shared_out = associated_item(tcx, shared, "Out");
++        let shared_out_impl = tcx.impl_item_implementor_ids(shared_impl)[&shared_out];
++        let cache_proof = tcx
++            .codegen_selection_proof(
++                typing_env.as_query_input(ty::TraitRef::new(tcx, cache_root, [source_ty])),
++            )
++            .unwrap();
++        let shared_projection = cache_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == shared_out)
++            .unwrap();
++        assert_eq!(cache_proof.trace.projections.len(), 1);
++        assert_eq!(shared_projection.projection.expect_projection_def_id(), shared_out);
++        let mut expected_owners: Vec<_> = [first, second]
++            .into_iter()
++            .map(|trait_id| {
++                cache_proof
++                    .trace
++                    .obligations
++                    .iter()
++                    .position(|obligation| {
++                        obligation
++                            .predicate
++                            .as_trait_clause()
++                            .is_some_and(|predicate| predicate.def_id() == trait_id)
++                    })
++                    .map(|index| rustc_middle::traits::CodegenProofNodeId(index.try_into().unwrap()))
++                    .unwrap()
++            })
++            .collect();
++        expected_owners.sort_by_key(|node| node.0);
++        assert_eq!(shared_projection.owners, expected_owners, "{:#?}", cache_proof.trace);
++        assert!(matches!(
++            &shared_projection.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(data))
++                if data.impl_def_id == shared_impl
++        ));
++        assert_eq!(shared_projection.selected_projection_item, Some(shared_out_impl));
++
++        let builtin_root = named_def(tcx, "BuiltinRoot", DefKind::Trait);
++        let sized = tcx.lang_items().sized_trait().unwrap();
++        let builtin_proof = tcx
++            .codegen_selection_proof(
++                typing_env.as_query_input(ty::TraitRef::new(tcx, builtin_root, [wrapper_ty])),
++            )
++            .unwrap();
++        let sized_node = builtin_proof
++            .trace
++            .obligations
++            .iter()
++            .position(|obligation| {
++                obligation
++                    .predicate
++                    .as_trait_clause()
++                    .is_some_and(|predicate| predicate.def_id() == sized)
++            })
++            .unwrap();
++        assert!(matches!(
++            builtin_proof
++                .trace
++                .trait_selections
++                .iter()
++                .find(|selection| selection.node.0 as usize == sized_node)
++                .unwrap()
++                .source,
++            ImplSource::Builtin(..)
++        ));
++
++        let for_all = named_def(tcx, "ForAll", DefKind::Trait);
++        let hrtb_root = named_def(tcx, "HrtbRoot", DefKind::Trait);
++        let for_all_impl = impl_for_adt(tcx, for_all, source);
++        let hrtb_proof = tcx
++            .codegen_selection_proof(
++                typing_env.as_query_input(ty::TraitRef::new(tcx, hrtb_root, [wrapper_ty])),
++            )
++            .unwrap();
++        assert!(
++            hrtb_proof
++                .trace
++                .obligations
++                .iter()
++                .any(|obligation| obligation.predicate.has_bound_vars()),
++            "{:#?}",
++            hrtb_proof.trace
++        );
++        assert!(hrtb_proof.trace.trait_selections.iter().any(|selection| {
++            matches!(
++                selection.source,
++                ImplSource::UserDefined(ref data) if data.impl_def_id == for_all_impl
++            )
++        }));
++
++        let object_trait = named_def(tcx, "ObjectTrait", DefKind::Trait);
++        let object_root = named_def(tcx, "ObjectRoot", DefKind::Trait);
++        let take_object = named_def(tcx, "take_object", DefKind::Fn);
++        let object_sig = tcx.fn_sig(take_object).instantiate_identity().skip_norm_wip();
++        let object_ref = tcx.instantiate_bound_regions_with_erased(object_sig).inputs()[0];
++        let ty::Ref(_, object_ty, _) = *object_ref.kind() else { unreachable!() };
++        let object_proof = tcx
++            .codegen_selection_proof(typing_env.as_query_input(ty::TraitRef::new(
++                tcx,
++                object_root,
++                [source_ty, object_ty],
++            )))
++            .unwrap();
++        let object_node = object_proof
++            .trace
++            .obligations
++            .iter()
++            .position(|obligation| {
++                obligation
++                    .predicate
++                    .as_trait_clause()
++                    .is_some_and(|predicate| predicate.def_id() == object_trait)
++            })
++            .unwrap();
++        assert!(matches!(
++            object_proof
++                .trace
++                .trait_selections
++                .iter()
++                .find(|selection| selection.node.0 as usize == object_node)
++                .unwrap()
++                .source,
++            ImplSource::Builtin(BuiltinImplSource::Object { .. }, _)
++        ));
++        let object_item = associated_item(tcx, object_trait, "Item");
++        let object_projection = object_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == object_item)
++            .unwrap();
++        assert!(matches!(object_projection.source, CodegenProjectionSource::Object(_)));
++        assert_eq!(object_projection.selected_trait_node, None);
++        assert_eq!(object_projection.selected_projection_item, None);
++        assert!(matches!(
++            object_projection.result,
++            CodegenProjectionTraceResult::Progress { raw_term, .. }
++                if raw_term.expect_ty() == tcx.type_of(value).instantiate_identity().skip_norm_wip()
++        ));
++
++        let param_bound = named_def(tcx, "ParamBound", DefKind::Trait);
++        let param_owner = named_def(tcx, "param_owner", DefKind::Fn);
++        let param_ty = ty::GenericArgs::identity_for_item(tcx, param_owner).type_at(0);
++        let param_proof = tcx
++            .codegen_selection_proof(
++                ty::TypingEnv::codegen(tcx, param_owner)
++                    .as_query_input(ty::TraitRef::new(tcx, param_bound, [param_ty])),
++            )
++            .unwrap();
++        assert!(matches!(param_proof.top_source, ImplSource::Param(_)));
++        assert_eq!(
++            param_proof
++                .trace
++                .trait_selections
++                .iter()
++                .find(|selection| selection.node == param_proof.trace.root)
++                .unwrap()
++                .source,
++            param_proof.top_source
++        );
++
++        let param_env_assoc = named_def(tcx, "ParamEnvAssoc", DefKind::Trait);
++        let param_env_root = named_def(tcx, "ParamEnvRoot", DefKind::Trait);
++        let param_env_owner = named_def(tcx, "param_env_owner", DefKind::Fn);
++        let param_env_ty = ty::GenericArgs::identity_for_item(tcx, param_env_owner).type_at(0);
++        let param_env_wrapper_ty =
++            Ty::new_adt(tcx, tcx.adt_def(wrapper), tcx.mk_args(&[param_env_ty.into()]));
++        let param_env_proof = tcx
++            .codegen_selection_proof(
++                ty::TypingEnv::codegen(tcx, param_env_owner).as_query_input(ty::TraitRef::new(
++                    tcx,
++                    param_env_root,
++                    [param_env_wrapper_ty],
++                )),
++            )
++            .unwrap();
++        let param_env_out = associated_item(tcx, param_env_assoc, "Out");
++        assert_eq!(param_env_proof.trace.projections.len(), 1, "{:#?}", param_env_proof.trace);
++        let param_env_projection = &param_env_proof.trace.projections[0];
++        assert_eq!(param_env_projection.projection.expect_projection_def_id(), param_env_out);
++        assert!(matches!(
++            param_env_projection.source,
++            CodegenProjectionSource::ParamEnv(predicate)
++                if predicate.item_def_id() == param_env_out
++        ));
++        assert!(matches!(
++            param_env_projection.result,
++            CodegenProjectionTraceResult::Progress { raw_term, ref nested }
++                if raw_term.expect_ty() == tcx.type_of(value).instantiate_identity().skip_norm_wip()
++                    && nested.is_empty()
++        ));
++        assert_eq!(
++            param_env_projection.owners,
++            vec![param_env_proof.trace.root],
++            "{:#?}",
++            param_env_proof.trace
++        );
++
++        let trait_def_inner = named_def(tcx, "TraitDefInner", DefKind::Trait);
++        let trait_def_root = named_def(tcx, "TraitDefRoot", DefKind::Trait);
++        let trait_def_owner = named_def(tcx, "trait_def_owner", DefKind::Fn);
++        let trait_def_ty = ty::GenericArgs::identity_for_item(tcx, trait_def_owner).type_at(0);
++        let trait_def_wrapper_ty =
++            Ty::new_adt(tcx, tcx.adt_def(wrapper), tcx.mk_args(&[trait_def_ty.into()]));
++        let trait_def_proof = tcx
++            .codegen_selection_proof(
++                ty::TypingEnv::codegen(tcx, trait_def_owner).as_query_input(ty::TraitRef::new(
++                    tcx,
++                    trait_def_root,
++                    [trait_def_wrapper_ty],
++                )),
++            )
++            .unwrap();
++        let trait_def_out = associated_item(tcx, trait_def_inner, "Out");
++        let trait_def_carrier = named_def(tcx, "TraitDefCarrier", DefKind::Trait);
++        let trait_def_nested = associated_item(tcx, trait_def_carrier, "Nested");
++        assert_eq!(trait_def_proof.trace.projections.len(), 2, "{:#?}", trait_def_proof.trace);
++        let trait_def_projection = trait_def_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == trait_def_out)
++            .unwrap();
++        let trait_def_nested_projection = trait_def_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| {
++                projection.projection.expect_projection_def_id() == trait_def_nested
++            })
++            .unwrap();
++        assert!(matches!(
++            trait_def_projection.source,
++            CodegenProjectionSource::TraitDef(predicate)
++                if predicate.item_def_id() == trait_def_out
++        ));
++        assert!(matches!(
++            trait_def_projection.result,
++            CodegenProjectionTraceResult::Progress { raw_term, ref nested }
++                if raw_term.expect_ty() == tcx.type_of(value).instantiate_identity().skip_norm_wip()
++                    && nested.is_empty()
++        ));
++        assert_eq!(
++            trait_def_projection.owners,
++            vec![trait_def_proof.trace.root],
++            "{:#?}",
++            trait_def_proof.trace
++        );
++        assert!(matches!(
++            trait_def_nested_projection.source,
++            CodegenProjectionSource::NoApplicableCandidate
++        ));
++        assert!(matches!(
++            trait_def_nested_projection.result,
++            CodegenProjectionTraceResult::NoProgress(term)
++                if term == trait_def_nested_projection.projection.to_term(tcx, ty::IsRigid::No)
++        ));
++        assert_eq!(
++            trait_def_nested_projection.owners,
++            vec![trait_def_proof.trace.root],
++            "{:#?}",
++            trait_def_proof.trace
++        );
++
++        let value_ty = tcx.type_of(value).instantiate_identity().skip_norm_wip();
++        let supply_goal = ty::AliasTerm::new_from_def_id(
++            tcx,
++            supply_item,
++            tcx.mk_args(&[source_ty.into()]),
++        );
++        let projection_supply_proof = projection_proof_with_parity(tcx, typing_env, supply_goal);
++        assert_eq!(projection_supply_proof.normalized_term.expect_ty(), value_ty);
++        assert_projection_root(projection_supply_proof, supply_goal);
++        assert_eq!(
++            projection_supply_proof.trace.projections.len(),
++            2,
++            "{:#?}",
++            projection_supply_proof.trace
++        );
++        let direct_supply = projection_supply_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == supply_item)
++            .unwrap();
++        let direct_other = projection_supply_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == other_x)
++            .unwrap();
++        assert!(matches!(
++            direct_supply.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(ref data))
++                if data.impl_def_id == supply_source_impl
++        ));
++        assert_eq!(direct_supply.selected_projection_item, Some(supply_item_impl));
++        assert!(matches!(
++            direct_other.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(ref data))
++                if data.impl_def_id == other_source_impl
++        ));
++        assert_eq!(direct_other.selected_projection_item, Some(other_x_impl));
++        assert_eq!(direct_supply.owners, vec![projection_supply_proof.trace.root]);
++        assert_eq!(direct_other.owners, vec![projection_supply_proof.trace.root]);
++
++        let required = named_def(tcx, "Required", DefKind::Trait);
++        let header_goal = ty::AliasTerm::new_from_def_id(
++            tcx,
++            header_out,
++            tcx.mk_args(&[source_ty.into(), value_ty.into()]),
++        );
++        let projection_header_proof = projection_proof_with_parity(tcx, typing_env, header_goal);
++        assert_eq!(projection_header_proof.normalized_term.expect_ty(), value_ty);
++        assert_projection_root(projection_header_proof, header_goal);
++        assert_eq!(
++            projection_header_proof.trace.projections.len(),
++            2,
++            "{:#?}",
++            projection_header_proof.trace
++        );
++        let direct_header_out = projection_header_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == header_out)
++            .unwrap();
++        let direct_header_key = projection_header_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| projection.projection.expect_projection_def_id() == header_key)
++            .unwrap();
++        assert!(matches!(
++            direct_header_out.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(ref data))
++                if data.impl_def_id == header_only_impl
++        ));
++        assert_eq!(direct_header_out.selected_projection_item, Some(header_out_impl));
++        assert!(matches!(
++            direct_header_key.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(ref data))
++                if data.impl_def_id == header_impl
++        ));
++        assert_eq!(direct_header_key.selected_projection_item, Some(header_key_impl));
++        assert_eq!(direct_header_out.owners, vec![projection_header_proof.trace.root]);
++        assert_eq!(
++            direct_header_key.owners,
++            vec![direct_header_out.selected_trait_node.unwrap()]
++        );
++        let CodegenProjectionTraceResult::Progress { nested, .. } = &direct_header_out.result
++        else {
++            unreachable!()
++        };
++        assert!(nested.iter().any(|node| {
++            projection_header_proof.trace.obligations[node.0 as usize]
++                .predicate
++                .as_trait_clause()
++                .is_some_and(|predicate| predicate.def_id() == required)
++        }));
++
++        let param_env_goal = ty::AliasTerm::new_from_def_id(
++            tcx,
++            param_env_out,
++            tcx.mk_args(&[param_env_ty.into()]),
++        );
++        let projection_param_env_proof = projection_proof_with_parity(
++            tcx,
++            ty::TypingEnv::codegen(tcx, param_env_owner),
++            param_env_goal,
++        );
++        assert_projection_root(projection_param_env_proof, param_env_goal);
++        assert_eq!(projection_param_env_proof.normalized_term.expect_ty(), value_ty);
++        assert_eq!(projection_param_env_proof.trace.projections.len(), 1);
++        let direct_param_env = &projection_param_env_proof.trace.projections[0];
++        assert_eq!(direct_param_env.projection, param_env_goal);
++        assert!(matches!(
++            direct_param_env.source,
++            CodegenProjectionSource::ParamEnv(predicate)
++                if predicate.item_def_id() == param_env_out
++        ));
++        assert!(matches!(
++            direct_param_env.result,
++            CodegenProjectionTraceResult::Progress { raw_term, ref nested }
++                if raw_term.expect_ty() == value_ty && nested.is_empty()
++        ));
++        assert_eq!(direct_param_env.owners, vec![projection_param_env_proof.trace.root]);
++
++        let object_goal = ty::AliasTerm::new_from_def_id(
++            tcx,
++            object_item,
++            tcx.mk_args(&[object_ty.into()]),
++        );
++        let projection_object_proof =
++            projection_proof_with_parity(tcx, typing_env, object_goal);
++        assert_projection_root(projection_object_proof, object_goal);
++        assert_eq!(projection_object_proof.normalized_term.expect_ty(), value_ty);
++        assert_eq!(projection_object_proof.trace.projections.len(), 1);
++        let direct_object = &projection_object_proof.trace.projections[0];
++        assert_eq!(direct_object.projection, object_goal);
++        assert!(matches!(direct_object.source, CodegenProjectionSource::Object(_)));
++        assert!(matches!(
++            direct_object.result,
++            CodegenProjectionTraceResult::Progress { raw_term, ref nested }
++                if raw_term.expect_ty() == value_ty && nested.is_empty()
++        ));
++        assert_eq!(direct_object.owners, vec![projection_object_proof.trace.root]);
++
++        let no_applicable_goal = ty::AliasTerm::new_from_def_id(
++            tcx,
++            trait_def_nested,
++            tcx.mk_args(&[trait_def_ty.into()]),
++        );
++        let projection_no_applicable_proof = projection_proof_with_parity(
++            tcx,
++            ty::TypingEnv::codegen(tcx, trait_def_owner),
++            no_applicable_goal,
++        );
++        assert_projection_root(projection_no_applicable_proof, no_applicable_goal);
++        assert_eq!(
++            projection_no_applicable_proof.normalized_term,
++            no_applicable_goal.to_term(tcx, ty::IsRigid::No)
++        );
++        assert_eq!(projection_no_applicable_proof.trace.projections.len(), 1);
++        let direct_no_applicable = &projection_no_applicable_proof.trace.projections[0];
++        assert_eq!(direct_no_applicable.projection, no_applicable_goal);
++        assert!(matches!(
++            direct_no_applicable.source,
++            CodegenProjectionSource::NoApplicableCandidate
++        ));
++        assert!(matches!(
++            direct_no_applicable.result,
++            CodegenProjectionTraceResult::NoProgress(term)
++                if term == no_applicable_goal.to_term(tcx, ty::IsRigid::No)
++        ));
++        assert_eq!(
++            direct_no_applicable.owners,
++            vec![projection_no_applicable_proof.trace.root]
++        );
++
++        let callback = named_def(tcx, "Callback", DefKind::TyAlias);
++        let callback_ty = tcx.type_of(callback).instantiate_identity().skip_norm_wip();
++        let fn_once_output = tcx.lang_items().fn_once_output().unwrap();
++        let builtin_goal = ty::AliasTerm::new_from_def_id(
++            tcx,
++            fn_once_output,
++            tcx.mk_args(&[callback_ty.into(), tcx.types.unit.into()]),
++        );
++        let projection_builtin_proof =
++            projection_proof_with_parity(tcx, typing_env, builtin_goal);
++        assert_projection_root(projection_builtin_proof, builtin_goal);
++        assert_eq!(projection_builtin_proof.normalized_term.expect_ty(), value_ty);
++        assert_eq!(projection_builtin_proof.trace.projections.len(), 1);
++        let direct_builtin = &projection_builtin_proof.trace.projections[0];
++        assert_eq!(direct_builtin.projection, builtin_goal);
++        assert!(matches!(
++            direct_builtin.source,
++            CodegenProjectionSource::Selected(ImplSource::Builtin(..))
++        ));
++        assert!(direct_builtin.selected_trait_node.is_some());
++        assert_eq!(direct_builtin.selected_projection_item, None);
++        assert!(matches!(
++            direct_builtin.result,
++            CodegenProjectionTraceResult::Progress { raw_term, ref nested }
++                if raw_term.expect_ty() == value_ty
++                    && nested.len() == 1
++                    && projection_builtin_proof.trace.obligations[nested[0].0 as usize]
++                        .predicate
++                        .as_trait_clause()
++                        .is_some_and(|predicate| predicate.def_id() == tcx.lang_items().sized_trait().unwrap())
++        ), "{:#?}", projection_builtin_proof.trace);
++        assert_eq!(direct_builtin.owners, vec![projection_builtin_proof.trace.root]);
++
++        let numbers = named_def(tcx, "Numbers", DefKind::Trait);
++        let numbers_n = associated_item(tcx, numbers, "N");
++        let const_goal = ty::AliasTerm::new_from_def_id(
++            tcx,
++            numbers_n,
++            tcx.mk_args(&[source_ty.into()]),
++        );
++        assert!(matches!(
++            tcx.codegen_projection_proof(typing_env.as_query_input(const_goal)),
++            Err(CodegenProjectionProofError::UnsupportedAliasKind)
++        ));
++
++        let node = named_def(tcx, "Node", DefKind::Struct);
++        let node_ty = tcx.type_of(node).instantiate_identity().skip_norm_wip();
++        let send = tcx.get_diagnostic_item(sym::Send).unwrap();
++        let send_ref = ty::TraitRef::new(tcx, send, [node_ty]);
++        let send_key = typing_env.as_query_input(send_ref);
++        let send_proof = tcx.codegen_selection_proof(send_key).unwrap();
++        assert!(matches!(send_proof.top_source, ImplSource::Builtin(..)));
++        assert!(!send_proof.trace.cycles.is_empty(), "{:#?}", send_proof.trace);
++        assert!(send_proof.trace.cycles.iter().all(|cycle| {
++            cycle.coinductive
++                && cycle
++                    .nodes
++                    .iter()
++                    .all(|node| (node.0 as usize) < send_proof.trace.obligations.len())
++        }));
++
++        self.reports.lock().unwrap().push(CanonicalRunReport {
++            main: canonical_report(tcx, proof),
++            header: canonical_report(tcx, header_proof),
++            cache: canonical_report(tcx, cache_proof),
++            param_env: canonical_report(tcx, param_env_proof),
++            trait_def: canonical_report(tcx, trait_def_proof),
++            projection_supply: canonical_projection_report(tcx, projection_supply_proof),
++            projection_header: canonical_projection_report(tcx, projection_header_proof),
++            projection_param_env: canonical_projection_report(tcx, projection_param_env_proof),
++            projection_object: canonical_projection_report(tcx, projection_object_proof),
++            projection_no_applicable: canonical_projection_report(
++                tcx,
++                projection_no_applicable_proof,
++            ),
++            projection_builtin: canonical_projection_report(tcx, projection_builtin_proof),
++            send: canonical_report(tcx, send_proof),
++        });
++
++        Compilation::Stop
++    }
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct CanonicalRunReport {
++    main: CanonicalSelectionReport,
++    header: CanonicalSelectionReport,
++    cache: CanonicalSelectionReport,
++    param_env: CanonicalSelectionReport,
++    trait_def: CanonicalSelectionReport,
++    projection_supply: CanonicalProjectionReport,
++    projection_header: CanonicalProjectionReport,
++    projection_param_env: CanonicalProjectionReport,
++    projection_object: CanonicalProjectionReport,
++    projection_no_applicable: CanonicalProjectionReport,
++    projection_builtin: CanonicalProjectionReport,
++    send: CanonicalSelectionReport,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct CanonicalSelectionReport {
++    top_source: Fingerprint,
++    trace: CanonicalTraceReport,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct CanonicalProjectionReport {
++    normalized_term: Fingerprint,
++    trace: CanonicalTraceReport,
++}
++
++#[derive(Debug, Eq, PartialEq)]
++struct CanonicalTraceReport {
++    root_obligation: Fingerprint,
++    obligations: Vec<Fingerprint>,
++    trait_selections: Vec<Fingerprint>,
++    projections: Vec<Fingerprint>,
++    fulfillments: Vec<Fingerprint>,
++    cycles: Vec<Fingerprint>,
++}
++
++fn projection_proof_with_parity<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    typing_env: ty::TypingEnv<'tcx>,
++    goal: ty::AliasTerm<'tcx>,
++) -> &'tcx CodegenProjectionProof<'tcx> {
++    let key = typing_env.as_query_input(goal);
++    let stock_before = stock_normalize(tcx, typing_env, goal);
++    let proof = tcx.codegen_projection_proof(key).unwrap();
++    let owned = proof.clone();
++    let warm = tcx.codegen_projection_proof(key).unwrap();
++    assert!(std::ptr::eq(proof, warm));
++    assert_eq!(owned, *warm);
++    let stock_after = stock_normalize(tcx, typing_env, goal);
++    assert_eq!(stock_before, stock_after);
++    assert_eq!(proof.normalized_term, stock_after);
++    proof
++}
++
++fn stock_normalize<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    typing_env: ty::TypingEnv<'tcx>,
++    goal: ty::AliasTerm<'tcx>,
++) -> ty::Term<'tcx> {
++    let arg = tcx
++        .try_normalize_generic_arg_after_erasing_regions(
++            typing_env.as_query_input(goal.to_term(tcx, ty::IsRigid::No).into_arg()),
++        )
++        .unwrap();
++    match arg.kind() {
++        ty::GenericArgKind::Type(ty) => ty.into(),
++        ty::GenericArgKind::Const(ct) => ct.into(),
++        ty::GenericArgKind::Lifetime(_) => unreachable!(),
++    }
++}
++
++fn assert_projection_root<'tcx>(
++    proof: &CodegenProjectionProof<'tcx>,
++    goal: ty::AliasTerm<'tcx>,
++) {
++    let root = proof.trace.root;
++    let root_clause = proof.trace.obligations[root.0 as usize]
++        .predicate
++        .as_projection_clause()
++        .unwrap()
++        .skip_binder();
++    assert_eq!(root_clause.projection_term, goal);
++    assert_eq!(root_clause.term, proof.normalized_term);
++    assert_eq!(
++        proof
++            .trace
++            .projections
++            .iter()
++            .filter(|projection| {
++                projection.projection == goal && projection.owners.contains(&root)
++            })
++            .count(),
++        1,
++        "{:#?}",
++        proof.trace
++    );
++    assert_eq!(
++        proof
++            .trace
++            .fulfillments
++            .iter()
++            .filter(|fulfillment| fulfillment.node == root)
++            .count(),
++        1,
++        "{:#?}",
++        proof.trace
++    );
++    for (index, obligation) in proof.trace.obligations.iter().enumerate() {
++        assert!(
++            !proof.trace.obligations[index + 1..].contains(obligation),
++            "{:#?}",
++            proof.trace
++        );
++    }
++}
++
++fn canonical_report<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    proof: &CodegenSelectionProof<'tcx>,
++) -> CanonicalSelectionReport {
++    CanonicalSelectionReport {
++        top_source: stable_fingerprint(tcx, &proof.top_source),
++        trace: canonical_trace_report(tcx, &proof.trace),
++    }
++}
++
++fn canonical_projection_report<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    proof: &CodegenProjectionProof<'tcx>,
++) -> CanonicalProjectionReport {
++    CanonicalProjectionReport {
++        normalized_term: stable_fingerprint(tcx, &proof.normalized_term),
++        trace: canonical_trace_report(tcx, &proof.trace),
++    }
++}
++
++fn canonical_trace_report<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    trace: &CodegenSolverTrace<'tcx>,
++) -> CanonicalTraceReport {
++    let root_obligation = &trace.obligations[trace.root.0 as usize];
++    CanonicalTraceReport {
++        root_obligation: stable_fingerprint(tcx, root_obligation),
++        obligations: sorted_fingerprints(tcx, &trace.obligations),
++        trait_selections: sorted_fingerprints(tcx, &trace.trait_selections),
++        projections: sorted_fingerprints(tcx, &trace.projections),
++        fulfillments: sorted_fingerprints(tcx, &trace.fulfillments),
++        cycles: sorted_fingerprints(tcx, &trace.cycles),
++    }
++}
++
++fn sorted_fingerprints<T: StableHash>(tcx: TyCtxt<'_>, values: &[T]) -> Vec<Fingerprint> {
++    let mut fingerprints: Vec<_> =
++        values.iter().map(|value| stable_fingerprint(tcx, value)).collect();
++    fingerprints.sort();
++    fingerprints
++}
++
++fn stable_fingerprint<T: StableHash>(tcx: TyCtxt<'_>, value: &T) -> Fingerprint {
++    tcx.with_stable_hashing_context(|mut hcx| {
++        let mut hasher = StableHasher::new();
++        value.stable_hash(&mut hcx, &mut hasher);
++        hasher.finish()
++    })
++}
++
++fn named_def(tcx: TyCtxt<'_>, name: &str, kind: DefKind) -> DefId {
++    let name = Symbol::intern(name);
++    tcx.iter_local_def_id()
++        .map(|def_id| def_id.to_def_id())
++        .find(|&def_id| tcx.def_kind(def_id) == kind && tcx.item_name(def_id) == name)
++        .unwrap()
++}
++
++fn associated_item(tcx: TyCtxt<'_>, owner: DefId, name: &str) -> DefId {
++    let name = Symbol::intern(name);
++    tcx.associated_items(owner)
++        .in_definition_order()
++        .find(|item| item.opt_name() == Some(name))
++        .unwrap()
++        .def_id
++}
++
++fn impl_for_adt(tcx: TyCtxt<'_>, trait_id: DefId, adt_id: DefId) -> DefId {
++    tcx.iter_local_def_id()
++        .map(|def_id| def_id.to_def_id())
++        .filter(|&def_id| tcx.def_kind(def_id) == DefKind::Impl { of_trait: true })
++        .find(|&def_id| {
++            tcx.impl_trait_id(def_id) == trait_id
++                && tcx
++                    .impl_trait_ref(def_id)
++                    .skip_binder()
++                    .self_ty()
++                    .ty_adt_def()
++                    .is_some_and(|adt| adt.did() == adt_id)
++        })
++        .unwrap()
++}
+-- 
+2.55.0
+

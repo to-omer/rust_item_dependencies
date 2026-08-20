@@ -1,0 +1,3653 @@
+From 3c6395d443f7f81fd0aad46b2d82755a9b469de1 Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Tue, 11 Aug 2026 11:20:00 +0900
+Subject: [PATCH 9/9] rustc: expose typed monomorphization dependencies
+
+---
+ compiler/rustc_driver_impl/src/lib.rs         |    2 +-
+ compiler/rustc_middle/src/arena.rs            |    1 +
+ compiler/rustc_middle/src/mir/mod.rs          |   11 +-
+ compiler/rustc_middle/src/mono.rs             |  127 +-
+ compiler/rustc_middle/src/queries.rs          |   17 +-
+ compiler/rustc_middle/src/query/erase.rs      |    7 +-
+ compiler/rustc_middle/src/query/keys.rs       |   11 +-
+ compiler/rustc_middle/src/traits/mod.rs       |   15 +
+ compiler/rustc_mir_transform/src/inline.rs    |    7 +-
+ .../src/mentioned_items.rs                    |   24 +-
+ compiler/rustc_monomorphize/src/collector.rs  |  929 ++++++++-
+ .../src/traits/vtable.rs                      |  124 +-
+ tests/ui-fulldeps/typed-mono-successors.rs    | 1757 +++++++++++++++++
+ 13 files changed, 2882 insertions(+), 150 deletions(-)
+ create mode 100644 tests/ui-fulldeps/typed-mono-successors.rs
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index def7099f..4e6b454e 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 8;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 9;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_middle/src/arena.rs b/compiler/rustc_middle/src/arena.rs
+index c4e79341..8d02eb36 100644
+--- a/compiler/rustc_middle/src/arena.rs
++++ b/compiler/rustc_middle/src/arena.rs
+@@ -116,6 +116,7 @@
+     codegen_associated_item_proof: rustc_middle::traits::CodegenAssociatedItemProof<'tcx>,
+     codegen_projection_proof: rustc_middle::traits::CodegenProjectionProof<'tcx>,
+     codegen_selection_proof: rustc_middle::traits::CodegenSelectionProof<'tcx>,
++    mono_successors: rustc_middle::mono::MonoSuccessors<'tcx>,
+ 
+     dep_kind_vtable: rustc_middle::dep_graph::DepKindVTable<'tcx>,
+ 
+diff --git a/compiler/rustc_middle/src/mir/mod.rs b/compiler/rustc_middle/src/mir/mod.rs
+index 9fa577eb..e6437327 100644
+--- a/compiler/rustc_middle/src/mir/mod.rs
++++ b/compiler/rustc_middle/src/mir/mod.rs
+@@ -186,13 +186,22 @@ pub fn initial(
+     }
+ }
+ 
++/// Why a function is retained as a pre-optimization mentioned item.
++#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, StableHash, TyEncodable, TyDecodable)]
++#[derive(TypeFoldable, TypeVisitable)]
++pub enum MentionedFnReason {
++    DirectCall,
++    FunctionPointer,
++    InlineAsm,
++}
++
+ /// Some item that needs to monomorphize successfully for a MIR body to be considered well-formed.
+ #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, StableHash, TyEncodable, TyDecodable)]
+ #[derive(TypeFoldable, TypeVisitable)]
+ pub enum MentionedItem<'tcx> {
+     /// A function that gets called. We don't necessarily know its precise type yet, since it can be
+     /// hidden behind a generic.
+-    Fn(Ty<'tcx>),
++    Fn { ty: Ty<'tcx>, reason: MentionedFnReason },
+     /// A type that has its drop shim called.
+     Drop(Ty<'tcx>),
+     /// Unsizing casts might require vtables, so we have to record them.
+diff --git a/compiler/rustc_middle/src/mono.rs b/compiler/rustc_middle/src/mono.rs
+index dc9a94f7..96dcb732 100644
+--- a/compiler/rustc_middle/src/mono.rs
++++ b/compiler/rustc_middle/src/mono.rs
+@@ -22,7 +22,10 @@
+ use crate::dep_graph::dep_node::{make_compile_codegen_unit, make_compile_mono_item};
+ use crate::dep_graph::{DepNode, WorkProduct, WorkProductId};
+ use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+-use crate::ty::{self, GenericArgs, Instance, InstanceKind, ShimKind, SymbolName, Ty, TyCtxt};
++use crate::mir::interpret::AllocId;
++use crate::ty::{
++    self, GenericArgs, Instance, InstanceKind, ShimKind, SymbolName, TraitRef, Ty, TyCtxt,
++};
+ 
+ /// Describes how a monomorphization will be instantiated in object files.
+ #[derive(PartialEq)]
+@@ -59,6 +62,128 @@ pub enum MonoItem<'tcx> {
+     GlobalAsm(ItemId),
+ }
+ 
++/// A mono item whose successors can be collected independently of the crate root set.
++#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, StableHash)]
++pub enum MonoTraceRoot<'tcx> {
++    Fn(Instance<'tcx>),
++    Static { def_id: DefId, trigger_span: Span },
++}
++
++/// A node retained by the typed monomorphization observer.
++///
++/// `Allocation` is session-local here. Consumers must convert it to an owned, content-based
++/// identity before leaving the compiler session.
++#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, StableHash)]
++pub enum MonoTraceNode<'tcx> {
++    Item(MonoItem<'tcx>),
++    Allocation(AllocId),
++    VTable { concrete_ty: Ty<'tcx>, trait_ref: Option<TraitRef<'tcx>> },
++}
++
++/// Why one trace node requires another. This is deliberately independent of the target's
++/// [`InstanceKind`]: a direct call may, for example, resolve to a function-pointer shim.
++#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, StableHash)]
++pub enum MonoUseCause {
++    DirectCall,
++    FunctionPointer,
++    ClosureFunctionPointer,
++    InlineAsmSymbol,
++    StaticReference,
++    ThreadLocalReference,
++    DropGlue,
++    VTableConstruction,
++    VTableMethod,
++    VTableDrop,
++    SupertraitVTable,
++    ConstAllocation,
++    AllocationReference,
++    ThreadLocalShim,
++    CompilerRequirement,
++}
++
++/// Which stock collection bucket discovered an edge.
++#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, StableHash)]
++pub enum MonoTraceCollection {
++    Used,
++    Mentioned,
++}
++
++/// Location evidence for an observed edge.
++#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, StableHash)]
++pub enum MonoTraceSite {
++    Source(Span),
++    AllocationOffset(u64),
++    VTableSlot(u64),
++    CompilerGenerated,
++}
++
++/// One typed edge, recorded before stock target deduplication.
++#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, StableHash)]
++pub struct MonoUseFact<'tcx> {
++    pub from: MonoTraceNode<'tcx>,
++    pub to: MonoTraceNode<'tcx>,
++    pub cause: MonoUseCause,
++    pub collection: MonoTraceCollection,
++    pub site: MonoTraceSite,
++}
++
++/// A required trait-associated constant retained by a concrete mono owner.
++///
++/// The proof query key is kept instead of copying the associated-item proof into this value.
++/// Consumers can use it to obtain the selected impl, final associated-const instance, and the
++/// trait-selection proof key from `codegen_associated_item_proof`.
++#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, StableHash)]
++pub struct MonoAssociatedConstUse<'tcx> {
++    pub owner: MonoTraceNode<'tcx>,
++    pub proof_key: ty::PseudoCanonicalInput<'tcx, (DefId, ty::GenericArgsRef<'tcx>)>,
++    pub site: MonoTraceSite,
++}
++
++/// A compiler proof referenced by a monomorphization use.
++#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, StableHash)]
++pub struct MonoProofUse<'tcx> {
++    pub from: MonoTraceNode<'tcx>,
++    pub proof: MonoProof<'tcx>,
++    pub cause: MonoUseCause,
++    pub collection: MonoTraceCollection,
++    pub site: MonoTraceSite,
++}
++
++/// The proof query input and exact result needed to validate a monomorphization use.
++#[derive(PartialEq, Eq, Clone, Copy, Debug, Hash, StableHash)]
++pub enum MonoProof<'tcx> {
++    TraitSelection {
++        proof_key: ty::PseudoCanonicalInput<'tcx, TraitRef<'tcx>>,
++    },
++    AssociatedItem {
++        selection_key: ty::PseudoCanonicalInput<'tcx, TraitRef<'tcx>>,
++        request: ty::PseudoCanonicalInput<'tcx, (DefId, ty::GenericArgsRef<'tcx>)>,
++        raw_instance: Instance<'tcx>,
++        codegen_instance: Instance<'tcx>,
++    },
++    Projection {
++        proof_key: ty::PseudoCanonicalInput<'tcx, ty::AliasTerm<'tcx>>,
++        expected: ty::Term<'tcx>,
++    },
++}
++
++/// Query-owned successors and their lossless typed provenance.
++#[derive(Clone, Debug, PartialEq, StableHash)]
++pub struct MonoSuccessors<'tcx> {
++    /// These two vectors are the exact stock transitions after target deduplication.
++    pub used: &'tcx [rustc_span::Spanned<MonoItem<'tcx>>],
++    pub mentioned: &'tcx [rustc_span::Spanned<MonoItem<'tcx>>],
++    /// Unlike `used` and `mentioned`, this vector retains repeated source sites.
++    pub facts: &'tcx [MonoUseFact<'tcx>],
++    /// Required associated constants from the owner body, independent of endpoint collection mode,
++    /// including uses removed from optimized MIR. Identical owner/key/site repetitions are
++    /// represented once; different source sites remain distinct.
++    pub associated_consts: &'tcx [MonoAssociatedConstUse<'tcx>],
++    /// Compiler proofs from used-item collection followed by mentioned-item collection. Within
++    /// each collection, semantic encounter, predicate, and vtable slot order is retained.
++    pub proof_uses: &'tcx [MonoProofUse<'tcx>],
++}
++
+ fn opt_incr_drop_glue_mode<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> InstantiationMode {
+     // Non-ADTs can't have a Drop impl. This case is mostly hit by closures whose captures require
+     // dropping.
+diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
+index 60ac76f9..02200c67 100644
+--- a/compiler/rustc_middle/src/queries.rs
++++ b/compiler/rustc_middle/src/queries.rs
+@@ -95,7 +95,8 @@
+     EvalToValTreeResult, GlobalId,
+ };
+ use crate::mono::{
+-    CodegenUnit, CollectionMode, MonoItem, MonoItemPartitions, NormalizationErrorInMono,
++    CodegenUnit, CollectionMode, MonoItem, MonoItemPartitions, MonoSuccessors, MonoTraceRoot,
++    NormalizationErrorInMono,
+ };
+ use crate::query::describe_as_module;
+ use crate::query::plumbing::{define_callbacks, maybe_into_query_key};
+@@ -109,8 +110,9 @@
+ use crate::traits::{
+     CodegenAssociatedItemProof, CodegenAssociatedItemProofError, CodegenObligationError,
+     CodegenProjectionProof, CodegenProjectionProofError, CodegenSelectionProof,
+-    CodegenSelectionProofError, DynCompatibilityViolation, EvaluationResult, ImplSource,
+-    ObligationCause, OverflowError, WellFormedLoc, solve, specialization_graph,
++    CodegenSelectionProofError, CodegenVtableMethodWitness, CodegenVtableMethodWitnessError,
++    DynCompatibilityViolation, EvaluationResult, ImplSource, ObligationCause, OverflowError,
++    WellFormedLoc, solve, specialization_graph,
+ };
+ use crate::ty::fast_reject::SimplifiedType;
+ use crate::ty::layout::ValidityRequirement;
+@@ -1581,6 +1583,11 @@
+         desc { "finding all vtable entries for trait `{}`", tcx.def_path_str(key.def_id) }
+     }
+ 
++    query codegen_vtable_method_witnesses(key: ty::TraitRef<'tcx>)
++        -> Result<&'tcx [CodegenVtableMethodWitness<'tcx>], CodegenVtableMethodWitnessError> {
++        desc { "observing vtable method requests for `{}`", tcx.def_path_str(key.def_id) }
++    }
++
+     query first_method_vtable_slot(key: ty::TraitRef<'tcx>) -> usize {
+         desc { "finding the slot within the vtable of `{}` for the implementation of `{}`", key.self_ty(), key.print_only_trait_name() }
+     }
+@@ -2790,6 +2797,10 @@
+         cache_on_disk
+     }
+ 
++    query mono_successors(key: (MonoTraceRoot<'tcx>, CollectionMode)) -> Result<&'tcx MonoSuccessors<'tcx>, NormalizationErrorInMono> {
++        desc { "collecting typed mono successors for `{:?}`", key.0 }
++    }
++
+     query size_estimate(key: ty::Instance<'tcx>) -> usize {
+         desc { "estimating codegen size of `{}`", key }
+         cache_on_disk
+diff --git a/compiler/rustc_middle/src/query/erase.rs b/compiler/rustc_middle/src/query/erase.rs
+index a7877b18..febbf075 100644
+--- a/compiler/rustc_middle/src/query/erase.rs
++++ b/compiler/rustc_middle/src/query/erase.rs
+@@ -16,7 +16,7 @@
+ use rustc_span::def_id::ModId;
+ use rustc_span::{ErrorGuaranteed, Spanned};
+ 
+-use crate::mono::{MonoItem, NormalizationErrorInMono};
++use crate::mono::{MonoItem, MonoSuccessors, NormalizationErrorInMono};
+ use crate::ty::{self, Ty, TyCtxt};
+ use crate::{mir, thir, traits};
+ 
+@@ -203,12 +203,17 @@ impl Erasable for $ty {
+         &'_ traits::CodegenAssociatedItemProof<'_>,
+         traits::CodegenAssociatedItemProofError,
+     >,
++    Result<
++        &'_ [traits::CodegenVtableMethodWitness<'_>],
++        traits::CodegenVtableMethodWitnessError,
++    >,
+     Result<&'_ traits::ImplSource<'_, ()>, traits::CodegenObligationError>,
+     Result<&'_ traits::CodegenProjectionProof<'_>, traits::CodegenProjectionProofError>,
+     Result<&'_ traits::CodegenSelectionProof<'_>, traits::CodegenSelectionProofError>,
+     Result<&'_ ty::List<Ty<'_>>, ty::util::AlwaysRequiresDrop>,
+     Result<(&'_ Steal<thir::Thir<'_>>, thir::ExprId), ErrorGuaranteed>,
+     Result<(&'_ [Spanned<MonoItem<'_>>], &'_ [Spanned<MonoItem<'_>>]), NormalizationErrorInMono>,
++    Result<&'_ MonoSuccessors<'_>, NormalizationErrorInMono>,
+     Result<(), ErrorGuaranteed>,
+     Result<Option<ty::EarlyBinder<'_, ty::Const<'_>>>, ErrorGuaranteed>,
+     Result<Option<ty::Instance<'_>>, ErrorGuaranteed>,
+diff --git a/compiler/rustc_middle/src/query/keys.rs b/compiler/rustc_middle/src/query/keys.rs
+index 8c4447a3..2e8e0ecc 100644
+--- a/compiler/rustc_middle/src/query/keys.rs
++++ b/compiler/rustc_middle/src/query/keys.rs
+@@ -14,7 +14,7 @@
+ 
+ use crate::dep_graph::DepNodeIndex;
+ use crate::infer::canonical::CanonicalQueryInput;
+-use crate::mono::CollectionMode;
++use crate::mono::{CollectionMode, MonoTraceRoot};
+ use crate::query::{DefIdCache, DefaultCache, SingleCache, VecCache};
+ use crate::ty::fast_reject::SimplifiedType;
+ use crate::ty::layout::ValidityRequirement;
+@@ -412,6 +412,15 @@ fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+     }
+ }
+ 
++impl<'tcx> QueryKey for (MonoTraceRoot<'tcx>, CollectionMode) {
++    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
++        match self.0 {
++            MonoTraceRoot::Fn(instance) => instance.default_span(tcx),
++            MonoTraceRoot::Static { trigger_span, .. } => trigger_span,
++        }
++    }
++}
++
+ /// Gets a `DefId` associated with a type
+ ///
+ /// Visited set is needed to avoid full iteration over
+diff --git a/compiler/rustc_middle/src/traits/mod.rs b/compiler/rustc_middle/src/traits/mod.rs
+index 186d7180..159483bb 100644
+--- a/compiler/rustc_middle/src/traits/mod.rs
++++ b/compiler/rustc_middle/src/traits/mod.rs
+@@ -1172,3 +1172,18 @@ pub enum CodegenAssociatedItemProofError {
+     UnsupportedSource,
+     IncompleteObservation,
+ }
++
++/// A vtable method slot and the associated-item request that produced it.
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash)]
++#[derive(TypeFoldable, TypeVisitable)]
++pub struct CodegenVtableMethodWitness<'tcx> {
++    pub slot: u64,
++    pub request: ty::PseudoCanonicalInput<'tcx, (DefId, ty::GenericArgsRef<'tcx>)>,
++    pub codegen_instance: ty::Instance<'tcx>,
++}
++
++/// Fail-closed outcomes for vtable method witness collection.
++#[derive(Copy, Clone, Debug, StableHash)]
++pub enum CodegenVtableMethodWitnessError {
++    IncompleteObservation,
++}
+diff --git a/compiler/rustc_mir_transform/src/inline.rs b/compiler/rustc_mir_transform/src/inline.rs
+index 47df95a3..abf18176 100644
+--- a/compiler/rustc_mir_transform/src/inline.rs
++++ b/compiler/rustc_mir_transform/src/inline.rs
+@@ -1027,9 +1027,12 @@ fn dest_needs_borrow(place: Place<'_>) -> bool {
+     // the actually used items. By doing this we can entirely avoid visiting the callee!
+     // We need to reconstruct the `required_item` for the callee so that we can find and
+     // remove it.
+-    let callee_item = MentionedItem::Fn(func.ty(caller_body, tcx));
++    let callee_ty = func.ty(caller_body, tcx);
+     let caller_mentioned_items = caller_body.mentioned_items.as_mut().unwrap();
+-    if let Some(idx) = caller_mentioned_items.iter().position(|item| item.node == callee_item) {
++    if let Some(idx) = caller_mentioned_items
++        .iter()
++        .position(|item| matches!(item.node, MentionedItem::Fn { ty, .. } if ty == callee_ty))
++    {
+         // We found the callee, so remove it and add its items instead.
+         caller_mentioned_items.remove(idx);
+         caller_mentioned_items.extend(callee_body.mentioned_items());
+diff --git a/compiler/rustc_mir_transform/src/mentioned_items.rs b/compiler/rustc_mir_transform/src/mentioned_items.rs
+index 89146f5c..9e1e0891 100644
+--- a/compiler/rustc_mir_transform/src/mentioned_items.rs
++++ b/compiler/rustc_mir_transform/src/mentioned_items.rs
+@@ -1,5 +1,5 @@
+ use rustc_middle::mir::visit::Visitor;
+-use rustc_middle::mir::{self, Location, MentionedItem};
++use rustc_middle::mir::{self, Location, MentionedFnReason, MentionedItem};
+ use rustc_middle::ty::adjustment::PointerCoercion;
+ use rustc_middle::ty::{self, TyCtxt};
+ use rustc_session::Session;
+@@ -42,8 +42,13 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+         match &terminator.kind {
+             mir::TerminatorKind::Call { func, .. } | mir::TerminatorKind::TailCall { func, .. } => {
+                 let callee_ty = func.ty(self.body, self.tcx);
+-                self.mentioned_items
+-                    .push(Spanned { node: MentionedItem::Fn(callee_ty), span: span() });
++                self.mentioned_items.push(Spanned {
++                    node: MentionedItem::Fn {
++                        ty: callee_ty,
++                        reason: MentionedFnReason::DirectCall,
++                    },
++                    span: span(),
++                });
+             }
+             mir::TerminatorKind::Drop { place, .. } => {
+                 let ty = place.ty(self.body, self.tcx).ty;
+@@ -54,7 +59,10 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+                     match *op {
+                         mir::InlineAsmOperand::SymFn { ref value } => {
+                             self.mentioned_items.push(Spanned {
+-                                node: MentionedItem::Fn(value.const_.ty()),
++                                node: MentionedItem::Fn {
++                                    ty: value.const_.ty(),
++                                    reason: MentionedFnReason::InlineAsm,
++                                },
+                                 span: span(),
+                             });
+                         }
+@@ -112,7 +120,13 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+                 _,
+             ) => {
+                 let fn_ty = operand.ty(self.body, self.tcx);
+-                self.mentioned_items.push(Spanned { node: MentionedItem::Fn(fn_ty), span: span() });
++                self.mentioned_items.push(Spanned {
++                    node: MentionedItem::Fn {
++                        ty: fn_ty,
++                        reason: MentionedFnReason::FunctionPointer,
++                    },
++                    span: span(),
++                });
+             }
+             _ => {}
+         }
+diff --git a/compiler/rustc_monomorphize/src/collector.rs b/compiler/rustc_monomorphize/src/collector.rs
+index 105c8e0e..e8e042d3 100644
+--- a/compiler/rustc_monomorphize/src/collector.rs
++++ b/compiler/rustc_monomorphize/src/collector.rs
+@@ -209,7 +209,7 @@
+ use std::ops::ControlFlow;
+ 
+ use rustc_data_structures::Limit;
+-use rustc_data_structures::fx::FxIndexMap;
++use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
+ use rustc_data_structures::sync::{Lock, par_for_each_in};
+ use rustc_data_structures::unord::{UnordMap, UnordSet};
+ use rustc_hir as hir;
+@@ -220,14 +220,18 @@
+ use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+ use rustc_middle::mir::interpret::{AllocId, ErrorHandled, GlobalAlloc, Scalar};
+ use rustc_middle::mir::visit::Visitor as MirVisitor;
+-use rustc_middle::mir::{self, Body, Location, MentionedItem, traversal};
+-use rustc_middle::mono::{CollectionMode, InstantiationMode, MonoItem, NormalizationErrorInMono};
++use rustc_middle::mir::{self, Body, Location, MentionedFnReason, MentionedItem, traversal};
++use rustc_middle::mono::{
++    CollectionMode, InstantiationMode, MonoAssociatedConstUse, MonoItem, MonoProof, MonoProofUse,
++    MonoSuccessors, MonoTraceCollection, MonoTraceNode, MonoTraceRoot, MonoTraceSite, MonoUseCause,
++    MonoUseFact, NormalizationErrorInMono,
++};
+ use rustc_middle::query::TyCtxtAt;
+ use rustc_middle::ty::adjustment::{CustomCoerceUnsized, PointerCoercion};
+ use rustc_middle::ty::layout::ValidityRequirement;
+ use rustc_middle::ty::{
+-    self, GenericArgs, GenericParamDefKind, Instance, InstanceKind, ShimKind, Ty, TyCtxt,
+-    TypeFoldable, TypeVisitable, TypeVisitableExt, TypeVisitor, Unnormalized, VtblEntry,
++    self, GenericArgs, GenericArgsRef, GenericParamDefKind, Instance, InstanceKind, ShimKind, Ty,
++    TyCtxt, TypeFoldable, TypeVisitable, TypeVisitableExt, TypeVisitor, Unnormalized, VtblEntry,
+ };
+ use rustc_middle::util::Providers;
+ use rustc_middle::{bug, span_bug};
+@@ -309,23 +313,297 @@ struct MonoItems<'tcx> {
+     // We want a set of MonoItem + Span where trying to re-insert a MonoItem with a different Span
+     // is ignored. Map does that, but it looks odd.
+     items: FxIndexMap<MonoItem<'tcx>, Span>,
++    trace: Option<MonoTraceSink<'tcx>>,
++}
++
++struct MonoTraceSink<'tcx> {
++    root: MonoTraceNode<'tcx>,
++    collection: MonoTraceCollection,
++    facts: Vec<MonoUseFact<'tcx>>,
++    proof_uses: Vec<MonoProofUse<'tcx>>,
++    failed: bool,
++}
++
++#[derive(Clone, Copy)]
++enum TraceFrom<'tcx> {
++    Root,
++    Node(MonoTraceNode<'tcx>),
++}
++
++fn source_trace_site(span: Span) -> MonoTraceSite {
++    if span.is_dummy() { MonoTraceSite::CompilerGenerated } else { MonoTraceSite::Source(span) }
++}
++
++#[derive(Clone, Copy)]
++struct AssociatedSelectionKeys<'tcx> {
++    request: ty::PseudoCanonicalInput<'tcx, (DefId, GenericArgsRef<'tcx>)>,
++    selection_key: ty::PseudoCanonicalInput<'tcx, ty::TraitRef<'tcx>>,
++    raw_instance: Instance<'tcx>,
++}
++
++fn normalized_selection_key<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    trait_ref: ty::TraitRef<'tcx>,
++) -> Result<ty::PseudoCanonicalInput<'tcx, ty::TraitRef<'tcx>>, NormalizationErrorInMono> {
++    let typing_env = ty::TypingEnv::fully_monomorphized();
++    let trait_ref = tcx
++        .try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(trait_ref))
++        .map_err(|_| NormalizationErrorInMono)?;
++    if trait_ref.has_non_region_param() || trait_ref.has_non_region_infer() {
++        return Err(NormalizationErrorInMono);
++    }
++    Ok(typing_env.as_query_input(trait_ref))
++}
++
++fn associated_selection_keys<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    requested_item: DefId,
++    requested_args: GenericArgsRef<'tcx>,
++) -> Result<Option<AssociatedSelectionKeys<'tcx>>, NormalizationErrorInMono> {
++    let Some(_) = tcx.trait_of_assoc(requested_item) else { return Ok(None) };
++    if requested_args.has_non_region_param() || requested_args.has_non_region_infer() {
++        return Err(NormalizationErrorInMono);
++    }
++
++    let typing_env = ty::TypingEnv::fully_monomorphized();
++    let request = tcx
++        .erase_and_anonymize_regions(typing_env.as_query_input((requested_item, requested_args)));
++    associated_selection_from_request(tcx, request).map(Some)
++}
++
++fn associated_selection_from_request<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    request: ty::PseudoCanonicalInput<'tcx, (DefId, GenericArgsRef<'tcx>)>,
++) -> Result<AssociatedSelectionKeys<'tcx>, NormalizationErrorInMono> {
++    let (requested_item, requested_args) = request.value;
++    if request.typing_env != ty::TypingEnv::fully_monomorphized()
++        || tcx.def_kind(requested_item) != DefKind::AssocFn
++        || requested_args.has_non_region_param()
++        || requested_args.has_non_region_infer()
++    {
++        return Err(NormalizationErrorInMono);
++    }
++    let trait_id = tcx.trait_of_assoc(requested_item).ok_or(NormalizationErrorInMono)?;
++    let typing_env = request.typing_env;
++    let raw_instance = tcx
++        .resolve_instance_raw(request)
++        .map_err(|_| NormalizationErrorInMono)?
++        .ok_or(NormalizationErrorInMono)?;
++    let receiver_args = tcx
++        .try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(requested_args))
++        .map_err(|_| NormalizationErrorInMono)?;
++    let trait_ref = ty::TraitRef::from_assoc(tcx, trait_id, receiver_args);
++    let selection_key = normalized_selection_key(tcx, trait_ref)?;
++    Ok(AssociatedSelectionKeys { request, selection_key, raw_instance })
++}
++
++fn record_trait_selection_proof<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    trait_ref: ty::TraitRef<'tcx>,
++    from: TraceFrom<'tcx>,
++    cause: MonoUseCause,
++    site: MonoTraceSite,
++    output: &mut MonoItems<'tcx>,
++) {
++    if !output.traces_observations() {
++        return;
++    }
++    let Ok(proof_key) = normalized_selection_key(tcx, trait_ref) else {
++        output.fail_observation();
++        return;
++    };
++    output.record_proof_use(from, MonoProof::TraitSelection { proof_key }, cause, site);
++}
++
++fn record_dyn_predicate_proofs<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    predicates: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
++    concrete_ty: Ty<'tcx>,
++    from: TraceFrom<'tcx>,
++    cause: MonoUseCause,
++    site: MonoTraceSite,
++    output: &mut MonoItems<'tcx>,
++) {
++    if !output.traces_observations() {
++        return;
++    }
++
++    for predicate in predicates {
++        match predicate.skip_binder() {
++            ty::ExistentialPredicate::Trait(_) => {
++                let trait_ref = predicate.map_bound(|predicate| match predicate {
++                    ty::ExistentialPredicate::Trait(trait_ref) => trait_ref,
++                    _ => unreachable!(),
++                });
++                let trait_ref = tcx.instantiate_bound_regions_with_erased(
++                    trait_ref.with_self_ty(tcx, concrete_ty),
++                );
++                record_trait_selection_proof(tcx, trait_ref, from, cause, site, output);
++            }
++            ty::ExistentialPredicate::Projection(_) => {
++                let projection = predicate.map_bound(|predicate| match predicate {
++                    ty::ExistentialPredicate::Projection(projection) => projection,
++                    _ => unreachable!(),
++                });
++                let projection = tcx.instantiate_bound_regions_with_erased(
++                    projection.with_self_ty(tcx, concrete_ty),
++                );
++                if !matches!(
++                    projection.projection_term.kind,
++                    ty::AliasTermKind::ProjectionTy { .. }
++                ) || projection.projection_term.args.type_at(0) != concrete_ty
++                    || projection.projection_term.args.has_non_region_param()
++                    || projection.projection_term.args.has_non_region_infer()
++                    || projection.term.has_non_region_param()
++                    || projection.term.has_non_region_infer()
++                {
++                    output.fail_observation();
++                    continue;
++                }
++                let typing_env = ty::TypingEnv::fully_monomorphized();
++                let proof_key = tcx.erase_and_anonymize_regions(
++                    typing_env.as_query_input(projection.projection_term),
++                );
++                let expected = tcx.erase_and_anonymize_regions(projection.term);
++                output.record_proof_use(
++                    from,
++                    MonoProof::Projection { proof_key, expected },
++                    cause,
++                    site,
++                );
++            }
++            ty::ExistentialPredicate::AutoTrait(def_id) => {
++                let trait_ref = ty::TraitRef::new(tcx, def_id, [concrete_ty]);
++                record_trait_selection_proof(tcx, trait_ref, from, cause, site, output);
++            }
++        }
++    }
+ }
+ 
+ impl<'tcx> MonoItems<'tcx> {
+     fn new() -> Self {
+-        Self { items: FxIndexMap::default() }
++        Self { items: FxIndexMap::default(), trace: None }
++    }
++
++    fn with_trace(root: MonoTraceNode<'tcx>, collection: MonoTraceCollection) -> Self {
++        Self {
++            items: FxIndexMap::default(),
++            trace: Some(MonoTraceSink {
++                root,
++                collection,
++                facts: Vec::new(),
++                proof_uses: Vec::new(),
++                failed: false,
++            }),
++        }
+     }
+ 
+     fn is_empty(&self) -> bool {
+         self.items.is_empty()
+     }
+ 
++    fn traces_observations(&self) -> bool {
++        self.trace.is_some()
++    }
++
+     fn push(&mut self, item: Spanned<MonoItem<'tcx>>) {
+         // Insert only if the entry does not exist. A normal insert would stomp the first span that
+         // got inserted.
+         self.items.entry(item.node).or_insert(item.span);
+     }
+ 
++    fn push_traced(
++        &mut self,
++        item: Spanned<MonoItem<'tcx>>,
++        cause: MonoUseCause,
++        site: MonoTraceSite,
++    ) {
++        self.push_traced_from(TraceFrom::Root, item, cause, site);
++    }
++
++    fn push_traced_from(
++        &mut self,
++        from: TraceFrom<'tcx>,
++        item: Spanned<MonoItem<'tcx>>,
++        cause: MonoUseCause,
++        site: MonoTraceSite,
++    ) {
++        if let Some(trace) = &mut self.trace {
++            let from = match from {
++                TraceFrom::Root => trace.root,
++                TraceFrom::Node(node) => node,
++            };
++            trace.facts.push(MonoUseFact {
++                from,
++                to: MonoTraceNode::Item(item.node),
++                cause,
++                collection: trace.collection,
++                site,
++            });
++        }
++        self.push(item);
++    }
++
++    fn record_edge(
++        &mut self,
++        from: TraceFrom<'tcx>,
++        to: MonoTraceNode<'tcx>,
++        cause: MonoUseCause,
++        site: MonoTraceSite,
++    ) {
++        if let Some(trace) = &mut self.trace {
++            let from = match from {
++                TraceFrom::Root => trace.root,
++                TraceFrom::Node(node) => node,
++            };
++            trace.facts.push(MonoUseFact { from, to, cause, collection: trace.collection, site });
++        }
++    }
++
++    fn record_proof_use(
++        &mut self,
++        from: TraceFrom<'tcx>,
++        proof: MonoProof<'tcx>,
++        cause: MonoUseCause,
++        site: MonoTraceSite,
++    ) {
++        if let Some(trace) = &mut self.trace {
++            let from = match from {
++                TraceFrom::Root => trace.root,
++                TraceFrom::Node(node) => node,
++            };
++            trace.proof_uses.push(MonoProofUse {
++                from,
++                proof,
++                cause,
++                collection: trace.collection,
++                site,
++            });
++        }
++    }
++
++    fn fail_observation(&mut self) {
++        if let Some(trace) = &mut self.trace {
++            trace.failed = true;
++        }
++    }
++
++    fn into_observation_parts(
++        self,
++    ) -> Result<
++        (Vec<Spanned<MonoItem<'tcx>>>, Vec<MonoUseFact<'tcx>>, Vec<MonoProofUse<'tcx>>),
++        NormalizationErrorInMono,
++    > {
++        let items = self.items.into_iter().map(|(item, span)| respan(span, item)).collect();
++        let Some(trace) = self.trace else {
++            return Ok((items, Vec::new(), Vec::new()));
++        };
++        if trace.failed {
++            return Err(NormalizationErrorInMono);
++        }
++        Ok((items, trace.facts, trace.proof_uses))
++    }
++
+     fn items(&self) -> impl Iterator<Item = MonoItem<'tcx>> {
+         self.items.keys().cloned()
+     }
+@@ -421,42 +699,10 @@ fn collect_items_rec<'tcx>(
+     match starting_item.node {
+         MonoItem::Static(def_id) => {
+             recursion_depth_reset = None;
+-
+-            // Statics always get evaluated (which is possible because they can't be generic), so for
+-            // `MentionedItems` collection there's nothing to do here.
+-            if mode == CollectionMode::UsedItems {
+-                let instance = Instance::mono(tcx, def_id);
+-
+-                // Sanity check whether this ended up being collected accidentally
+-                debug_assert!(tcx.should_codegen_locally(instance));
+-
+-                let DefKind::Static { nested, .. } = tcx.def_kind(def_id) else { bug!() };
+-                // Nested statics have no type.
+-                if !nested {
+-                    let ty = instance.ty(tcx, ty::TypingEnv::fully_monomorphized());
+-                    visit_drop_use(tcx, ty, true, starting_item.span, &mut used_items);
+-                }
+-
+-                if let Ok(alloc) = tcx.eval_static_initializer(def_id) {
+-                    for &prov in alloc.inner().provenance().ptrs().values() {
+-                        collect_alloc(tcx, prov.alloc_id(), &mut used_items);
+-                    }
+-                }
+-
+-                if tcx.needs_thread_local_shim(def_id) {
+-                    used_items.push(respan(
+-                        starting_item.span,
+-                        MonoItem::Fn(Instance {
+-                            def: InstanceKind::Shim(ShimKind::ThreadLocal(def_id)),
+-                            args: GenericArgs::empty(),
+-                        }),
+-                    ));
+-                }
+-            }
+-
+-            // mentioned_items stays empty since there's no codegen for statics. statics don't get
+-            // optimized, and if they did then the const-eval interpreter would have to worry about
+-            // mentioned_items.
++            let (static_used, static_mentioned) =
++                collect_items_of_static(tcx, def_id, starting_item.span, mode, false);
++            used_items.extend(static_used);
++            mentioned_items.extend(static_mentioned);
+         }
+         MonoItem::Fn(instance) => {
+             // Sanity check whether this ended up being collected accidentally
+@@ -506,7 +752,7 @@ fn collect_items_rec<'tcx>(
+                         hir::InlineAsmOperand::Const { anon_const } => {
+                             match tcx.const_eval_poly(anon_const.def_id.to_def_id()) {
+                                 Ok(val) => {
+-                                    collect_const_value(tcx, val, &mut used_items);
++                                    collect_const_value(tcx, val, *op_sp, &mut used_items);
+                                 }
+                                 Err(ErrorHandled::TooGeneric(..)) => {
+                                     span_bug!(*op_sp, "asm const cannot be resolved; too generic")
+@@ -518,7 +764,14 @@ fn collect_items_rec<'tcx>(
+                         }
+                         hir::InlineAsmOperand::SymFn { expr } => {
+                             let fn_ty = tcx.typeck(item_id.owner_id).expr_ty(expr);
+-                            visit_fn_use(tcx, fn_ty, false, *op_sp, &mut used_items);
++                            visit_fn_use(
++                                tcx,
++                                fn_ty,
++                                false,
++                                *op_sp,
++                                MonoUseCause::InlineAsmSymbol,
++                                &mut used_items,
++                            );
+                         }
+                         hir::InlineAsmOperand::SymStatic { path: _, def_id } => {
+                             let instance = Instance::mono(tcx, def_id);
+@@ -692,10 +945,29 @@ struct MirUsedCollector<'a, 'tcx> {
+     used_items: &'a mut MonoItems<'tcx>,
+     /// See the comment in `collect_items_of_instance` for the purpose of this set.
+     /// Note that this contains *not-monomorphized* items!
+-    used_mentioned_items: &'a mut UnordSet<MentionedItem<'tcx>>,
++    used_mentioned_items: &'a mut UnordSet<MentionedItemIdentity<'tcx>>,
+     instance: Instance<'tcx>,
+ }
+ 
++#[derive(Clone, Copy, PartialEq, Eq, Hash)]
++enum MentionedItemIdentity<'tcx> {
++    Fn(Ty<'tcx>),
++    Drop(Ty<'tcx>),
++    UnsizeCast { source_ty: Ty<'tcx>, target_ty: Ty<'tcx> },
++    Closure(Ty<'tcx>),
++}
++
++fn mentioned_item_identity<'tcx>(item: MentionedItem<'tcx>) -> MentionedItemIdentity<'tcx> {
++    match item {
++        MentionedItem::Fn { ty, .. } => MentionedItemIdentity::Fn(ty),
++        MentionedItem::Drop(ty) => MentionedItemIdentity::Drop(ty),
++        MentionedItem::UnsizeCast { source_ty, target_ty } => {
++            MentionedItemIdentity::UnsizeCast { source_ty, target_ty }
++        }
++        MentionedItem::Closure(ty) => MentionedItemIdentity::Closure(ty),
++    }
++}
++
+ impl<'a, 'tcx> MirUsedCollector<'a, 'tcx> {
+     fn monomorphize<T>(&self, value: T) -> T
+     where
+@@ -749,7 +1021,7 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+                 let source_ty = operand.ty(self.body, self.tcx);
+                 // *Before* monomorphizing, record that we already handled this mention.
+                 self.used_mentioned_items
+-                    .insert(MentionedItem::UnsizeCast { source_ty, target_ty });
++                    .insert(MentionedItemIdentity::UnsizeCast { source_ty, target_ty });
+                 let target_ty = self.monomorphize(target_ty);
+                 let source_ty = self.monomorphize(source_ty);
+                 let (source_ty, target_ty) =
+@@ -774,9 +1046,16 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+             ) => {
+                 let fn_ty = operand.ty(self.body, self.tcx);
+                 // *Before* monomorphizing, record that we already handled this mention.
+-                self.used_mentioned_items.insert(MentionedItem::Fn(fn_ty));
++                self.used_mentioned_items.insert(MentionedItemIdentity::Fn(fn_ty));
+                 let fn_ty = self.monomorphize(fn_ty);
+-                visit_fn_use(self.tcx, fn_ty, false, span, self.used_items);
++                visit_fn_use(
++                    self.tcx,
++                    fn_ty,
++                    false,
++                    span,
++                    MonoUseCause::FunctionPointer,
++                    self.used_items,
++                );
+             }
+             mir::Rvalue::Cast(
+                 mir::CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(_), _),
+@@ -785,13 +1064,17 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+             ) => {
+                 let source_ty = operand.ty(self.body, self.tcx);
+                 // *Before* monomorphizing, record that we already handled this mention.
+-                self.used_mentioned_items.insert(MentionedItem::Closure(source_ty));
++                self.used_mentioned_items.insert(MentionedItemIdentity::Closure(source_ty));
+                 let source_ty = self.monomorphize(source_ty);
+                 if let ty::Closure(def_id, args) = *source_ty.kind() {
+                     let instance =
+                         Instance::resolve_closure(self.tcx, def_id, args, ty::ClosureKind::FnOnce);
+                     if self.tcx.should_codegen_locally(instance) {
+-                        self.used_items.push(create_fn_mono_item(self.tcx, instance, span));
++                        self.used_items.push_traced(
++                            create_fn_mono_item(self.tcx, instance, span),
++                            MonoUseCause::ClosureFunctionPointer,
++                            source_trace_site(span),
++                        );
+                     }
+                 } else {
+                     bug!()
+@@ -802,7 +1085,11 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+                 let instance = Instance::mono(self.tcx, def_id);
+                 if self.tcx.should_codegen_locally(instance) {
+                     trace!("collecting thread-local static {:?}", def_id);
+-                    self.used_items.push(respan(span, MonoItem::Static(def_id)));
++                    self.used_items.push_traced(
++                        respan(span, MonoItem::Static(def_id)),
++                        MonoUseCause::ThreadLocalReference,
++                        source_trace_site(span),
++                    );
+                 }
+             }
+             _ => { /* not interesting */ }
+@@ -817,7 +1104,7 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+     fn visit_const_operand(&mut self, constant: &mir::ConstOperand<'tcx>, _location: Location) {
+         // No `super_constant` as we don't care about `visit_ty`/`visit_ty_const`.
+         let Some(val) = self.eval_constant(constant) else { return };
+-        collect_const_value(self.tcx, val, self.used_items);
++        collect_const_value(self.tcx, val, constant.span, self.used_items);
+     }
+ 
+     fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Location) {
+@@ -828,7 +1115,11 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+         let push_mono_lang_item = |this: &mut Self, lang_item: LangItem| {
+             let instance = Instance::mono(tcx, tcx.require_lang_item(lang_item, source));
+             if tcx.should_codegen_locally(instance) {
+-                this.used_items.push(create_fn_mono_item(tcx, instance, source));
++                this.used_items.push_traced(
++                    create_fn_mono_item(tcx, instance, source),
++                    MonoUseCause::CompilerRequirement,
++                    source_trace_site(source),
++                );
+             }
+         };
+ 
+@@ -837,7 +1128,7 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+             | mir::TerminatorKind::TailCall { ref func, .. } => {
+                 let callee_ty = func.ty(self.body, tcx);
+                 // *Before* monomorphizing, record that we already handled this mention.
+-                self.used_mentioned_items.insert(MentionedItem::Fn(callee_ty));
++                self.used_mentioned_items.insert(MentionedItemIdentity::Fn(callee_ty));
+                 let callee_ty = self.monomorphize(callee_ty);
+ 
+                 // HACK(explicit_tail_calls): collect tail calls to `#[track_caller]` functions as indirect,
+@@ -866,13 +1157,14 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+                     callee_ty,
+                     !force_indirect_call,
+                     source,
++                    MonoUseCause::DirectCall,
+                     &mut self.used_items,
+                 )
+             }
+             mir::TerminatorKind::Drop { ref place, .. } => {
+                 let ty = place.ty(self.body, self.tcx).ty;
+                 // *Before* monomorphizing, record that we already handled this mention.
+-                self.used_mentioned_items.insert(MentionedItem::Drop(ty));
++                self.used_mentioned_items.insert(MentionedItemIdentity::Drop(ty));
+                 let ty = self.monomorphize(ty);
+                 visit_drop_use(self.tcx, ty, true, source, self.used_items);
+             }
+@@ -882,15 +1174,26 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+                         mir::InlineAsmOperand::SymFn { ref value } => {
+                             let fn_ty = value.const_.ty();
+                             // *Before* monomorphizing, record that we already handled this mention.
+-                            self.used_mentioned_items.insert(MentionedItem::Fn(fn_ty));
++                            self.used_mentioned_items.insert(MentionedItemIdentity::Fn(fn_ty));
+                             let fn_ty = self.monomorphize(fn_ty);
+-                            visit_fn_use(self.tcx, fn_ty, false, source, self.used_items);
++                            visit_fn_use(
++                                self.tcx,
++                                fn_ty,
++                                false,
++                                source,
++                                MonoUseCause::InlineAsmSymbol,
++                                self.used_items,
++                            );
+                         }
+                         mir::InlineAsmOperand::SymStatic { def_id } => {
+                             let instance = Instance::mono(self.tcx, def_id);
+                             if self.tcx.should_codegen_locally(instance) {
+                                 trace!("collecting asm sym static {:?}", def_id);
+-                                self.used_items.push(respan(source, MonoItem::Static(def_id)));
++                                self.used_items.push_traced(
++                                    respan(source, MonoItem::Static(def_id)),
++                                    MonoUseCause::InlineAsmSymbol,
++                                    source_trace_site(source),
++                                );
+                             }
+                         }
+                         _ => {}
+@@ -947,7 +1250,16 @@ fn visit_drop_use<'tcx>(
+     output: &mut MonoItems<'tcx>,
+ ) {
+     let instance = Instance::resolve_drop_glue(tcx, ty);
+-    visit_instance_use(tcx, instance, is_direct_call, source, output);
++    visit_instance_use(
++        tcx,
++        instance,
++        is_direct_call,
++        source,
++        MonoUseCause::DropGlue,
++        TraceFrom::Root,
++        source_trace_site(source),
++        output,
++    );
+ }
+ 
+ /// For every call of this function in the visitor, make sure there is a matching call in the
+@@ -957,10 +1269,22 @@ fn visit_fn_use<'tcx>(
+     ty: Ty<'tcx>,
+     is_direct_call: bool,
+     source: Span,
++    cause: MonoUseCause,
+     output: &mut MonoItems<'tcx>,
+ ) {
+     if let ty::FnDef(def_id, args) = *ty.kind() {
+         let args = args.no_bound_vars().unwrap();
++        let selection = if output.traces_observations() {
++            match associated_selection_keys(tcx, def_id, args) {
++                Ok(selection) => selection,
++                Err(_) => {
++                    output.fail_observation();
++                    None
++                }
++            }
++        } else {
++            None
++        };
+         let instance = if is_direct_call {
+             ty::Instance::expect_resolve(
+                 tcx,
+@@ -980,7 +1304,29 @@ fn visit_fn_use<'tcx>(
+                 _ => bug!("failed to resolve instance for {ty}"),
+             }
+         };
+-        visit_instance_use(tcx, instance, is_direct_call, source, output);
++        if let Some(selection) = selection {
++            output.record_proof_use(
++                TraceFrom::Root,
++                MonoProof::AssociatedItem {
++                    selection_key: selection.selection_key,
++                    request: selection.request,
++                    raw_instance: selection.raw_instance,
++                    codegen_instance: instance,
++                },
++                cause,
++                source_trace_site(source),
++            );
++        }
++        visit_instance_use(
++            tcx,
++            instance,
++            is_direct_call,
++            source,
++            cause,
++            TraceFrom::Root,
++            source_trace_site(source),
++            output,
++        );
+     }
+ }
+ 
+@@ -989,6 +1335,9 @@ fn visit_instance_use<'tcx>(
+     instance: ty::Instance<'tcx>,
+     is_direct_call: bool,
+     source: Span,
++    cause: MonoUseCause,
++    from: TraceFrom<'tcx>,
++    site: MonoTraceSite,
+     output: &mut MonoItems<'tcx>,
+ ) {
+     debug!("visit_item_use({:?}, is_direct_call={:?})", instance, is_direct_call);
+@@ -1004,7 +1353,12 @@ fn visit_instance_use<'tcx>(
+             let def_id = tcx.require_lang_item(LangItem::PanicNounwind, source);
+             let panic_instance = Instance::mono(tcx, def_id);
+             if tcx.should_codegen_locally(panic_instance) {
+-                output.push(create_fn_mono_item(tcx, panic_instance, source));
++                output.push_traced_from(
++                    from,
++                    create_fn_mono_item(tcx, panic_instance, source),
++                    MonoUseCause::CompilerRequirement,
++                    site,
++                );
+             }
+         } else if !intrinsic.must_be_overridden
+             && (tcx.sess.opts.unstable_opts.force_intrinsic_fallback
+@@ -1021,7 +1375,12 @@ fn visit_instance_use<'tcx>(
+             // the fallback body.
+             let instance = ty::Instance::new_raw(instance.def_id(), instance.args);
+             if tcx.should_codegen_locally(instance) {
+-                output.push(create_fn_mono_item(tcx, instance, source));
++                output.push_traced_from(
++                    from,
++                    create_fn_mono_item(tcx, instance, source),
++                    MonoUseCause::CompilerRequirement,
++                    site,
++                );
+             }
+         }
+     }
+@@ -1043,7 +1402,12 @@ fn visit_instance_use<'tcx>(
+             // Note that we also optimize away the call to visit_instance_use in vtable construction
+             // (see create_mono_items_for_vtable_methods).
+             if !is_direct_call {
+-                output.push(create_fn_mono_item(tcx, instance, source));
++                output.push_traced_from(
++                    from,
++                    create_fn_mono_item(tcx, instance, source),
++                    cause,
++                    site,
++                );
+             }
+         }
+         ty::InstanceKind::Item(..)
+@@ -1058,7 +1422,7 @@ fn visit_instance_use<'tcx>(
+         | ty::InstanceKind::Shim(ty::ShimKind::FnPtr(..))
+         | ty::InstanceKind::Shim(ty::ShimKind::Clone(..))
+         | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAddr(..)) => {
+-            output.push(create_fn_mono_item(tcx, instance, source));
++            output.push_traced_from(from, create_fn_mono_item(tcx, instance, source), cause, site);
+         }
+     }
+ }
+@@ -1238,31 +1602,113 @@ fn create_mono_items_for_vtable_methods<'tcx>(
+     let ty::Dynamic(trait_ty, ..) = trait_ty.kind() else {
+         bug!("create_mono_items_for_vtable_methods: {trait_ty:?} not a trait type");
+     };
+-    if let Some(principal) = trait_ty.principal() {
+-        let trait_ref =
+-            tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, impl_ty));
++    let trait_ref = trait_ty.principal().map(|principal| {
++        tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, impl_ty))
++    });
++    let vtable = MonoTraceNode::VTable { concrete_ty: impl_ty, trait_ref };
++    record_dyn_predicate_proofs(
++        tcx,
++        trait_ty,
++        impl_ty,
++        TraceFrom::Root,
++        MonoUseCause::VTableConstruction,
++        source_trace_site(source),
++        output,
++    );
++    output.record_edge(
++        TraceFrom::Root,
++        vtable,
++        MonoUseCause::VTableConstruction,
++        source_trace_site(source),
++    );
++    collect_vtable_entries(tcx, vtable, trait_ref, impl_ty, source, output);
++}
++
++fn collect_vtable_entries<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    vtable: MonoTraceNode<'tcx>,
++    trait_ref: Option<ty::TraitRef<'tcx>>,
++    impl_ty: Ty<'tcx>,
++    source: Span,
++    output: &mut MonoItems<'tcx>,
++) {
++    if let Some(trait_ref) = trait_ref {
+         assert!(!trait_ref.has_escaping_bound_vars());
+ 
+         // Walk all methods of the trait, including those of its supertraits
+         let entries = tcx.vtable_entries(trait_ref);
++        let witnesses = if output.traces_observations() {
++            match tcx.codegen_vtable_method_witnesses(trait_ref) {
++                Ok(witnesses) => Some(witnesses),
++                Err(_) => {
++                    output.fail_observation();
++                    None
++                }
++            }
++        } else {
++            None
++        };
+         debug!(?entries);
+-        let methods = entries
+-            .iter()
+-            .filter_map(|entry| match entry {
++        for (slot, entry) in entries.iter().enumerate() {
++            let slot = u64::try_from(slot).unwrap();
++            let site = MonoTraceSite::VTableSlot(slot);
++            match entry {
+                 VtblEntry::MetadataDropInPlace
+                 | VtblEntry::MetadataSize
+                 | VtblEntry::MetadataAlign
+-                | VtblEntry::Vacant => None,
+-                VtblEntry::TraitVPtr(_) => {
+-                    // all super trait items already covered, so skip them.
+-                    None
++                | VtblEntry::Vacant => {}
++                VtblEntry::TraitVPtr(supertrait_ref) => {
++                    record_trait_selection_proof(
++                        tcx,
++                        *supertrait_ref,
++                        TraceFrom::Node(vtable),
++                        MonoUseCause::SupertraitVTable,
++                        site,
++                        output,
++                    );
++                    output.record_edge(
++                        TraceFrom::Node(vtable),
++                        MonoTraceNode::VTable {
++                            concrete_ty: impl_ty,
++                            trait_ref: Some(*supertrait_ref),
++                        },
++                        MonoUseCause::SupertraitVTable,
++                        site,
++                    );
+                 }
+                 VtblEntry::Method(instance) => {
+-                    Some(*instance).filter(|instance| tcx.should_codegen_locally(*instance))
++                    if let Some(witnesses) = witnesses {
++                        match witnesses.iter().find(|witness| witness.slot == slot) {
++                            Some(witness) if witness.codegen_instance == *instance => {
++                                match associated_selection_from_request(tcx, witness.request) {
++                                    Ok(selection) => output.record_proof_use(
++                                        TraceFrom::Node(vtable),
++                                        MonoProof::AssociatedItem {
++                                            selection_key: selection.selection_key,
++                                            request: selection.request,
++                                            raw_instance: selection.raw_instance,
++                                            codegen_instance: witness.codegen_instance,
++                                        },
++                                        MonoUseCause::VTableMethod,
++                                        site,
++                                    ),
++                                    Err(_) => output.fail_observation(),
++                                }
++                            }
++                            _ => output.fail_observation(),
++                        }
++                    }
++                    if tcx.should_codegen_locally(*instance) {
++                        output.push_traced_from(
++                            TraceFrom::Node(vtable),
++                            create_fn_mono_item(tcx, *instance, source),
++                            MonoUseCause::VTableMethod,
++                            site,
++                        );
++                    }
+                 }
+-            })
+-            .map(|item| create_fn_mono_item(tcx, item, source));
+-        output.extend(methods);
++            }
++        }
+     }
+ 
+     // Also add the destructor, if it's necessary.
+@@ -1270,19 +1716,60 @@ fn create_mono_items_for_vtable_methods<'tcx>(
+     // This matches the check in vtable_allocation_provider in middle/ty/vtable.rs,
+     // if we don't need drop we're not adding an actual pointer to the vtable.
+     if impl_ty.needs_drop(tcx, ty::TypingEnv::fully_monomorphized()) {
+-        visit_drop_use(tcx, impl_ty, false, source, output);
++        let instance = Instance::resolve_drop_glue(tcx, impl_ty);
++        visit_instance_use(
++            tcx,
++            instance,
++            false,
++            source,
++            MonoUseCause::VTableDrop,
++            TraceFrom::Node(vtable),
++            MonoTraceSite::VTableSlot(0),
++            output,
++        );
+     }
+ }
+ 
+ /// Scans the CTFE alloc in order to find function pointers and statics that must be monomorphized.
+-fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoItems<'tcx>) {
++fn collect_alloc<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    alloc_id: AllocId,
++    source: Span,
++    output: &mut MonoItems<'tcx>,
++) {
++    collect_alloc_from(
++        tcx,
++        TraceFrom::Root,
++        alloc_id,
++        MonoUseCause::ConstAllocation,
++        source_trace_site(source),
++        output,
++    );
++}
++
++fn collect_alloc_from<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    from: TraceFrom<'tcx>,
++    alloc_id: AllocId,
++    cause: MonoUseCause,
++    site: MonoTraceSite,
++    output: &mut MonoItems<'tcx>,
++) {
++    let allocation = MonoTraceNode::Allocation(alloc_id);
++    output.record_edge(from, allocation, cause, site);
++
+     match tcx.global_alloc(alloc_id) {
+         GlobalAlloc::Static(def_id) => {
+             assert!(!tcx.is_thread_local_static(def_id));
+             let instance = Instance::mono(tcx, def_id);
+             if tcx.should_codegen_locally(instance) {
+                 trace!("collecting static {:?}", def_id);
+-                output.push(dummy_spanned(MonoItem::Static(def_id)));
++                output.push_traced_from(
++                    TraceFrom::Node(allocation),
++                    dummy_spanned(MonoItem::Static(def_id)),
++                    MonoUseCause::StaticReference,
++                    MonoTraceSite::CompilerGenerated,
++                );
+             }
+         }
+         GlobalAlloc::Memory(alloc) => {
+@@ -1291,8 +1778,15 @@ fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoIt
+             // avoid `ensure_sufficient_stack` in the common case of "no pointers"
+             if !ptrs.is_empty() {
+                 rustc_data_structures::stack::ensure_sufficient_stack(move || {
+-                    for &prov in ptrs.values() {
+-                        collect_alloc(tcx, prov.alloc_id(), output);
++                    for &(offset, prov) in ptrs.iter() {
++                        collect_alloc_from(
++                            tcx,
++                            TraceFrom::Node(allocation),
++                            prov.alloc_id(),
++                            MonoUseCause::AllocationReference,
++                            MonoTraceSite::AllocationOffset(offset.bytes()),
++                            output,
++                        );
+                     }
+                 });
+             }
+@@ -1300,17 +1794,54 @@ fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoIt
+         GlobalAlloc::Function { instance, .. } => {
+             if tcx.should_codegen_locally(instance) {
+                 trace!("collecting {:?} with {:#?}", alloc_id, instance);
+-                output.push(create_fn_mono_item(tcx, instance, DUMMY_SP));
++                output.push_traced_from(
++                    TraceFrom::Node(allocation),
++                    create_fn_mono_item(tcx, instance, DUMMY_SP),
++                    MonoUseCause::FunctionPointer,
++                    MonoTraceSite::CompilerGenerated,
++                );
+             }
+         }
+         GlobalAlloc::VTable(ty, dyn_ty) => {
++            let trait_ref = dyn_ty.principal().map(|principal| {
++                tcx.instantiate_bound_regions_with_erased(principal.with_self_ty(tcx, ty))
++            });
++            let vtable = MonoTraceNode::VTable { concrete_ty: ty, trait_ref };
++            record_dyn_predicate_proofs(
++                tcx,
++                dyn_ty,
++                ty,
++                TraceFrom::Node(allocation),
++                MonoUseCause::VTableConstruction,
++                MonoTraceSite::CompilerGenerated,
++                output,
++            );
++            output.record_edge(
++                TraceFrom::Node(allocation),
++                vtable,
++                MonoUseCause::VTableConstruction,
++                MonoTraceSite::CompilerGenerated,
++            );
+             let alloc_id = tcx.vtable_allocation((
+                 ty,
+                 dyn_ty
+                     .principal()
+                     .map(|principal| tcx.instantiate_bound_regions_with_erased(principal)),
+             ));
+-            collect_alloc(tcx, alloc_id, output)
++            collect_alloc_from(
++                tcx,
++                TraceFrom::Node(vtable),
++                alloc_id,
++                MonoUseCause::AllocationReference,
++                MonoTraceSite::CompilerGenerated,
++                output,
++            );
++            // Preserve stock endpoint insertion order and first spans: the raw allocation walk is
++            // the canonical transition source. Slot typing is appended fact-first afterwards;
++            // duplicate endpoint pushes are then ignored by `MonoItems`.
++            if output.trace.is_some() {
++                collect_vtable_entries(tcx, vtable, trait_ref, ty, DUMMY_SP, output);
++            }
+         }
+         GlobalAlloc::TypeId { .. } => {}
+     }
+@@ -1319,11 +1850,75 @@ fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoIt
+ /// Scans the MIR in order to find function calls, closures, and drop-glue.
+ ///
+ /// Anything that's found is added to `output`. Furthermore the "mentioned items" of the MIR are returned.
++fn collect_items_of_static<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    def_id: DefId,
++    trigger_span: Span,
++    mode: CollectionMode,
++    trace: bool,
++) -> (MonoItems<'tcx>, MonoItems<'tcx>) {
++    assert!(def_id.is_local(), "mono successor static root must be local");
++    let root = MonoTraceNode::Item(MonoItem::Static(def_id));
++    let mut used_items = if trace {
++        MonoItems::with_trace(root, MonoTraceCollection::Used)
++    } else {
++        MonoItems::new()
++    };
++    let mentioned_items = if trace {
++        MonoItems::with_trace(root, MonoTraceCollection::Mentioned)
++    } else {
++        MonoItems::new()
++    };
++
++    // Statics always get evaluated, so there is no separate mentioned traversal.
++    if mode == CollectionMode::UsedItems {
++        let instance = Instance::mono(tcx, def_id);
++        debug_assert!(tcx.should_codegen_locally(instance));
++        let source = trigger_span;
++
++        let DefKind::Static { nested, .. } = tcx.def_kind(def_id) else { bug!() };
++        if !nested {
++            let ty = instance.ty(tcx, ty::TypingEnv::fully_monomorphized());
++            visit_drop_use(tcx, ty, true, source, &mut used_items);
++        }
++
++        if let Ok(alloc) = tcx.eval_static_initializer(def_id) {
++            for &(offset, prov) in alloc.inner().provenance().ptrs().iter() {
++                collect_alloc_from(
++                    tcx,
++                    TraceFrom::Node(root),
++                    prov.alloc_id(),
++                    MonoUseCause::AllocationReference,
++                    MonoTraceSite::AllocationOffset(offset.bytes()),
++                    &mut used_items,
++                );
++            }
++        }
++
++        if tcx.needs_thread_local_shim(def_id) {
++            used_items.push_traced(
++                respan(
++                    source,
++                    MonoItem::Fn(Instance {
++                        def: InstanceKind::Shim(ShimKind::ThreadLocal(def_id)),
++                        args: GenericArgs::empty(),
++                    }),
++                ),
++                MonoUseCause::ThreadLocalShim,
++                source_trace_site(source),
++            );
++        }
++    }
++
++    (used_items, mentioned_items)
++}
++
+ #[instrument(skip(tcx), level = "debug")]
+ fn collect_items_of_instance<'tcx>(
+     tcx: TyCtxt<'tcx>,
+     instance: Instance<'tcx>,
+     mode: CollectionMode,
++    trace: bool,
+ ) -> Result<(MonoItems<'tcx>, MonoItems<'tcx>), NormalizationErrorInMono> {
+     // This item is getting monomorphized, do mono-time checks.
+     let body = tcx.instance_mir(instance.def);
+@@ -1343,8 +1938,17 @@ fn collect_items_of_instance<'tcx>(
+     // mentioned item. So instead we collect all pre-monomorphized `MentionedItem` that were already
+     // added to `used_items` in a hash set, which can efficiently query in the
+     // `body.mentioned_items` loop below without even having to monomorphize the item.
+-    let mut used_items = MonoItems::new();
+-    let mut mentioned_items = MonoItems::new();
++    let root = MonoTraceNode::Item(MonoItem::Fn(instance));
++    let mut used_items = if trace {
++        MonoItems::with_trace(root, MonoTraceCollection::Used)
++    } else {
++        MonoItems::new()
++    };
++    let mut mentioned_items = if trace {
++        MonoItems::with_trace(root, MonoTraceCollection::Mentioned)
++    } else {
++        MonoItems::new()
++    };
+     let mut used_mentioned_items = Default::default();
+     let mut collector = MirUsedCollector {
+         tcx,
+@@ -1369,14 +1973,14 @@ fn collect_items_of_instance<'tcx>(
+     // them errors.
+     for const_op in body.required_consts() {
+         if let Some(val) = collector.eval_constant(const_op) {
+-            collect_const_value(tcx, val, &mut mentioned_items);
++            collect_const_value(tcx, val, const_op.span, &mut mentioned_items);
+         }
+     }
+ 
+     // Always gather mentioned items. We try to avoid processing items that we have already added to
+     // `used_items` above.
+     for item in body.mentioned_items() {
+-        if !collector.used_mentioned_items.contains(&item.node) {
++        if !collector.used_mentioned_items.contains(&mentioned_item_identity(item.node)) {
+             let item_mono = collector.monomorphize(item.node);
+             visit_mentioned_item(tcx, &item_mono, item.span, &mut mentioned_items);
+         }
+@@ -1392,12 +1996,93 @@ fn items_of_instance<'tcx>(
+     (&'tcx [Spanned<MonoItem<'tcx>>], &'tcx [Spanned<MonoItem<'tcx>>]),
+     NormalizationErrorInMono,
+ > {
+-    let (used_items, mentioned_items) = collect_items_of_instance(tcx, instance, mode)?;
++    let (used_items, mentioned_items) = collect_items_of_instance(tcx, instance, mode, false)?;
++    Ok((tcx.arena.alloc_from_iter(used_items), tcx.arena.alloc_from_iter(mentioned_items)))
++}
+ 
+-    let used_items = tcx.arena.alloc_from_iter(used_items);
+-    let mentioned_items = tcx.arena.alloc_from_iter(mentioned_items);
++fn collect_associated_const_uses<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    owner: MonoTraceNode<'tcx>,
++    instance: Instance<'tcx>,
++    body: &Body<'tcx>,
++) -> Result<Vec<MonoAssociatedConstUse<'tcx>>, NormalizationErrorInMono> {
++    let typing_env = ty::TypingEnv::fully_monomorphized();
++    let mut uses = Vec::new();
+ 
+-    Ok((used_items, mentioned_items))
++    for operand in body.required_consts() {
++        let Ok(const_) = instance.try_instantiate_mir_and_normalize_erasing_regions(
++            tcx,
++            typing_env,
++            ty::EarlyBinder::bind(tcx, operand.const_),
++        ) else {
++            return Err(NormalizationErrorInMono);
++        };
++        let mir::Const::Unevaluated(unevaluated, _) = const_ else { continue };
++        if unevaluated.promoted.is_some()
++            || !matches!(tcx.def_kind(unevaluated.def), DefKind::AssocConst { .. })
++            || tcx.trait_of_assoc(unevaluated.def).is_none()
++        {
++            continue;
++        }
++
++        let proof_key = tcx.erase_and_anonymize_regions(
++            typing_env.as_query_input((unevaluated.def, unevaluated.args)),
++        );
++        uses.push(MonoAssociatedConstUse {
++            owner,
++            proof_key,
++            site: source_trace_site(operand.span),
++        });
++    }
++
++    let mut seen = FxHashSet::default();
++    uses.retain(|use_| seen.insert(*use_));
++    Ok(uses)
++}
++
++fn mono_successors<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    (root, mode): (MonoTraceRoot<'tcx>, CollectionMode),
++) -> Result<&'tcx MonoSuccessors<'tcx>, NormalizationErrorInMono> {
++    let (used_items, mentioned_items, associated_consts) = match root {
++        MonoTraceRoot::Fn(instance) => {
++            let items = collect_items_of_instance(tcx, instance, mode, true)?;
++            let owner = MonoTraceNode::Item(MonoItem::Fn(instance));
++            let associated_consts = collect_associated_const_uses(
++                tcx,
++                owner,
++                instance,
++                tcx.instance_mir(instance.def),
++            )?;
++            (items.0, items.1, associated_consts)
++        }
++        MonoTraceRoot::Static { def_id, trigger_span } => {
++            let items = collect_items_of_static(tcx, def_id, trigger_span, mode, true);
++            let instance = Instance::mono(tcx, def_id);
++            let owner = MonoTraceNode::Item(MonoItem::Static(def_id));
++            let associated_consts = collect_associated_const_uses(
++                tcx,
++                owner,
++                instance,
++                tcx.instance_mir(instance.def),
++            )?;
++            (items.0, items.1, associated_consts)
++        }
++    };
++
++    let (used, mut facts, mut proof_uses) = used_items.into_observation_parts()?;
++    let (mentioned, mentioned_facts, mentioned_proof_uses) =
++        mentioned_items.into_observation_parts()?;
++    facts.extend(mentioned_facts);
++    proof_uses.extend(mentioned_proof_uses);
++
++    Ok(tcx.arena.alloc(MonoSuccessors {
++        used: tcx.arena.alloc_from_iter(used),
++        mentioned: tcx.arena.alloc_from_iter(mentioned),
++        facts: tcx.arena.alloc_from_iter(facts),
++        associated_consts: tcx.arena.alloc_from_iter(associated_consts),
++        proof_uses: tcx.arena.alloc_from_iter(proof_uses),
++    }))
+ }
+ 
+ /// `item` must be already monomorphized.
+@@ -1409,9 +2094,20 @@ fn visit_mentioned_item<'tcx>(
+     output: &mut MonoItems<'tcx>,
+ ) {
+     match *item {
+-        MentionedItem::Fn(ty) => {
++        MentionedItem::Fn { ty, reason } => {
+             if let ty::FnDef(def_id, args) = *ty.kind() {
+                 let args = args.no_bound_vars().unwrap();
++                let selection = if output.traces_observations() {
++                    match associated_selection_keys(tcx, def_id, args) {
++                        Ok(selection) => selection,
++                        Err(_) => {
++                            output.fail_observation();
++                            None
++                        }
++                    }
++                } else {
++                    None
++                };
+                 let instance = Instance::expect_resolve(
+                     tcx,
+                     ty::TypingEnv::fully_monomorphized(),
+@@ -1419,11 +2115,38 @@ fn visit_mentioned_item<'tcx>(
+                     args,
+                     span,
+                 );
++                let cause = match reason {
++                    MentionedFnReason::DirectCall => MonoUseCause::DirectCall,
++                    MentionedFnReason::FunctionPointer => MonoUseCause::FunctionPointer,
++                    MentionedFnReason::InlineAsm => MonoUseCause::InlineAsmSymbol,
++                };
++                if let Some(selection) = selection {
++                    output.record_proof_use(
++                        TraceFrom::Root,
++                        MonoProof::AssociatedItem {
++                            selection_key: selection.selection_key,
++                            request: selection.request,
++                            raw_instance: selection.raw_instance,
++                            codegen_instance: instance,
++                        },
++                        cause,
++                        source_trace_site(span),
++                    );
++                }
+                 // `visit_instance_use` was written for "used" item collection but works just as well
+                 // for "mentioned" item collection.
+                 // We can set `is_direct_call`; that just means we'll skip a bunch of shims that anyway
+                 // can't have their own failing constants.
+-                visit_instance_use(tcx, instance, /*is_direct_call*/ true, span, output);
++                visit_instance_use(
++                    tcx,
++                    instance,
++                    /*is_direct_call*/ true,
++                    span,
++                    cause,
++                    TraceFrom::Root,
++                    source_trace_site(span),
++                    output,
++                );
+             }
+         }
+         MentionedItem::Drop(ty) => {
+@@ -1444,7 +2167,11 @@ fn visit_mentioned_item<'tcx>(
+                 let instance =
+                     Instance::resolve_closure(tcx, def_id, args, ty::ClosureKind::FnOnce);
+                 if tcx.should_codegen_locally(instance) {
+-                    output.push(create_fn_mono_item(tcx, instance, span));
++                    output.push_traced(
++                        create_fn_mono_item(tcx, instance, span),
++                        MonoUseCause::ClosureFunctionPointer,
++                        source_trace_site(span),
++                    );
+                 }
+             } else {
+                 bug!()
+@@ -1457,14 +2184,17 @@ fn visit_mentioned_item<'tcx>(
+ fn collect_const_value<'tcx>(
+     tcx: TyCtxt<'tcx>,
+     value: mir::ConstValue,
++    source: Span,
+     output: &mut MonoItems<'tcx>,
+ ) {
+     match value {
+         mir::ConstValue::Scalar(Scalar::Ptr(ptr, _size)) => {
+-            collect_alloc(tcx, ptr.provenance.alloc_id(), output)
++            collect_alloc(tcx, ptr.provenance.alloc_id(), source, output)
+         }
+         mir::ConstValue::Indirect { alloc_id, .. }
+-        | mir::ConstValue::Slice { alloc_id, meta: _ } => collect_alloc(tcx, alloc_id, output),
++        | mir::ConstValue::Slice { alloc_id, meta: _ } => {
++            collect_alloc(tcx, alloc_id, source, output)
++        }
+         _ => {}
+     }
+ }
+@@ -1598,7 +2328,7 @@ fn process_item(&mut self, id: hir::ItemId) {
+                     let Ok(val) = self.tcx.const_eval_poly(def_id) else {
+                         return;
+                     };
+-                    collect_const_value(self.tcx, val, self.output);
++                    collect_const_value(self.tcx, val, self.tcx.def_span(def_id), self.output);
+                 }
+             }
+             DefKind::Impl { of_trait: true } => {
+@@ -1872,4 +2602,5 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
+ pub(crate) fn provide(providers: &mut Providers) {
+     providers.hooks.should_codegen_locally = should_codegen_locally;
+     providers.queries.items_of_instance = items_of_instance;
++    providers.queries.mono_successors = mono_successors;
+ }
+diff --git a/compiler/rustc_trait_selection/src/traits/vtable.rs b/compiler/rustc_trait_selection/src/traits/vtable.rs
+index 77d7a39a..6eaf027b 100644
+--- a/compiler/rustc_trait_selection/src/traits/vtable.rs
++++ b/compiler/rustc_trait_selection/src/traits/vtable.rs
+@@ -5,6 +5,7 @@
+ use rustc_infer::traits::util::PredicateSet;
+ use rustc_middle::bug;
+ use rustc_middle::query::Providers;
++use rustc_middle::traits::{CodegenVtableMethodWitness, CodegenVtableMethodWitnessError};
+ use rustc_middle::ty::{
+     self, GenericArgs, GenericParamDefKind, Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast,
+     VtblEntry,
+@@ -235,6 +236,14 @@ fn vtable_entries<'tcx>(
+     tcx: TyCtxt<'tcx>,
+     trait_ref: ty::TraitRef<'tcx>,
+ ) -> &'tcx [VtblEntry<'tcx>] {
++    tcx.arena.alloc_from_iter(vtable_entries_inner(tcx, trait_ref, None))
++}
++
++fn vtable_entries_inner<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    trait_ref: ty::TraitRef<'tcx>,
++    mut witnesses: Option<&mut Vec<CodegenVtableMethodWitness<'tcx>>>,
++) -> Vec<VtblEntry<'tcx>> {
+     debug_assert!(!trait_ref.has_non_region_infer() && !trait_ref.has_non_region_param());
+     tcx.debug_assert_fully_normalized(ty::TypingEnv::fully_monomorphized(), trait_ref);
+ 
+@@ -254,43 +263,58 @@ fn vtable_entries<'tcx>(
+                 let own_existential_entries =
+                     tcx.own_existential_vtable_entries(existential_trait_ref.def_id);
+ 
+-                let own_entries = own_existential_entries.iter().copied().map(|def_id| {
+-                    debug!("vtable_entries: trait_method={:?}", def_id);
+-
+-                    // The method may have some early-bound lifetimes; add regions for those.
+-                    // FIXME: Is this normalize needed?
+-                    let args = tcx.normalize_erasing_regions(
+-                        ty::TypingEnv::fully_monomorphized(),
+-                        Unnormalized::new_wip(GenericArgs::for_item(tcx, def_id, |param, _| {
+-                            match param.kind {
+-                                GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
+-                                GenericParamDefKind::Type { .. }
+-                                | GenericParamDefKind::Const { .. } => {
+-                                    trait_ref.args[param.index as usize]
+-                                }
+-                            }
+-                        })),
+-                    );
+-
+-                    // It's possible that the method relies on where-clauses that
+-                    // do not hold for this particular set of type parameters.
+-                    // Note that this method could then never be called, so we
+-                    // do not want to try and codegen it, in that case (see #23435).
+-                    if tcx.instantiate_and_check_impossible_clauses((def_id, args)) {
+-                        debug!("vtable_entries: clauses do not hold");
+-                        return VtblEntry::Vacant;
+-                    }
++                let first_slot = entries.len();
++                let own_entries =
++                    own_existential_entries.iter().copied().enumerate().map(|(offset, def_id)| {
++                        debug!("vtable_entries: trait_method={:?}", def_id);
++
++                        // The method may have some early-bound lifetimes; add regions for those.
++                        // FIXME: Is this normalize needed?
++                        let args = tcx.normalize_erasing_regions(
++                            ty::TypingEnv::fully_monomorphized(),
++                            Unnormalized::new_wip(GenericArgs::for_item(
++                                tcx,
++                                def_id,
++                                |param, _| match param.kind {
++                                    GenericParamDefKind::Lifetime => tcx.lifetimes.re_erased.into(),
++                                    GenericParamDefKind::Type { .. }
++                                    | GenericParamDefKind::Const { .. } => {
++                                        trait_ref.args[param.index as usize]
++                                    }
++                                },
++                            )),
++                        );
++
++                        // It's possible that the method relies on where-clauses that
++                        // do not hold for this particular set of type parameters.
++                        // Note that this method could then never be called, so we
++                        // do not want to try and codegen it, in that case (see #23435).
++                        if tcx.instantiate_and_check_impossible_clauses((def_id, args)) {
++                            debug!("vtable_entries: clauses do not hold");
++                            return VtblEntry::Vacant;
++                        }
+ 
+-                    let instance = ty::Instance::expect_resolve_for_vtable(
+-                        tcx,
+-                        ty::TypingEnv::fully_monomorphized(),
+-                        def_id,
+-                        args,
+-                        DUMMY_SP,
+-                    );
++                        let instance = ty::Instance::expect_resolve_for_vtable(
++                            tcx,
++                            ty::TypingEnv::fully_monomorphized(),
++                            def_id,
++                            args,
++                            DUMMY_SP,
++                        );
++
++                        if let Some(witnesses) = witnesses.as_deref_mut() {
++                            let request = tcx.erase_and_anonymize_regions(
++                                ty::TypingEnv::fully_monomorphized().as_query_input((def_id, args)),
++                            );
++                            witnesses.push(CodegenVtableMethodWitness {
++                                slot: u64::try_from(first_slot + offset).unwrap(),
++                                request,
++                                codegen_instance: instance,
++                            });
++                        }
+ 
+-                    VtblEntry::Method(instance)
+-                });
++                        VtblEntry::Method(instance)
++                    });
+ 
+                 entries.extend(own_entries);
+ 
+@@ -305,7 +329,34 @@ fn vtable_entries<'tcx>(
+ 
+     let _ = prepare_vtable_segments(tcx, trait_ref, vtable_segment_callback);
+ 
+-    tcx.arena.alloc_from_iter(entries)
++    entries
++}
++
++fn codegen_vtable_method_witnesses<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    trait_ref: ty::TraitRef<'tcx>,
++) -> Result<&'tcx [CodegenVtableMethodWitness<'tcx>], CodegenVtableMethodWitnessError> {
++    let stock = tcx.vtable_entries(trait_ref);
++    let mut witnesses = Vec::new();
++    let observed_entries = vtable_entries_inner(tcx, trait_ref, Some(&mut witnesses));
++    if observed_entries.as_slice() != stock {
++        return Err(CodegenVtableMethodWitnessError::IncompleteObservation);
++    }
++
++    let mut observed = witnesses.iter();
++    for (slot, entry) in stock.iter().enumerate() {
++        let VtblEntry::Method(instance) = entry else { continue };
++        let Some(witness) = observed.next() else {
++            return Err(CodegenVtableMethodWitnessError::IncompleteObservation);
++        };
++        if witness.slot != u64::try_from(slot).unwrap() || witness.codegen_instance != *instance {
++            return Err(CodegenVtableMethodWitnessError::IncompleteObservation);
++        }
++    }
++    if observed.next().is_some() {
++        return Err(CodegenVtableMethodWitnessError::IncompleteObservation);
++    }
++    Ok(tcx.arena.alloc_from_iter(witnesses))
+ }
+ 
+ // Given a `dyn Subtrait: Supertrait` trait ref, find corresponding first slot
+@@ -441,6 +492,7 @@ pub(super) fn provide(providers: &mut Providers) {
+     *providers = Providers {
+         own_existential_vtable_entries,
+         vtable_entries,
++        codegen_vtable_method_witnesses,
+         first_method_vtable_slot,
+         supertrait_vtable_slot,
+         ..*providers
+diff --git a/tests/ui-fulldeps/typed-mono-successors.rs b/tests/ui-fulldeps/typed-mono-successors.rs
+new file mode 100644
+index 00000000..d1c4c9fd
+--- /dev/null
++++ b/tests/ui-fulldeps/typed-mono-successors.rs
+@@ -0,0 +1,1757 @@
++//@ edition: 2021
++//@ run-pass
++//@ run-flags: {{sysroot-base}}
++//@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
++//@ ignore-cross-compile
++//@ ignore-remote
++
++#![feature(rustc_private)]
++
++extern crate rustc_driver;
++extern crate rustc_hir;
++extern crate rustc_interface;
++extern crate rustc_middle;
++extern crate rustc_session;
++extern crate rustc_span;
++
++use std::path::PathBuf;
++
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::DefId;
++use rustc_interface::interface;
++use rustc_middle::mir;
++use rustc_middle::mono::{
++    CollectionMode, MonoAssociatedConstUse, MonoItem, MonoProof, MonoSuccessors,
++    MonoTraceCollection, MonoTraceNode, MonoTraceRoot, MonoTraceSite, MonoUseCause,
++};
++use rustc_middle::traits::ImplSource;
++use rustc_middle::ty::{Instance, InstanceKind, ShimKind, TyCtxt, TypeVisitableExt};
++use rustc_session::config::{Input, OptLevel, Options, Sysroot};
++use rustc_span::{DUMMY_SP, FileName, Span, Spanned, sym};
++
++const INPUT: &str = r#"
++#![allow(dead_code)]
++
++#[inline(never)]
++fn direct<T>() {
++    std::hint::black_box(std::mem::size_of::<T>());
++}
++
++fn from_const() {}
++fn dead_call() {}
++fn dead_reified() {}
++
++const TABLE: [fn(); 1] = [from_const];
++
++fn static_a() {}
++fn static_b() {}
++fn static_dead() {}
++
++#[used]
++static KEEP: [fn(); 2] = [static_a, static_b];
++static DEAD_STATIC: [fn(); 1] = [static_dead];
++
++trait Tr {
++    fn a(&self);
++    fn b(&self);
++}
++
++struct D;
++
++impl Drop for D {
++    fn drop(&mut self) {}
++}
++
++impl Tr for D {
++    #[inline(never)]
++    fn a(&self) {}
++
++    #[inline(never)]
++    fn b(&self) {}
++}
++
++static CONST_D: D = D;
++const CONST_DYN: &dyn Tr = &CONST_D;
++
++#[inline(never)]
++fn inline_asm_reference() {
++    unsafe {
++        std::arch::asm!(
++            "/* {function_symbol} {static_symbol} */",
++            function_symbol = sym static_a,
++            static_symbol = sym CONST_D,
++        );
++    }
++}
++
++#[inline(never)]
++fn make_vtable_and_drops() {
++    {
++        let first = D;
++        let object: &dyn Tr = &first;
++        object.a();
++    }
++    {
++        let _second = D;
++    }
++}
++
++fn main() {
++    direct::<u8>();
++    direct::<u8>();
++    direct::<u16>();
++    std::hint::black_box(TABLE);
++    std::hint::black_box(CONST_DYN);
++    inline_asm_reference();
++    make_vtable_and_drops();
++    if false {
++        dead_call();
++        let pointer: fn() = dead_reified;
++        std::hint::black_box(pointer);
++    }
++}
++"#;
++
++const INLINE_INPUT: &str = r#"
++#![allow(dead_code)]
++
++#[inline(always)]
++fn target() {}
++
++fn main() {
++    let pointer: fn() = target;
++    std::hint::black_box(pointer);
++    target();
++}
++"#;
++
++const ASSOCIATED_CONST_INPUT: &str = r#"
++#![allow(dead_code)]
++
++trait Header {
++    type Key;
++}
++
++struct Source;
++
++impl Header for Source {
++    type Key = u8;
++}
++
++trait Pick {
++    const N: usize = 11;
++}
++
++trait Routed<A, const K: usize> {
++    const N: usize = K;
++}
++
++struct Defaulted<T>(T);
++
++impl<T: Header<Key = u8>> Pick for Defaulted<T> {}
++
++struct Overridden<T>(T);
++
++impl<T: Header<Key = u8>> Pick for Overridden<T> {
++    const N: usize = nested::<5>();
++}
++
++struct RoutedDefault<T>(T);
++
++impl<T: Header<Key = u8>, A, const K: usize> Routed<A, K> for RoutedDefault<T> {}
++
++struct RoutedOverride<T>(T);
++
++impl<T: Header<Key = u8>, A, const K: usize> Routed<A, K> for RoutedOverride<T> {
++    const N: usize = K + 1;
++}
++
++const fn nested<const X: usize>() -> usize {
++    X + 2
++}
++
++const fn identity(value: usize) -> usize {
++    value
++}
++
++#[inline(never)]
++fn generic<T: Pick>() -> usize {
++    <T as Pick>::N
++}
++
++#[inline(never)]
++fn direct() -> usize {
++    <Defaulted<Source> as Pick>::N
++}
++
++#[inline(never)]
++fn repeated() -> usize {
++    let first = <Defaulted<Source> as Pick>::N;
++    let second = <Defaulted<Source> as Pick>::N;
++    first + second
++}
++
++#[inline(never)]
++fn routed() -> usize {
++    <RoutedDefault<Source> as Routed<u16, 3>>::N
++        + <RoutedOverride<Source> as Routed<u32, 5>>::N
++}
++
++static VALUE: usize = <Overridden<Source> as Pick>::N;
++static PROMOTED_VALUE: &usize = &identity(<Defaulted<Source> as Pick>::N);
++
++fn main() {
++    std::hint::black_box(generic::<Defaulted<Source>>());
++    std::hint::black_box(generic::<Overridden<Source>>());
++    std::hint::black_box(direct());
++    std::hint::black_box(repeated());
++    std::hint::black_box(routed());
++    std::hint::black_box(VALUE);
++    std::hint::black_box(PROMOTED_VALUE);
++}
++"#;
++
++const PROOF_INPUT: &str = r#"
++#![allow(dead_code)]
++
++trait Missing {}
++
++trait Super {
++    fn defaulted(&self) -> u8 { 1 }
++}
++
++trait Other {
++    fn other(&self) -> u8 { 2 }
++}
++
++trait Marker {}
++
++trait ObjectTrait: Super + Other + Marker {
++    type Assoc;
++
++    fn overridden(&self) -> u8 { 3 }
++
++    fn tracked(&self) -> u8 { 5 }
++
++    fn vacant(&self) where Self::Assoc: Missing {}
++}
++
++struct Concrete;
++
++impl Super for Concrete {}
++impl Other for Concrete {}
++impl Marker for Concrete {}
++impl ObjectTrait for Concrete {
++    type Assoc = u8;
++
++    fn overridden(&self) -> u8 { 4 }
++
++    #[track_caller]
++    fn tracked(&self) -> u8 { 6 }
++}
++
++trait Dispatch<A> {
++    #[track_caller]
++    fn invoke<const K: usize>(&self) -> usize {
++        std::mem::size_of::<A>() + K
++    }
++}
++
++struct DefaultDispatch;
++impl Dispatch<u16> for DefaultDispatch {}
++
++struct OverrideDispatch;
++impl Dispatch<u32> for OverrideDispatch {
++    #[track_caller]
++    fn invoke<const K: usize>(&self) -> usize {
++        std::mem::size_of::<u32>() + K + 1
++    }
++}
++
++struct NeedsDrop;
++impl Drop for NeedsDrop {
++    fn drop(&mut self) {}
++}
++
++#[inline(never)]
++fn proof_entry() {
++    let default = DefaultDispatch;
++    std::hint::black_box(Dispatch::<u16>::invoke::<3>(&default));
++    std::hint::black_box(Dispatch::<u16>::invoke::<3>(&default));
++
++    let override_ = OverrideDispatch;
++    std::hint::black_box(Dispatch::<u32>::invoke::<5>(&override_));
++
++    let pointer: fn(&DefaultDispatch) -> usize =
++        <DefaultDispatch as Dispatch<u16>>::invoke::<3>;
++    std::hint::black_box(pointer);
++
++    let tuple = (1u8,);
++    std::hint::black_box(Clone::clone(&tuple));
++
++    let concrete = Concrete;
++    let object: &(dyn ObjectTrait<Assoc = u8> + Send) = &concrete;
++    std::hint::black_box(object.overridden());
++    std::hint::black_box(object.tracked());
++    std::hint::black_box(object.defaulted());
++}
++
++#[inline(never)]
++fn only_drop() {
++    let _value = NeedsDrop;
++}
++
++fn main() {
++    proof_entry();
++    only_drop();
++}
++"#;
++
++fn main() {
++    let args: Vec<String> = std::env::args().collect();
++    assert!(args.len() >= 2, "expected the stage sysroot");
++
++    let sysroot = PathBuf::from(&args[1]);
++    run_input(INPUT, sysroot.clone(), false, false, check_observer);
++    run_input(INLINE_INPUT, sysroot.clone(), true, false, check_inline_reason);
++    run_input(
++        ASSOCIATED_CONST_INPUT,
++        sysroot.clone(),
++        false,
++        true,
++        check_associated_const_uses,
++    );
++    run_input(PROOF_INPUT, sysroot, false, false, check_proof_uses);
++}
++
++fn run_input<F>(
++    input_text: &str,
++    sysroot: PathBuf,
++    inline_mir: bool,
++    optimize: bool,
++    check: F,
++)
++where
++    F: for<'tcx> FnOnce(TyCtxt<'tcx>) + Send,
++{
++    let mut opts = Options::default();
++    opts.sysroot = Sysroot::new(Some(sysroot));
++    opts.unstable_opts.inline_mir = Some(inline_mir);
++    if optimize {
++        opts.optimize = OptLevel::Aggressive;
++    }
++
++    let input = Input::Str {
++        name: FileName::anon_source_code(input_text),
++        input: input_text.to_owned(),
++    };
++    let config = interface::Config {
++        opts,
++        crate_cfg: Default::default(),
++        crate_check_cfg: Default::default(),
++        input,
++        output_file: None,
++        output_dir: None,
++        ice_file: None,
++        file_loader: None,
++        lint_caps: Default::default(),
++        psess_created: None,
++        track_state: None,
++        register_lints: None,
++        override_queries: None,
++        extra_symbols: Vec::new(),
++        make_codegen_backend: None,
++        using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
++        external_resource_guard: None,
++    };
++
++    interface::run_compiler(config, |compiler| {
++        let krate = rustc_interface::passes::parse(&compiler.sess);
++        rustc_interface::create_and_enter_global_ctxt(&compiler, krate, |tcx| {
++            let _ = tcx.analysis(());
++            tcx.sess.dcx().abort_if_errors();
++            check(tcx);
++        });
++    });
++}
++
++fn check_observer<'tcx>(tcx: TyCtxt<'tcx>) {
++    let entry = Instance::mono(tcx, tcx.entry_fn(()).unwrap().0);
++    let entry_item = MonoItem::Fn(entry);
++    let entry_span = tcx.def_span(entry.def_id());
++    let successors = query(tcx, Spanned { node: entry_item, span: entry_span });
++
++    // Query memory-cache hits must return the complete value, not rely on a side recorder.
++    let again = query(tcx, Spanned { node: entry_item, span: entry_span });
++    assert_eq!(successors, again);
++
++    // The legacy query is exactly the endpoint projection of the new query.
++    let (stock_used, stock_mentioned) =
++        tcx.items_of_instance((entry, CollectionMode::UsedItems)).unwrap();
++    assert_eq!(successors.used, stock_used);
++    assert_eq!(successors.mentioned, stock_mentioned);
++
++    let direct_u8 = exactly_one_instance(tcx, successors.used, "direct", Some(tcx.types.u8));
++    let direct_u16 = exactly_one_instance(tcx, successors.used, "direct", Some(tcx.types.u16));
++    assert_ne!(direct_u8, direct_u16);
++    assert_eq!(count_named(tcx, successors.used, "direct"), 2);
++    assert_eq!(count_named(tcx, successors.mentioned, "direct"), 0);
++
++    // The stock endpoint set deduplicates direct::<u8>, while facts retain both source calls.
++    let direct_u8_used_sites = source_sites_to_instance(
++        successors,
++        MonoTraceCollection::Used,
++        MonoUseCause::DirectCall,
++        direct_u8,
++    );
++    assert_eq!(direct_u8_used_sites.len(), 2);
++    assert_ne!(direct_u8_used_sites[0], direct_u8_used_sites[1]);
++    assert!(successors.facts.iter().filter(|fact| {
++        fact.collection == MonoTraceCollection::Used
++            && fact.cause == MonoUseCause::DirectCall
++            && fact.to == MonoTraceNode::Item(MonoItem::Fn(direct_u8))
++    }).all(|fact| fact.from == MonoTraceNode::Item(entry_item)));
++    assert_eq!(
++        source_sites_to_instance(
++            successors,
++            MonoTraceCollection::Used,
++            MonoUseCause::DirectCall,
++            direct_u16,
++        )
++        .len(),
++        1
++    );
++
++    // Used dominance suppresses both the redundant Mentioned endpoint and its trace fact.
++    assert_eq!(
++        source_sites_to_instance(
++            successors,
++            MonoTraceCollection::Mentioned,
++            MonoUseCause::DirectCall,
++            direct_u8,
++        )
++        .len(),
++        0
++    );
++    assert_eq!(count_named(tcx, successors.used, "dead_call"), 0);
++    assert_eq!(count_named(tcx, successors.mentioned, "dead_call"), 1);
++    let dead_reified = exactly_one_instance(tcx, successors.mentioned, "dead_reified", None);
++    assert!(successors.facts.iter().any(|fact| {
++        fact.collection == MonoTraceCollection::Mentioned
++            && fact.cause == MonoUseCause::FunctionPointer
++            && fact.from == MonoTraceNode::Item(entry_item)
++            && fact.to == MonoTraceNode::Item(MonoItem::Fn(dead_reified))
++            && matches!(fact.site, MonoTraceSite::Source(_))
++    }));
++
++    // The const allocation is reached through both Used and required-const/Mentioned collection.
++    let from_const = exactly_one_instance(tcx, successors.used, "from_const", None);
++    assert_eq!(count_named(tcx, successors.mentioned, "from_const"), 1);
++    for collection in [MonoTraceCollection::Used, MonoTraceCollection::Mentioned] {
++        assert!(successors.facts.iter().any(|fact| {
++            fact.collection == collection
++                && fact.cause == MonoUseCause::FunctionPointer
++                && matches!(fact.from, MonoTraceNode::Allocation(_))
++                && fact.to == MonoTraceNode::Item(MonoItem::Fn(from_const))
++                && fact.site == MonoTraceSite::CompilerGenerated
++        }));
++    }
++    assert_eq!(
++        proof_inventory(tcx, successors, MonoTraceCollection::Used),
++        [
++            "trait:Tr|allocation|VTableConstruction|Used|compiler",
++            "associated:a|vtable:Tr|VTableMethod|Used|slot:3",
++            "associated:b|vtable:Tr|VTableMethod|Used|slot:4",
++        ]
++    );
++    assert_eq!(
++        proof_inventory(tcx, successors, MonoTraceCollection::Mentioned),
++        [
++            "trait:Tr|allocation|VTableConstruction|Mentioned|compiler",
++            "associated:a|vtable:Tr|VTableMethod|Mentioned|slot:3",
++            "associated:b|vtable:Tr|VTableMethod|Mentioned|slot:4",
++        ]
++    );
++
++    // A trait object materialized by CTFE has no MIR unsize site. Its allocation still exposes
++    // typed vtable slots instead of only generic function-pointer allocation edges.
++    assert!(successors.facts.iter().any(|fact| {
++        fact.collection == MonoTraceCollection::Used
++            && fact.cause == MonoUseCause::VTableConstruction
++            && matches!(fact.from, MonoTraceNode::Allocation(_))
++            && matches!(fact.to, MonoTraceNode::VTable { .. })
++            && fact.site == MonoTraceSite::CompilerGenerated
++    }));
++    let mut const_vtable_slots: Vec<(&str, u64)> = successors
++        .facts
++        .iter()
++        .filter_map(|fact| {
++            if fact.collection != MonoTraceCollection::Used
++                || fact.cause != MonoUseCause::VTableMethod
++            {
++                return None;
++            }
++            let MonoTraceNode::VTable { .. } = fact.from else { return None };
++            let MonoTraceNode::Item(MonoItem::Fn(instance)) = fact.to else { return None };
++            let MonoTraceSite::VTableSlot(slot) = fact.site else { return None };
++            if named_instance(tcx, instance, "a") {
++                Some(("a", slot))
++            } else if named_instance(tcx, instance, "b") {
++                Some(("b", slot))
++            } else {
++                None
++            }
++        })
++        .collect();
++    const_vtable_slots.sort_unstable();
++    const_vtable_slots.dedup();
++    assert_eq!(const_vtable_slots, [("a", 3), ("b", 4)]);
++
++    let inline_asm = exactly_one_instance(tcx, successors.used, "inline_asm_reference", None);
++    let inline_asm_successors = query(
++        tcx,
++        Spanned { node: MonoItem::Fn(inline_asm), span: tcx.def_span(inline_asm.def_id()) },
++    );
++    assert!(inline_asm_successors.facts.iter().any(|fact| {
++        fact.collection == MonoTraceCollection::Used
++            && fact.cause == MonoUseCause::InlineAsmSymbol
++            && fact.from == MonoTraceNode::Item(MonoItem::Fn(inline_asm))
++            && matches!(fact.to, MonoTraceNode::Item(MonoItem::Fn(instance)) if named_instance(tcx, instance, "static_a"))
++            && matches!(fact.site, MonoTraceSite::Source(_))
++    }));
++
++    let const_d = local_static(tcx, "CONST_D");
++    assert!(inline_asm_successors.facts.iter().any(|fact| {
++        fact.collection == MonoTraceCollection::Used
++            && fact.cause == MonoUseCause::InlineAsmSymbol
++            && fact.from == MonoTraceNode::Item(MonoItem::Fn(inline_asm))
++            && fact.to == MonoTraceNode::Item(MonoItem::Static(const_d))
++            && matches!(fact.site, MonoTraceSite::Source(_))
++    }));
++
++    // The incoming static span is part of the query identity. The same static reached from two
++    // sites must retain the corresponding endpoint/fact span instead of aliasing in memory cache.
++    let const_d_span = tcx.def_span(const_d);
++    assert_ne!(const_d_span, entry_span);
++    let const_d_from_definition = tcx
++        .mono_successors((
++            MonoTraceRoot::Static { def_id: const_d, trigger_span: const_d_span },
++            CollectionMode::UsedItems,
++        ))
++        .unwrap();
++    let const_d_from_entry = tcx
++        .mono_successors((
++            MonoTraceRoot::Static { def_id: const_d, trigger_span: entry_span },
++            CollectionMode::UsedItems,
++        ))
++        .unwrap();
++    for (successors, expected_span) in
++        [(const_d_from_definition, const_d_span), (const_d_from_entry, entry_span)]
++    {
++        assert_no_dummy_source(successors);
++        let drop_items: Vec<_> = successors
++            .used
++            .iter()
++            .filter(|item| is_drop_glue(MonoTraceNode::Item(item.node)))
++            .collect();
++        assert_eq!(drop_items.len(), 1);
++        assert_eq!(drop_items[0].span, expected_span);
++        assert!(successors.facts.iter().any(|fact| {
++            fact.from == MonoTraceNode::Item(MonoItem::Static(const_d))
++                && fact.to == MonoTraceNode::Item(drop_items[0].node)
++                && fact.cause == MonoUseCause::DropGlue
++                && fact.site == MonoTraceSite::Source(expected_span)
++        }));
++    }
++    let const_d_from_generated = tcx
++        .mono_successors((
++            MonoTraceRoot::Static { def_id: const_d, trigger_span: DUMMY_SP },
++            CollectionMode::UsedItems,
++        ))
++        .unwrap();
++    assert_no_dummy_source(const_d_from_generated);
++    let generated_drop_items: Vec<_> = const_d_from_generated
++        .used
++        .iter()
++        .filter(|item| is_drop_glue(MonoTraceNode::Item(item.node)))
++        .collect();
++    assert_eq!(generated_drop_items.len(), 1);
++    assert_eq!(generated_drop_items[0].span, DUMMY_SP);
++    assert!(const_d_from_generated.facts.iter().any(|fact| {
++        fact.from == MonoTraceNode::Item(MonoItem::Static(const_d))
++            && fact.to == MonoTraceNode::Item(generated_drop_items[0].node)
++            && fact.cause == MonoUseCause::DropGlue
++            && fact.site == MonoTraceSite::CompilerGenerated
++    }));
++
++    let keep = local_static(tcx, "KEEP");
++    let keep_span = tcx.def_span(keep);
++    let keep_successors = tcx
++        .mono_successors((
++            MonoTraceRoot::Static { def_id: keep, trigger_span: keep_span },
++            CollectionMode::UsedItems,
++        ))
++        .unwrap();
++    assert_no_dummy_source(keep_successors);
++    exactly_one_instance(tcx, keep_successors.used, "static_a", None);
++    exactly_one_instance(tcx, keep_successors.used, "static_b", None);
++    let mut keep_offsets: Vec<u64> = keep_successors
++        .facts
++        .iter()
++        .filter_map(|fact| {
++            if fact.from == MonoTraceNode::Item(MonoItem::Static(keep))
++                && fact.collection == MonoTraceCollection::Used
++                && fact.cause == MonoUseCause::AllocationReference
++            {
++                Some(match fact.site {
++                    MonoTraceSite::AllocationOffset(offset) => offset,
++                    _ => panic!("static allocation edge lacked its actual offset"),
++                })
++            } else {
++                None
++            }
++        })
++        .collect();
++    keep_offsets.sort_unstable();
++    assert_eq!(keep_offsets, [0, tcx.data_layout.pointer_size().bytes()]);
++
++    let make = exactly_one_instance(tcx, successors.used, "make_vtable_and_drops", None);
++    let make_successors = query(
++        tcx,
++        Spanned { node: MonoItem::Fn(make), span: tcx.def_span(make.def_id()) },
++    );
++    let mut method_slots: Vec<(&str, u64)> = make_successors
++        .facts
++        .iter()
++        .filter_map(|fact| {
++            if fact.collection != MonoTraceCollection::Used
++                || fact.cause != MonoUseCause::VTableMethod
++            {
++                return None;
++            }
++            let MonoTraceNode::VTable { .. } = fact.from else { panic!("missing vtable owner") };
++            let MonoTraceNode::Item(MonoItem::Fn(instance)) = fact.to else {
++                panic!("vtable method did not target an instance")
++            };
++            let MonoTraceSite::VTableSlot(slot) = fact.site else {
++                panic!("vtable method did not retain its slot")
++            };
++            Some((if named_instance(tcx, instance, "a") { "a" } else if named_instance(tcx, instance, "b") { "b" } else { panic!("unexpected vtable method") }, slot))
++        })
++        .collect();
++    method_slots.sort_unstable();
++    assert_eq!(method_slots, [("a", 3), ("b", 4)]);
++
++    let vtable_drop = make_successors
++        .facts
++        .iter()
++        .filter(|fact| {
++            fact.collection == MonoTraceCollection::Used
++                && fact.cause == MonoUseCause::VTableDrop
++                && fact.site == MonoTraceSite::VTableSlot(0)
++                && is_drop_glue(fact.to)
++        })
++        .count();
++    assert_eq!(vtable_drop, 1);
++    let mut direct_drop_sites: Vec<Span> = make_successors
++        .facts
++        .iter()
++        .filter_map(|fact| {
++            if fact.collection == MonoTraceCollection::Used
++                && fact.from == MonoTraceNode::Item(MonoItem::Fn(make))
++                && fact.cause == MonoUseCause::DropGlue
++                && is_drop_glue(fact.to)
++            {
++                Some(match fact.site {
++                    MonoTraceSite::Source(span) => span,
++                    _ => panic!("MIR drop edge lacked a source span"),
++                })
++            } else {
++                None
++            }
++        })
++        .collect();
++    direct_drop_sites.sort_by_key(|span| (span.lo(), span.hi()));
++    direct_drop_sites.dedup();
++    assert_eq!(direct_drop_sites.len(), 2);
++
++    // A minimal main policy walks both Fn and Static through the same query. KEEP is a compiler
++    // root; the ordinary unreferenced static is intentionally not seeded.
++    let classes = walk(
++        tcx,
++        [
++            Spanned { node: entry_item, span: entry_span },
++            Spanned { node: MonoItem::Static(keep), span: keep_span },
++        ],
++    );
++    assert!(contains_instance(classes.used.as_slice(), direct_u8));
++    assert!(contains_instance(classes.used.as_slice(), direct_u16));
++    assert!(contains_named(tcx, classes.used.as_slice(), "static_a"));
++    assert!(contains_named(tcx, classes.used.as_slice(), "static_b"));
++    assert!(!contains_named(tcx, classes.used.as_slice(), "static_dead"));
++    assert!(contains_named(tcx, classes.used.as_slice(), "from_const"));
++    assert!(!contains_named(tcx, classes.mentioned.as_slice(), "from_const"));
++    assert!(contains_named(tcx, classes.mentioned.as_slice(), "dead_call"));
++}
++
++fn check_inline_reason<'tcx>(tcx: TyCtxt<'tcx>) {
++    let owner = Instance::mono(tcx, tcx.entry_fn(()).unwrap().0);
++    let target = local_function_instance(tcx, "target");
++    let successors = tcx
++        .mono_successors((MonoTraceRoot::Fn(owner), CollectionMode::MentionedItems))
++        .unwrap();
++    assert_no_dummy_source(successors);
++
++    // Stock inlining removes the first same-Ty mentioned entry. The prior reify mention is first,
++    // so the surviving pre-optimization reason is DirectCall even though that call was inlined.
++    assert_eq!(count_named(tcx, successors.mentioned, "target"), 1);
++    assert!(successors.facts.iter().any(|fact| {
++        fact.collection == MonoTraceCollection::Mentioned
++            && fact.from == MonoTraceNode::Item(MonoItem::Fn(owner))
++            && fact.to == MonoTraceNode::Item(MonoItem::Fn(target))
++            && fact.cause == MonoUseCause::DirectCall
++    }));
++    assert!(!successors.facts.iter().any(|fact| {
++        fact.to == MonoTraceNode::Item(MonoItem::Fn(target))
++            && fact.cause == MonoUseCause::FunctionPointer
++    }));
++}
++
++fn check_proof_uses<'tcx>(tcx: TyCtxt<'tcx>) {
++    let object_trait = named_def(tcx, "ObjectTrait", DefKind::Trait);
++    let concrete = named_def(tcx, "Concrete", DefKind::Struct);
++    let concrete_ty = rustc_middle::ty::Ty::new_adt(
++        tcx,
++        tcx.adt_def(concrete),
++        rustc_middle::ty::GenericArgs::empty(),
++    );
++    let object_ref = rustc_middle::ty::TraitRef::new(tcx, object_trait, [concrete_ty]);
++    let cold_witnesses = tcx.codegen_vtable_method_witnesses(object_ref).unwrap();
++    let warm_witnesses = tcx.codegen_vtable_method_witnesses(object_ref).unwrap();
++    assert!(std::ptr::eq(cold_witnesses, warm_witnesses));
++
++    let owner = local_function_instance(tcx, "proof_entry");
++    let cold = tcx
++        .mono_successors((MonoTraceRoot::Fn(owner), CollectionMode::UsedItems))
++        .unwrap();
++    let warm = tcx
++        .mono_successors((MonoTraceRoot::Fn(owner), CollectionMode::UsedItems))
++        .unwrap();
++    assert!(std::ptr::eq(cold, warm));
++    let mentioned = tcx
++        .mono_successors((MonoTraceRoot::Fn(owner), CollectionMode::MentionedItems))
++        .unwrap();
++    assert_no_dummy_source(cold);
++    assert_no_dummy_source(mentioned);
++    assert_proof_contract(tcx, cold);
++    assert_proof_contract(tcx, mentioned);
++    assert_eq!(
++        proof_inventory(tcx, cold, MonoTraceCollection::Used),
++        [
++            "associated:invoke|fn:proof_entry|DirectCall|Used|source:66:25",
++            "associated:invoke|fn:proof_entry|DirectCall|Used|source:67:25",
++            "associated:invoke|fn:proof_entry|DirectCall|Used|source:70:25",
++            "associated:invoke|fn:proof_entry|FunctionPointer|Used|source:73:8",
++            "trait:ObjectTrait|fn:proof_entry|VTableConstruction|Used|source:80:56",
++            "projection:Assoc|fn:proof_entry|VTableConstruction|Used|source:80:56",
++            "trait:Send|fn:proof_entry|VTableConstruction|Used|source:80:56",
++            "associated:defaulted|vtable:ObjectTrait|VTableMethod|Used|slot:3",
++            "associated:other|vtable:ObjectTrait|VTableMethod|Used|slot:4",
++            "trait:Other|vtable:ObjectTrait|SupertraitVTable|Used|slot:5",
++            "associated:overridden|vtable:ObjectTrait|VTableMethod|Used|slot:6",
++            "associated:tracked|vtable:ObjectTrait|VTableMethod|Used|slot:7",
++            "associated:overridden|fn:proof_entry|DirectCall|Used|source:81:25",
++            "associated:tracked|fn:proof_entry|DirectCall|Used|source:82:25",
++            "associated:defaulted|fn:proof_entry|DirectCall|Used|source:83:25",
++        ]
++    );
++    assert_eq!(
++        proof_inventory(tcx, cold, MonoTraceCollection::Mentioned),
++        ["associated:clone|fn:proof_entry|DirectCall|Mentioned|source:77:25"]
++    );
++    assert!(proof_inventory(tcx, mentioned, MonoTraceCollection::Used).is_empty());
++    assert_eq!(
++        proof_inventory(tcx, mentioned, MonoTraceCollection::Mentioned),
++        [
++            "associated:invoke|fn:proof_entry|DirectCall|Mentioned|source:66:25",
++            "associated:invoke|fn:proof_entry|DirectCall|Mentioned|source:67:25",
++            "associated:invoke|fn:proof_entry|DirectCall|Mentioned|source:70:25",
++            "associated:invoke|fn:proof_entry|FunctionPointer|Mentioned|source:73:8",
++            "associated:clone|fn:proof_entry|DirectCall|Mentioned|source:77:25",
++            "trait:ObjectTrait|fn:proof_entry|VTableConstruction|Mentioned|source:80:56",
++            "projection:Assoc|fn:proof_entry|VTableConstruction|Mentioned|source:80:56",
++            "trait:Send|fn:proof_entry|VTableConstruction|Mentioned|source:80:56",
++            "associated:defaulted|vtable:ObjectTrait|VTableMethod|Mentioned|slot:3",
++            "associated:other|vtable:ObjectTrait|VTableMethod|Mentioned|slot:4",
++            "trait:Other|vtable:ObjectTrait|SupertraitVTable|Mentioned|slot:5",
++            "associated:overridden|vtable:ObjectTrait|VTableMethod|Mentioned|slot:6",
++            "associated:tracked|vtable:ObjectTrait|VTableMethod|Mentioned|slot:7",
++            "associated:overridden|fn:proof_entry|DirectCall|Mentioned|source:81:25",
++            "associated:tracked|fn:proof_entry|DirectCall|Mentioned|source:82:25",
++            "associated:defaulted|fn:proof_entry|DirectCall|Mentioned|source:83:25",
++        ]
++    );
++
++    let dispatch = named_def(tcx, "Dispatch", DefKind::Trait);
++    let invoke = associated_item(tcx, dispatch, "invoke");
++    let default_dispatch = named_def(tcx, "DefaultDispatch", DefKind::Struct);
++    let override_dispatch = named_def(tcx, "OverrideDispatch", DefKind::Struct);
++    let default_ty = rustc_middle::ty::Ty::new_adt(
++        tcx,
++        tcx.adt_def(default_dispatch),
++        rustc_middle::ty::GenericArgs::empty(),
++    );
++    let override_ty = rustc_middle::ty::Ty::new_adt(
++        tcx,
++        tcx.adt_def(override_dispatch),
++        rustc_middle::ty::GenericArgs::empty(),
++    );
++    let three = rustc_middle::ty::Const::from_target_usize(tcx, 3);
++    let five = rustc_middle::ty::Const::from_target_usize(tcx, 5);
++    let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
++    let default_request = typing_env.as_query_input((
++        invoke,
++        tcx.mk_args(&[default_ty.into(), tcx.types.u16.into(), three.into()]),
++    ));
++    let override_request = typing_env.as_query_input((
++        invoke,
++        tcx.mk_args(&[override_ty.into(), tcx.types.u32.into(), five.into()]),
++    ));
++
++    let default_direct: Vec<_> = cold
++        .proof_uses
++        .iter()
++        .filter(|use_| {
++            matches!(
++                use_.proof,
++                MonoProof::AssociatedItem { request, .. }
++                    if request == default_request
++                        && use_.cause == MonoUseCause::DirectCall
++                        && use_.collection == MonoTraceCollection::Used
++            )
++        })
++        .collect();
++    assert_eq!(default_direct.len(), 2);
++    let mut default_sites: Vec<_> = default_direct
++        .iter()
++        .map(|use_| match use_.site {
++            MonoTraceSite::Source(span) => span,
++            _ => panic!("direct associated item lacked a source site"),
++        })
++        .collect();
++    default_sites.sort_by_key(|span| (span.lo(), span.hi()));
++    default_sites.dedup();
++    assert_eq!(default_sites.len(), 2);
++    assert_eq!(
++        cold.proof_uses
++            .iter()
++            .filter(|use_| matches!(
++                use_.proof,
++                MonoProof::AssociatedItem { request, .. }
++                    if request == override_request
++                        && use_.cause == MonoUseCause::DirectCall
++                        && use_.collection == MonoTraceCollection::Used
++            ))
++            .count(),
++        1
++    );
++
++    let used_reify = cold
++        .proof_uses
++        .iter()
++        .find_map(|use_| match use_.proof {
++            MonoProof::AssociatedItem {
++                request,
++                raw_instance,
++                codegen_instance,
++                ..
++            } if request == default_request
++                && use_.cause == MonoUseCause::FunctionPointer
++                && use_.collection == MonoTraceCollection::Used =>
++            {
++                Some((raw_instance, codegen_instance))
++            }
++            _ => None,
++        })
++        .unwrap();
++    assert_ne!(used_reify.0, used_reify.1);
++    assert!(matches!(used_reify.1.def, InstanceKind::Shim(ShimKind::Reify(..))));
++    let mentioned_reify = mentioned
++        .proof_uses
++        .iter()
++        .find_map(|use_| match use_.proof {
++            MonoProof::AssociatedItem {
++                request,
++                raw_instance,
++                codegen_instance,
++                ..
++            } if request == default_request
++                && use_.cause == MonoUseCause::FunctionPointer
++                && use_.collection == MonoTraceCollection::Mentioned =>
++            {
++                Some((raw_instance, codegen_instance))
++            }
++            _ => None,
++        })
++        .unwrap();
++    assert_eq!(mentioned_reify.0, mentioned_reify.1);
++    assert_eq!(mentioned_reify.0, used_reify.0);
++
++    let clone_trait = tcx.lang_items().clone_trait().unwrap();
++    let clone = associated_item(tcx, clone_trait, "clone");
++    let clone_use = cold
++        .proof_uses
++        .iter()
++        .find(|use_| matches!(
++            use_.proof,
++            MonoProof::AssociatedItem { request, .. } if request.value.0 == clone
++        ))
++        .unwrap();
++    let MonoProof::AssociatedItem { selection_key, .. } = clone_use.proof else { unreachable!() };
++    assert!(matches!(
++        &tcx.codegen_selection_proof(selection_key).unwrap().top_source,
++        ImplSource::Builtin(..)
++    ));
++
++    let marker = named_def(tcx, "Marker", DefKind::Trait);
++    // A zero-method supertrait has no stock vtable entry; its impl dependency comes from the
++    // selected impl's supertrait constraints, so the mono observer must not invent a proof.
++    assert!(!cold.proof_uses.iter().any(|use_| matches!(
++        use_.proof,
++        MonoProof::TraitSelection { proof_key } if proof_key.value.def_id == marker
++    )));
++    let object_method = associated_item(tcx, object_trait, "overridden");
++    let virtual_use = cold
++        .proof_uses
++        .iter()
++        .find_map(|use_| match use_.proof {
++            MonoProof::AssociatedItem {
++                request,
++                raw_instance,
++                codegen_instance,
++                ..
++            } if request.value.0 == object_method
++                && use_.cause == MonoUseCause::DirectCall
++                && matches!(raw_instance.def, InstanceKind::Virtual(..)) =>
++            {
++                Some((raw_instance, codegen_instance))
++            }
++            _ => None,
++        })
++        .unwrap();
++    assert_eq!(virtual_use.0, virtual_use.1);
++    assert!(!cold.facts.iter().any(|fact| {
++        fact.to == MonoTraceNode::Item(MonoItem::Fn(virtual_use.1))
++    }));
++
++    let witnesses = tcx.codegen_vtable_method_witnesses(object_ref).unwrap();
++    let entries = tcx.vtable_entries(object_ref);
++    assert!(entries.iter().any(|entry| matches!(entry, rustc_middle::ty::VtblEntry::Vacant)));
++    let vacant = associated_item(tcx, object_trait, "vacant");
++    let tracked = associated_item(tcx, object_trait, "tracked");
++    assert!(!witnesses.iter().any(|witness| witness.request.value.0 == vacant));
++    for witness in witnesses {
++        let use_ = cold
++            .proof_uses
++            .iter()
++            .find(|use_| {
++                use_.cause == MonoUseCause::VTableMethod
++                    && use_.site == MonoTraceSite::VTableSlot(witness.slot)
++                    && matches!(
++                        use_.proof,
++                        MonoProof::AssociatedItem {
++                            request,
++                            codegen_instance,
++                            ..
++                        } if request == witness.request
++                            && codegen_instance == witness.codegen_instance
++                    )
++            })
++            .unwrap();
++        let MonoProof::AssociatedItem { raw_instance, codegen_instance, .. } = use_.proof else {
++            unreachable!()
++        };
++        if witness.request.value.0 == tracked {
++            assert_ne!(raw_instance, codegen_instance);
++            assert_eq!(raw_instance.args, codegen_instance.args);
++            assert!(matches!(
++                codegen_instance.def,
++                InstanceKind::Shim(ShimKind::Reify(def_id, None))
++                    if def_id == raw_instance.def_id()
++            ));
++        } else {
++            assert_eq!(raw_instance, codegen_instance);
++        }
++    }
++    assert!(cold.proof_uses.iter().any(|use_| {
++        use_.cause == MonoUseCause::SupertraitVTable
++            && matches!(use_.proof, MonoProof::TraitSelection { .. })
++            && matches!(use_.site, MonoTraceSite::VTableSlot(_))
++    }));
++    let send = tcx.get_diagnostic_item(sym::Send).unwrap();
++    assert!(cold.proof_uses.iter().any(|use_| matches!(
++        use_.proof,
++        MonoProof::TraitSelection { proof_key }
++            if proof_key.value.def_id == send
++                && use_.cause == MonoUseCause::VTableConstruction
++    )));
++    let assoc = associated_item(tcx, object_trait, "Assoc");
++    assert!(cold.proof_uses.iter().any(|use_| matches!(
++        use_.proof,
++        MonoProof::Projection {
++            proof_key:
++                rustc_middle::ty::PseudoCanonicalInput {
++                    value: rustc_middle::ty::AliasTerm {
++                        kind: rustc_middle::ty::AliasTermKind::ProjectionTy { def_id },
++                        ..
++                    },
++                    ..
++                },
++            expected,
++        } if def_id == assoc && expected == tcx.types.u8.into()
++    )));
++
++    let only_drop = local_function_instance(tcx, "only_drop");
++    for mode in [CollectionMode::UsedItems, CollectionMode::MentionedItems] {
++        let successors = tcx.mono_successors((MonoTraceRoot::Fn(only_drop), mode)).unwrap();
++        assert!(successors.proof_uses.is_empty());
++    }
++}
++
++fn proof_inventory<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    successors: &MonoSuccessors<'tcx>,
++    collection: MonoTraceCollection,
++) -> Vec<String> {
++    successors
++        .proof_uses
++        .iter()
++        .filter(|use_| use_.collection == collection)
++        .map(|use_| {
++            let proof = match use_.proof {
++                MonoProof::TraitSelection { proof_key } => {
++                    format!("trait:{}", tcx.item_name(proof_key.value.def_id))
++                }
++                MonoProof::AssociatedItem { request, .. } => {
++                    format!("associated:{}", tcx.item_name(request.value.0))
++                }
++                MonoProof::Projection { proof_key, .. } => {
++                    let rustc_middle::ty::AliasTermKind::ProjectionTy { def_id } =
++                        proof_key.value.kind
++                    else {
++                        unreachable!()
++                    };
++                    format!("projection:{}", tcx.item_name(def_id))
++                }
++            };
++            let from = match use_.from {
++                MonoTraceNode::Item(MonoItem::Fn(instance)) => {
++                    format!("fn:{}", tcx.item_name(instance.def_id()))
++                }
++                MonoTraceNode::Item(MonoItem::Static(def_id)) => {
++                    format!("static:{}", tcx.item_name(def_id))
++                }
++                MonoTraceNode::Item(MonoItem::GlobalAsm(item_id)) => {
++                    format!("global_asm:{item_id:?}")
++                }
++                MonoTraceNode::Allocation(_) => "allocation".to_owned(),
++                MonoTraceNode::VTable { trait_ref: Some(trait_ref), .. } => {
++                    format!("vtable:{}", tcx.item_name(trait_ref.def_id))
++                }
++                MonoTraceNode::VTable { trait_ref: None, .. } => "vtable:none".to_owned(),
++            };
++            let site = match use_.site {
++                MonoTraceSite::Source(span) => {
++                    let lo = tcx.sess.source_map().lookup_char_pos(span.lo());
++                    format!("source:{}:{}", lo.line, lo.col.0)
++                }
++                MonoTraceSite::AllocationOffset(offset) => format!("allocation:{offset}"),
++                MonoTraceSite::VTableSlot(slot) => format!("slot:{slot}"),
++                MonoTraceSite::CompilerGenerated => "compiler".to_owned(),
++            };
++            format!("{proof}|{from}|{:?}|{:?}|{site}", use_.cause, use_.collection)
++        })
++        .collect()
++}
++
++fn assert_proof_contract<'tcx>(tcx: TyCtxt<'tcx>, successors: &MonoSuccessors<'tcx>) {
++    for use_ in successors.proof_uses {
++        assert!(!matches!(use_.site, MonoTraceSite::Source(span) if span.is_dummy()));
++        match use_.proof {
++            MonoProof::TraitSelection { proof_key } => {
++                assert!(matches!(
++                    use_.cause,
++                    MonoUseCause::VTableConstruction | MonoUseCause::SupertraitVTable
++                ));
++                if use_.cause == MonoUseCause::SupertraitVTable {
++                    assert!(matches!(use_.from, MonoTraceNode::VTable { .. }));
++                    assert!(matches!(use_.site, MonoTraceSite::VTableSlot(_)));
++                }
++                tcx.codegen_selection_proof(proof_key).unwrap();
++            }
++            MonoProof::AssociatedItem {
++                selection_key,
++                request,
++                raw_instance,
++                codegen_instance,
++            } => {
++                assert_eq!(tcx.def_kind(request.value.0), DefKind::AssocFn);
++                let trait_id = tcx.trait_of_assoc(request.value.0).unwrap();
++                let receiver_args = tcx.normalize_erasing_regions(
++                    request.typing_env,
++                    rustc_middle::ty::Unnormalized::new_wip(request.value.1),
++                );
++                assert_eq!(
++                    selection_key,
++                    request.typing_env.as_query_input(rustc_middle::ty::TraitRef::from_assoc(
++                        tcx,
++                        trait_id,
++                        receiver_args,
++                    ))
++                );
++                assert_eq!(
++                    tcx.resolve_instance_raw(request).unwrap().unwrap(),
++                    raw_instance
++                );
++                let selection = tcx.codegen_selection_proof(selection_key).unwrap();
++                match &selection.top_source {
++                    ImplSource::UserDefined(_) => {
++                        let proof = tcx.codegen_associated_item_proof(request).unwrap();
++                        assert_eq!(proof.selection_key, selection_key);
++                        assert_eq!(proof.source, selection.top_source);
++                        assert_eq!(proof.final_instance, raw_instance);
++                    }
++                    ImplSource::Builtin(..) | ImplSource::Param(_) => {
++                        assert!(tcx.codegen_associated_item_proof(request).is_err());
++                    }
++                }
++
++                match use_.cause {
++                    MonoUseCause::DirectCall => assert_eq!(codegen_instance, raw_instance),
++                    MonoUseCause::FunctionPointer | MonoUseCause::InlineAsmSymbol => {
++                        let expected = if use_.collection == MonoTraceCollection::Used {
++                            Instance::resolve_for_fn_ptr(
++                                tcx,
++                                request.typing_env,
++                                request.value.0,
++                                request.value.1,
++                            )
++                            .unwrap()
++                        } else {
++                            raw_instance
++                        };
++                        assert_eq!(codegen_instance, expected);
++                    }
++                    MonoUseCause::VTableMethod => {
++                        let MonoTraceNode::VTable { trait_ref: Some(trait_ref), .. } = use_.from
++                        else {
++                            panic!("vtable method proof lacked its vtable owner")
++                        };
++                        let MonoTraceSite::VTableSlot(slot) = use_.site else {
++                            panic!("vtable method proof lacked its slot")
++                        };
++                        let witness = tcx
++                            .codegen_vtable_method_witnesses(trait_ref)
++                            .unwrap()
++                            .iter()
++                            .find(|witness| witness.slot == slot)
++                            .unwrap();
++                        assert_eq!(witness.request, request);
++                        assert_eq!(witness.codegen_instance, codegen_instance);
++                    }
++                    _ => panic!("associated item proof had an unrelated cause"),
++                }
++            }
++            MonoProof::Projection { proof_key, expected } => {
++                assert_eq!(use_.cause, MonoUseCause::VTableConstruction);
++                assert!(matches!(
++                    proof_key.value.kind,
++                    rustc_middle::ty::AliasTermKind::ProjectionTy { .. }
++                ));
++                assert!(!proof_key.value.args.type_at(0).has_non_region_param());
++                let proof = tcx.codegen_projection_proof(proof_key).unwrap();
++                assert_eq!(proof.normalized_term, expected);
++            }
++        }
++    }
++}
++
++fn check_associated_const_uses<'tcx>(tcx: TyCtxt<'tcx>) {
++    let pick = named_def(tcx, "Pick", DefKind::Trait);
++    let pick_const = associated_item(tcx, pick, "N");
++    let source = named_def(tcx, "Source", DefKind::Struct);
++    let defaulted = named_def(tcx, "Defaulted", DefKind::Struct);
++    let overridden = named_def(tcx, "Overridden", DefKind::Struct);
++    let defaulted_impl = impl_for_adt(tcx, pick, defaulted);
++    let overridden_impl = impl_for_adt(tcx, pick, overridden);
++    let overridden_const = tcx.impl_item_implementor_ids(overridden_impl)[&pick_const];
++    let routed_trait = named_def(tcx, "Routed", DefKind::Trait);
++    let routed_const = associated_item(tcx, routed_trait, "N");
++    let routed_default = named_def(tcx, "RoutedDefault", DefKind::Struct);
++    let routed_override = named_def(tcx, "RoutedOverride", DefKind::Struct);
++    let routed_default_impl = impl_for_adt(tcx, routed_trait, routed_default);
++    let routed_override_impl = impl_for_adt(tcx, routed_trait, routed_override);
++    let routed_override_const =
++        tcx.impl_item_implementor_ids(routed_override_impl)[&routed_const];
++
++    let source_ty = rustc_middle::ty::Ty::new_adt(
++        tcx,
++        tcx.adt_def(source),
++        rustc_middle::ty::GenericArgs::empty(),
++    );
++    let defaulted_ty = rustc_middle::ty::Ty::new_adt(
++        tcx,
++        tcx.adt_def(defaulted),
++        tcx.mk_args(&[source_ty.into()]),
++    );
++    let overridden_ty = rustc_middle::ty::Ty::new_adt(
++        tcx,
++        tcx.adt_def(overridden),
++        tcx.mk_args(&[source_ty.into()]),
++    );
++    let routed_default_ty = rustc_middle::ty::Ty::new_adt(
++        tcx,
++        tcx.adt_def(routed_default),
++        tcx.mk_args(&[source_ty.into()]),
++    );
++    let routed_override_ty = rustc_middle::ty::Ty::new_adt(
++        tcx,
++        tcx.adt_def(routed_override),
++        tcx.mk_args(&[source_ty.into()]),
++    );
++
++    let entry = Instance::mono(tcx, tcx.entry_fn(()).unwrap().0);
++    let entry_successors = query(
++        tcx,
++        Spanned { node: MonoItem::Fn(entry), span: tcx.def_span(entry.def_id()) },
++    );
++    let generic_default = exactly_one_instance(
++        tcx,
++        entry_successors.used,
++        "generic",
++        Some(defaulted_ty),
++    );
++    let generic_override = exactly_one_instance(
++        tcx,
++        entry_successors.used,
++        "generic",
++        Some(overridden_ty),
++    );
++    let direct = exactly_one_instance(tcx, entry_successors.used, "direct", None);
++    let repeated = exactly_one_instance(tcx, entry_successors.used, "repeated", None);
++    let routed = exactly_one_instance(tcx, entry_successors.used, "routed", None);
++
++    assert_associated_const_use(
++        tcx,
++        query(
++            tcx,
++            Spanned {
++                node: MonoItem::Fn(generic_default),
++                span: tcx.def_span(generic_default.def_id()),
++            },
++        ),
++        MonoTraceNode::Item(MonoItem::Fn(generic_default)),
++        "<T as Pick>::N",
++        pick,
++        pick_const,
++        tcx.mk_args(&[defaulted_ty.into()]),
++        defaulted_impl,
++        Instance::new_raw(pick_const, tcx.mk_args(&[defaulted_ty.into()])),
++    );
++    assert_associated_const_use(
++        tcx,
++        query(
++            tcx,
++            Spanned {
++                node: MonoItem::Fn(generic_override),
++                span: tcx.def_span(generic_override.def_id()),
++            },
++        ),
++        MonoTraceNode::Item(MonoItem::Fn(generic_override)),
++        "<T as Pick>::N",
++        pick,
++        pick_const,
++        tcx.mk_args(&[overridden_ty.into()]),
++        overridden_impl,
++        Instance::new_raw(overridden_const, tcx.mk_args(&[source_ty.into()])),
++    );
++
++    let direct_successors = query(
++        tcx,
++        Spanned { node: MonoItem::Fn(direct), span: tcx.def_span(direct.def_id()) },
++    );
++    assert!(direct_successors.used.is_empty());
++    assert!(direct_successors.mentioned.is_empty());
++    assert!(direct_successors.facts.is_empty());
++    assert_associated_const_use(
++        tcx,
++        direct_successors,
++        MonoTraceNode::Item(MonoItem::Fn(direct)),
++        "<Defaulted<Source> as Pick>::N",
++        pick,
++        pick_const,
++        tcx.mk_args(&[defaulted_ty.into()]),
++        defaulted_impl,
++        Instance::new_raw(pick_const, tcx.mk_args(&[defaulted_ty.into()])),
++    );
++    assert!(tcx.instance_mir(direct.def).basic_blocks.iter().any(|block| {
++        block.statements.iter().any(|statement| match &statement.kind {
++            mir::StatementKind::Assign(assign) => matches!(
++                &assign.1,
++                mir::Rvalue::Use(mir::Operand::Constant(constant), _)
++                    if matches!(constant.const_, mir::Const::Val(..))
++            ),
++            _ => false,
++        })
++    }));
++
++    let repeated_used = tcx
++        .mono_successors((MonoTraceRoot::Fn(repeated), CollectionMode::UsedItems))
++        .unwrap();
++    let repeated_mentioned = tcx
++        .mono_successors((MonoTraceRoot::Fn(repeated), CollectionMode::MentionedItems))
++        .unwrap();
++    assert_no_dummy_source(repeated_used);
++    assert_no_dummy_source(repeated_mentioned);
++    assert!(repeated_used.used.is_empty());
++    assert!(repeated_used.mentioned.is_empty());
++    assert!(repeated_used.facts.is_empty());
++    assert!(repeated_mentioned.used.is_empty());
++    assert!(repeated_mentioned.mentioned.is_empty());
++    assert!(repeated_mentioned.facts.is_empty());
++    assert_eq!(repeated_used.associated_consts, repeated_mentioned.associated_consts);
++    let [first, second]: &[MonoAssociatedConstUse<'tcx>] = repeated_used.associated_consts else {
++        panic!(
++            "expected two associated-const uses, got {:?}",
++            repeated_used.associated_consts
++        )
++    };
++    let expected_key = rustc_middle::ty::TypingEnv::fully_monomorphized()
++        .as_query_input((pick_const, tcx.mk_args(&[defaulted_ty.into()])));
++    for use_fact in [first, second] {
++        assert_eq!(use_fact.owner, MonoTraceNode::Item(MonoItem::Fn(repeated)));
++        assert_eq!(use_fact.proof_key, expected_key);
++    }
++    let [MonoTraceSite::Source(first_span), MonoTraceSite::Source(second_span)] =
++        [first.site, second.site]
++    else {
++        panic!("repeated associated-const uses lacked source sites")
++    };
++    assert!(first_span.lo() < second_span.lo());
++    for span in [first_span, second_span] {
++        assert_eq!(
++            tcx.sess.source_map().span_to_snippet(span).unwrap(),
++            "<Defaulted<Source> as Pick>::N"
++        );
++    }
++
++    let promoted_value = local_static(tcx, "PROMOTED_VALUE");
++    let promoted_instance = Instance::mono(tcx, promoted_value);
++    let promoted_body = tcx.instance_mir(promoted_instance.def);
++    let [promoted_outer, promoted_wrapper] = promoted_body.required_consts() else {
++        panic!(
++            "expected the original const and its promoted wrapper, got {:?}",
++            promoted_body.required_consts()
++        )
++    };
++    let mir::Const::Unevaluated(promoted_outer_const, _) = promoted_outer.const_ else {
++        panic!("associated const retained by the outer body was already evaluated")
++    };
++    assert_eq!(promoted_outer_const.def, pick_const);
++    assert!(promoted_outer_const.promoted.is_none());
++    let mir::Const::Unevaluated(promoted_wrapper, _) = promoted_wrapper.const_ else {
++        panic!("promoted wrapper was already evaluated")
++    };
++    assert_eq!(promoted_wrapper.def, promoted_value);
++    let promoted_index = promoted_wrapper.promoted.expect("expected a promoted index");
++    let promoted_mir = &tcx.promoted_mir(promoted_wrapper.def)[promoted_index];
++    let [promoted_inner] = promoted_mir.required_consts() else {
++        panic!(
++            "expected one required const inside the promoted body, got {:?}",
++            promoted_mir.required_consts()
++        )
++    };
++    let mir::Const::Unevaluated(promoted_inner_const, _) = promoted_inner.const_ else {
++        panic!("associated const inside the promoted body was already evaluated")
++    };
++    assert_eq!(promoted_inner_const.def, pick_const);
++    assert!(promoted_inner_const.promoted.is_none());
++    assert_eq!(promoted_outer_const, promoted_inner_const);
++    assert_eq!(promoted_outer.span, promoted_inner.span);
++    assert_associated_const_use(
++        tcx,
++        tcx.mono_successors((
++            MonoTraceRoot::Static {
++                def_id: promoted_value,
++                trigger_span: tcx.def_span(promoted_value),
++            },
++            CollectionMode::UsedItems,
++        ))
++        .unwrap(),
++        MonoTraceNode::Item(MonoItem::Static(promoted_value)),
++        "<Defaulted<Source> as Pick>::N",
++        pick,
++        pick_const,
++        tcx.mk_args(&[defaulted_ty.into()]),
++        defaulted_impl,
++        Instance::new_raw(pick_const, tcx.mk_args(&[defaulted_ty.into()])),
++    );
++
++    let routed_successors = query(
++        tcx,
++        Spanned { node: MonoItem::Fn(routed), span: tcx.def_span(routed.def_id()) },
++    );
++    assert!(routed_successors.used.is_empty());
++    assert!(routed_successors.mentioned.is_empty());
++    assert!(routed_successors.facts.is_empty());
++    let [routed_default_fact, routed_override_fact]: &[MonoAssociatedConstUse<'tcx>] =
++        routed_successors.associated_consts
++    else {
++        panic!(
++            "expected two routed associated-const uses, got {:?}",
++            routed_successors.associated_consts
++        )
++    };
++    let three = rustc_middle::ty::Const::from_target_usize(tcx, 3);
++    let five = rustc_middle::ty::Const::from_target_usize(tcx, 5);
++    let routed_default_args =
++        tcx.mk_args(&[routed_default_ty.into(), tcx.types.u16.into(), three.into()]);
++    assert_associated_const_fact(
++        tcx,
++        routed_default_fact,
++        MonoTraceNode::Item(MonoItem::Fn(routed)),
++        "<RoutedDefault<Source> as Routed<u16, 3>>::N",
++        routed_trait,
++        routed_const,
++        routed_default_args,
++        routed_default_impl,
++        Instance::new_raw(routed_const, routed_default_args),
++    );
++    let routed_override_args =
++        tcx.mk_args(&[routed_override_ty.into(), tcx.types.u32.into(), five.into()]);
++    let routed_override_final_args =
++        tcx.mk_args(&[source_ty.into(), tcx.types.u32.into(), five.into()]);
++    assert_associated_const_fact(
++        tcx,
++        routed_override_fact,
++        MonoTraceNode::Item(MonoItem::Fn(routed)),
++        "<RoutedOverride<Source> as Routed<u32, 5>>::N",
++        routed_trait,
++        routed_const,
++        routed_override_args,
++        routed_override_impl,
++        Instance::new_raw(routed_override_const, routed_override_final_args),
++    );
++
++    let value = local_static(tcx, "VALUE");
++    let value_successors = tcx
++        .mono_successors((
++            MonoTraceRoot::Static { def_id: value, trigger_span: tcx.def_span(value) },
++            CollectionMode::UsedItems,
++        ))
++        .unwrap();
++    let value_mentioned_successors = tcx
++        .mono_successors((
++            MonoTraceRoot::Static { def_id: value, trigger_span: tcx.def_span(value) },
++            CollectionMode::MentionedItems,
++        ))
++        .unwrap();
++    assert_no_dummy_source(value_mentioned_successors);
++    assert!(value_successors.used.is_empty());
++    assert!(value_successors.mentioned.is_empty());
++    assert!(value_successors.facts.is_empty());
++    assert!(value_mentioned_successors.used.is_empty());
++    assert!(value_mentioned_successors.mentioned.is_empty());
++    assert!(value_mentioned_successors.facts.is_empty());
++    assert_eq!(
++        value_successors.associated_consts,
++        value_mentioned_successors.associated_consts
++    );
++    assert_associated_const_use(
++        tcx,
++        value_successors,
++        MonoTraceNode::Item(MonoItem::Static(value)),
++        "<Overridden<Source> as Pick>::N",
++        pick,
++        pick_const,
++        tcx.mk_args(&[overridden_ty.into()]),
++        overridden_impl,
++        Instance::new_raw(overridden_const, tcx.mk_args(&[source_ty.into()])),
++    );
++}
++
++#[allow(clippy::too_many_arguments)]
++fn assert_associated_const_use<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    successors: &MonoSuccessors<'tcx>,
++    expected_owner: MonoTraceNode<'tcx>,
++    expected_snippet: &str,
++    trait_id: DefId,
++    trait_item: DefId,
++    call_args: rustc_middle::ty::GenericArgsRef<'tcx>,
++    expected_impl: DefId,
++    expected_instance: Instance<'tcx>,
++) {
++    let [use_fact]: &[MonoAssociatedConstUse<'tcx>] = successors.associated_consts else {
++        panic!("expected one associated-const use, got {:?}", successors.associated_consts)
++    };
++    assert_associated_const_fact(
++        tcx,
++        use_fact,
++        expected_owner,
++        expected_snippet,
++        trait_id,
++        trait_item,
++        call_args,
++        expected_impl,
++        expected_instance,
++    );
++}
++
++#[allow(clippy::too_many_arguments)]
++fn assert_associated_const_fact<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    use_fact: &MonoAssociatedConstUse<'tcx>,
++    expected_owner: MonoTraceNode<'tcx>,
++    expected_snippet: &str,
++    trait_id: DefId,
++    trait_item: DefId,
++    call_args: rustc_middle::ty::GenericArgsRef<'tcx>,
++    expected_impl: DefId,
++    expected_instance: Instance<'tcx>,
++) {
++    assert_eq!(use_fact.owner, expected_owner);
++    let typing_env = rustc_middle::ty::TypingEnv::fully_monomorphized();
++    assert_eq!(use_fact.proof_key, typing_env.as_query_input((trait_item, call_args)));
++    let MonoTraceSite::Source(span) = use_fact.site else {
++        panic!("associated-const use lacked a source site: {use_fact:?}")
++    };
++    assert_eq!(tcx.sess.source_map().span_to_snippet(span).unwrap(), expected_snippet);
++
++    let proof = tcx.codegen_associated_item_proof(use_fact.proof_key).unwrap();
++    let again = tcx.codegen_associated_item_proof(use_fact.proof_key).unwrap();
++    assert!(std::ptr::eq(proof, again));
++    assert_eq!(proof.final_instance, expected_instance);
++    assert_eq!(proof.leaf_item, expected_instance.def_id());
++    assert_eq!(
++        proof.selection_key,
++        typing_env.as_query_input(rustc_middle::ty::TraitRef::from_assoc(tcx, trait_id, call_args))
++    );
++    assert!(matches!(
++        &proof.source,
++        ImplSource::UserDefined(data) if data.impl_def_id == expected_impl
++    ));
++}
++
++fn query<'tcx>(tcx: TyCtxt<'tcx>, item: Spanned<MonoItem<'tcx>>) -> &'tcx MonoSuccessors<'tcx> {
++    let root = match item.node {
++        MonoItem::Fn(instance) => MonoTraceRoot::Fn(instance),
++        MonoItem::Static(def_id) => MonoTraceRoot::Static {
++            def_id,
++            trigger_span: item.span,
++        },
++        MonoItem::GlobalAsm(_) => panic!("global asm is outside this observer contract"),
++    };
++    let successors = tcx.mono_successors((root, CollectionMode::UsedItems)).unwrap();
++    assert_no_dummy_source(successors);
++    successors
++}
++
++fn assert_no_dummy_source(successors: &MonoSuccessors<'_>) {
++    assert!(!successors
++        .facts
++        .iter()
++        .any(|fact| matches!(fact.site, MonoTraceSite::Source(span) if span.is_dummy())));
++    assert!(!successors
++        .associated_consts
++        .iter()
++        .any(|fact| matches!(fact.site, MonoTraceSite::Source(span) if span.is_dummy())));
++}
++
++fn named_def(tcx: TyCtxt<'_>, name: &str, kind: DefKind) -> DefId {
++    let name = rustc_span::Symbol::intern(name);
++    tcx.iter_local_def_id()
++        .map(|def_id| def_id.to_def_id())
++        .find(|&def_id| tcx.def_kind(def_id) == kind && tcx.item_name(def_id) == name)
++        .unwrap()
++}
++
++fn associated_item(tcx: TyCtxt<'_>, owner: DefId, name: &str) -> DefId {
++    let name = rustc_span::Symbol::intern(name);
++    tcx.associated_items(owner)
++        .in_definition_order()
++        .find(|item| item.opt_name() == Some(name))
++        .unwrap()
++        .def_id
++}
++
++fn impl_for_adt(tcx: TyCtxt<'_>, trait_id: DefId, adt_id: DefId) -> DefId {
++    tcx.iter_local_def_id()
++        .map(|def_id| def_id.to_def_id())
++        .filter(|&def_id| tcx.def_kind(def_id) == DefKind::Impl { of_trait: true })
++        .find(|&impl_id| {
++            tcx.impl_trait_id(impl_id) == trait_id
++                && tcx
++                    .type_of(impl_id)
++                    .instantiate_identity()
++                    .skip_norm_wip()
++                    .ty_adt_def()
++                    .is_some_and(|def| def.did() == adt_id)
++        })
++        .unwrap()
++}
++
++fn local_static(tcx: TyCtxt<'_>, name: &str) -> rustc_hir::def_id::DefId {
++    let def_id = tcx
++        .hir_crate_items(())
++        .definitions()
++        .map(|id| id.to_def_id())
++        .find(|&def_id| {
++            matches!(tcx.def_kind(def_id), DefKind::Static { .. })
++                && tcx.item_name(def_id).as_str() == name
++        })
++        .unwrap();
++    assert!(matches!(tcx.def_kind(def_id), DefKind::Static { .. }));
++    def_id
++}
++
++fn named_instance(tcx: TyCtxt<'_>, instance: Instance<'_>, name: &str) -> bool {
++    tcx.opt_item_name(instance.def_id()).is_some_and(|symbol| symbol.as_str() == name)
++}
++
++fn local_function_instance<'tcx>(tcx: TyCtxt<'tcx>, name: &str) -> Instance<'tcx> {
++    let def_id = tcx
++        .hir_crate_items(())
++        .definitions()
++        .map(|id| id.to_def_id())
++        .find(|&def_id| {
++            tcx.def_kind(def_id) == DefKind::Fn
++                && tcx.opt_item_name(def_id).is_some_and(|symbol| symbol.as_str() == name)
++        })
++        .unwrap();
++    Instance::mono(tcx, def_id)
++}
++
++fn exactly_one_instance<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    items: &[Spanned<MonoItem<'tcx>>],
++    name: &str,
++    type_arg: Option<rustc_middle::ty::Ty<'tcx>>,
++) -> Instance<'tcx> {
++    let matches: Vec<_> = items
++        .iter()
++        .filter_map(|item| match item.node {
++            MonoItem::Fn(instance)
++                if named_instance(tcx, instance, name)
++                    && type_arg.is_none_or(|ty| instance.args.type_at(0) == ty) =>
++            {
++                Some(instance)
++            }
++            _ => None,
++        })
++        .collect();
++    assert_eq!(matches.len(), 1, "expected one instance of {name}, got {matches:?}");
++    matches[0]
++}
++
++fn count_named(tcx: TyCtxt<'_>, items: &[Spanned<MonoItem<'_>>], name: &str) -> usize {
++    items
++        .iter()
++        .filter(|item| matches!(item.node, MonoItem::Fn(instance) if named_instance(tcx, instance, name)))
++        .count()
++}
++
++fn contains_named(tcx: TyCtxt<'_>, items: &[MonoItem<'_>], name: &str) -> bool {
++    items
++        .iter()
++        .any(|item| matches!(*item, MonoItem::Fn(instance) if named_instance(tcx, instance, name)))
++}
++
++fn contains_instance<'tcx>(items: &[MonoItem<'tcx>], wanted: Instance<'tcx>) -> bool {
++    items.iter().any(|item| *item == MonoItem::Fn(wanted))
++}
++
++fn source_sites_to_instance<'tcx>(
++    successors: &MonoSuccessors<'tcx>,
++    collection: MonoTraceCollection,
++    cause: MonoUseCause,
++    target: Instance<'tcx>,
++) -> Vec<Span> {
++    successors
++        .facts
++        .iter()
++        .filter_map(|fact| {
++            if fact.collection == collection
++                && fact.cause == cause
++                && fact.to == MonoTraceNode::Item(MonoItem::Fn(target))
++            {
++                Some(match fact.site {
++                    MonoTraceSite::Source(span) => span,
++                    _ => panic!("source edge did not retain a source span"),
++                })
++            } else {
++                None
++            }
++        })
++        .collect()
++}
++
++fn is_drop_glue(node: MonoTraceNode<'_>) -> bool {
++    matches!(
++        node,
++        MonoTraceNode::Item(MonoItem::Fn(Instance {
++            def: InstanceKind::Shim(ShimKind::DropGlue(..)),
++            ..
++        }))
++    )
++}
++
++struct Classes<'tcx> {
++    used: Vec<MonoItem<'tcx>>,
++    mentioned: Vec<MonoItem<'tcx>>,
++}
++
++fn walk<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    seeds: impl IntoIterator<Item = Spanned<MonoItem<'tcx>>>,
++) -> Classes<'tcx> {
++    let mut used_queue: Vec<_> = seeds.into_iter().collect();
++    let mut mentioned_queue = Vec::new();
++    let mut used = Vec::new();
++    let mut mentioned = Vec::new();
++
++    loop {
++        while let Some(item) = used_queue.pop() {
++            if used.contains(&item.node) {
++                continue;
++            }
++            used.push(item.node);
++            let successors = query(tcx, item);
++            used_queue.extend(successors.used.iter().copied());
++            mentioned_queue.extend(successors.mentioned.iter().copied());
++        }
++
++        let Some(item) = mentioned_queue.pop() else { break };
++        if used.contains(&item.node) || mentioned.contains(&item.node) {
++            continue;
++        }
++        mentioned.push(item.node);
++        let root = match item.node {
++            MonoItem::Fn(instance) => MonoTraceRoot::Fn(instance),
++            MonoItem::Static(def_id) => MonoTraceRoot::Static {
++                def_id,
++                trigger_span: item.span,
++            },
++            MonoItem::GlobalAsm(_) => panic!("global asm is outside this observer contract"),
++        };
++        let successors = tcx
++            .mono_successors((root, CollectionMode::MentionedItems))
++            .unwrap();
++        assert_no_dummy_source(successors);
++        used_queue.extend(successors.used.iter().copied());
++        mentioned_queue.extend(successors.mentioned.iter().copied());
++    }
++
++    mentioned.retain(|item| !used.contains(item));
++    Classes { used, mentioned }
++}
+-- 
+2.55.0
+

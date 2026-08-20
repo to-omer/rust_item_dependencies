@@ -1,0 +1,66 @@
+From 14998244294254b9c86bc473022b9c3980d2bc75 Mon Sep 17 00:00:00 2001
+From: to-omer <48119218+to-omer@users.noreply.github.com>
+Date: Fri, 14 Aug 2026 08:12:55 +0900
+Subject: [PATCH 16/16] Ignore bound projection-only dependency origins
+
+---
+ .../src/traits/typeck_impl_dependencies.rs             |  2 +-
+ ...peck-impl-dependencies-source-free-origins-input.rs | 10 ++++++++++
+ .../typeck-impl-dependencies-source-free-origins.rs    |  5 +++++
+ 3 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs b/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs
+index 36fb2f6b..6823f377 100644
+--- a/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs
++++ b/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs
+@@ -442,7 +442,7 @@ pub fn finish(&self, infcx: &InferCtxt<'tcx>) -> Result<Vec<TypeckImplDependency
+             .collect::<FxHashSet<_>>();
+         for origin in &origins {
+             let Some(projection) = origin.key.1.as_projection_clause() else { continue };
+-            let Some(projection) = projection.no_bound_vars() else { return Err(()) };
++            let Some(projection) = projection.no_bound_vars() else { continue };
+             let projection_origin = ProjectionOrigin {
+                 key: (origin.key.0, projection.projection_term),
+                 owner: origin.owner,
+diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs
+index 5300de2f..da442a60 100644
+--- a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs
++++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs
+@@ -34,3 +34,13 @@ fn require<T>()
+ fn hrtb_body() {
+     require::<S>();
+ }
++
++fn external_hrtb_projection(values: &[isize]) -> Vec<isize> {
++    values
++        .iter()
++        .scan(0, |sum, &value| {
++            *sum += value;
++            Some(*sum)
++        })
++        .collect()
++}
+diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs b/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs
+index e6c339ce..d2fd5f75 100644
+--- a/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs
++++ b/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs
+@@ -42,11 +42,16 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+ 
+         let local = named_def(tcx, "Local", DefKind::Trait);
+         let hrtb_body = named_def(tcx, "hrtb_body", DefKind::Fn).expect_local();
++        let external_hrtb_projection =
++            named_def(tcx, "external_hrtb_projection", DefKind::Fn).expect_local();
+         let local_impl = only_impl_for_trait(tcx, local).expect_local();
+         let out = associated_item(tcx, local, "Out");
+         let out_impl = tcx.impl_item_implementor_ids(local_impl)[&out];
+ 
+         assert_eq!(cold.len(), 3);
++        assert!(cold.iter().all(|dependency| {
++            dependency.source_owner != external_hrtb_projection
++        }));
+         assert_eq!(
+             exact_dependencies(cold, tcx),
+             HashSet::from([
+-- 
+2.55.0
+

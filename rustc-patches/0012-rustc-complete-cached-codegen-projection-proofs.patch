@@ -1,0 +1,161 @@
+From bb01380f7af4e9f8da77b19af289f6196388cd54 Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Fri, 14 Aug 2026 06:40:00 +0900
+Subject: [PATCH 12/14] rustc: complete cached codegen projection proofs
+
+---
+ .../src/traits/codegen_proof.rs               | 16 +++-------
+ .../src/traits/project.rs                     | 27 +++++++----------
+ .../auxiliary/selection-proof-trace-input.rs  |  1 +
+ tests/ui-fulldeps/selection-proof-trace.rs    | 30 +++++++++++++++++++
+ 4 files changed, 45 insertions(+), 29 deletions(-)
+
+diff --git a/compiler/rustc_trait_selection/src/traits/codegen_proof.rs b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
+index 0c332374..59ecf0f6 100644
+--- a/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
++++ b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
+@@ -77,12 +77,6 @@ pub(crate) fn unmute(&mut self) {
+         self.muted = self.muted.checked_sub(1).expect("unbalanced codegen proof mute");
+     }
+ 
+-    pub(crate) fn mark_incomplete(&mut self) {
+-        if self.is_recording() {
+-            self.incomplete = true;
+-        }
+-    }
+-
+     pub(crate) fn set_current_owner(
+         &mut self,
+         owner: Option<CodegenProofNodeId>,
+@@ -123,12 +117,10 @@ pub(crate) fn record_selection(
+             .map(|obligation| self.node_for(obligation))
+             .collect();
+         let selection = CodegenTraitSelectionTrace { node, source: source.map(|_| ()), nested };
+-        match self.trait_selections.iter().find(|existing| existing.node == node) {
+-            Some(existing) if existing == &selection => {}
+-            Some(_) => {
+-                self.incomplete = true;
+-            }
+-            None => self.trait_selections.push(selection),
++        // Re-selecting the same obligation may produce fresh inference variables. Preserve
++        // distinct observations until `finish` resolves them, then fail closed if they differ.
++        if !self.trait_selections.contains(&selection) {
++            self.trait_selections.push(selection);
+         }
+     }
+ 
+diff --git a/compiler/rustc_trait_selection/src/traits/project.rs b/compiler/rustc_trait_selection/src/traits/project.rs
+index 883ce0d5..c96aae1c 100644
+--- a/compiler/rustc_trait_selection/src/traits/project.rs
++++ b/compiler/rustc_trait_selection/src/traits/project.rs
+@@ -333,30 +333,23 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
+     // bounds. It might be the case that we want two distinct caches,
+     // or else another kind of cache entry.
+     let mut cache_entry = infcx.inner.borrow_mut().projection_cache().try_start(cache_key);
+-    let unobserved_terminal_cache_entry =
+-        matches!(
+-            &cache_entry,
+-            Err(ProjectionCacheEntry::NormalizedTerm { .. }
+-                | ProjectionCacheEntry::Ambiguous
+-                | ProjectionCacheEntry::Error)
+-        ) && selcx.codegen_proof_recorder().is_some_and(|recorder| {
++    let terminal_cache_entry = matches!(
++        &cache_entry,
++        Err(ProjectionCacheEntry::NormalizedTerm { .. }
++            | ProjectionCacheEntry::Ambiguous
++            | ProjectionCacheEntry::Error)
++    );
++    let unobserved_codegen_terminal_cache_entry = terminal_cache_entry
++        && selcx.codegen_proof_recorder().is_some_and(|recorder| {
+             let recorder = recorder.borrow();
+             recorder.is_recording() && !recorder.projection_has_result(param_env, projection_term)
+         });
+-    if unobserved_terminal_cache_entry && let Some(recorder) = selcx.codegen_proof_recorder() {
+-        recorder.borrow_mut().mark_incomplete();
+-    }
+     let unobserved_dependency_terminal_cache_entry = !dependency_projection_has_result
+-        && matches!(
+-            &cache_entry,
+-            Err(ProjectionCacheEntry::NormalizedTerm { .. }
+-                | ProjectionCacheEntry::Ambiguous
+-                | ProjectionCacheEntry::Error)
+-        )
++        && terminal_cache_entry
+         && selcx
+             .typeck_impl_dependency_recorder()
+             .is_some_and(|recorder| recorder.borrow().is_recording());
+-    if unobserved_dependency_terminal_cache_entry {
++    if unobserved_codegen_terminal_cache_entry || unobserved_dependency_terminal_cache_entry {
+         let mut inner = infcx.inner.borrow_mut();
+         let mut cache = inner.projection_cache();
+         assert!(cache.remove(cache_key));
+diff --git a/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
+index e7e55142..72918153 100644
+--- a/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
++++ b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
+@@ -19,6 +19,7 @@ trait Supply {
+ struct Source;
+ 
+ type Callback = fn() -> Value;
++type IteratorMap = std::iter::Map<std::ops::Range<i32>, fn(i32) -> i32>;
+ 
+ impl Other for Source {
+     type X = Value;
+diff --git a/tests/ui-fulldeps/selection-proof-trace.rs b/tests/ui-fulldeps/selection-proof-trace.rs
+index de531d48..2fe8b0dc 100644
+--- a/tests/ui-fulldeps/selection-proof-trace.rs
++++ b/tests/ui-fulldeps/selection-proof-trace.rs
+@@ -275,6 +275,34 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+             );
+         }
+ 
++        // Candidate evaluation for `Map: Iterator` normalizes `I::Item` while proof recording is
++        // muted. The committed rematch must not reuse that evidence-less terminal cache entry.
++        let iterator_map = named_def(tcx, "IteratorMap", DefKind::TyAlias);
++        let iterator_map_ty = tcx.type_of(iterator_map).instantiate_identity().skip_norm_wip();
++        let iterator = tcx.get_diagnostic_item(sym::Iterator).unwrap();
++        let iterator_item = tcx.get_diagnostic_item(sym::IteratorItem).unwrap();
++        let iterator_key =
++            typing_env.as_query_input(ty::TraitRef::new(tcx, iterator, [iterator_map_ty]));
++        let iterator_proof = tcx.codegen_selection_proof(iterator_key).unwrap();
++        assert_eq!(iterator_proof.top_source, *tcx.codegen_select_candidate(iterator_key).unwrap());
++        let iterator_owned = iterator_proof.clone();
++        let iterator_warm = tcx.codegen_selection_proof(iterator_key).unwrap();
++        assert!(std::ptr::eq(iterator_proof, iterator_warm));
++        assert_eq!(iterator_owned, *iterator_warm);
++        let iterator_item_projection = iterator_proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| {
++                projection.projection.expect_projection_def_id() == iterator_item
++            })
++            .unwrap();
++        assert!(matches!(
++            iterator_item_projection.source,
++            CodegenProjectionSource::Selected(ImplSource::UserDefined(_))
++        ));
++        assert!(iterator_item_projection.selected_projection_item.is_some());
++
+         // The selected HeaderOnly impl has a projection in its header. This inner projection must
+         // come from the original committed rematch, not from speculative candidate search.
+         let header = named_def(tcx, "Header", DefKind::Trait);
+@@ -849,6 +877,7 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+ 
+         self.reports.lock().unwrap().push(CanonicalRunReport {
+             main: canonical_report(tcx, proof),
++            iterator: canonical_report(tcx, iterator_proof),
+             header: canonical_report(tcx, header_proof),
+             cache: canonical_report(tcx, cache_proof),
+             param_env: canonical_report(tcx, param_env_proof),
+@@ -872,6 +901,7 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+ #[derive(Debug, Eq, PartialEq)]
+ struct CanonicalRunReport {
+     main: CanonicalSelectionReport,
++    iterator: CanonicalSelectionReport,
+     header: CanonicalSelectionReport,
+     cache: CanonicalSelectionReport,
+     param_env: CanonicalSelectionReport,
+-- 
+2.55.0
+

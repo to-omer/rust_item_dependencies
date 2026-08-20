@@ -1,0 +1,2 @@
+[alias]
+rid = "--config build.build-dir='target/rust-item-dependencies/launcher' -Zscript tools/rid.rs"

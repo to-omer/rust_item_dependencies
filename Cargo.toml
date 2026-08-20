@@ -1,0 +1,14 @@
+[package]
+name = "rust-item-dependencies"
+version = "0.0.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+# This crate links rustc_private metadata from a custom stage2. Cargo invokes
+# rustdoc separately, so doctests cannot share that compiler ABI.
+doctest = false
+
+[dependencies]

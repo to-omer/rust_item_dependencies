@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full:
+    name: Full acceptance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: >-
+          rustup toolchain install nightly-2026-08-10
+          --profile minimal
+          --component clippy
+          --component rustc-dev
+          --component rust-src
+          --component rustfmt
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --locked --all-targets
+      - name: Bootstrap patched compiler through cargo rid
+        run: >-
+          cargo rid tests/fixtures/compiler/driver_smoke.rs
+          -o target/ci-reduced.rs
+      - name: Build patched compiler
+        shell: bash
+        run: bash scripts/build-patched-rustc.sh target/rust-item-dependencies/rustc
+      - name: Run full acceptance suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          host=$(rustc -Vv | sed -n 's/^host: //p' | tr -d '\r')
+          test -n "$host"
+          stage2="$PWD/target/rust-item-dependencies/rustc/build/$host/stage2"
+          bash scripts/check-acceptance.sh "$stage2"

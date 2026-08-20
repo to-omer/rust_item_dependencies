@@ -1,0 +1,407 @@
+From 3fd0a2f57c265a90a0b000527cc4e0c935ac09be Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Tue, 11 Aug 2026 04:20:24 +0900
+Subject: [PATCH] rustc: preserve selected import provenance
+
+---
+ compiler/rustc_driver_impl/src/lib.rs         |  2 +-
+ compiler/rustc_hir_typeck/src/method/mod.rs   | 13 +++++++
+ compiler/rustc_hir_typeck/src/writeback.rs    |  4 ++
+ compiler/rustc_middle/src/ty/mod.rs           | 18 ++++++++-
+ .../rustc_middle/src/ty/typeck_results.rs     | 13 +++++++
+ compiler/rustc_resolve/src/ident.rs           |  5 ++-
+ compiler/rustc_resolve/src/imports.rs         |  3 +-
+ compiler/rustc_resolve/src/late.rs            | 34 ++++++++++++++---
+ compiler/rustc_resolve/src/lib.rs             | 38 ++++++++++++++++++-
+ 9 files changed, 119 insertions(+), 11 deletions(-)
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 49ed4e63..3e4e3ca9 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 3;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 4;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_hir_typeck/src/method/mod.rs b/compiler/rustc_hir_typeck/src/method/mod.rs
+index 3425ba5d..4d7b98da 100644
+--- a/compiler/rustc_hir_typeck/src/method/mod.rs
++++ b/compiler/rustc_hir_typeck/src/method/mod.rs
+@@ -253,6 +253,13 @@ pub(crate) fn lookup_method(
+             return Err(IllegalSizedBound { candidates, needs_mut, bound_span: span, self_expr });
+         }
+ 
++        if !pick.import_ids.is_empty() {
++            self.typeck_results
++                .borrow_mut()
++                .selected_trait_imports_mut()
++                .insert(call_expr.hir_id, pick.import_ids.to_vec());
++        }
++
+         Ok(result.callee)
+     }
+ 
+@@ -566,6 +573,12 @@ pub(crate) fn resolve_fully_qualified_call(
+ 
+         let def_kind = pick.item.as_def_kind();
+         tcx.check_stability(pick.item.def_id, Some(expr_id), span, Some(method_name.span));
++        if !pick.import_ids.is_empty() {
++            self.typeck_results
++                .borrow_mut()
++                .selected_trait_imports_mut()
++                .insert(expr_id, pick.import_ids.to_vec());
++        }
+         Ok((def_kind, pick.item.def_id))
+     }
+ 
+diff --git a/compiler/rustc_hir_typeck/src/writeback.rs b/compiler/rustc_hir_typeck/src/writeback.rs
+index 7b1f38f8..c47b3272 100644
+--- a/compiler/rustc_hir_typeck/src/writeback.rs
++++ b/compiler/rustc_hir_typeck/src/writeback.rs
+@@ -85,6 +85,10 @@ pub(crate) fn resolve_type_vars_in_body(
+         debug!("used_trait_imports({:?}) = {:?}", item_def_id, used_trait_imports);
+         wbcx.typeck_results.used_trait_imports = used_trait_imports;
+ 
++        let selected_trait_imports =
++            mem::take(&mut self.typeck_results.borrow_mut().selected_trait_imports);
++        wbcx.typeck_results.selected_trait_imports = selected_trait_imports;
++
+         debug!("writeback: typeck results for {:?} are {:#?}", item_def_id, wbcx.typeck_results);
+ 
+         self.tcx.arena.alloc(wbcx.typeck_results)
+diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
+index 5328b295..3bfd1be9 100644
+--- a/compiler/rustc_middle/src/ty/mod.rs
++++ b/compiler/rustc_middle/src/ty/mod.rs
+@@ -113,7 +113,7 @@
+     UserTypeKind,
+ };
+ use crate::diagnostics::{OpaqueHiddenTypeMismatch, TypeMismatchReason};
+-use crate::metadata::{AmbigModChild, ModChild};
++use crate::metadata::{AmbigModChild, ModChild, Reexport};
+ use crate::middle::privacy::EffectiveVisibilities;
+ use crate::mir::{Body, CoroutineLayout, CoroutineSavedLocal, MirPhase, SourceInfo};
+ use crate::query::{IntoQueryKey, Providers};
+@@ -184,6 +184,11 @@ pub struct ResolverGlobalCtxt {
+     pub macro_reachable_adts: FxIndexMap<LocalDefId, FxIndexSet<LocalDefId>>,
+     pub extern_crate_map: UnordMap<LocalDefId, CrateNum>,
+     pub maybe_unused_trait_imports: FxIndexSet<LocalDefId>,
++    /// Import/re-export chains selected by finalized non-macro path resolution.
++    ///
++    /// These records preserve the source owner and use site before resolver
++    /// output is lowered into body-wide used-import sets.
++    pub resolved_import_uses: Vec<ResolvedImportUse>,
+     pub module_children: LocalDefIdMap<Vec<ModChild>>,
+     pub ambig_module_children: LocalDefIdMap<Vec<AmbigModChild>>,
+     pub glob_map: FxIndexMap<LocalDefId, FxIndexSet<Symbol>>,
+@@ -204,6 +209,17 @@ pub struct ResolverGlobalCtxt {
+     pub delegation_infos: FxIndexMap<LocalDefId, DelegationInfo>,
+ }
+ 
++#[derive(Debug, StableHash)]
++pub struct ResolvedImportUse {
++    pub owner: LocalDefId,
++    pub path_span: Span,
++    pub segment_span: Span,
++    pub namespace: hir::def::Namespace,
++    pub target: Res<!>,
++    /// Ordered from the use-site-visible import towards the original item.
++    pub import_chain: Vec<Reexport>,
++}
++
+ #[derive(Debug)]
+ pub struct PerOwnerResolverData<'tcx> {
+     pub node_id_to_def_id: NodeMap<LocalDefId> = Default::default(),
+diff --git a/compiler/rustc_middle/src/ty/typeck_results.rs b/compiler/rustc_middle/src/ty/typeck_results.rs
+index ff7cef36..1d55f197 100644
+--- a/compiler/rustc_middle/src/ty/typeck_results.rs
++++ b/compiler/rustc_middle/src/ty/typeck_results.rs
+@@ -162,6 +162,10 @@ pub struct TypeckResults<'tcx> {
+     /// This is used for warning unused imports.
+     pub used_trait_imports: UnordSet<LocalDefId>,
+ 
++    /// The exact trait-import chain selected at each successful method or
++    /// type-relative associated-item lookup site.
++    pub selected_trait_imports: ItemLocalMap<Vec<LocalDefId>>,
++
+     /// If any errors occurred while type-checking this body,
+     /// this field will be set to `Some(ErrorGuaranteed)`.
+     pub tainted_by_errors: Option<ErrorGuaranteed>,
+@@ -251,6 +255,7 @@ pub fn new(hir_owner: OwnerId) -> TypeckResults<'tcx> {
+             fru_field_types: Default::default(),
+             coercion_casts: Default::default(),
+             used_trait_imports: Default::default(),
++            selected_trait_imports: Default::default(),
+             tainted_by_errors: None,
+             hidden_types: Default::default(),
+             closure_min_captures: Default::default(),
+@@ -295,6 +300,14 @@ pub fn type_dependent_defs_mut(
+         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.type_dependent_defs }
+     }
+ 
++    pub fn selected_trait_imports(&self) -> LocalTableInContext<'_, Vec<LocalDefId>> {
++        LocalTableInContext { hir_owner: self.hir_owner, data: &self.selected_trait_imports }
++    }
++
++    pub fn selected_trait_imports_mut(&mut self) -> LocalTableInContextMut<'_, Vec<LocalDefId>> {
++        LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.selected_trait_imports }
++    }
++
+     pub fn splatted_defs(
+         &self,
+     ) -> LocalTableInContext<'_, Result<SplattedDef<'tcx>, ErrorGuaranteed>> {
+diff --git a/compiler/rustc_resolve/src/ident.rs b/compiler/rustc_resolve/src/ident.rs
+index 2a1b208f..c855a43c 100644
+--- a/compiler/rustc_resolve/src/ident.rs
++++ b/compiler/rustc_resolve/src/ident.rs
+@@ -1350,7 +1350,7 @@ fn finalize_module_binding(
+         finalize: Finalize,
+         shadowing: Shadowing,
+     ) -> Result<Decl<'ra>, ControlFlow<Determinacy, Determinacy>> {
+-        let Finalize { path_span, report_private, used, root_span, .. } = finalize;
++        let Finalize { path_span, report_private, used, root_span, owner, .. } = finalize;
+ 
+         let Some(binding) = binding else {
+             return Err(ControlFlow::Continue(Determined));
+@@ -1381,6 +1381,9 @@ fn finalize_module_binding(
+             self.macro_expanded_macro_export_errors.insert((path_span, binding.span));
+         }
+ 
++        if let Some(owner) = owner {
++            self.record_import_use(owner, path_span, ident.span, binding);
++        }
+         self.record_use(ident, binding, used);
+         return Ok(binding);
+     }
+diff --git a/compiler/rustc_resolve/src/imports.rs b/compiler/rustc_resolve/src/imports.rs
+index 499f9ea2..d74e6f8f 100644
+--- a/compiler/rustc_resolve/src/imports.rs
++++ b/compiler/rustc_resolve/src/imports.rs
+@@ -1199,7 +1199,8 @@ fn finalize_import(&mut self, import: Import<'ra>) -> Option<UnresolvedImportErr
+             errors.iter().filter(|error| error.warning.is_none()).count()
+         };
+         let prev_ambiguity_errors_len = ambiguity_errors_len(&self.ambiguity_errors);
+-        let finalize = Finalize::with_root_span(import.root_id, import.span, import.root_span);
++        let finalize = Finalize::with_root_span(import.root_id, import.span, import.root_span)
++            .with_owner(import.def_id());
+ 
+         // We'll provide more context to the privacy errors later, up to `len`.
+         let privacy_errors_len = self.privacy_errors.len();
+diff --git a/compiler/rustc_resolve/src/late.rs b/compiler/rustc_resolve/src/late.rs
+index fc723586..97c91098 100644
+--- a/compiler/rustc_resolve/src/late.rs
++++ b/compiler/rustc_resolve/src/late.rs
+@@ -979,7 +979,10 @@ fn visit_ty(&mut self, ty: &'ast Ty) {
+                     .resolve_ident_in_lexical_scope(
+                         self_ty,
+                         TypeNS,
+-                        Some(Finalize::new(ty.id, ty.span)),
++                        Some(
++                            Finalize::new(ty.id, ty.span)
++                                .with_owner(Some(self.r.current_owner.def_id)),
++                        ),
+                         None,
+                     )
+                     .map_or(Res::Err, |d| d.res());
+@@ -3460,7 +3463,8 @@ fn with_optional_trait_ref<T>(
+                 &None,
+                 &path,
+                 PathSource::Trait(AliasPossibility::No),
+-                Finalize::new(trait_ref.ref_id, trait_ref.path.span),
++                Finalize::new(trait_ref.ref_id, trait_ref.path.span)
++                    .with_owner(Some(self.r.current_owner.def_id)),
+                 RecordPartialRes::Yes,
+                 None,
+             );
+@@ -4428,6 +4432,12 @@ fn try_resolve_as_non_binding(
+             ) if is_syntactic_ambiguity => {
+                 // Disambiguate in favor of a unit struct/variant or constant pattern.
+                 if let Some(binding) = binding {
++                    self.r.record_import_use(
++                        self.r.current_owner.def_id,
++                        ident.span,
++                        ident.span,
++                        binding,
++                    );
+                     self.r.record_use(ident, binding, Used::Other);
+                 }
+                 Some(res)
+@@ -4540,7 +4550,7 @@ fn smart_resolve_path(
+             qself,
+             &Segment::from_path(path),
+             source,
+-            Finalize::new(id, path.span),
++            Finalize::new(id, path.span).with_owner(Some(self.r.current_owner.def_id)),
+             RecordPartialRes::Yes,
+             None,
+         );
+@@ -4871,18 +4881,24 @@ fn resolve_qpath_anywhere(
+         source: PathSource<'_, 'ast, 'ra>,
+     ) -> Result<Option<PartialRes>, Spanned<ResolutionError<'ra>>> {
+         let mut fin_res = None;
++        let mut fin_import_uses = None;
+ 
+         for (i, &ns) in [primary_ns, TypeNS, ValueNS].iter().enumerate() {
+             if i == 0 || ns != primary_ns {
+-                match self.resolve_qpath(qself, path, ns, finalize, source)? {
++                let import_use_checkpoint = self.r.resolved_import_uses.len();
++                let result = self.resolve_qpath(qself, path, ns, finalize, source);
++                let import_uses = self.r.resolved_import_uses.split_off(import_use_checkpoint);
++                match result? {
+                     Some(partial_res)
+                         if partial_res.unresolved_segments() == 0 || defer_to_typeck =>
+                     {
++                        self.r.resolved_import_uses.extend(import_uses);
+                         return Ok(Some(partial_res));
+                     }
+                     partial_res => {
+                         if fin_res.is_none() {
+                             fin_res = partial_res;
++                            fin_import_uses = Some(import_uses);
+                         }
+                     }
+                 }
+@@ -4897,6 +4913,7 @@ fn resolve_qpath_anywhere(
+             return Ok(Some(res));
+         }
+ 
++        self.r.resolved_import_uses.extend(fin_import_uses.into_iter().flatten());
+         Ok(fin_res)
+     }
+ 
+@@ -4931,7 +4948,7 @@ fn resolve_qpath(
+                 &None,
+                 &path[..qself.position],
+                 PathSource::Trait(AliasPossibility::No),
+-                Finalize::new(finalize.node_id, qself.path_span),
++                Finalize { path_span: qself.path_span, root_span: qself.path_span, ..finalize },
+                 RecordPartialRes::No,
+                 Some(&qself),
+             );
+@@ -4956,7 +4973,7 @@ fn resolve_qpath(
+                 &None,
+                 &path[..=qself.position],
+                 PathSource::TraitItem(ns, &source),
+-                Finalize::with_root_span(finalize.node_id, finalize.path_span, qself.path_span),
++                Finalize { root_span: qself.path_span, ..finalize },
+                 RecordPartialRes::No,
+                 Some(&qself),
+             );
+@@ -4970,6 +4987,7 @@ fn resolve_qpath(
+             )));
+         }
+ 
++        let import_use_checkpoint = self.r.resolved_import_uses.len();
+         let result = match self.resolve_path(path, Some(ns), Some(finalize), source) {
+             PathResult::NonModule(path_res) => path_res,
+             PathResult::Module(ModuleOrUniformRoot::Module(module)) if !module.is_normal() => {
+@@ -4997,6 +5015,10 @@ fn resolve_qpath(
+                 if (ns == TypeNS || path.len() > 1)
+                     && PrimTy::from_name(path[0].ident.name).is_some() =>
+             {
++                // The imported module was only a failed resolution attempt. The semantic
++                // result below is the primitive type, so its import chain must not leak into
++                // dependency provenance.
++                self.r.resolved_import_uses.truncate(import_use_checkpoint);
+                 let prim = PrimTy::from_name(path[0].ident.name).unwrap();
+                 let tcx = self.r.tcx();
+ 
+diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
+index b7e57ad8..e5cfcfc0 100644
+--- a/compiler/rustc_resolve/src/lib.rs
++++ b/compiler/rustc_resolve/src/lib.rs
+@@ -65,7 +65,7 @@
+ use rustc_middle::middle::privacy::EffectiveVisibilities;
+ use rustc_middle::query::Providers;
+ use rustc_middle::ty::{
+-    self, DelegationInfo, MainDefinition, PerOwnerResolverData, RegisteredTools,
++    self, DelegationInfo, MainDefinition, PerOwnerResolverData, RegisteredTools, ResolvedImportUse,
+     ResolverAstLowering, ResolverGlobalCtxt, TyCtxt, TyCtxtFeed, Visibility,
+ };
+ use rustc_middle::{bug, span_bug};
+@@ -1366,6 +1366,9 @@ pub struct Resolver<'ra, 'tcx> {
+     /// An import will be inserted into this map if it has been used.
+     import_use_map: FxHashMap<Import<'ra>, Used> = default::fx_hash_map(),
+ 
++    /// Finalized import/re-export provenance for semantic, non-macro paths.
++    resolved_import_uses: Vec<ResolvedImportUse> = Vec::new(),
++
+     /// `CrateNum` resolutions of `extern crate` items.
+     extern_crate_map: UnordMap<LocalDefId, CrateNum> = Default::default(),
+     module_children: LocalDefIdMap<Vec<ModChild>> = Default::default(),
+@@ -1941,6 +1944,7 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+         let expn_that_defined = self.expn_that_defined;
+         let extern_crate_map = self.extern_crate_map;
+         let maybe_unused_trait_imports = self.maybe_unused_trait_imports;
++        let resolved_import_uses = self.resolved_import_uses;
+         let glob_map = self.glob_map;
+         let main_def = self.main_def;
+         let confused_type_with_std_module = self.confused_type_with_std_module;
+@@ -1970,6 +1974,7 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+             ambig_module_children: self.ambig_module_children,
+             glob_map,
+             maybe_unused_trait_imports,
++            resolved_import_uses,
+             main_def,
+             trait_impls: self.trait_impls,
+             proc_macros,
+@@ -2308,6 +2313,27 @@ fn record_use(&mut self, ident: Ident, used_decl: Decl<'ra>, used: Used) {
+         }
+     }
+ 
++    fn record_import_use(
++        &mut self,
++        owner: LocalDefId,
++        path_span: Span,
++        segment_span: Span,
++        binding: Decl<'ra>,
++    ) {
++        let import_chain = binding.reexport_chain();
++        if import_chain.is_empty() {
++            return;
++        }
++        self.resolved_import_uses.push(ResolvedImportUse {
++            owner,
++            path_span,
++            segment_span,
++            namespace: binding.res().ns().expect("an imported path binding must have a namespace"),
++            target: binding.res().expect_non_local(),
++            import_chain: import_chain.into_vec(),
++        });
++    }
++
+     #[inline]
+     fn add_to_glob_map(&mut self, import: Import<'_>, name: Symbol) {
+         if let ImportKind::Glob { def_id, .. } = import.kind {
+@@ -2805,6 +2831,11 @@ struct Finalize {
+     stage: Stage = Stage::Early,
+     /// Some import data, in case we are resolving an import's final segment.
+     import: Option<ImportSummary> = None,
++    /// HIR owner whose semantic path use is being finalized.
++    ///
++    /// `None` is used for diagnostic/speculative and macro resolution, which
++    /// must not contribute path provenance facts.
++    owner: Option<LocalDefId> = None,
+ }
+ 
+ impl Finalize {
+@@ -2815,6 +2846,11 @@ fn new(node_id: NodeId, path_span: Span) -> Finalize {
+     fn with_root_span(node_id: NodeId, path_span: Span, root_span: Span) -> Finalize {
+         Finalize { node_id, path_span, root_span, .. }
+     }
++
++    fn with_owner(mut self, owner: Option<LocalDefId>) -> Finalize {
++        self.owner = owner;
++        self
++    }
+ }
+ 
+ pub fn provide(providers: &mut Providers) {
+-- 
+2.55.0
+

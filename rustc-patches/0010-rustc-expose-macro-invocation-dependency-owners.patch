@@ -1,0 +1,121 @@
+From 94dba1159f2ae46ca0511effcd1a7ca706532a79 Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Thu, 13 Aug 2026 01:50:00 +0900
+Subject: [PATCH 10/10] rustc: expose macro invocation dependency owners
+
+---
+ compiler/rustc_driver_impl/src/lib.rs       |  2 +-
+ compiler/rustc_middle/src/ty/mod.rs         |  2 ++
+ compiler/rustc_resolve/src/def_collector.rs | 18 +++++++++++++++---
+ compiler/rustc_resolve/src/lib.rs           |  2 ++
+ compiler/rustc_resolve/src/macros.rs        |  1 +
+ 5 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 4e6b454e..dd25bd0e 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 9;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 10;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
+index c78f02e5..726b06df 100644
+--- a/compiler/rustc_middle/src/ty/mod.rs
++++ b/compiler/rustc_middle/src/ty/mod.rs
+@@ -286,6 +286,8 @@ pub struct MacroResolvedImportUse {
+ pub struct MacroInvocationOrigin {
+     /// Expansion whose output contained this invocation when it was collected.
+     pub discovered_in_expansion: ExpnId,
++    /// Local definition that lexically contains this invocation.
++    pub parent_definition: LocalDefId,
+     /// Span of the unexpanded AST node that contained the invocation.
+     ///
+     /// For a written statement or item macro this includes its trailing semicolon.
+diff --git a/compiler/rustc_resolve/src/def_collector.rs b/compiler/rustc_resolve/src/def_collector.rs
+index 97ca994c..32453a62 100644
+--- a/compiler/rustc_resolve/src/def_collector.rs
++++ b/compiler/rustc_resolve/src/def_collector.rs
+@@ -68,10 +68,20 @@ pub(super) fn create_def(
+ 
+     fn with_parent<F: FnOnce(&mut Self)>(&mut self, parent_def: LocalDefId, f: F) {
+         let orig_parent_def = mem::replace(&mut self.invocation_parent.parent_def, parent_def);
++        let orig_dependency_parent_def =
++            mem::replace(&mut self.invocation_parent.dependency_parent_def, parent_def);
+         f(self);
++        self.invocation_parent.dependency_parent_def = orig_dependency_parent_def;
+         self.invocation_parent.parent_def = orig_parent_def;
+     }
+ 
++    fn with_dependency_parent<F: FnOnce(&mut Self)>(&mut self, parent_def: LocalDefId, f: F) {
++        let orig_parent_def =
++            mem::replace(&mut self.invocation_parent.dependency_parent_def, parent_def);
++        f(self);
++        self.invocation_parent.dependency_parent_def = orig_parent_def;
++    }
++
+     pub(super) fn with_owner<F: FnOnce(&mut Self, TyCtxtFeed<'tcx, LocalDefId>)>(
+         &mut self,
+         owner: NodeId,
+@@ -368,7 +378,7 @@ fn visit_generic_param(&mut self, param: &'a GenericParam) {
+             GenericParamKind::Type { .. } => DefKind::TyParam,
+             GenericParamKind::Const { .. } => DefKind::ConstParam,
+         };
+-        self.create_def(param.id, Some(param.ident.name), def_kind, param.ident.span);
++        let def = self.create_def(param.id, Some(param.ident.name), def_kind, param.ident.span);
+ 
+         // impl-Trait can happen inside generic parameters, like
+         // ```
+@@ -376,8 +386,10 @@ fn visit_generic_param(&mut self, param: &'a GenericParam) {
+         // ```
+         //
+         // In that case, the impl-trait is lowered as an additional generic parameter.
+-        self.with_impl_trait(ImplTraitContext::Universal, |this| {
+-            visit::walk_generic_param(this, param)
++        self.with_dependency_parent(def.def_id(), |this| {
++            this.with_impl_trait(ImplTraitContext::Universal, |this| {
++                visit::walk_generic_param(this, param)
++            })
+         });
+     }
+ 
+diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
+index 6de5aa2b..a03cf47d 100644
+--- a/compiler/rustc_resolve/src/lib.rs
++++ b/compiler/rustc_resolve/src/lib.rs
+@@ -189,6 +189,7 @@ fn module(module: LocalModule<'ra>, arenas: &'ra ResolverArenas<'ra>) -> ParentS
+ #[derive(Copy, Debug, Clone)]
+ struct InvocationParent {
+     parent_def: LocalDefId,
++    dependency_parent_def: LocalDefId,
+     impl_trait_context: ImplTraitContext,
+     in_attr: bool,
+     owner: NodeId,
+@@ -197,6 +198,7 @@ struct InvocationParent {
+ impl InvocationParent {
+     const ROOT: Self = Self {
+         parent_def: CRATE_DEF_ID,
++        dependency_parent_def: CRATE_DEF_ID,
+         impl_trait_context: ImplTraitContext::Existential,
+         in_attr: false,
+         owner: CRATE_NODE_ID,
+diff --git a/compiler/rustc_resolve/src/macros.rs b/compiler/rustc_resolve/src/macros.rs
+index 47ba9276..9bb58b4a 100644
+--- a/compiler/rustc_resolve/src/macros.rs
++++ b/compiler/rustc_resolve/src/macros.rs
+@@ -405,6 +405,7 @@ fn resolve_macro_invocation(
+         let expn_id = invoc_id.to_expn_id();
+         let origin = MacroInvocationOrigin {
+             discovered_in_expansion: invoc.discovered_in_expansion.to_expn_id(),
++            parent_definition: invocation_parent.dependency_parent_def,
+             invocation_node_span: invoc.node_span(),
+             target_span: invoc.target_span(),
+             fragment_kind: macro_invocation_fragment_kind(invoc.fragment_kind),
+-- 
+2.55.0
+

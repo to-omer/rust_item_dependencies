@@ -1,0 +1,77 @@
+From 9aa0524375d54cb6be87b19f96c49f3729069aeb Mon Sep 17 00:00:00 2001
+From: to-omer <48119218+to-omer@users.noreply.github.com>
+Date: Fri, 14 Aug 2026 12:01:40 +0900
+Subject: [PATCH] Ignore unresolved imported path provenance
+
+---
+ compiler/rustc_resolve/src/lib.rs                  | 10 ++++++++--
+ tests/ui/resolve/error-recovery-import-observer.rs | 10 ++++++++++
+ .../resolve/error-recovery-import-observer.stderr  | 14 ++++++++++++++
+ 3 files changed, 32 insertions(+), 2 deletions(-)
+ create mode 100644 tests/ui/resolve/error-recovery-import-observer.rs
+ create mode 100644 tests/ui/resolve/error-recovery-import-observer.stderr
+
+diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
+index 9b108340..f044c189 100644
+--- a/compiler/rustc_resolve/src/lib.rs
++++ b/compiler/rustc_resolve/src/lib.rs
+@@ -2349,12 +2349,18 @@ fn record_import_use(
+         if import_chain.is_empty() {
+             return;
+         }
++
++        let resolution = binding.res();
++        if matches!(resolution, def::Res::Err) {
++            return;
++        }
++
+         self.resolved_import_uses.push(ResolvedImportUse {
+             owner,
+             path_span,
+             segment_span,
+-            namespace: binding.res().ns().expect("an imported path binding must have a namespace"),
+-            target: binding.res().expect_non_local(),
++            namespace: resolution.ns().expect("an imported path binding must have a namespace"),
++            target: resolution.expect_non_local(),
+             import_chain: import_chain.into_vec(),
+         });
+     }
+diff --git a/tests/ui/resolve/error-recovery-import-observer.rs b/tests/ui/resolve/error-recovery-import-observer.rs
+new file mode 100644
+index 00000000..2d6139b8
+--- /dev/null
++++ b/tests/ui/resolve/error-recovery-import-observer.rs
+@@ -0,0 +1,10 @@
++#![allow(unused_imports)]
++
++mod reexport {
++    pub use nonexistent::Missing;
++    //~^ ERROR unresolved import `nonexistent`
++}
++
++use reexport::Missing;
++
++fn main() {}
+diff --git a/tests/ui/resolve/error-recovery-import-observer.stderr b/tests/ui/resolve/error-recovery-import-observer.stderr
+new file mode 100644
+index 00000000..da3134bf
+--- /dev/null
++++ b/tests/ui/resolve/error-recovery-import-observer.stderr
+@@ -0,0 +1,14 @@
++error[E0432]: unresolved import `nonexistent`
++  --> $DIR/error-recovery-import-observer.rs:4:13
++   |
++LL |     pub use nonexistent::Missing;
++   |             ^^^^^^^^^^^ use of unresolved module or unlinked crate `nonexistent`
++   |
++help: you might be missing a crate named `nonexistent`, add it to your project and import it in your code
++   |
++LL + extern crate nonexistent;
++   |
++
++error: aborting due to 1 previous error
++
++For more information about this error, try `rustc --explain E0432`.
+-- 
+2.55.0
+

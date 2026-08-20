@@ -1,0 +1,33 @@
+From e823797f83d590c1cafed8f4cf45dfd20be3a033 Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Tue, 11 Aug 2026 04:15:00 +0900
+Subject: [PATCH] rustc_driver: bind stage2 to patch queue digest
+
+---
+ compiler/rustc_driver_impl/src/lib.rs | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 780186e9..49ed4e63 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,15 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 2;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 3;
++
++/// Digest of the ordered patch queue used to build this compiler.
++///
++/// The build must provide this value explicitly. This prevents an external
++/// rustc_private client from accepting a stale stage2 artifact merely because
++/// it exposes the same schema version.
++pub const RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST: &str =
++    env!("RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST");
+ 
+ pub use rustc_interface::interface::Config as CompilerConfig;
+ pub use rustc_session::{ExternalResourceGuard, ExternalResourceKind, ExternalResourceUse};
+-- 
+2.55.0
+

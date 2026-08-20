@@ -1,0 +1,537 @@
+From 7564e70010a59d2e3409459bfdcbead3ed4076b9 Mon Sep 17 00:00:00 2001
+From: to-omer <48119218+to-omer@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 15:56:03 +0900
+Subject: [PATCH] Expose selected declarative macro rules
+
+---
+ compiler/rustc_driver_impl/src/lib.rs         |   2 +-
+ compiler/rustc_expand/src/base.rs             |   7 +-
+ compiler/rustc_expand/src/mbe/macro_rules.rs  |  46 ++++--
+ compiler/rustc_middle/src/ty/mod.rs           |  22 +++
+ compiler/rustc_resolve/src/def_collector.rs   |   1 +
+ compiler/rustc_resolve/src/lib.rs             |   8 ++
+ compiler/rustc_resolve/src/macros.rs          |  59 +++++++-
+ .../auxiliary/macro-rule-observer-input.rs    |  40 ++++++
+ tests/ui-fulldeps/macro-rule-observer.rs      | 132 ++++++++++++++++++
+ 9 files changed, 304 insertions(+), 13 deletions(-)
+ create mode 100644 tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs
+ create mode 100644 tests/ui-fulldeps/macro-rule-observer.rs
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index ca5d524b..2381668e 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 11;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 12;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_expand/src/base.rs b/compiler/rustc_expand/src/base.rs
+index f15b0059..dfad8095 100644
+--- a/compiler/rustc_expand/src/base.rs
++++ b/compiler/rustc_expand/src/base.rs
+@@ -1060,7 +1060,12 @@ fn resolve_macro_invocation(
+         force: bool,
+     ) -> Result<Arc<SyntaxExtension>, Indeterminate>;
+ 
+-    fn record_macro_rule_usage(&mut self, mac_id: NodeId, rule_index: usize);
++    fn record_macro_rule_usage(
++        &mut self,
++        mac_id: NodeId,
++        rule_index: usize,
++        invocation_id: LocalExpnId,
++    );
+ 
+     fn check_unused_macros(&mut self);
+ 
+diff --git a/compiler/rustc_expand/src/mbe/macro_rules.rs b/compiler/rustc_expand/src/mbe/macro_rules.rs
+index 6b997713..ddf3b8e8 100644
+--- a/compiler/rustc_expand/src/mbe/macro_rules.rs
++++ b/compiler/rustc_expand/src/mbe/macro_rules.rs
+@@ -152,7 +152,7 @@ pub(crate) fn from_tts<'cx>(
+ 
+ pub(crate) enum MacroRule {
+     /// A function-style rule, for use with `m!()`
+-    Func { lhs: Vec<MatcherLoc>, lhs_span: Span, rhs: mbe::TokenTree },
++    Func { lhs: Vec<MatcherLoc>, lhs_span: Span, rhs: mbe::TokenTree, rule_span: (Span, Span) },
+     /// An attr rule, for use with `#[m]`
+     Attr {
+         unsafe_rule: bool,
+@@ -161,9 +161,10 @@ pub(crate) enum MacroRule {
+         body: Vec<MatcherLoc>,
+         body_span: Span,
+         rhs: mbe::TokenTree,
++        rule_span: (Span, Span),
+     },
+     /// A derive rule, for use with `#[m]`
+-    Derive { body: Vec<MatcherLoc>, body_span: Span, rhs: mbe::TokenTree },
++    Derive { body: Vec<MatcherLoc>, body_span: Span, rhs: mbe::TokenTree, rule_span: (Span, Span) },
+ }
+ 
+ /// A selection of a matcher in a [`MacroRule`].
+@@ -224,6 +225,20 @@ pub fn nrules(&self) -> usize {
+         self.rules.len()
+     }
+ 
++    /// Complete source-range endpoints for all rules, in matching order.
++    ///
++    /// Each range starts at the rule's first token and ends at the separator
++    /// following that rule, when one is present, or at the right-hand side.
++    /// Endpoints remain separate because generated tokens can have different
++    /// syntax contexts that cannot be combined into one `Span` losslessly.
++    pub fn rule_span_endpoints(&self) -> impl ExactSizeIterator<Item = (Span, Span)> + '_ {
++        self.rules.iter().map(|rule| match rule {
++            MacroRule::Func { rule_span, .. }
++            | MacroRule::Attr { rule_span, .. }
++            | MacroRule::Derive { rule_span, .. } => *rule_span,
++        })
++    }
++
+     pub fn is_macro_rules(&self) -> bool {
+         self.macro_rules
+     }
+@@ -264,7 +279,11 @@ pub fn expand_derive(
+                 }
+ 
+                 if is_defined_in_current_crate(self.node_id) {
+-                    cx.resolver.record_macro_rule_usage(self.node_id, rule_index);
++                    cx.resolver.record_macro_rule_usage(
++                        self.node_id,
++                        rule_index,
++                        cx.current_expansion.id,
++                    );
+                 }
+ 
+                 Ok(tts)
+@@ -477,7 +496,7 @@ fn expand_macro<'cx, 'a: 'cx>(
+ 
+             let is_local = is_defined_in_current_crate(node_id);
+             if is_local {
+-                cx.resolver.record_macro_rule_usage(node_id, rule_index);
++                cx.resolver.record_macro_rule_usage(node_id, rule_index, cx.current_expansion.id);
+             }
+ 
+             // Let the context choose how to interpret the result. Weird, but useful for X-macros.
+@@ -571,7 +590,7 @@ fn expand_macro_attr(
+             }
+ 
+             if is_local {
+-                cx.resolver.record_macro_rule_usage(node_id, i);
++                cx.resolver.record_macro_rule_usage(node_id, i, cx.current_expansion.id);
+             }
+ 
+             Ok(tts)
+@@ -809,6 +828,7 @@ pub fn compile_declarative_macro(
+     let mut rules = Vec::new();
+ 
+     while p.token != token::Eof {
++        let rule_start_span = p.token.span;
+         let unsafe_rule = p.eat_keyword_noexpect(kw::Unsafe);
+         let unsafe_keyword_span = p.prev_token.span;
+         if unsafe_rule && let Some(guar) = check_no_eof(sess, &p, "expected `attr`") {
+@@ -893,6 +913,8 @@ pub fn compile_declarative_macro(
+             return dummy_syn_ext(guar.unwrap());
+         };
+         let lhs = mbe::macro_parser::compute_locs(&delimited.tts);
++        let separator_span = (p.token != token::Eof).then_some(p.token.span);
++        let rule_span = (rule_start_span, separator_span.unwrap_or_else(|| rhs.span()));
+         if let Some(args) = args {
+             let args_span = args.span();
+             let mbe::TokenTree::Delimited(.., delimited) = args else {
+@@ -900,11 +922,19 @@ pub fn compile_declarative_macro(
+             };
+             let args = mbe::macro_parser::compute_locs(&delimited.tts);
+             let body_span = lhs_span;
+-            rules.push(MacroRule::Attr { unsafe_rule, args, args_span, body: lhs, body_span, rhs });
++            rules.push(MacroRule::Attr {
++                unsafe_rule,
++                args,
++                args_span,
++                body: lhs,
++                body_span,
++                rhs,
++                rule_span,
++            });
+         } else if is_derive {
+-            rules.push(MacroRule::Derive { body: lhs, body_span: lhs_span, rhs });
++            rules.push(MacroRule::Derive { body: lhs, body_span: lhs_span, rhs, rule_span });
+         } else {
+-            rules.push(MacroRule::Func { lhs, lhs_span, rhs });
++            rules.push(MacroRule::Func { lhs, lhs_span, rhs, rule_span });
+         }
+         if p.token == token::Eof {
+             break;
+diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
+index 726b06df..ee972d02 100644
+--- a/compiler/rustc_middle/src/ty/mod.rs
++++ b/compiler/rustc_middle/src/ty/mod.rs
+@@ -191,6 +191,10 @@ pub struct ResolverGlobalCtxt {
+     pub resolved_import_uses: Vec<ResolvedImportUse>,
+     /// Macro invocations after their path and expansion data have been finalized.
+     pub macro_invocation_origins: UnordMap<ExpnId, MacroInvocationOrigin>,
++    /// Ordered, complete source ranges of the rules in each local `macro_rules!` definition.
++    ///
++    /// The vector index is the rule index reported by `selected_macro_rule`.
++    pub macro_rules_definitions: UnordMap<LocalDefId, Vec<MacroRuleDefinition>>,
+     pub module_children: LocalDefIdMap<Vec<ModChild>>,
+     pub ambig_module_children: LocalDefIdMap<Vec<AmbigModChild>>,
+     pub glob_map: FxIndexMap<LocalDefId, FxIndexSet<Symbol>>,
+@@ -298,10 +302,28 @@ pub struct MacroInvocationOrigin {
+     pub target_span: Option<Span>,
+     pub fragment_kind: MacroInvocationFragmentKind,
+     pub implementation_kind: MacroImplementationKind,
++    /// Exact local declarative macro rule selected by this invocation.
++    ///
++    /// This is `None` for macros other than local `macro_rules!` definitions.
++    pub selected_macro_rule: Option<MacroRuleSelection>,
+     /// Final import/re-export paths selected for this invocation.
+     pub resolved_import_uses: Vec<MacroResolvedImportUse>,
+ }
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash)]
++pub struct MacroRuleSelection {
++    pub definition: LocalDefId,
++    pub rule_index: usize,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash)]
++pub struct MacroRuleDefinition {
++    /// First token of the rule, including `unsafe`, `attr`, or `derive` when present.
++    pub start_span: Span,
++    /// Rule-owned separator when present, otherwise the right-hand side.
++    pub end_span: Span,
++}
++
+ #[derive(Debug)]
+ pub struct PerOwnerResolverData<'tcx> {
+     pub node_id_to_def_id: NodeMap<LocalDefId> = Default::default(),
+diff --git a/compiler/rustc_resolve/src/def_collector.rs b/compiler/rustc_resolve/src/def_collector.rs
+index 32453a62..e4e1e1f9 100644
+--- a/compiler/rustc_resolve/src/def_collector.rs
++++ b/compiler/rustc_resolve/src/def_collector.rs
+@@ -231,6 +231,7 @@ fn visit_item(&mut self, i: &'a Item) {
+             i.span,
+             |this, feed| {
+                 if let Some(ext) = opt_syn_ext {
++                    this.r.record_macro_rules_definition(i.id, feed.def_id(), &ext);
+                     this.r.local_macro_map.insert(feed.def_id(), this.r.arenas.alloc_macro(ext));
+                 }
+ 
+diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
+index f044c189..bddb6a0f 100644
+--- a/compiler/rustc_resolve/src/lib.rs
++++ b/compiler/rustc_resolve/src/lib.rs
+@@ -1375,6 +1375,12 @@ pub struct Resolver<'ra, 'tcx> {
+     /// Exact source origins for successfully resolved macro invocations.
+     macro_invocation_origins: UnordMap<ExpnId, MacroInvocationOrigin> = Default::default(),
+ 
++    /// Ordered rule spans for every successfully compiled local `macro_rules!` definition.
++    macro_rules_definitions: UnordMap<LocalDefId, Vec<ty::MacroRuleDefinition>> = Default::default(),
++
++    /// Maps the AST node passed to the macro expander back to its local definition.
++    macro_rules_definition_ids: NodeMap<LocalDefId> = Default::default(),
++
+     /// `CrateNum` resolutions of `extern crate` items.
+     extern_crate_map: UnordMap<LocalDefId, CrateNum> = Default::default(),
+     module_children: LocalDefIdMap<Vec<ModChild>> = Default::default(),
+@@ -1969,6 +1975,7 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+         let maybe_unused_trait_imports = self.maybe_unused_trait_imports;
+         let resolved_import_uses = self.resolved_import_uses;
+         let macro_invocation_origins = self.macro_invocation_origins;
++        let macro_rules_definitions = self.macro_rules_definitions;
+         let glob_map = self.glob_map;
+         let main_def = self.main_def;
+         let confused_type_with_std_module = self.confused_type_with_std_module;
+@@ -2000,6 +2007,7 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+             maybe_unused_trait_imports,
+             resolved_import_uses,
+             macro_invocation_origins,
++            macro_rules_definitions,
+             main_def,
+             trait_impls: self.trait_impls,
+             proc_macros,
+diff --git a/compiler/rustc_resolve/src/macros.rs b/compiler/rustc_resolve/src/macros.rs
+index 9bb58b4a..e034e657 100644
+--- a/compiler/rustc_resolve/src/macros.rs
++++ b/compiler/rustc_resolve/src/macros.rs
+@@ -22,8 +22,8 @@
+ use rustc_hir::{Attribute, StabilityLevel};
+ use rustc_middle::middle::stability;
+ use rustc_middle::ty::{
+-    MacroImplementationKind, MacroInvocationFragmentKind, MacroInvocationOrigin, RegisteredTools,
+-    TyCtxt,
++    MacroImplementationKind, MacroInvocationFragmentKind, MacroInvocationOrigin,
++    MacroRuleDefinition, MacroRuleSelection, RegisteredTools, TyCtxt,
+ };
+ use rustc_session::Session;
+ use rustc_session::diagnostics::feature_err;
+@@ -410,6 +410,7 @@ fn resolve_macro_invocation(
+             target_span: invoc.target_span(),
+             fragment_kind: macro_invocation_fragment_kind(invoc.fragment_kind),
+             implementation_kind: macro_implementation_kind(&ext),
++            selected_macro_rule: None,
+             resolved_import_uses: Vec::new(),
+         };
+         if self.macro_invocation_origins.try_insert(expn_id, origin).is_err() {
+@@ -420,10 +421,37 @@ fn resolve_macro_invocation(
+         Ok(Arc::clone(ext))
+     }
+ 
+-    fn record_macro_rule_usage(&mut self, id: NodeId, rule_i: usize) {
++    fn record_macro_rule_usage(&mut self, id: NodeId, rule_i: usize, invocation_id: LocalExpnId) {
+         if let Some((_, rules)) = self.unused_macro_rules.get_mut(&id) {
+             rules.remove(rule_i);
+         }
++
++        let Some(definition) = self.macro_rules_definition_ids.get(&id).copied() else {
++            // Declarative macros 2.0 use the same expander but are outside this observer.
++            return;
++        };
++        let Some(rule_spans) = self.macro_rules_definitions.get(&definition) else {
++            self.dcx().bug("a selected local macro rule must have a rule inventory")
++        };
++        if rule_i >= rule_spans.len() {
++            self.dcx().bug("a selected local macro rule index must be in its rule inventory");
++        }
++
++        let expn_id = invocation_id.to_expn_id();
++        let Some(origin) = self.macro_invocation_origins.get_mut(&expn_id) else {
++            self.dcx().bug("a selected local macro rule must have an invocation origin")
++        };
++        if origin.implementation_kind != MacroImplementationKind::Declarative {
++            self.dcx().bug("a selected macro rule must belong to a declarative invocation");
++        }
++        let selection = MacroRuleSelection { definition, rule_index: rule_i };
++        match origin.selected_macro_rule {
++            None => origin.selected_macro_rule = Some(selection),
++            Some(previous) if previous == selection => {}
++            Some(_) => {
++                self.dcx().bug("a macro invocation cannot select two different declarative rules")
++            }
++        }
+     }
+ 
+     fn check_unused_macros(&mut self) {
+@@ -656,6 +684,31 @@ fn insert_impl_trait_name(&mut self, id: NodeId, name: Symbol) {
+ }
+ 
+ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
++    pub(crate) fn record_macro_rules_definition(
++        &mut self,
++        node_id: NodeId,
++        definition: LocalDefId,
++        extension: &SyntaxExtension,
++    ) {
++        let SyntaxExtensionKind::MacroRules(rules) = &extension.kind else { return };
++        if !rules.is_macro_rules() {
++            return;
++        }
++        let definitions = rules
++            .rule_span_endpoints()
++            .map(|(start_span, end_span)| MacroRuleDefinition { start_span, end_span })
++            .collect::<Vec<_>>();
++        if definitions.is_empty() {
++            self.dcx().bug("a declarative macro rule inventory cannot be empty");
++        }
++        if self.macro_rules_definition_ids.insert(node_id, definition).is_some() {
++            self.dcx().bug("a local declarative macro node cannot have two definitions");
++        }
++        if self.macro_rules_definitions.insert(definition, definitions).is_some() {
++            self.dcx().bug("a local declarative macro definition cannot have two rule inventories");
++        }
++    }
++
+     /// Resolve macro path with error reporting and recovery.
+     /// Uses dummy syntax extensions for unresolved macros or macros with unexpected resolutions
+     /// for better error recovery.
+diff --git a/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs b/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs
+new file mode 100644
+index 00000000..9dd1d45f
+--- /dev/null
++++ b/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs
+@@ -0,0 +1,40 @@
++#![allow(unused_macros)]
++#![feature(decl_macro)]
++
++#[macro_export]
++macro_rules! _dispatch {
++    (@base) => { 2usize };
++    (@recur) => { crate::_dispatch!(@base) };
++    ($value:expr) => { $value + crate::_dispatch!(@recur) };
++    (@never) => { compile_error!("this rule must stay unexpanded") }
++}
++
++#[macro_export]
++macro_rules! _unused_export {
++    (first) => { 0usize };
++    (second) => { 1usize };
++}
++
++macro_rules! make_generated {
++    () => {{
++        macro_rules! generated {
++            (hit) => { 5usize };
++            (miss) => { 6usize };
++        }
++        generated!(hit)
++    }};
++}
++
++macro modern {
++    (hit) => { 7usize },
++    (miss) => { 8usize },
++}
++
++fn main() {
++    let direct = crate::_dispatch!(3usize);
++    let generated = make_generated!();
++    let modern = modern!(hit);
++    assert_eq!(direct, 5);
++    assert_eq!(generated, 5);
++    assert_eq!(modern, 7);
++}
+diff --git a/tests/ui-fulldeps/macro-rule-observer.rs b/tests/ui-fulldeps/macro-rule-observer.rs
+new file mode 100644
+index 00000000..7e14ee8e
+--- /dev/null
++++ b/tests/ui-fulldeps/macro-rule-observer.rs
+@@ -0,0 +1,132 @@
++//@ edition: 2024
++//@ run-pass
++//@ run-flags: --sysroot {{sysroot-base}} --edition=2024 {{src-base}}/auxiliary/macro-rule-observer-input.rs
++//@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
++//@ ignore-cross-compile
++//@ ignore-remote
++
++#![feature(rustc_private)]
++
++extern crate rustc_driver;
++extern crate rustc_hir;
++extern crate rustc_interface;
++extern crate rustc_middle;
++extern crate rustc_span;
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::process::ExitCode;
++
++use rustc_driver::Compilation;
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::LocalDefId;
++use rustc_interface::interface::Compiler;
++use rustc_middle::ty::{MacroImplementationKind, MacroRuleDefinition, TyCtxt};
++use rustc_span::hygiene::{ExpnKind, MacroKind};
++use rustc_span::Symbol;
++
++fn main() -> ExitCode {
++    rustc_driver::catch_with_exit_code(move || {
++        let args: Vec<_> = std::env::args().collect();
++        rustc_driver::run_compiler(&args, &mut Callbacks);
++    })
++}
++
++struct Callbacks;
++
++impl rustc_driver::Callbacks for Callbacks {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++        let resolutions = tcx.resolutions(());
++
++        let dispatch = named_macro(tcx, "_dispatch");
++        let unused_export = named_macro(tcx, "_unused_export");
++        let make_generated = named_macro(tcx, "make_generated");
++        let generated = named_macro(tcx, "generated");
++        let modern = named_macro(tcx, "modern");
++
++        assert_eq!(resolutions.macro_rules_definitions.len(), 4);
++        assert!(!resolutions.macro_rules_definitions.contains_key(&modern));
++        assert_rule_snippets(
++            tcx,
++            &resolutions.macro_rules_definitions[&dispatch],
++            &[
++                "(@base) => { 2usize };",
++                "(@recur) => { crate::_dispatch!(@base) };",
++                "($value:expr) => { $value + crate::_dispatch!(@recur) };",
++                "(@never) => { compile_error!(\"this rule must stay unexpanded\") }",
++            ],
++        );
++        assert_rule_snippets(
++            tcx,
++            &resolutions.macro_rules_definitions[&unused_export],
++            &["(first) => { 0usize };", "(second) => { 1usize };"],
++        );
++        assert_rule_snippets(
++            tcx,
++            &resolutions.macro_rules_definitions[&make_generated],
++            &["() => {{\n        macro_rules! generated {\n            (hit) => { 5usize };\n            (miss) => { 6usize };\n        }\n        generated!(hit)\n    }};"],
++        );
++        assert_eq!(resolutions.macro_rules_definitions[&generated].len(), 2);
++
++        let selections = RefCell::new(HashMap::new());
++        assert!(resolutions
++            .macro_invocation_origins
++            .items()
++            .all(|(&expn_id, origin)| {
++            let macro_def_id = expn_id.expn_data().macro_def_id;
++            let observed_definition = macro_def_id
++                .and_then(|def_id| def_id.as_local())
++                .filter(|def_id| resolutions.macro_rules_definitions.contains_key(def_id));
++            if let Some(expected_definition) = observed_definition {
++                assert_eq!(origin.implementation_kind, MacroImplementationKind::Declarative);
++                assert!(matches!(expn_id.expn_data().kind, ExpnKind::Macro(MacroKind::Bang, _)));
++                let selection = origin
++                    .selected_macro_rule
++                    .expect("every successful local declarative invocation must select a rule");
++                assert_eq!(selection.definition, expected_definition);
++                assert!(selection.rule_index < resolutions.macro_rules_definitions[&selection.definition].len());
++                *selections
++                    .borrow_mut()
++                    .entry((selection.definition, selection.rule_index))
++                    .or_insert(0) += 1;
++            } else {
++                assert_eq!(origin.selected_macro_rule, None);
++            }
++            true
++        }));
++        let selections = selections.into_inner();
++
++        assert_eq!(
++            selections,
++            HashMap::from([
++                ((dispatch, 0), 1),
++                ((dispatch, 1), 1),
++                ((dispatch, 2), 1),
++                ((make_generated, 0), 1),
++                ((generated, 0), 1),
++            ])
++        );
++        Compilation::Stop
++    }
++}
++
++fn assert_rule_snippets(tcx: TyCtxt<'_>, definitions: &[MacroRuleDefinition], expected: &[&str]) {
++    assert_eq!(definitions.len(), expected.len());
++    let source_map = tcx.sess.source_map();
++    for (definition, expected) in definitions.iter().zip(expected) {
++        assert!(!definition.start_span.from_expansion());
++        assert!(!definition.end_span.from_expansion());
++        let range = definition.start_span.with_hi(definition.end_span.hi());
++        assert_eq!(source_map.span_to_snippet(range).unwrap(), *expected);
++    }
++}
++
++fn named_macro(tcx: TyCtxt<'_>, name: &str) -> LocalDefId {
++    let name = Symbol::intern(name);
++    tcx.iter_local_def_id()
++        .find(|&def_id| {
++            matches!(tcx.def_kind(def_id), DefKind::Macro(_)) && tcx.item_name(def_id) == name
++        })
++        .unwrap()
++}
+-- 
+2.55.0
+

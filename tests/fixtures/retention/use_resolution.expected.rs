@@ -1,0 +1,1 @@
+mod catalog{pub struct Named;pub mod inner{pub fn nested(){}}pub fn globbed(){}}use crate::catalog::{self as namespace,inner::{nested as nested_alias},Named as Renamed,*};fn main(){let _=namespace::Named;nested_alias();let _=Renamed;globbed();}

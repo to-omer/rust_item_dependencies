@@ -1,0 +1,265 @@
+From 1de82b5179b502b752eb13266abe428d7fcbed8f Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Tue, 11 Aug 2026 03:16:07 +0900
+Subject: [PATCH] rustc: guard compile-time environment access
+
+---
+ compiler/rustc_builtin_macros/src/env.rs      | 11 ++++
+ compiler/rustc_driver_impl/src/lib.rs         |  9 ++--
+ compiler/rustc_interface/src/interface.rs     |  8 ++-
+ compiler/rustc_session/src/session.rs         | 53 ++++++++++++++++++-
+ .../examples/rustc-interface-example.rs       |  1 +
+ .../rustc-interface-getting-diagnostics.rs    |  1 +
+ src/librustdoc/core.rs                        |  1 +
+ src/librustdoc/doctest.rs                     |  1 +
+ 8 files changed, 80 insertions(+), 5 deletions(-)
+
+diff --git a/compiler/rustc_builtin_macros/src/env.rs b/compiler/rustc_builtin_macros/src/env.rs
+index aaa9117b..a7cc8f56 100644
+--- a/compiler/rustc_builtin_macros/src/env.rs
++++ b/compiler/rustc_builtin_macros/src/env.rs
+@@ -11,6 +11,7 @@
+ use rustc_ast::{ExprKind, GenericArg, Mutability};
+ use rustc_ast_pretty::pprust;
+ use rustc_expand::base::{DummyResult, ExpandResult, ExtCtxt, MacEager, MacroExpanderResult};
++use rustc_session::ExternalResourceKind;
+ use rustc_span::edit_distance::edit_distance;
+ use rustc_span::{Ident, Span, Symbol, kw, sym};
+ use thin_vec::thin_vec;
+@@ -33,6 +34,12 @@ pub(crate) fn expand_option_env<'cx>(
+     sp: Span,
+     tts: TokenStream,
+ ) -> MacroExpanderResult<'cx> {
++    if let Some(guar) =
++        cx.sess.reject_external_resource(ExternalResourceKind::OptionalEnvironment, sp)
++    {
++        return ExpandResult::Ready(DummyResult::any(sp, guar));
++    }
++
+     let ExpandResult::Ready(mac_expr) = get_single_expr_from_tts(cx, sp, tts, "option_env!") else {
+         return ExpandResult::Retry(());
+     };
+@@ -93,6 +100,10 @@ pub(crate) fn expand_env<'cx>(
+     sp: Span,
+     tts: TokenStream,
+ ) -> MacroExpanderResult<'cx> {
++    if let Some(guar) = cx.sess.reject_external_resource(ExternalResourceKind::Environment, sp) {
++        return ExpandResult::Ready(DummyResult::any(sp, guar));
++    }
++
+     let ExpandResult::Ready(mac) = get_exprs_from_tts(cx, tts) else {
+         return ExpandResult::Retry(());
+     };
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index ee06a618..780186e9 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -116,12 +116,14 @@ pub(super) fn install() {}
+ 
+ /// The upstream revision against which the rust-item-dependencies observer ABI
+ /// was implemented.
+-pub const RUST_ITEM_DEPENDENCIES_BASE_REVISION: &str =
+-    "969b803cbe1d4499f841ae0a49c637d8c70a0458";
++pub const RUST_ITEM_DEPENDENCIES_BASE_REVISION: &str = "969b803cbe1d4499f841ae0a49c637d8c70a0458";
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 1;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 2;
++
++pub use rustc_interface::interface::Config as CompilerConfig;
++pub use rustc_session::{ExternalResourceGuard, ExternalResourceKind, ExternalResourceUse};
+ 
+ pub const DEFAULT_BUG_REPORT_URL: &str = "https://github.com/rust-lang/rust/issues/new\
+     ?labels=C-bug%2C+I-ICE%2C+T-compiler&template=ice.md";
+@@ -223,6 +225,7 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send))
+         output_dir: odir,
+         ice_file,
+         file_loader: None,
++        external_resource_guard: None,
+         lint_caps: Default::default(),
+         psess_created: None,
+         track_state: None,
+diff --git a/compiler/rustc_interface/src/interface.rs b/compiler/rustc_interface/src/interface.rs
+index 2737d2ca..a9c759ee 100644
+--- a/compiler/rustc_interface/src/interface.rs
++++ b/compiler/rustc_interface/src/interface.rs
+@@ -17,7 +17,7 @@
+ use rustc_query_impl::print_query_stack;
+ use rustc_session::config::{self, Cfg, CheckCfg, ExpectedValues, Input, OutFileName};
+ use rustc_session::parse::ParseSess;
+-use rustc_session::{CompilerIO, EarlyDiagCtxt, Session, lint};
++use rustc_session::{CompilerIO, EarlyDiagCtxt, ExternalResourceGuard, Session, lint};
+ use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMapInputs};
+ use rustc_span::{FileName, sym};
+ use tracing::trace;
+@@ -326,6 +326,10 @@ pub struct Config {
+     /// running rustc without having to save". (See #102759.)
+     pub file_loader: Option<Box<dyn FileLoader + Send + Sync>>,
+ 
++    /// Rejects compile-time access to external resources before the resource
++    /// is read and reports the attempted access to the driver.
++    pub external_resource_guard: Option<ExternalResourceGuard>,
++
+     pub lint_caps: FxHashMap<lint::LintId, lint::Level>,
+ 
+     /// This is a callback from the driver that is called when [`ParseSess`] is created.
+@@ -409,6 +413,7 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
+ 
+             let temps_dir = config.opts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
+ 
++            let external_resource_guard = config.external_resource_guard;
+             let mut sess = rustc_session::build_session(
+                 config.opts,
+                 CompilerIO {
+@@ -423,6 +428,7 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
+                 config.ice_file,
+                 config.using_internal_features,
+             );
++            sess.external_resource_guard = external_resource_guard;
+ 
+             let codegen_backend = match config.make_codegen_backend {
+                 None => util::get_codegen_backend(
+diff --git a/compiler/rustc_session/src/session.rs b/compiler/rustc_session/src/session.rs
+index f30d825b..abac8c79 100644
+--- a/compiler/rustc_session/src/session.rs
++++ b/compiler/rustc_session/src/session.rs
+@@ -7,7 +7,7 @@
+ 
+ use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
+ use rustc_data_structures::profiling::{SelfProfiler, SelfProfilerRef};
+-use rustc_data_structures::sync::{AppendOnlyVec, DynSend, DynSync, Lock};
++use rustc_data_structures::sync::{AppendOnlyVec, DynSend, DynSync, IntoDynSyncSend, Lock};
+ use rustc_data_structures::{Limit, flock};
+ use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
+ use rustc_errors::codes::*;
+@@ -77,6 +77,39 @@ pub struct CompilerIO {
+     pub temps_dir: Option<PathBuf>,
+ }
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ExternalResourceKind {
++    Environment,
++    OptionalEnvironment,
++}
++
++impl ExternalResourceKind {
++    fn description(self) -> &'static str {
++        match self {
++            ExternalResourceKind::Environment => "env!",
++            ExternalResourceKind::OptionalEnvironment => "option_env!",
++        }
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++pub struct ExternalResourceUse {
++    pub kind: ExternalResourceKind,
++    pub span: Span,
++}
++
++pub struct ExternalResourceGuard(IntoDynSyncSend<Box<dyn Fn(ExternalResourceUse) + Send + Sync>>);
++
++impl ExternalResourceGuard {
++    pub fn new(guard: impl Fn(ExternalResourceUse) + Send + Sync + 'static) -> Self {
++        ExternalResourceGuard(IntoDynSyncSend(Box::new(guard)))
++    }
++
++    fn report(&self, resource_use: ExternalResourceUse) {
++        (self.0)(resource_use);
++    }
++}
++
+ pub trait DynLintStore: Any + DynSync + DynSend {
+     /// Provides a way to access lint groups without depending on `rustc_lint`
+     fn lint_groups_iter(&self) -> Box<dyn Iterator<Item = LintGroup> + '_>;
+@@ -392,6 +425,10 @@ pub struct Session {
+     /// File paths accessed during the build.
+     pub file_depinfo: Lock<FxIndexSet<Symbol>>,
+ 
++    /// When present, rejects compile-time resource access before the external
++    /// state is read and reports the attempted access to the compiler driver.
++    pub external_resource_guard: Option<ExternalResourceGuard>,
++
+     target_filesearch: Arc<FileSearch>,
+     host_filesearch: Arc<FileSearch>,
+ 
+@@ -452,6 +489,19 @@ pub struct LintGroup {
+ }
+ 
+ impl Session {
++    pub fn reject_external_resource(
++        &self,
++        kind: ExternalResourceKind,
++        span: Span,
++    ) -> Option<ErrorGuaranteed> {
++        let guard = self.external_resource_guard.as_ref()?;
++        guard.report(ExternalResourceUse { kind, span });
++        Some(self.dcx().span_err(
++            span,
++            format!("compile-time resource access through {} is disabled", kind.description()),
++        ))
++    }
++
+     pub fn miri_unleashed_feature(&self, span: Span, feature_gate: Option<Symbol>) {
+         self.miri_unleashed_features.lock().push((span, feature_gate));
+     }
+@@ -1346,6 +1396,7 @@ pub fn build_session(
+         using_internal_features,
+         env_depinfo: Default::default(),
+         file_depinfo: Default::default(),
++        external_resource_guard: None,
+         target_filesearch,
+         host_filesearch,
+         replaced_intrinsics: FxHashSet::default(), // filled by `run_compiler`
+diff --git a/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs b/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs
+index 4601d9ad..03aec7a8 100644
+--- a/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs
++++ b/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs
+@@ -33,6 +33,7 @@ fn main() {
+         output_dir: None,                // Option<PathBuf>
+         output_file: None,               // Option<PathBuf>
+         file_loader: None,               // Option<Box<dyn FileLoader + Send + Sync>>
++        external_resource_guard: None,    // Option<ExternalResourceGuard>
+         lint_caps: FxHashMap::default(), // FxHashMap<lint::LintId, lint::Level>
+         // This is a callback from the driver that is called when [`ParseSess`] is created.
+         psess_created: None, //Option<Box<dyn FnOnce(&mut ParseSess) + Send>>
+diff --git a/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs b/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs
+index ea2a7727..93fe66ec 100644
+--- a/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs
++++ b/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs
+@@ -66,6 +66,7 @@ fn main() {
+         output_dir: None,
+         output_file: None,
+         file_loader: None,
++        external_resource_guard: None,
+         lint_caps: rustc_hash::FxHashMap::default(),
+         psess_created: Some(Box::new(|parse_sess| {
+             parse_sess.dcx().set_emitter(Box::new(DebugEmitter {
+diff --git a/src/librustdoc/core.rs b/src/librustdoc/core.rs
+index af102458..80f72873 100644
+--- a/src/librustdoc/core.rs
++++ b/src/librustdoc/core.rs
+@@ -309,6 +309,7 @@ pub(crate) fn create_config(
+             Some(render_options.output.clone())
+         },
+         file_loader: None,
++        external_resource_guard: None,
+         lint_caps,
+         psess_created: None,
+         track_state: None,
+diff --git a/src/librustdoc/doctest.rs b/src/librustdoc/doctest.rs
+index 7ba40962..d75b5a8b 100644
+--- a/src/librustdoc/doctest.rs
++++ b/src/librustdoc/doctest.rs
+@@ -189,6 +189,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
+         output_file: None,
+         output_dir: None,
+         file_loader: None,
++        external_resource_guard: None,
+         lint_caps,
+         psess_created: None,
+         track_state: None,
+-- 
+2.55.0
+

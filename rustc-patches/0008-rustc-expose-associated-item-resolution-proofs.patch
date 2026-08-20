@@ -1,0 +1,455 @@
+From 16b37d339cce8577962f16e292577a79684d876c Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Tue, 11 Aug 2026 10:04:56 +0900
+Subject: [PATCH 8/9] rustc: expose associated item resolution proofs
+
+---
+ compiler/rustc_driver_impl/src/lib.rs      |   2 +-
+ compiler/rustc_middle/src/arena.rs         |   1 +
+ compiler/rustc_middle/src/queries.rs       |  13 +-
+ compiler/rustc_middle/src/query/erase.rs   |   4 +
+ compiler/rustc_middle/src/traits/mod.rs    |  34 ++++
+ compiler/rustc_ty_utils/src/instance.rs    |  98 ++++++++++-
+ tests/ui-fulldeps/associated-item-proof.rs | 196 +++++++++++++++++++++
+ 7 files changed, 342 insertions(+), 6 deletions(-)
+ create mode 100644 tests/ui-fulldeps/associated-item-proof.rs
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 9c92bd5e..def7099f 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 7;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 8;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_middle/src/arena.rs b/compiler/rustc_middle/src/arena.rs
+index 06369bdc..c4e79341 100644
+--- a/compiler/rustc_middle/src/arena.rs
++++ b/compiler/rustc_middle/src/arena.rs
+@@ -113,6 +113,7 @@
+     used_trait_imports: rustc_data_structures::unord::UnordSet<rustc_hir::def_id::LocalDefId>,
+     is_late_bound_map: rustc_data_structures::fx::FxIndexSet<rustc_hir::ItemLocalId>,
+     impl_source: rustc_middle::traits::ImplSource<'tcx, ()>,
++    codegen_associated_item_proof: rustc_middle::traits::CodegenAssociatedItemProof<'tcx>,
+     codegen_projection_proof: rustc_middle::traits::CodegenProjectionProof<'tcx>,
+     codegen_selection_proof: rustc_middle::traits::CodegenSelectionProof<'tcx>,
+ 
+diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
+index e7391774..60ac76f9 100644
+--- a/compiler/rustc_middle/src/queries.rs
++++ b/compiler/rustc_middle/src/queries.rs
+@@ -107,9 +107,10 @@
+     OutlivesBound,
+ };
+ use crate::traits::{
+-    CodegenObligationError, CodegenProjectionProof, CodegenProjectionProofError,
+-    CodegenSelectionProof, CodegenSelectionProofError, DynCompatibilityViolation, EvaluationResult,
+-    ImplSource, ObligationCause, OverflowError, WellFormedLoc, solve, specialization_graph,
++    CodegenAssociatedItemProof, CodegenAssociatedItemProofError, CodegenObligationError,
++    CodegenProjectionProof, CodegenProjectionProofError, CodegenSelectionProof,
++    CodegenSelectionProofError, DynCompatibilityViolation, EvaluationResult, ImplSource,
++    ObligationCause, OverflowError, WellFormedLoc, solve, specialization_graph,
+ };
+ use crate::ty::fast_reject::SimplifiedType;
+ use crate::ty::layout::ValidityRequirement;
+@@ -2692,6 +2693,12 @@
+         desc { "resolving instance `{}`", ty::Instance::new_raw(key.value.0, key.value.1) }
+     }
+ 
++    query codegen_associated_item_proof(
++        key: ty::PseudoCanonicalInput<'tcx, (DefId, GenericArgsRef<'tcx>)>
++    ) -> Result<&'tcx CodegenAssociatedItemProof<'tcx>, CodegenAssociatedItemProofError> {
++        desc { "observing associated-item resolution for `{}`", ty::Instance::new_raw(key.value.0, key.value.1) }
++    }
++
+     query reveal_opaque_types_in_bounds(key: ty::Clauses<'tcx>) -> ty::Clauses<'tcx> {
+         desc { "revealing opaque types in `{:?}`", key }
+     }
+diff --git a/compiler/rustc_middle/src/query/erase.rs b/compiler/rustc_middle/src/query/erase.rs
+index 08892529..a7877b18 100644
+--- a/compiler/rustc_middle/src/query/erase.rs
++++ b/compiler/rustc_middle/src/query/erase.rs
+@@ -199,6 +199,10 @@ impl Erasable for $ty {
+     Option<usize>,
+     Result<&'_ TokenStream, ()>,
+     Result<&'_ rustc_target::callconv::FnAbi<'_, Ty<'_>>, &'_ ty::layout::FnAbiError<'_>>,
++    Result<
++        &'_ traits::CodegenAssociatedItemProof<'_>,
++        traits::CodegenAssociatedItemProofError,
++    >,
+     Result<&'_ traits::ImplSource<'_, ()>, traits::CodegenObligationError>,
+     Result<&'_ traits::CodegenProjectionProof<'_>, traits::CodegenProjectionProofError>,
+     Result<&'_ traits::CodegenSelectionProof<'_>, traits::CodegenSelectionProofError>,
+diff --git a/compiler/rustc_middle/src/traits/mod.rs b/compiler/rustc_middle/src/traits/mod.rs
+index ca11c181..186d7180 100644
+--- a/compiler/rustc_middle/src/traits/mod.rs
++++ b/compiler/rustc_middle/src/traits/mod.rs
+@@ -1138,3 +1138,37 @@ fn from(error: CodegenObligationError) -> Self {
+         CodegenSelectionProofError::Selection(error)
+     }
+ }
++
++/// A specialization-graph node used to explain an associated-item resolution.
++#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash)]
++#[derive(TypeFoldable, TypeVisitable)]
++pub enum CodegenSpecializationNode {
++    Impl(DefId),
++    Trait(DefId),
++}
++
++/// The user-defined leaf selected for a concrete associated-item instance.
++#[derive(Clone, Debug, PartialEq, Eq, StableHash)]
++#[derive(TypeFoldable, TypeVisitable)]
++pub struct CodegenAssociatedItemProof<'tcx> {
++    pub selection_key: ty::PseudoCanonicalInput<'tcx, ty::TraitRef<'tcx>>,
++    pub source: ImplSource<'tcx, ()>,
++    pub final_instance: ty::Instance<'tcx>,
++    pub leaf_item: DefId,
++    pub defining_node: CodegenSpecializationNode,
++    pub finalizing_node: Option<CodegenSpecializationNode>,
++    /// The specialization ancestors from the selected impl through the trait root, inclusive.
++    pub ancestor_path: Vec<CodegenSpecializationNode>,
++}
++
++/// Fail-closed outcomes for the associated-item proof observer.
++#[derive(Copy, Clone, Debug, StableHash)]
++pub enum CodegenAssociatedItemProofError {
++    Resolution(ErrorGuaranteed),
++    Selection(CodegenObligationError),
++    NotAssociated,
++    UnsupportedItemKind,
++    Unresolved,
++    UnsupportedSource,
++    IncompleteObservation,
++}
+diff --git a/compiler/rustc_ty_utils/src/instance.rs b/compiler/rustc_ty_utils/src/instance.rs
+index c0f476a7..ff866fb4 100644
+--- a/compiler/rustc_ty_utils/src/instance.rs
++++ b/compiler/rustc_ty_utils/src/instance.rs
+@@ -5,7 +5,10 @@
+ use rustc_infer::infer::TyCtxtInferExt;
+ use rustc_middle::bug;
+ use rustc_middle::query::Providers;
+-use rustc_middle::traits::{BuiltinImplSource, CodegenObligationError};
++use rustc_middle::traits::{
++    BuiltinImplSource, CodegenAssociatedItemProof, CodegenAssociatedItemProofError,
++    CodegenObligationError, CodegenSpecializationNode,
++};
+ use rustc_middle::ty::{
+     self, ClosureKind, GenericArgsRef, Instance, PseudoCanonicalInput, TyCtxt, TypeVisitableExt,
+     Unnormalized,
+@@ -109,6 +112,97 @@ fn resolve_instance_raw<'tcx>(
+     result
+ }
+ 
++fn codegen_associated_item_proof<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    key: ty::PseudoCanonicalInput<'tcx, (DefId, GenericArgsRef<'tcx>)>,
++) -> Result<&'tcx CodegenAssociatedItemProof<'tcx>, CodegenAssociatedItemProofError> {
++    let PseudoCanonicalInput { typing_env, value: (trait_item_id, args) } = key;
++    if !matches!(tcx.def_kind(trait_item_id), DefKind::AssocFn | DefKind::AssocConst { .. }) {
++        return Err(CodegenAssociatedItemProofError::UnsupportedItemKind);
++    }
++    let trait_id =
++        tcx.trait_of_assoc(trait_item_id).ok_or(CodegenAssociatedItemProofError::NotAssociated)?;
++    let final_instance = tcx
++        .resolve_instance_raw(key)
++        .map_err(CodegenAssociatedItemProofError::Resolution)?
++        .ok_or(CodegenAssociatedItemProofError::Unresolved)?;
++    let rcvr_args = tcx.normalize_erasing_regions(typing_env, Unnormalized::new_wip(args));
++    let trait_ref = ty::TraitRef::from_assoc(tcx, trait_id, rcvr_args);
++    let selection_key = typing_env.as_query_input(trait_ref);
++    let source = tcx
++        .codegen_select_candidate(selection_key)
++        .map_err(CodegenAssociatedItemProofError::Selection)?
++        .clone();
++    let (impl_def_id, impl_args) = match &source {
++        traits::ImplSource::UserDefined(data) => (data.impl_def_id, data.args),
++        traits::ImplSource::Param(_) | traits::ImplSource::Builtin(..) => {
++            return Err(CodegenAssociatedItemProofError::UnsupportedSource);
++        }
++    };
++
++    if tcx.impl_trait_id(impl_def_id) != trait_id {
++        return Err(CodegenAssociatedItemProofError::IncompleteObservation);
++    }
++    let trait_def = tcx.trait_def(trait_id);
++    let ancestors = trait_def
++        .ancestors(tcx, impl_def_id)
++        .map_err(CodegenAssociatedItemProofError::Resolution)?;
++    let leaf_def = ancestors
++        .leaf_def(tcx, trait_item_id)
++        .ok_or(CodegenAssociatedItemProofError::IncompleteObservation)?;
++    let normalized_typing_env = typing_env.with_post_analysis_normalized(tcx);
++    let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(normalized_typing_env);
++    let translated_args = rcvr_args.rebase_onto(tcx, trait_id, impl_args);
++    let translated_args =
++        translate_args(&infcx, param_env, impl_def_id, translated_args, leaf_def.defining_node);
++    let expected_instance =
++        Instance::new_raw(leaf_def.item.def_id, tcx.erase_and_anonymize_regions(translated_args));
++    if final_instance != expected_instance {
++        return Err(CodegenAssociatedItemProofError::IncompleteObservation);
++    }
++
++    let defining_node = codegen_specialization_node(leaf_def.defining_node);
++    let finalizing_node = leaf_def.finalizing_node.map(codegen_specialization_node);
++    let mut reached_defining_node = false;
++    let mut ancestor_path = Vec::new();
++    for node in ancestors {
++        let node = codegen_specialization_node(node);
++        ancestor_path.push(node);
++        if node == defining_node {
++            reached_defining_node = true;
++        }
++    }
++    if !reached_defining_node
++        || ancestor_path.first() != Some(&CodegenSpecializationNode::Impl(impl_def_id))
++        || ancestor_path.last() != Some(&CodegenSpecializationNode::Trait(trait_id))
++        || finalizing_node.is_some_and(|node| !ancestor_path.contains(&node))
++    {
++        return Err(CodegenAssociatedItemProofError::IncompleteObservation);
++    }
++
++    let proof = CodegenAssociatedItemProof {
++        selection_key,
++        source,
++        final_instance,
++        leaf_item: leaf_def.item.def_id,
++        defining_node,
++        finalizing_node,
++        ancestor_path,
++    };
++    Ok(tcx.arena.alloc(proof))
++}
++
++fn codegen_specialization_node(
++    node: traits::specialization_graph::Node,
++) -> CodegenSpecializationNode {
++    match node {
++        traits::specialization_graph::Node::Impl(def_id) => CodegenSpecializationNode::Impl(def_id),
++        traits::specialization_graph::Node::Trait(def_id) => {
++            CodegenSpecializationNode::Trait(def_id)
++        }
++    }
++}
++
+ fn resolve_associated_item<'tcx>(
+     tcx: TyCtxt<'tcx>,
+     trait_item_id: DefId,
+@@ -435,5 +529,5 @@ fn resolve_associated_item<'tcx>(
+ }
+ 
+ pub(crate) fn provide(providers: &mut Providers) {
+-    *providers = Providers { resolve_instance_raw, ..*providers };
++    *providers = Providers { codegen_associated_item_proof, resolve_instance_raw, ..*providers };
+ }
+diff --git a/tests/ui-fulldeps/associated-item-proof.rs b/tests/ui-fulldeps/associated-item-proof.rs
+new file mode 100644
+index 00000000..e6c70cef
+--- /dev/null
++++ b/tests/ui-fulldeps/associated-item-proof.rs
+@@ -0,0 +1,196 @@
++//@ run-pass
++//@ run-flags: --sysroot {{sysroot-base}} --edition=2021
++//@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
++//@ ignore-cross-compile
++//@ ignore-remote
++
++#![feature(rustc_private)]
++
++extern crate rustc_driver;
++extern crate rustc_hir;
++extern crate rustc_interface;
++extern crate rustc_middle;
++extern crate rustc_span;
++
++use std::process::ExitCode;
++
++use rustc_driver::Compilation;
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::DefId;
++use rustc_interface::interface::Compiler;
++use rustc_middle::traits::{CodegenSpecializationNode, ImplSource};
++use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
++use rustc_span::Symbol;
++
++fn main() -> ExitCode {
++    rustc_driver::catch_with_exit_code(move || {
++        std::fs::write(
++            "associated_item_proof_input.rs",
++            r#"
++                trait Pick {
++                    fn pick<U>(&self) -> u8 {
++                        let _ = std::mem::size_of::<U>();
++                        1
++                    }
++                }
++
++                struct Defaulted<T>(T);
++                impl<T> Pick for Defaulted<T> {}
++
++                struct Overridden<T>(T);
++                impl<T> Pick for Overridden<T> {
++                    fn pick<U>(&self) -> u8 {
++                        let _ = std::mem::size_of::<U>();
++                        2
++                    }
++                }
++
++                fn main() {
++                    assert_eq!(Defaulted(0u8).pick::<u16>(), 1);
++                    assert_eq!(Overridden(0u8).pick::<u16>(), 2);
++                }
++            "#,
++        )
++        .unwrap();
++
++        let mut args: Vec<_> = std::env::args().collect();
++        args.push("--crate-name=associated_item_proof_input".to_owned());
++        args.push("associated_item_proof_input.rs".to_owned());
++        rustc_driver::run_compiler(&args, &mut CompilerCalls);
++    })
++}
++
++struct CompilerCalls;
++
++impl rustc_driver::Callbacks for CompilerCalls {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++
++        let pick = named_def(tcx, "Pick", DefKind::Trait);
++        let pick_method = associated_item(tcx, pick, "pick");
++        let defaulted = named_def(tcx, "Defaulted", DefKind::Struct);
++        let overridden = named_def(tcx, "Overridden", DefKind::Struct);
++        let defaulted_impl = impl_for_adt(tcx, pick, defaulted);
++        let overridden_impl = impl_for_adt(tcx, pick, overridden);
++        let overridden_method = tcx.impl_item_implementor_ids(overridden_impl)[&pick_method];
++
++        let defaulted_ty = adt_with_u8(tcx, defaulted);
++        let overridden_ty = adt_with_u8(tcx, overridden);
++        assert_user_defined_proof(
++            tcx,
++            pick,
++            pick_method,
++            defaulted_ty,
++            defaulted_impl,
++            pick_method,
++            CodegenSpecializationNode::Trait(pick),
++            vec![
++                CodegenSpecializationNode::Impl(defaulted_impl),
++                CodegenSpecializationNode::Trait(pick),
++            ],
++            tcx.mk_args(&[defaulted_ty.into(), tcx.types.u16.into()]),
++            false,
++        );
++        assert_user_defined_proof(
++            tcx,
++            pick,
++            pick_method,
++            overridden_ty,
++            overridden_impl,
++            overridden_method,
++            CodegenSpecializationNode::Impl(overridden_impl),
++            vec![
++                CodegenSpecializationNode::Impl(overridden_impl),
++                CodegenSpecializationNode::Trait(pick),
++            ],
++            tcx.mk_args(&[tcx.types.u8.into(), tcx.types.u16.into()]),
++            true,
++        );
++
++        Compilation::Stop
++    }
++}
++
++fn assert_user_defined_proof<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    trait_id: DefId,
++    trait_item: DefId,
++    self_ty: Ty<'tcx>,
++    expected_impl: DefId,
++    expected_leaf: DefId,
++    expected_defining_node: CodegenSpecializationNode,
++    expected_ancestor_path: Vec<CodegenSpecializationNode>,
++    expected_final_args: ty::GenericArgsRef<'tcx>,
++    prewarm_stock_queries: bool,
++) {
++    let typing_env = ty::TypingEnv::fully_monomorphized();
++    let call_args = tcx.mk_args(&[self_ty.into(), tcx.types.u16.into()]);
++    let key = tcx.erase_and_anonymize_regions(typing_env.as_query_input((trait_item, call_args)));
++    let expected_selection_key =
++        typing_env.as_query_input(ty::TraitRef::new(tcx, trait_id, [self_ty]));
++    if prewarm_stock_queries {
++        let _ = tcx.resolve_instance_raw(key).unwrap().unwrap();
++        let _ = tcx.codegen_select_candidate(expected_selection_key).unwrap();
++    }
++    let proof = tcx.codegen_associated_item_proof(key).unwrap();
++    let warm_proof = tcx.codegen_associated_item_proof(key).unwrap();
++    assert!(std::ptr::eq(proof, warm_proof));
++
++    let stock_instance = tcx.resolve_instance_raw(key).unwrap().unwrap();
++    assert_eq!(proof.final_instance, stock_instance);
++    assert_eq!(proof.final_instance, Instance::new_raw(expected_leaf, expected_final_args));
++
++    assert_eq!(proof.selection_key, expected_selection_key);
++    assert_eq!(proof.source, *tcx.codegen_select_candidate(expected_selection_key).unwrap());
++    assert_eq!(
++        proof.source,
++        tcx.codegen_selection_proof(proof.selection_key).unwrap().top_source
++    );
++    assert!(matches!(
++        &proof.source,
++        ImplSource::UserDefined(data)
++            if data.impl_def_id == expected_impl
++                && data.args == tcx.mk_args(&[tcx.types.u8.into()])
++    ));
++    assert_eq!(proof.leaf_item, expected_leaf);
++    assert_eq!(proof.defining_node, expected_defining_node);
++    assert_eq!(proof.finalizing_node, Some(CodegenSpecializationNode::Impl(expected_impl)));
++    assert_eq!(proof.ancestor_path, expected_ancestor_path);
++}
++
++fn adt_with_u8<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Ty<'tcx> {
++    Ty::new_adt(tcx, tcx.adt_def(def_id), tcx.mk_args(&[tcx.types.u8.into()]))
++}
++
++fn named_def(tcx: TyCtxt<'_>, name: &str, kind: DefKind) -> DefId {
++    let name = Symbol::intern(name);
++    tcx.iter_local_def_id()
++        .map(|def_id| def_id.to_def_id())
++        .find(|&def_id| tcx.def_kind(def_id) == kind && tcx.item_name(def_id) == name)
++        .unwrap()
++}
++
++fn associated_item(tcx: TyCtxt<'_>, owner: DefId, name: &str) -> DefId {
++    let name = Symbol::intern(name);
++    tcx.associated_items(owner)
++        .in_definition_order()
++        .find(|item| item.opt_name() == Some(name))
++        .unwrap()
++        .def_id
++}
++
++fn impl_for_adt(tcx: TyCtxt<'_>, trait_id: DefId, adt_id: DefId) -> DefId {
++    tcx.iter_local_def_id()
++        .map(|def_id| def_id.to_def_id())
++        .filter(|&def_id| tcx.def_kind(def_id) == DefKind::Impl { of_trait: true })
++        .find(|&def_id| {
++            tcx.impl_trait_id(def_id) == trait_id
++                && tcx
++                    .impl_trait_ref(def_id)
++                    .skip_binder()
++                    .self_ty()
++                    .ty_adt_def()
++                    .is_some_and(|adt| adt.did() == adt_id)
++        })
++        .unwrap()
++}
+-- 
+2.55.0
+
