@@ -207,7 +207,14 @@ fn build_compiler(repository_root: &Path, rust_source: &Path) -> Result<(), Stri
     command
         .args(prefix_arguments)
         .arg(rust_source.join("x.py"))
-        .args(["build", "--stage", "2", "compiler/rustc", "library"])
+        .args([
+            "build",
+            "--ci=false",
+            "--stage",
+            "2",
+            "compiler/rustc",
+            "library",
+        ])
         .current_dir(rust_source)
         .env("RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST", queue_digest)
         .env_remove("RUSTFLAGS")
