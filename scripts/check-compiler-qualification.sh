@@ -184,7 +184,7 @@ rustc_serialize=$(native_path "$rustc_serialize")
 rustc_span=$(native_path "$rustc_span")
 rustc_target=$(native_path "$rustc_target")
 compiler_metadata=$(native_path "$compiler_metadata")
-cargo_target_directory=$(native_path "$repository_root/target/rid/tests/cargo-$queue_digest")
+cargo_target_directory=$(native_path "$repository_root/target/rid/tests")
 
 # Cargo cannot discover rustc_private crates from the stage2 sysroot because
 # their metadata is emitted under stage1. Pass every crate used directly by
