@@ -12,7 +12,7 @@ Rust、Cargo、Git、Pythonと、Rustコンパイラをビルドできる環境�
 cargo rid input.rs -o reduced.rs
 ```
 
-初回は、このツールが利用するRustコンパイラを`target/rust-item-dependencies/`配下に取得してビルドします。2回目以降は同じコンパイラを再利用します。
+初回は、このツールが利用するRustコンパイラを`target/rid/`配下に取得してビルドします。2回目以降は同じコンパイラを再利用します。
 
 入力ファイルと同じ場所や、すでに存在するファイルを出力先に指定することはできません。
 

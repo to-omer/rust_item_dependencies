@@ -60,9 +60,9 @@ case "$host" in
 esac
 set --
 for candidate in \
-    "$compiler_library"/librustc_driver-*.so \
-    "$compiler_library"/librustc_driver-*.dylib \
-    "$compiler_library"/rustc_driver-*.dll
+    "$compiler_metadata"/librustc_driver-*.so \
+    "$compiler_metadata"/librustc_driver-*.dylib \
+    "$compiler_metadata"/rustc_driver-*.dll
 do
     if [ -f "$candidate" ]; then
         set -- "$@" "$candidate"

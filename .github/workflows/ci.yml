@@ -51,12 +51,12 @@ jobs:
           -o target/ci-reduced.rs
       - name: Build patched compiler
         shell: bash
-        run: bash scripts/build-patched-rustc.sh target/rust-item-dependencies/rustc
+        run: bash scripts/build-patched-rustc.sh target/rid/rustc
       - name: Run full acceptance suite
         shell: bash
         run: |
           set -euo pipefail
           host=$(rustc -Vv | sed -n 's/^host: //p' | tr -d '\r')
           test -n "$host"
-          stage2="$PWD/target/rust-item-dependencies/rustc/build/$host/stage2"
+          stage2="$PWD/target/rid/rustc/build/$host/stage2"
           bash scripts/check-acceptance.sh "$stage2"

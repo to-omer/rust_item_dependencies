@@ -29,7 +29,7 @@ fi
 
 cd "$rustc_checkout"
 RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$actual_queue_digest" \
-    ./x check compiler/rustc_driver_impl compiler/rustc_builtin_macros
-./x fmt --check --all
+    ./x check --ci=false compiler/rustc_driver_impl compiler/rustc_builtin_macros
+./x fmt --ci=false --check --all
 RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$actual_queue_digest" \
-    ./x build --stage 2 compiler/rustc library
+    ./x build --ci=false --stage 2 compiler/rustc library

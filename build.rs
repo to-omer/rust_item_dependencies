@@ -85,7 +85,7 @@ fn validate_patched_compiler(rustc: &OsString, sysroot: &Path, host: &str) -> Pa
     } else {
         sysroot.join("lib")
     };
-    let rustc_driver = unique_rustc_driver(&compiler_library_directory);
+    let rustc_driver = unique_rustc_driver(&compiler_metadata);
     let output = PathBuf::from(
         std::env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR for the build script"),
     )

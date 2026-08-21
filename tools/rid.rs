@@ -53,7 +53,7 @@ fn run() -> Result<(), String> {
     let repository_root = tools_directory
         .parent()
         .ok_or_else(|| "cannot locate the repository root".to_owned())?;
-    let generated = repository_root.join("target/rust-item-dependencies");
+    let generated = repository_root.join("target/rid");
     let rust_source = generated.join("rustc");
     fs::create_dir_all(&generated)
         .map_err(|error| format!("cannot create {}: {error}", generated.display()))?;
@@ -207,7 +207,14 @@ fn build_compiler(repository_root: &Path, rust_source: &Path) -> Result<(), Stri
     command
         .args(prefix_arguments)
         .arg(rust_source.join("x.py"))
-        .args(["build", "--stage", "2", "compiler/rustc", "library"])
+        .args([
+            "build",
+            "--ci=false",
+            "--stage",
+            "2",
+            "compiler/rustc",
+            "library",
+        ])
         .current_dir(rust_source)
         .env("RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST", queue_digest)
         .env_remove("RUSTFLAGS")
@@ -278,7 +285,7 @@ fn compiler_paths(stage2: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf),
         ));
     }
     let driver_prefix = format!("{}rustc_driver-", env::consts::DLL_PREFIX);
-    let rustc_driver = unique_file(&compiler_library, |name| {
+    let rustc_driver = unique_file(&compiler_metadata, |name| {
         name.starts_with(&driver_prefix) && name.ends_with(env::consts::DLL_SUFFIX)
     })?;
     Ok((rustc, compiler_library, compiler_metadata, rustc_driver))

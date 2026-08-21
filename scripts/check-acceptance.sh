@@ -56,7 +56,7 @@ echo "==> patched compiler observer fixtures"
 (
     cd "$rustc_source"
     RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$queue_digest" \
-        ./x test --stage 2 --force-rerun \
+        ./x test --ci=false --stage 2 --force-rerun \
         tests/ui-fulldeps/selection-proof-trace.rs \
         tests/ui-fulldeps/macro-rule-observer.rs \
         tests/ui-fulldeps/associated-item-proof.rs \
