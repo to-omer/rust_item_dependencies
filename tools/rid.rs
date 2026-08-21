@@ -285,7 +285,7 @@ fn compiler_paths(stage2: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf),
         ));
     }
     let driver_prefix = format!("{}rustc_driver-", env::consts::DLL_PREFIX);
-    let rustc_driver = unique_file(&compiler_library, |name| {
+    let rustc_driver = unique_file(&compiler_metadata, |name| {
         name.starts_with(&driver_prefix) && name.ends_with(env::consts::DLL_SUFFIX)
     })?;
     Ok((rustc, compiler_library, compiler_metadata, rustc_driver))
