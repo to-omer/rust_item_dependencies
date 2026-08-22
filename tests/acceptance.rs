@@ -63,6 +63,25 @@ fn complex_reductions_match_handwritten_sources() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn associated_struct_paths_keep_the_selected_impl_and_reach_a_fixed_point() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = include_str!("fixtures/retention/associated_struct_paths.input.rs");
+    let expected = include_str!("fixtures/retention/associated_struct_paths.expected.rs");
+
+    let verified = analyzer
+        .reduce_and_verify(&input(source, &target))
+        .expect("associated struct expressions and patterns must be reducible");
+    assert_verified("associated struct paths", source, expected, &verified);
+
+    let fixed = analyzer
+        .reduce_and_verify(&input(expected, &target))
+        .expect("the associated struct reduction must remain reducible");
+    assert_eq!(fixed.reduced_source(), expected);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn a_complex_macro_reduction_is_deterministic_and_byte_idempotent() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();
