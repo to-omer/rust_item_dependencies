@@ -11,6 +11,8 @@ use rustc_interface::interface::Compiler;
 use rustc_lexer::{FrontmatterAllowed, TokenKind, strip_shebang, tokenize};
 #[cfg(rust_item_dependencies_patched)]
 use rustc_middle::ty::{MacroImplementationKind, TyCtxt};
+#[cfg(rust_item_dependencies_patched)]
+use rustc_span::hygiene::{ExpnId, ExpnKind, MacroKind};
 use rustc_span::{SourceFile, Span, Symbol, sym};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -110,6 +112,82 @@ pub struct SourceInventory {
     pub units: Vec<WrittenUnit>,
     pub pieces: Vec<OwnedPiece>,
     pub(crate) macro_rules: Vec<MacroRuleSourceFacts>,
+    pub(crate) ownerless_attribute_invocations: Vec<SourceUnitId>,
+}
+
+impl SourceInventory {
+    pub(crate) fn ownerless_attribute_target(
+        &self,
+        invocation: SourceUnitId,
+    ) -> Option<SourceUnitId> {
+        self.ownerless_attribute_invocations
+            .binary_search(&invocation)
+            .ok()?;
+        self.units.get(invocation.0 as usize)?.parent
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AttributeSource {
+    pub invocation: Option<SourceUnitId>,
+    pub target: SourceUnitId,
+}
+
+pub(crate) fn resolve_attribute_source(
+    inventory: &SourceInventory,
+    invocation_range: ByteRange,
+    node_range: ByteRange,
+    target_range: ByteRange,
+) -> Result<AttributeSource, SourceError> {
+    if invocation_range.start >= invocation_range.end
+        || !node_range.contains(invocation_range)
+        || !node_range.contains(target_range)
+    {
+        return Err(SourceError::IncompleteAttributeObservation);
+    }
+    let mut targets = inventory
+        .units
+        .iter()
+        .filter(|unit| {
+            unit.cfg_state == CfgState::Active
+                && unit.full_range.contains(node_range)
+                && unit.full_range.contains(target_range)
+                && unit.full_range.contains(invocation_range)
+        })
+        .collect::<Vec<_>>();
+    let smallest = targets
+        .iter()
+        .map(|unit| unit.full_range.len())
+        .min()
+        .ok_or(SourceError::IncompleteAttributeObservation)?;
+    targets.retain(|unit| unit.full_range.len() == smallest);
+    let [target] = targets.as_slice() else {
+        return Err(SourceError::IncompleteAttributeObservation);
+    };
+
+    let invocations = inventory
+        .units
+        .iter()
+        .filter(|unit| {
+            unit.kind == WrittenUnitKind::MacroInvocation
+                && unit.cfg_state == CfgState::Active
+                && unit.parent == Some(target.id)
+                && unit.atomic_group == target.atomic_group
+                && unit.full_range.end <= target_range.start
+                && (unit.full_range == invocation_range
+                    || unit.full_range.contains(invocation_range))
+        })
+        .map(|unit| unit.id)
+        .collect::<Vec<_>>();
+    let invocation = match invocations.as_slice() {
+        [] => None,
+        [invocation] => Some(*invocation),
+        _ => return Err(SourceError::IncompleteAttributeObservation),
+    };
+    Ok(AttributeSource {
+        invocation,
+        target: target.id,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,6 +205,14 @@ pub(crate) struct ObservedMacroRules {
     pub definition_range: ByteRange,
     pub rule_ranges: Vec<ByteRange>,
     pub selected_rule_indices: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ObservedAttributeMacro {
+    invocation_range: ByteRange,
+    node_range: ByteRange,
+    target_range: ByteRange,
+    target_survives: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +234,7 @@ pub(crate) enum SourceError {
     NormalizationMismatch,
     InvalidSpan,
     InvalidInventory,
+    IncompleteAttributeObservation,
     IncompleteMacroRuleObservation,
 }
 
@@ -334,6 +421,31 @@ struct PendingUnit {
     syntax_ordinal: u32,
 }
 
+fn pending_units(units: &[WrittenUnit]) -> (Vec<PendingUnit>, BTreeMap<AtomicGroupId, u32>) {
+    let representatives = units.iter().fold(
+        BTreeMap::<AtomicGroupId, u32>::new(),
+        |mut representatives, unit| {
+            representatives
+                .entry(unit.atomic_group)
+                .or_insert(unit.id.0);
+            representatives
+        },
+    );
+    let pending = units
+        .iter()
+        .map(|unit| PendingUnit {
+            temporary_id: unit.id.0,
+            kind: unit.kind,
+            full_range: unit.full_range,
+            parent: unit.parent.map(|parent| parent.0),
+            cfg_state: unit.cfg_state,
+            atomic_representative: representatives[&unit.atomic_group],
+            syntax_ordinal: unit.id.0,
+        })
+        .collect();
+    (pending, representatives)
+}
+
 pub(crate) fn collect_source(
     compiler: &Compiler,
     krate: &ast::Crate,
@@ -377,7 +489,204 @@ pub(crate) fn collect_source(
         units,
         pieces,
         macro_rules: Vec::new(),
+        ownerless_attribute_invocations: Vec::new(),
     })
+}
+
+#[cfg(rust_item_dependencies_patched)]
+pub(crate) fn refine_attribute_macros_from_compiler(
+    compiler: &Compiler,
+    tcx: TyCtxt<'_>,
+    expanded: &ast::Crate,
+    inventory: &mut SourceInventory,
+) -> Result<(), SourceError> {
+    #[derive(Default)]
+    struct SurvivingTargetCollector {
+        spans: Vec<Span>,
+    }
+
+    impl SurvivingTargetCollector {
+        fn record(&mut self, span: Span) {
+            if !span.from_expansion() {
+                self.spans.push(span);
+            }
+        }
+    }
+
+    impl<'ast> Visitor<'ast> for SurvivingTargetCollector {
+        fn visit_item(&mut self, item: &'ast ast::Item) {
+            self.record(item.span);
+            visit::walk_item(self, item);
+        }
+
+        fn visit_assoc_item(&mut self, item: &'ast ast::AssocItem, context: AssocCtxt) {
+            self.record(item.span);
+            visit::walk_assoc_item(self, item, context);
+        }
+    }
+
+    let mut surviving = SurvivingTargetCollector::default();
+    surviving.visit_crate(expanded);
+    let surviving = surviving
+        .spans
+        .into_iter()
+        .map(|span| original_span_range(compiler, &inventory.offsets, span))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+
+    let origins = tcx
+        .resolutions(())
+        .macro_invocation_origins
+        .items()
+        .map(|(&expansion, origin)| {
+            (
+                expansion.expn_hash().local_hash().as_u64(),
+                expansion,
+                origin,
+            )
+        })
+        .into_sorted_stable_ord_by_key(|record| &record.0);
+    let mut observations = Vec::new();
+    for (_, expansion, origin) in origins {
+        let observation = (|| -> Result<Option<ObservedAttributeMacro>, SourceError> {
+            let ExpnKind::Macro(MacroKind::Attr, _) = expansion.expn_data().kind else {
+                return Ok(None);
+            };
+            if origin.discovered_in_expansion != ExpnId::root() {
+                return Ok(None);
+            }
+            let target_span = origin
+                .target_span
+                .ok_or(SourceError::IncompleteAttributeObservation)?;
+            let invocation_range = original_span_range(
+                compiler,
+                &inventory.offsets,
+                expansion.expn_data().call_site,
+            )?;
+            let node_range =
+                original_span_range(compiler, &inventory.offsets, origin.invocation_node_span)?;
+            let target_range = original_span_range(compiler, &inventory.offsets, target_span)?;
+            Ok(Some(ObservedAttributeMacro {
+                invocation_range,
+                node_range,
+                target_range,
+                target_survives: surviving.contains(&target_range),
+            }))
+        })()?;
+        if let Some(observation) = observation {
+            observations.push(observation);
+        }
+    }
+    observations.sort();
+    if observations.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(SourceError::IncompleteAttributeObservation);
+    }
+    refine_attribute_macros(inventory, observations)
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn refine_attribute_macros(
+    inventory: &mut SourceInventory,
+    observations: Vec<ObservedAttributeMacro>,
+) -> Result<(), SourceError> {
+    if !inventory.macro_rules.is_empty()
+        || !inventory.ownerless_attribute_invocations.is_empty()
+        || inventory
+            .units
+            .iter()
+            .any(|unit| unit.kind == WrittenUnitKind::MacroRule)
+    {
+        return Err(SourceError::InvalidInventory);
+    }
+    validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
+
+    let (mut pending, representatives) = pending_units(&inventory.units);
+    let mut next_temporary =
+        u32::try_from(pending.len()).map_err(|_| SourceError::SourceTooLarge)?;
+    let mut ownerless_invocations = BTreeSet::new();
+    let mut replaced_targets = BTreeMap::<u32, BTreeSet<u32>>::new();
+
+    for observation in observations {
+        let source = resolve_attribute_source(
+            inventory,
+            observation.invocation_range,
+            observation.node_range,
+            observation.target_range,
+        )?;
+        let target = &inventory.units[source.target.0 as usize];
+        let invocation = match source.invocation {
+            None => {
+                let temporary_id = next_temporary;
+                next_temporary = next_temporary
+                    .checked_add(1)
+                    .ok_or(SourceError::SourceTooLarge)?;
+                pending.push(PendingUnit {
+                    temporary_id,
+                    kind: WrittenUnitKind::MacroInvocation,
+                    full_range: observation.invocation_range,
+                    parent: Some(target.id.0),
+                    cfg_state: CfgState::Active,
+                    atomic_representative: representatives[&target.atomic_group],
+                    syntax_ordinal: temporary_id,
+                });
+                temporary_id
+            }
+            Some(invocation) => invocation.0,
+        };
+        if !observation.target_survives {
+            match target.kind {
+                WrittenUnitKind::Item
+                | WrittenUnitKind::NestedItem
+                | WrittenUnitKind::InlineModule => {
+                    replaced_targets
+                        .entry(target.id.0)
+                        .or_default()
+                        .insert(invocation);
+                }
+                WrittenUnitKind::MacroInvocation => {}
+                _ => return Err(SourceError::IncompleteAttributeObservation),
+            }
+            ownerless_invocations.insert(invocation);
+        }
+    }
+
+    let parents = pending
+        .iter()
+        .map(|unit| (unit.temporary_id, unit.parent))
+        .collect::<BTreeMap<_, _>>();
+    let mut removed = BTreeSet::new();
+    for (&target, invocations) in &replaced_targets {
+        for unit in &pending {
+            if unit.temporary_id == target || invocations.contains(&unit.temporary_id) {
+                continue;
+            }
+            let mut parent = unit.parent;
+            while let Some(candidate) = parent {
+                if candidate == target {
+                    removed.insert(unit.temporary_id);
+                    break;
+                }
+                parent = parents
+                    .get(&candidate)
+                    .copied()
+                    .ok_or(SourceError::IncompleteAttributeObservation)?;
+            }
+        }
+    }
+    pending.retain(|unit| !removed.contains(&unit.temporary_id));
+
+    let (units, id_map) = finish_pending_units(pending)?;
+    let mut ownerless_attribute_invocations = ownerless_invocations
+        .into_iter()
+        .map(|invocation| id_map[&invocation])
+        .collect::<Vec<_>>();
+    ownerless_attribute_invocations.sort();
+    let pieces = own_lexical_pieces(&inventory.original, &units)?;
+    validate_inventory(&inventory.original, &units, &pieces)?;
+    validate_ownerless_attribute_invocations(&units, &ownerless_attribute_invocations)?;
+    inventory.units = units;
+    inventory.pieces = pieces;
+    inventory.ownerless_attribute_invocations = ownerless_attribute_invocations;
+    Ok(())
 }
 
 pub(crate) fn refine_macro_rules(
@@ -393,6 +702,10 @@ pub(crate) fn refine_macro_rules(
         return Err(SourceError::InvalidInventory);
     }
     validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
+    validate_ownerless_attribute_invocations(
+        &inventory.units,
+        &inventory.ownerless_attribute_invocations,
+    )?;
     observations.sort_by_key(|observation| observation.definition_range);
     if observations
         .windows(2)
@@ -401,28 +714,7 @@ pub(crate) fn refine_macro_rules(
         return Err(SourceError::InvalidInventory);
     }
 
-    let representatives = inventory.units.iter().fold(
-        BTreeMap::<AtomicGroupId, u32>::new(),
-        |mut representatives, unit| {
-            representatives
-                .entry(unit.atomic_group)
-                .or_insert(unit.id.0);
-            representatives
-        },
-    );
-    let mut pending = inventory
-        .units
-        .iter()
-        .map(|unit| PendingUnit {
-            temporary_id: unit.id.0,
-            kind: unit.kind,
-            full_range: unit.full_range,
-            parent: unit.parent.map(|parent| parent.0),
-            cfg_state: unit.cfg_state,
-            atomic_representative: representatives[&unit.atomic_group],
-            syntax_ordinal: unit.id.0,
-        })
-        .collect::<Vec<_>>();
+    let (mut pending, _) = pending_units(&inventory.units);
     let mut next_temporary =
         u32::try_from(pending.len()).map_err(|_| SourceError::SourceTooLarge)?;
     let mut raw_facts = Vec::new();
@@ -517,12 +809,20 @@ pub(crate) fn refine_macro_rules(
             required_rules: required.into_iter().map(|rule| id_map[&rule]).collect(),
         })
         .collect::<Vec<_>>();
+    let mut ownerless_attribute_invocations = inventory
+        .ownerless_attribute_invocations
+        .iter()
+        .map(|invocation| id_map[&invocation.0])
+        .collect::<Vec<_>>();
+    ownerless_attribute_invocations.sort();
     let pieces = own_lexical_pieces(&inventory.original, &units)?;
     validate_inventory(&inventory.original, &units, &pieces)?;
     validate_macro_rule_facts(&units, &macro_rules)?;
+    validate_ownerless_attribute_invocations(&units, &ownerless_attribute_invocations)?;
     inventory.units = units;
     inventory.pieces = pieces;
     inventory.macro_rules = macro_rules;
+    inventory.ownerless_attribute_invocations = ownerless_attribute_invocations;
     Ok(())
 }
 
@@ -700,6 +1000,52 @@ pub(crate) fn validate_macro_rule_facts(
         .collect::<BTreeSet<_>>();
     if definitions != expected_definitions {
         return Err(SourceError::InvalidInventory);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_ownerless_attribute_invocations(
+    units: &[WrittenUnit],
+    invocations: &[SourceUnitId],
+) -> Result<(), SourceError> {
+    if invocations.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(SourceError::InvalidInventory);
+    }
+    let mut targets = BTreeMap::<SourceUnitId, BTreeSet<SourceUnitId>>::new();
+    for &invocation_id in invocations {
+        let invocation = units
+            .get(invocation_id.0 as usize)
+            .ok_or(SourceError::InvalidInventory)?;
+        let target_id = invocation.parent.ok_or(SourceError::InvalidInventory)?;
+        let target = units
+            .get(target_id.0 as usize)
+            .ok_or(SourceError::InvalidInventory)?;
+        if invocation.kind != WrittenUnitKind::MacroInvocation
+            || invocation.cfg_state != CfgState::Active
+            || invocation.parent != Some(target.id)
+            || invocation.atomic_group != target.atomic_group
+            || target.cfg_state != CfgState::Active
+            || !matches!(
+                target.kind,
+                WrittenUnitKind::MacroInvocation
+                    | WrittenUnitKind::Item
+                    | WrittenUnitKind::NestedItem
+                    | WrittenUnitKind::InlineModule
+            )
+        {
+            return Err(SourceError::InvalidInventory);
+        }
+        if target.kind != WrittenUnitKind::MacroInvocation {
+            targets.entry(target.id).or_default().insert(invocation.id);
+        }
+    }
+    for (target, allowed) in targets {
+        if units.iter().any(|unit| {
+            unit.parent == Some(target) && !allowed.contains(&unit.id)
+                || unit.parent.is_some_and(|parent| allowed.contains(&parent))
+        }) {
+            return Err(SourceError::InvalidInventory);
+        }
     }
     Ok(())
 }
@@ -1649,6 +1995,7 @@ mod tests {
             units,
             pieces,
             macro_rules: Vec::new(),
+            ownerless_attribute_invocations: Vec::new(),
         };
         let mut unselected_inventory = inventory.clone();
 
@@ -1745,6 +2092,7 @@ mod tests {
             units,
             pieces,
             macro_rules: Vec::new(),
+            ownerless_attribute_invocations: Vec::new(),
         };
 
         assert_eq!(

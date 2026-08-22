@@ -1120,6 +1120,12 @@ fn patched_driver_preserves_complete_macro_invocation_origins() {
                 Some(marker_range(source, "struct Derived;")),
             ),
             (
+                "#[test]",
+                Some(marker_range(source, "#[test]")),
+                Some(range_between(source, "#[test]", "fn test_only() {}")),
+                Some(marker_range(source, "fn test_only() {}")),
+            ),
+            (
                 "println!",
                 Some(marker_range(source, "println!(\"expansion-origin\")")),
                 Some(marker_range(source, "println!(\"expansion-origin\");")),
@@ -1308,6 +1314,22 @@ fn patched_driver_preserves_complete_macro_invocation_origins() {
             .as_deref()
             .is_some_and(|definition| definition.ends_with("::Clone")),
         "the builtin derive must retain its external definition: {clone_derive:?}"
+    );
+
+    let test = unique_macro_invocation(&report.macro_invocations, |record| {
+        record.kind == "#[test]" && record.discovered_in.is_none()
+    });
+    assert!(
+        test.macro_definition
+            .as_deref()
+            .is_some_and(|definition| definition.ends_with("::test")),
+        "the builtin test attribute must retain its canonical definition: {test:?}"
+    );
+    assert_eq!(test.fragment_kind, "Items");
+    assert_eq!(test.implementation_kind, "Builtin");
+    assert!(
+        test.generated_definitions.is_empty(),
+        "the test attribute removes its target from a normal binary: {test:?}"
     );
 }
 

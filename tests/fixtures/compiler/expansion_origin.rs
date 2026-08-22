@@ -53,6 +53,9 @@ const EAGER: &str = concat!("line=", line!());
 #[derive(Clone)]
 struct Derived;
 
+#[test]
+fn test_only() {}
+
 fn main() {
     println!("expansion-origin");
     generated_one();

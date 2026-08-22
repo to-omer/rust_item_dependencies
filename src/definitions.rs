@@ -23,6 +23,8 @@ use crate::graph::{
     InjectedRole,
 };
 use crate::rewrite::{SourceRewrite, SourceRewriteError};
+#[cfg(rust_item_dependencies_patched)]
+use crate::source::resolve_attribute_source;
 use crate::source::{
     ByteRange, CfgState, SourceError, SourceInventory, WrittenUnitKind, original_span_range,
 };
@@ -840,6 +842,26 @@ fn written_macro_invocation<'a>(
     let node_range = original_span_range(compiler, &source.offsets, origin.invocation_node_span)?;
     let call_range =
         original_span_range(compiler, &source.offsets, expansion.expn_data().call_site)?;
+    if matches!(
+        &expansion.expn_data().kind,
+        ExpnKind::Macro(MacroKind::Attr, _)
+    ) {
+        let target_range = original_span_range(
+            compiler,
+            &source.offsets,
+            origin
+                .target_span
+                .ok_or(DefinitionError::IncompleteDependency)?,
+        )?;
+        let invocation = resolve_attribute_source(source, call_range, node_range, target_range)
+            .map_err(|_| DefinitionError::IncompleteDependency)?
+            .invocation
+            .ok_or(DefinitionError::IncompleteDependency)?;
+        return source
+            .units
+            .get(invocation.0 as usize)
+            .ok_or(DefinitionError::IncompleteDependency);
+    }
     let mut matches = source.units.iter().filter(|unit| {
         unit.kind == WrittenUnitKind::MacroInvocation
             && unit.cfg_state == CfgState::Active

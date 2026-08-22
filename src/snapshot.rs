@@ -2183,6 +2183,7 @@ mod tests {
                 },
             ],
             macro_rules: Vec::new(),
+            ownerless_attribute_invocations: Vec::new(),
         }
     }
 

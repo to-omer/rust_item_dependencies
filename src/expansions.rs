@@ -27,7 +27,7 @@ use crate::dependency_graph::{DependencyEdge, ExpansionNode};
 use crate::graph::{DefinitionId, DefinitionOrigin, DefinitionTarget};
 use crate::source::SourceInventory;
 #[cfg(rust_item_dependencies_patched)]
-use crate::source::{ByteRange, original_span_range};
+use crate::source::{ByteRange, original_span_range, resolve_attribute_source};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExpansionError {
@@ -120,25 +120,43 @@ pub(crate) fn collect_expansions(
         let source_call_parent =
             (source_call != ExpnId::root() && source_call != expansion).then_some(source_call);
         let identity_parent = discovered_in.or(source_call_parent).or(semantic_parent);
-        let source_owner = origin
-            .map(|origin| expansion_source_owner(compiler, source, definitions, origin))
-            .transpose()?;
         let fragment = origin.map(|origin| fragment_kind(origin.fragment_kind));
         let implementation = origin.map(|origin| implementation_kind(origin.implementation_kind));
         let selected_macro_rule = origin
             .map(|origin| selected_macro_rule_range(compiler, tcx, source, origin))
             .transpose()?
             .flatten();
+        let attribute = matches!(&data.kind, ExpnKind::Macro(MacroKind::Attr, _));
         let written_invocation = if let Some(origin) =
             origin.filter(|origin| origin.discovered_in_expansion == ExpnId::root())
         {
             Some(
-                written_invocation(source, invocation_range, node_range, target_range, origin)
-                    .ok_or(ExpansionError::IncompleteOrigin)?,
+                written_invocation(
+                    source,
+                    invocation_range,
+                    node_range,
+                    target_range,
+                    origin,
+                    attribute,
+                )
+                .ok_or(ExpansionError::IncompleteOrigin)?,
             )
         } else {
             None
         };
+        let source_owner = origin
+            .map(|origin| {
+                expansion_source_owner(
+                    compiler,
+                    source,
+                    definitions,
+                    origin,
+                    written_invocation,
+                    attribute,
+                )
+            })
+            .transpose()?
+            .flatten();
         raw.push(RawExpansion {
             compiler_id: expansion,
             identity_parent,
@@ -449,7 +467,9 @@ fn expansion_source_owner(
     source: &SourceInventory,
     definitions: &CollectedDefinitions,
     origin: &MacroInvocationOrigin,
-) -> Result<DefinitionId, ExpansionError> {
+    written_invocation: Option<crate::source::SourceUnitId>,
+    attribute: bool,
+) -> Result<Option<DefinitionId>, ExpansionError> {
     if let Some(target_span) = origin.target_span {
         if let Some(target_range) = source_range(compiler, source, target_span)? {
             let mut candidates = definitions
@@ -472,13 +492,26 @@ fn expansion_source_owner(
                     .get(1)
                     .is_none_or(|candidate| candidate.0 != depth)
             {
-                return Ok(owner);
+                return Ok(Some(owner));
+            }
+            if candidates.is_empty()
+                && attribute
+                && (origin.discovered_in_expansion != ExpnId::root()
+                    || written_invocation.is_some_and(|invocation| {
+                        source
+                            .ownerless_attribute_target(invocation)
+                            .and_then(|target| source.units.get(target.0 as usize))
+                            .is_some_and(|target| target.full_range.contains(target_range))
+                    }))
+            {
+                return Ok(None);
             }
             return Err(ExpansionError::IncompleteOrigin);
         }
     }
     definitions
         .definition_id(origin.parent_definition)
+        .map(Some)
         .ok_or(ExpansionError::IncompleteOrigin)
 }
 
@@ -489,19 +522,28 @@ fn written_invocation(
     node_range: Option<ByteRange>,
     target_range: Option<ByteRange>,
     origin: &MacroInvocationOrigin,
+    attribute: bool,
 ) -> Option<crate::source::SourceUnitId> {
-    source
+    if origin.discovered_in_expansion != ExpnId::root() {
+        return None;
+    }
+    if attribute {
+        return resolve_attribute_source(source, invocation_range?, node_range?, target_range?)
+            .ok()?
+            .invocation;
+    }
+    let mut matches = source
         .units
         .iter()
         .filter(|unit| {
             unit.kind == crate::source::WrittenUnitKind::MacroInvocation
                 && unit.cfg_state == crate::source::CfgState::Active
                 && (Some(unit.full_range) == invocation_range
-                    || Some(unit.full_range) == node_range
-                    || target_range.is_some_and(|target| target.contains(unit.full_range)))
+                    || Some(unit.full_range) == node_range)
         })
-        .map(|unit| unit.id)
-        .find(|_| origin.discovered_in_expansion == ExpnId::root())
+        .map(|unit| unit.id);
+    let invocation = matches.next()?;
+    matches.next().is_none().then_some(invocation)
 }
 
 #[cfg(rust_item_dependencies_patched)]
