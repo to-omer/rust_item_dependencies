@@ -502,6 +502,15 @@ fn expansion_source_owner(
                             .ownerless_attribute_target(invocation)
                             .and_then(|target| source.units.get(target.0 as usize))
                             .is_some_and(|target| target.full_range.contains(target_range))
+                            || definitions.graph.definitions.iter().any(|definition| {
+                                matches!(
+                                    definition.origin,
+                                    DefinitionOrigin::Expanded {
+                                        invocation: definition_invocation,
+                                        ..
+                                    } if definition_invocation == invocation
+                                )
+                            })
                     }))
             {
                 return Ok(None);

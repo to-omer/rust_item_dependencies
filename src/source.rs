@@ -523,6 +523,11 @@ pub(crate) fn refine_attribute_macros_from_compiler(
             self.record(item.span);
             visit::walk_assoc_item(self, item, context);
         }
+
+        fn visit_foreign_item(&mut self, item: &'ast ast::ForeignItem) {
+            self.record(item.span);
+            visit::walk_item(self, item);
+        }
     }
 
     let mut surviving = SurvivingTargetCollector::default();
@@ -1482,6 +1487,46 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
             self.record_configured_attribute_macros(item.attrs(), configured.attrs(), active);
         }
         visit::walk_assoc_item(self, item, context);
+        self.active_stack.pop();
+        self.parent_stack.pop();
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast ast::ForeignItem) {
+        let configured = self.configured(item);
+        let active = configured.is_some();
+        let span = item
+            .attrs
+            .iter()
+            .fold(item.span, |span, attribute| span.to(attribute.span));
+        let range = match self.span_range(span) {
+            Ok(range) => range,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
+        let kind = if matches!(item.kind, ast::ForeignItemKind::MacCall(_)) {
+            WrittenUnitKind::MacroInvocation
+        } else {
+            WrittenUnitKind::Item
+        };
+        let parent = self.current_parent();
+        let id = self.add_unit(kind, range, active, parent, None);
+        if let ast::ForeignItemKind::MacCall(mac) = &item.kind {
+            match self.span_range(mac.span()) {
+                Ok(key) => {
+                    self.seen_macro_ranges.insert(key, id);
+                }
+                Err(error) => self.fail(error),
+            }
+        }
+
+        self.parent_stack.push(id);
+        self.active_stack.push(active);
+        if let Some(configured) = &configured {
+            self.record_configured_attribute_macros(item.attrs(), configured.attrs(), active);
+        }
+        visit::walk_item(self, item);
         self.active_stack.pop();
         self.parent_stack.pop();
     }

@@ -228,23 +228,48 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
             },
         ];
         for definition in tcx.iter_local_def_id() {
+            let kind = tcx.def_kind(definition);
             if !matches!(
-                tcx.def_kind(definition),
-                DefKind::Static { nested: false, .. }
+                kind,
+                DefKind::Fn | DefKind::AssocFn | DefKind::Static { .. }
             ) {
                 continue;
             }
-            let flags = tcx.codegen_fn_attrs(definition).flags;
-            if flags.intersects(CodegenFnAttrFlags::USED_COMPILER | CodegenFnAttrFlags::USED_LINKER)
+
+            let attributes = tcx.codegen_fn_attrs(definition);
+            let reason = if matches!(kind, DefKind::Static { .. })
+                && attributes
+                    .flags
+                    .intersects(CodegenFnAttrFlags::USED_COMPILER | CodegenFnAttrFlags::USED_LINKER)
             {
-                seeds.push(Seed {
-                    root: MonoTraceRoot::Static {
-                        def_id: definition.to_def_id(),
-                        trigger_span: tcx.def_span(definition),
-                    },
-                    reason: Some(RootReason::UsedAttribute),
-                });
+                Some(RootReason::UsedAttribute)
+            } else if attributes.contains_extern_indicator()
+                && !tcx.generics_of(definition).requires_monomorphization(tcx)
+            {
+                Some(RootReason::ExternalSymbol)
+            } else {
+                None
+            };
+            let Some(reason) = reason else {
+                continue;
+            };
+            let root = match kind {
+                DefKind::Fn | DefKind::AssocFn => {
+                    MonoTraceRoot::Fn(Instance::mono(tcx, definition.to_def_id()))
+                }
+                DefKind::Static { .. } => MonoTraceRoot::Static {
+                    def_id: definition.to_def_id(),
+                    trigger_span: tcx.def_span(definition),
+                },
+                _ => unreachable!("filtered above"),
+            };
+            if seeds.iter().any(|seed| seed.root == root) {
+                continue;
             }
+            seeds.push(Seed {
+                root,
+                reason: Some(reason),
+            });
         }
         Ok(Self {
             compiler,
