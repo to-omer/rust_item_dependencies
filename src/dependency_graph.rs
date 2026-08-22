@@ -475,6 +475,7 @@ pub struct DependencyEdge {
 pub enum RootReason {
     StartInstance,
     UsedAttribute,
+    ExternalSymbol,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -607,6 +608,13 @@ impl DependencyGraph {
                         RootReason::UsedAttribute => {
                             !matches!(mono_nodes[root.node.0 as usize].key, MonoKey::Static { .. })
                         }
+                        RootReason::ExternalSymbol => !matches!(
+                            mono_nodes[root.node.0 as usize].key,
+                            MonoKey::Instance {
+                                role: MonoInstanceRole::Callable,
+                                ..
+                            } | MonoKey::Static { .. }
+                        ),
                     }
             })
             || compiler_required_roots

@@ -85,7 +85,6 @@ pub enum UnsupportedReason {
     ExternalDependency,
     ProcMacro,
     NoStdOrNoMain,
-    Ffi,
     Assembly,
     NativeLinkOrCustomRuntime,
     UnsupportedTarget,
@@ -1155,16 +1154,6 @@ impl UnexpandedValidator<'_> {
         }
     }
 
-    fn validate_extern(&mut self, external: ast::Extern) {
-        match external {
-            ast::Extern::None => {}
-            ast::Extern::Explicit(name, _) if name.symbol_unescaped.as_str() == "Rust" => {}
-            ast::Extern::Implicit(span) | ast::Extern::Explicit(_, span) => {
-                self.reject(UnsupportedReason::Ffi, span)
-            }
-        }
-    }
-
     fn finish(mut self) -> Result<(), InputError> {
         self.errors.sort_by_key(|error| match error {
             InputError::UnsupportedInput { reason, range } => {
@@ -1189,7 +1178,6 @@ impl<'ast> Visitor<'ast> for UnexpandedValidator<'_> {
             ast::ItemKind::Mod(_, _, ast::ModKind::Unloaded) => {
                 self.reject(UnsupportedReason::AdditionalSourceFile, item.span)
             }
-            ast::ItemKind::ForeignMod(_) => self.reject(UnsupportedReason::Ffi, item.span),
             ast::ItemKind::GlobalAsm(_) => self.reject(UnsupportedReason::Assembly, item.span),
             ast::ItemKind::ExternCrate(original, identifier) => {
                 let name = original.unwrap_or(identifier.name);
@@ -1218,20 +1206,17 @@ impl<'ast> Visitor<'ast> for UnexpandedValidator<'_> {
         self.active_stack.pop();
     }
 
-    fn visit_fn_header(&mut self, header: &'ast ast::FnHeader) {
-        if self.current_active() {
-            self.validate_extern(header.ext);
-        }
-        visit::walk_fn_header(self, header);
-    }
-
-    fn visit_ty(&mut self, ty: &'ast ast::Ty) {
-        if self.current_active()
-            && let ast::TyKind::FnPtr(function) = &ty.kind
-        {
-            self.validate_extern(function.ext);
-        }
-        visit::walk_ty(self, ty);
+    fn visit_foreign_item(&mut self, item: &'ast ast::ForeignItem) {
+        let Some(configured) = self.configured(item) else {
+            self.active_stack.push(false);
+            visit::walk_item(self, item);
+            self.active_stack.pop();
+            return;
+        };
+        self.validate_attributes(&configured.attrs);
+        self.active_stack.push(true);
+        visit::walk_item(self, item);
+        self.active_stack.pop();
     }
 
     fn visit_expr(&mut self, expression: &'ast ast::Expr) {
@@ -1357,7 +1342,6 @@ impl<'ast> Visitor<'ast> for ExpandedValidator<'_> {
     fn visit_item(&mut self, item: &'ast ast::Item) {
         self.validate_attributes(&item.attrs);
         match &item.kind {
-            ast::ItemKind::ForeignMod(_) => self.reject(UnsupportedReason::Ffi, item.span),
             ast::ItemKind::GlobalAsm(_) => self.reject(UnsupportedReason::Assembly, item.span),
             ast::ItemKind::ExternCrate(original, identifier) => {
                 let name = original.unwrap_or(identifier.name);
@@ -1375,28 +1359,9 @@ impl<'ast> Visitor<'ast> for ExpandedValidator<'_> {
         visit::walk_assoc_item(self, item, context);
     }
 
-    fn visit_fn_header(&mut self, header: &'ast ast::FnHeader) {
-        match header.ext {
-            ast::Extern::None => {}
-            ast::Extern::Explicit(name, _) if name.symbol_unescaped.as_str() == "Rust" => {}
-            ast::Extern::Implicit(span) | ast::Extern::Explicit(_, span) => {
-                self.reject(UnsupportedReason::Ffi, span)
-            }
-        }
-        visit::walk_fn_header(self, header);
-    }
-
-    fn visit_ty(&mut self, ty: &'ast ast::Ty) {
-        if let ast::TyKind::FnPtr(function) = &ty.kind {
-            match function.ext {
-                ast::Extern::None => {}
-                ast::Extern::Explicit(name, _) if name.symbol_unescaped.as_str() == "Rust" => {}
-                ast::Extern::Implicit(span) | ast::Extern::Explicit(_, span) => {
-                    self.reject(UnsupportedReason::Ffi, span)
-                }
-            }
-        }
-        visit::walk_ty(self, ty);
+    fn visit_foreign_item(&mut self, item: &'ast ast::ForeignItem) {
+        self.validate_attributes(&item.attrs);
+        visit::walk_item(self, item);
     }
 
     fn visit_expr(&mut self, expression: &'ast ast::Expr) {
@@ -1417,8 +1382,7 @@ fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<Unsupporte
         || attribute.has_name(sym::proc_macro_derive)
     {
         Some(UnsupportedReason::ProcMacro)
-    } else if attribute.has_name(sym::global_allocator)
-        || attribute.has_name(sym::panic_handler)
+    } else if attribute.has_name(sym::panic_handler)
         || attribute.has_name(sym::alloc_error_handler)
         || attribute.has_name(sym::crate_name)
         || attribute.has_name(sym::crate_type)
@@ -1426,10 +1390,6 @@ fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<Unsupporte
         || attribute.has_name(sym::no_link)
         || attribute.has_name(sym::windows_subsystem)
         || attribute.has_name(sym::link)
-        || attribute.has_name(sym::link_section)
-        || attribute.has_name(sym::linkage)
-        || attribute.has_name(sym::no_mangle)
-        || attribute.has_name(sym::export_name)
     {
         Some(UnsupportedReason::NativeLinkOrCustomRuntime)
     } else {
@@ -1440,15 +1400,7 @@ fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<Unsupporte
 fn unsupported_attribute_symbol(name: Symbol) -> Option<UnsupportedReason> {
     matches!(
         name,
-        sym::global_allocator
-            | sym::panic_handler
-            | sym::alloc_error_handler
-            | sym::no_link
-            | sym::link
-            | sym::link_section
-            | sym::linkage
-            | sym::no_mangle
-            | sym::export_name
+        sym::panic_handler | sym::alloc_error_handler | sym::no_link | sym::link
     )
     .then_some(UnsupportedReason::NativeLinkOrCustomRuntime)
 }
@@ -1649,6 +1601,7 @@ impl FileLoader for DenyExternalFiles {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     #[cfg(rust_item_dependencies_patched)]
     use std::path::Path;
     use std::path::PathBuf;
@@ -2198,6 +2151,11 @@ mod tests {
             "try { 1 }",
         );
         assert_unsupported(
+            "#[linkage = \"external\"] static EXTERNAL: i32 = 0;\nfn main() {}\n",
+            UnsupportedReason::UnstableLanguageFeature,
+            "linkage",
+        );
+        assert_unsupported(
             "\u{feff}// 注\r\nmod external;\r\nfn main() {}\r\n",
             UnsupportedReason::AdditionalSourceFile,
             "mod external;",
@@ -2216,16 +2174,6 @@ mod tests {
             "#![no_std]\nfn main() {}\n",
             UnsupportedReason::NoStdOrNoMain,
             "#![no_std]",
-        );
-        assert_unsupported(
-            "unsafe extern \"C\" { fn foreign(); }\nfn main() {}\n",
-            UnsupportedReason::Ffi,
-            "unsafe extern \"C\" { fn foreign(); }",
-        );
-        assert_unsupported(
-            "type Callback = extern \"C\" fn();\nfn main() {}\n",
-            UnsupportedReason::Ffi,
-            "extern \"C\"",
         );
         assert_unsupported(
             "fn main() { unsafe { core::arch::asm!(\"\"); } }\n",
@@ -2247,11 +2195,6 @@ mod tests {
             UnsupportedReason::ProcMacro,
             "#[proc_macro]",
         );
-        assert_unsupported(
-            "#[global_allocator]\nstatic A: () = ();\nfn main() {}\n",
-            UnsupportedReason::NativeLinkOrCustomRuntime,
-            "#[global_allocator]",
-        );
         for (source, snippet) in [
             (
                 "#![crate_name = \"other\"]\nfn main() {}\n",
@@ -2271,16 +2214,8 @@ mod tests {
                 "#![windows_subsystem = \"windows\"]",
             ),
             (
-                "#[unsafe(no_mangle)] fn exported() {}\nfn main() {}\n",
-                "#[unsafe(no_mangle)]",
-            ),
-            (
-                "#[unsafe(export_name = \"exported\")] fn named() {}\nfn main() {}\n",
-                "#[unsafe(export_name = \"exported\")]",
-            ),
-            (
-                "#[unsafe(link_section = \"custom\")] static VALUE: u8 = 0;\nfn main() {}\n",
-                "#[unsafe(link_section = \"custom\")]",
+                "#[link(name = \"native\")] unsafe extern \"C\" { fn foreign(); }\nfn main() {}\n",
+                "#[link(name = \"native\")]",
             ),
         ] {
             assert_unsupported(
@@ -2333,7 +2268,7 @@ mod tests {
                 MacroImplementationKind::Builtin,
                 sym::global_allocator,
             ),
-            Some(UnsupportedReason::NativeLinkOrCustomRuntime)
+            None
         );
         assert_eq!(
             super::unsupported_resolved_attribute(MacroImplementationKind::Builtin, sym::test),
@@ -2343,16 +2278,103 @@ mod tests {
             super::unsupported_resolved_attribute(MacroImplementationKind::Procedural, sym::test,),
             Some(UnsupportedReason::ProcMacro)
         );
-        assert_unsupported(
-            concat!(
+        assert!(
+            inspect(concat!(
                 "use std::prelude::v1::global_allocator as ga;\n",
                 "#[ga]\n",
                 "static A: std::alloc::System = std::alloc::System;\n",
                 "fn main() {}\n",
-            ),
-            UnsupportedReason::NativeLinkOrCustomRuntime,
-            "#[ga]",
+            ))
+            .is_ok()
         );
+    }
+
+    #[test]
+    fn foreign_items_follow_edition_cfg_and_source_unit_rules() {
+        let legacy = "extern \"C\" { fn foreign(); }\nfn main() {}\n";
+        for edition in [Edition::Rust2015, Edition::Rust2018, Edition::Rust2021] {
+            assert!(inspect_edition(legacy, edition).is_ok(), "{edition:?}");
+        }
+
+        let source = concat!(
+            "unsafe extern \"C\" {\n",
+            "    #[link_name = \"abs\"]\n",
+            "    fn renamed(value: core::ffi::c_int) -> core::ffi::c_int;\n",
+            "    static FOREIGN: i32;\n",
+            "    #[cfg(any())] static INACTIVE: i32;\n",
+            "}\n",
+            "type Callback = extern \"C\" fn(i32) -> i32;\n",
+            "extern \"C\" fn identity(value: i32) -> i32 { value }\n",
+            "fn main() { let _: Callback = identity; }\n",
+        );
+        let inventory = inspect(source).unwrap();
+        let foreign_block = inventory
+            .units
+            .iter()
+            .find(|unit| {
+                unit.kind == WrittenUnitKind::Item
+                    && source[unit.full_range.start as usize..unit.full_range.end as usize]
+                        == source[..source.find("\ntype Callback").unwrap()]
+            })
+            .expect("the foreign block must be an item");
+        let expected = [
+            (
+                "#[link_name = \"abs\"]\n    fn renamed(value: core::ffi::c_int) -> core::ffi::c_int;",
+                CfgState::Active,
+            ),
+            ("static FOREIGN: i32;", CfgState::Active),
+            ("#[cfg(any())] static INACTIVE: i32;", CfgState::Inactive),
+        ];
+        let foreign_items = expected
+            .iter()
+            .map(|(snippet, state)| {
+                let start = source.find(snippet).unwrap() as u32;
+                inventory
+                    .units
+                    .iter()
+                    .find(|unit| {
+                        unit.kind == WrittenUnitKind::Item
+                            && unit.full_range == range(start, start + snippet.len() as u32)
+                    })
+                    .map(|unit| (unit, state))
+                    .expect("every foreign item must have its own source unit")
+            })
+            .collect::<Vec<_>>();
+        for (unit, state) in &foreign_items {
+            assert_eq!(unit.parent, Some(foreign_block.id));
+            assert_eq!(unit.cfg_state, **state);
+        }
+        assert_eq!(
+            foreign_items
+                .iter()
+                .map(|(unit, _)| unit.atomic_group)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            foreign_items.len()
+        );
+    }
+
+    #[test]
+    fn a_macro_call_inside_a_foreign_block_is_an_independent_source_unit() {
+        let source = concat!(
+            "macro_rules! declaration { () => { fn foreign(); } }\n",
+            "unsafe extern \"C\" { declaration!(); }\n",
+            "fn main() {}\n",
+        );
+        let inventory = inspect(source).unwrap();
+        let snippet = "declaration!();";
+        let start = source.find(snippet).unwrap() as u32;
+        let invocation = inventory
+            .units
+            .iter()
+            .find(|unit| {
+                unit.kind == WrittenUnitKind::MacroInvocation
+                    && unit.full_range == range(start, start + snippet.len() as u32)
+            })
+            .expect("the foreign item macro must have its own source unit");
+        let parent = &inventory.units[invocation.parent.unwrap().0 as usize];
+        assert_eq!(parent.kind, WrittenUnitKind::Item);
+        assert_ne!(invocation.atomic_group, parent.atomic_group);
     }
 
     #[test]
@@ -2432,6 +2454,10 @@ mod tests {
     fn compiler_errors_and_missing_entry_are_not_reported_as_unsupported_syntax() {
         assert!(matches!(
             inspect("fn main() { let _: u8 = \"not a number\"; }\n"),
+            Err(InputError::OriginalCompilationFailed(_))
+        ));
+        assert!(matches!(
+            inspect("#[unsafe(no_mangle)] extern \"C\" fn generic<T>() {}\nfn main() {}\n"),
             Err(InputError::OriginalCompilationFailed(_))
         ));
         assert_eq!(
@@ -2602,25 +2628,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_ffi_and_assembly_are_rejected_at_the_written_invocation() {
-        assert_unsupported(
-            concat!(
-                "macro_rules! foreign { () => { unsafe extern \"C\" { fn generated(); } }; }\n",
-                "foreign!();\n",
-                "fn main() {}\n",
-            ),
-            UnsupportedReason::Ffi,
-            "foreign!()",
-        );
-        assert_unsupported(
-            concat!(
-                "macro_rules! method { () => { extern \"C\" fn f() {} }; }\n",
-                "trait T { method!(); }\n",
-                "fn main() {}\n",
-            ),
-            UnsupportedReason::Ffi,
-            "method!()",
-        );
+    fn expanded_assembly_and_native_linkage_are_rejected_at_the_written_invocation() {
         assert_unsupported(
             concat!(
                 "macro_rules! assembly { () => { core::arch::global_asm!(\"\"); }; }\n",
@@ -2638,15 +2646,6 @@ mod tests {
             ),
             UnsupportedReason::NativeLinkOrCustomRuntime,
             "linkage!()",
-        );
-        assert_unsupported(
-            concat!(
-                "macro_rules! native { () => { #[unsafe(no_mangle)] fn exported() {} }; }\n",
-                "native!();\n",
-                "fn main() {}\n",
-            ),
-            UnsupportedReason::NativeLinkOrCustomRuntime,
-            "native!()",
         );
     }
 
@@ -2723,21 +2722,6 @@ mod tests {
                 snippet,
             );
         }
-    }
-
-    #[cfg(rust_item_dependencies_patched)]
-    #[test]
-    fn generated_builtin_attribute_is_rejected_at_the_written_invocation() {
-        assert_unsupported(
-            concat!(
-                "macro_rules! native { () => { #[global_allocator] ",
-                "static A: std::alloc::System = std::alloc::System; }; }\n",
-                "native!();\n",
-                "fn main() {}\n",
-            ),
-            UnsupportedReason::NativeLinkOrCustomRuntime,
-            "native!()",
-        );
     }
 
     fn range(start: u32, end: u32) -> ByteRange {

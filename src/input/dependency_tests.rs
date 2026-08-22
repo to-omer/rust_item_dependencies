@@ -58,6 +58,11 @@ fn main() {
 
 const FULL_RANGE_REMAINING_ITEM: &str = "fn dead() {}fn main() {}";
 
+const EXTERNAL_SYMBOL_ROOTS: &str =
+    include_str!("../../tests/fixtures/retention/external_symbol_roots.input.rs");
+const EXTERNAL_SYMBOL_ROOTS_EXPECTED: &str =
+    include_str!("../../tests/fixtures/retention/external_symbol_roots.expected.rs");
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct AllocationRef {
     root: String,
@@ -170,6 +175,75 @@ fn macro_generated_associated_direct_call_builds_a_valid_graph() {
     ];
     expected.sort();
     assert_eq!(selection, expected);
+}
+
+#[test]
+fn external_symbols_are_compiler_roots_with_their_dependencies() {
+    let (sysroot, target) = compiler_context();
+    let reduction = inspect_source_with_reduction(
+        &SourceInput {
+            source: EXTERNAL_SYMBOL_ROOTS.to_owned(),
+            edition: Edition::Rust2024,
+            target,
+        },
+        &sysroot,
+    )
+    .expect("external symbols must be reducible");
+
+    let roots = reduction
+        .graph
+        .compiler_required_roots
+        .iter()
+        .filter(|root| root.reason == RootReason::ExternalSymbol)
+        .map(|root| {
+            reduction.graph.mono_nodes[root.node.0 as usize]
+                .materialized_definition
+                .map(|target| target_label(&reduction.graph.definitions, target))
+                .expect("external symbol roots must materialize definitions")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(roots.len(), 4);
+    assert!(roots.iter().any(|root| root == "exported_function"));
+    assert!(roots.iter().any(|root| root == "EXPORTED_STATIC"));
+    assert!(roots.iter().any(|root| root.ends_with("::method")));
+    assert!(roots.iter().any(|root| root == "generated"));
+
+    assert_eq!(reduction.rewrite.source, EXTERNAL_SYMBOL_ROOTS_EXPECTED);
+}
+
+#[test]
+fn overlapping_compiler_root_reasons_do_not_duplicate_main_or_used_statics() {
+    let source = concat!(
+        "#[used]\n",
+        "#[unsafe(export_name = \"rid_used_export\")]\n",
+        "static BOTH: i32 = 1;\n",
+        "\n",
+        "#[unsafe(export_name = \"rid_main_body\")]\n",
+        "fn main() {}\n",
+    );
+    let (sysroot, target) = compiler_context();
+    let reduction = inspect_source_with_reduction(
+        &SourceInput {
+            source: source.to_owned(),
+            edition: Edition::Rust2024,
+            target,
+        },
+        &sysroot,
+    )
+    .expect("overlapping compiler roots must be reducible");
+
+    assert_eq!(reduction.rewrite.source, source);
+    let mut reasons = reduction
+        .graph
+        .compiler_required_roots
+        .iter()
+        .map(|root| root.reason)
+        .collect::<Vec<_>>();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec![RootReason::StartInstance, RootReason::UsedAttribute]
+    );
 }
 
 #[test]
