@@ -11,6 +11,7 @@ use crate::dependency_graph::{DependencyGraph, DependencyKind, GraphNode};
 use crate::graph::{DefinitionGraph, DefinitionId, DefinitionKind, DefinitionOrigin};
 use crate::source::{
     CfgState, SourceInventory, SourceUnitId, WrittenUnitKind, validate_macro_rule_facts,
+    validate_ownerless_attribute_invocations,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1279,6 +1280,11 @@ fn validate_source(source: &SourceInventory) -> Result<(), RetentionError> {
     }
     validate_macro_rule_facts(&source.units, &source.macro_rules)
         .map_err(|_| RetentionError::InvalidSource)?;
+    validate_ownerless_attribute_invocations(
+        &source.units,
+        &source.ownerless_attribute_invocations,
+    )
+    .map_err(|_| RetentionError::InvalidSource)?;
     Ok(())
 }
 
@@ -1393,6 +1399,7 @@ mod tests {
             units,
             pieces: Vec::new(),
             macro_rules: Vec::new(),
+            ownerless_attribute_invocations: Vec::new(),
         }
     }
 

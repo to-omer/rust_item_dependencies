@@ -14,8 +14,10 @@ use rustc_errors::emitter::Emitter;
 use rustc_errors::formatting::format_diag_messages;
 use rustc_errors::{DiagInner, E0463, E0554, E0658, ErrCode, Level};
 use rustc_expand::config::{StripUnconfigured, features, pre_configure_attrs};
-use rustc_feature::{Features, UnstableFeatures, is_builtin_attr_name};
+use rustc_feature::{Features, UnstableFeatures};
 use rustc_interface::interface::{Compiler, Config};
+#[cfg(rust_item_dependencies_patched)]
+use rustc_middle::ty::MacroImplementationKind;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::Input;
 use rustc_span::source_map::{FileLoader, SourceMap};
@@ -40,11 +42,11 @@ use crate::retention::{
     Retention, RetentionError, SourceConstraints, collect_source_constraints, compute_retention,
 };
 use crate::rewrite::{SourceRewrite, SourceRewriteError, rewrite_source};
-#[cfg(rust_item_dependencies_patched)]
-use crate::source::refine_macro_rules_from_compiler;
 use crate::source::{
     ByteRange, OriginalOffsetMap, SourceError, SourceInventory, collect_source, original_span_range,
 };
+#[cfg(rust_item_dependencies_patched)]
+use crate::source::{refine_attribute_macros_from_compiler, refine_macro_rules_from_compiler};
 use crate::tags::{DefinitionTags, TagError, collect_definition_tags};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -723,20 +725,33 @@ impl Callbacks for InputCallbacks {
             return Compilation::Stop;
         }
         self.expansion_complete.store(true, Ordering::Relaxed);
-        let inventory = self
-            .inventory
-            .as_ref()
-            .expect("source inventory must be collected before expansion");
+        #[cfg(rust_item_dependencies_patched)]
+        if let Some(error) = validate_attribute_expansions(tcx, &self.offsets) {
+            return self.finish(Err(error));
+        }
         {
             let (_, krate) = tcx.resolver_for_lowering();
             let krate = krate.borrow();
-            if let Err(error) = validate_expanded(compiler, &krate, inventory) {
+            if let Err(error) = validate_expanded(
+                compiler,
+                &krate,
+                self.inventory
+                    .as_ref()
+                    .expect("source inventory must be collected before expansion"),
+            ) {
                 return self.finish(Err(error));
             }
-        }
-        #[cfg(rust_item_dependencies_patched)]
-        if let Some(error) = validate_builtin_attribute_expansions(tcx, &self.offsets) {
-            return self.finish(Err(error));
+            #[cfg(rust_item_dependencies_patched)]
+            if let Err(error) = refine_attribute_macros_from_compiler(
+                compiler,
+                tcx,
+                &krate,
+                self.inventory
+                    .as_mut()
+                    .expect("source inventory must survive through expansion"),
+            ) {
+                return self.finish(Err(error.into()));
+            }
         }
         #[cfg(rust_item_dependencies_patched)]
         {
@@ -745,7 +760,15 @@ impl Callbacks for InputCallbacks {
                 let mut request = OMIT_ONE_MACRO_RULE_SELECTION_FROM
                     .lock()
                     .expect("macro rule selection omission mutex is poisoned");
-                if request.as_deref() == Some(inventory.original.as_ref()) {
+                if request.as_deref()
+                    == Some(
+                        self.inventory
+                            .as_ref()
+                            .expect("source inventory must survive through expansion")
+                            .original
+                            .as_ref(),
+                    )
+                {
                     request.take();
                     true
                 } else {
@@ -991,11 +1014,10 @@ fn normalize_observation_ranges(
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn validate_builtin_attribute_expansions(
+fn validate_attribute_expansions(
     tcx: TyCtxt<'_>,
     offsets: &OriginalOffsetMap,
 ) -> Option<InputError> {
-    use rustc_middle::ty::MacroImplementationKind;
     use rustc_span::hygiene::{ExpnKind, MacroKind};
 
     let rejected = tcx
@@ -1003,26 +1025,44 @@ fn validate_builtin_attribute_expansions(
         .macro_invocation_origins
         .items()
         .filter_map(|(&expansion, origin)| {
-            if origin.implementation_kind != MacroImplementationKind::Builtin {
-                return None;
-            }
             let ExpnKind::Macro(MacroKind::Attr, name) = expansion.expn_data().kind else {
                 return None;
             };
-            unsupported_attribute_symbol(name)?;
+            let canonical_name = if origin.implementation_kind == MacroImplementationKind::Builtin {
+                expansion
+                    .expn_data()
+                    .macro_def_id
+                    .map_or(name, |definition| tcx.item_name(definition))
+            } else {
+                name
+            };
+            let reason =
+                unsupported_resolved_attribute(origin.implementation_kind, canonical_name)?;
             let raw = expansion.expn_data().call_site;
             let source_map = tcx.sess.source_map();
             let range = original_diagnostic_range_from_span(source_map, offsets, raw);
-            Some(range.ok())
+            Some((range.ok(), reason))
         })
         .min();
-    rejected.map(|range| match range {
+    rejected.map(|(range, reason)| match range {
         Some(range) => InputError::UnsupportedInput {
-            reason: UnsupportedReason::NativeLinkOrCustomRuntime,
+            reason,
             range: Some(range),
         },
         None => InputError::Source(SourceError::InvalidSpan),
     })
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn unsupported_resolved_attribute(
+    implementation: MacroImplementationKind,
+    canonical_name: Symbol,
+) -> Option<UnsupportedReason> {
+    match implementation {
+        MacroImplementationKind::Builtin => unsupported_attribute_symbol(canonical_name),
+        MacroImplementationKind::Procedural => Some(UnsupportedReason::ProcMacro),
+        _ => None,
+    }
 }
 
 fn validate_unexpanded(
@@ -1111,11 +1151,6 @@ impl UnexpandedValidator<'_> {
         for attribute in attributes {
             if let Some(reason) = unsupported_attribute_reason(attribute) {
                 self.reject(reason, attribute.span);
-            } else if attribute
-                .name()
-                .is_some_and(|name| name != sym::derive && !is_builtin_attr_name(name))
-            {
-                self.reject(UnsupportedReason::ProcMacro, attribute.span);
             }
         }
     }
@@ -2208,16 +2243,6 @@ mod tests {
             "extern crate proc_macro;",
         );
         assert_unsupported(
-            "#[fastout]\nfn main() {}\n",
-            UnsupportedReason::ProcMacro,
-            "#[fastout]",
-        );
-        assert_unsupported(
-            "#[derive(Clone)]\n#[fastout]\nstruct Value;\nfn main() {}\n",
-            UnsupportedReason::ProcMacro,
-            "#[fastout]",
-        );
-        assert_unsupported(
             "#[proc_macro]\npub fn generated() {}\nfn main() {}\n",
             UnsupportedReason::ProcMacro,
             "#[proc_macro]",
@@ -2297,12 +2322,45 @@ mod tests {
         );
     }
 
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn resolved_attribute_classification_uses_the_compiler_implementation_kind() {
+        use rustc_middle::ty::MacroImplementationKind;
+        use rustc_span::sym;
+
+        assert_eq!(
+            super::unsupported_resolved_attribute(
+                MacroImplementationKind::Builtin,
+                sym::global_allocator,
+            ),
+            Some(UnsupportedReason::NativeLinkOrCustomRuntime)
+        );
+        assert_eq!(
+            super::unsupported_resolved_attribute(MacroImplementationKind::Builtin, sym::test),
+            None
+        );
+        assert_eq!(
+            super::unsupported_resolved_attribute(MacroImplementationKind::Procedural, sym::test,),
+            Some(UnsupportedReason::ProcMacro)
+        );
+        assert_unsupported(
+            concat!(
+                "use std::prelude::v1::global_allocator as ga;\n",
+                "#[ga]\n",
+                "static A: std::alloc::System = std::alloc::System;\n",
+                "fn main() {}\n",
+            ),
+            UnsupportedReason::NativeLinkOrCustomRuntime,
+            "#[ga]",
+        );
+    }
+
     #[test]
     fn inactive_and_shadowed_constructs_do_not_trigger_guards() {
         let source = concat!(
             "#![cfg_attr(any(), feature(rustc_attrs))]\n",
             "#[cfg(any())] mod external;\n",
-            "#[cfg(any())] #[fastout] fn ignored() {}\n",
+            "#[cfg(any())] #[rust_item_dependencies_unknown_attribute] fn ignored() {}\n",
             "#[cfg(any())] unsafe extern \"C\" { fn foreign(); }\n",
             "#[cfg(any())] const DATA: &str = include_str!(\"missing.txt\");\n",
             "struct Ignored { #[cfg(any())] callback: extern \"C\" fn() }\n",
@@ -2473,18 +2531,28 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_imported_macro_is_an_original_compilation_failure() {
-        let source = "use unavailable::input;\nfn main() { input!(); }\n";
-        let Err(InputError::OriginalCompilationFailed(diagnostics)) =
-            inspect_edition(source, Edition::Rust2018)
-        else {
-            panic!("an unresolved imported macro must remain a compiler diagnostic");
-        };
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.range.is_some_and(|range| {
-                &source[range.start as usize..range.end as usize] == "unavailable"
-            })
-        }));
+    fn unresolved_macro_syntax_is_an_original_compilation_failure() {
+        for (source, expected) in [
+            (
+                "use unavailable::input;\nfn main() { input!(); }\n",
+                "unavailable",
+            ),
+            (
+                "#[rust_item_dependencies_unknown_attribute]\nfn main() {}\n",
+                "rust_item_dependencies_unknown_attribute",
+            ),
+        ] {
+            let Err(InputError::OriginalCompilationFailed(diagnostics)) =
+                inspect_edition(source, Edition::Rust2018)
+            else {
+                panic!("unresolved macro syntax must remain a compiler diagnostic");
+            };
+            assert!(diagnostics.iter().any(|diagnostic| {
+                diagnostic.range.is_some_and(|range| {
+                    &source[range.start as usize..range.end as usize] == expected
+                })
+            }));
+        }
     }
 
     #[test]

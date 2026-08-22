@@ -1,9 +1,7 @@
 #![feature(rustc_private)]
 
 #[cfg(rust_item_dependencies_patched)]
-use rust_item_dependencies::{
-    AnalysisError, Analyzer, Edition, SourceInput, UnsupportedReason, VerifiedReduction,
-};
+use rust_item_dependencies::{AnalysisError, Analyzer, Edition, SourceInput, VerifiedReduction};
 
 #[cfg(rust_item_dependencies_patched)]
 const CASES: &[(&str, &str, &str)] = &[
@@ -137,27 +135,38 @@ fn x86_sysroot_sources_are_not_treated_as_user_inputs() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
-fn an_external_proc_macro_is_rejected_at_the_written_attribute() {
+fn builtin_test_attributes_are_accepted_and_their_unreachable_items_are_removed() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
-    let source = include_str!("fixtures/acceptance/external_proc_macro.input.rs");
-    let error = analyzer
-        .analyze(&SourceInput {
-            source: source.to_owned(),
-            edition: Edition::Rust2018,
-            target: host_target(),
-        })
-        .unwrap_err();
-    let AnalysisError::UnsupportedInput {
-        reason: UnsupportedReason::ProcMacro,
-        range: Some(range),
-    } = error
-    else {
-        panic!("unexpected external proc-macro result: {error:?}");
-    };
-    assert_eq!(
-        &source[range.start as usize..range.end as usize],
-        "#[fastout]"
-    );
+    let target = host_target();
+    let cases = [
+        (
+            "written and cfg_attr test attributes",
+            "use std::prelude::v1::test as renamed_test;#[test]fn test_only(){}#[renamed_test]fn renamed_test_only(){}#[cfg_attr(all(),test)]fn cfg_test_only(){macro_rules! local{()=>{1}}let _=local!();}#[cfg_attr(all(),derive(Clone))]struct Live;fn main(){let _=Live.clone();}",
+            "#[cfg_attr(all(),derive(Clone))]struct Live;fn main(){let _=Live.clone();}",
+        ),
+        (
+            "generated test attribute",
+            "macro_rules! tests{()=>{#[test]fn generated_test(){macro_rules! local{()=>{1}}let _=local!();}}}tests!();fn main(){}",
+            "fn main(){}",
+        ),
+        (
+            "test attribute on a macro invocation",
+            "macro_rules! item{()=>{fn generated(){}}}#[test]item!();fn main(){}",
+            "fn main(){}",
+        ),
+    ];
+
+    for (case, source, expected) in cases {
+        let verified = analyzer
+            .reduce_and_verify(&input(source, &target))
+            .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_verified(case, source, expected, &verified);
+
+        let fixed = analyzer
+            .reduce_and_verify(&input(verified.reduced_source(), &target))
+            .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
+        assert_eq!(fixed.reduced_source(), verified.reduced_source(), "{case}");
+    }
 }
 
 #[cfg(rust_item_dependencies_patched)]
