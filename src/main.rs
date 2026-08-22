@@ -56,6 +56,9 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     for artifact in cli.dependency_artifacts {
         options = options.with_dependency_artifact(artifact);
     }
+    for artifact in cli.allowed_proc_macro_artifacts {
+        options = options.allow_proc_macro_execution(artifact);
+    }
     let analyzer = Analyzer::new_with_options(options).map_err(render_analysis_error)?;
     let reduction = analyzer
         .reduce(&SourceInput {
@@ -90,6 +93,9 @@ fn render_analysis_error(error: AnalysisError) -> String {
             rendered.push_str(&format!(": {path:?}: {error}"));
         }
         AnalysisError::UnsupportedExternalCrateArtifact { path } => {
+            rendered.push_str(&format!(": {path:?}"));
+        }
+        AnalysisError::InvalidProcMacroExecutionArtifact { path } => {
             rendered.push_str(&format!(": {path:?}"));
         }
         AnalysisError::ConflictingExternalCrateArtifactName {
@@ -201,6 +207,7 @@ mod tests {
                 cfg_names: Vec::new(),
                 external_crates: Vec::new(),
                 dependency_artifacts: Vec::new(),
+                allowed_proc_macro_artifacts: Vec::new(),
             }
         );
 
@@ -224,15 +231,18 @@ mod tests {
         assert!(explicit.cfg_names.is_empty());
         assert!(explicit.external_crates.is_empty());
         assert!(explicit.dependency_artifacts.is_empty());
+        assert!(explicit.allowed_proc_macro_artifacts.is_empty());
     }
 
     #[test]
-    fn parses_repeated_direct_and_transitive_dependency_artifacts() {
+    fn parses_repeated_dependency_artifacts_and_proc_macro_permissions() {
         let Parsed::Run(cli) = parse(&[
             "--extern",
             "wrapper=target/deps/libwrapper.rlib",
             "--dependency-artifact",
             "target/deps/libleaf.rlib",
+            "--allow-proc-macro",
+            "target/deps/libderive.dylib",
             "--extern",
             "support=target/deps/libsupport=version.rlib",
             "input.rs",
@@ -259,6 +269,10 @@ mod tests {
         assert_eq!(
             cli.dependency_artifacts,
             [std::path::PathBuf::from("target/deps/libleaf.rlib")]
+        );
+        assert_eq!(
+            cli.allowed_proc_macro_artifacts,
+            [std::path::PathBuf::from("target/deps/libderive.dylib")]
         );
     }
 
@@ -332,6 +346,14 @@ mod tests {
         assert_eq!(
             parse(&["--dependency-artifact", ""]).unwrap_err(),
             "--dependency-artifact requires a nonempty path"
+        );
+        assert_eq!(
+            parse(&["--allow-proc-macro"]).unwrap_err(),
+            "--allow-proc-macro requires a value"
+        );
+        assert_eq!(
+            parse(&["--allow-proc-macro", ""]).unwrap_err(),
+            "--allow-proc-macro requires a nonempty path"
         );
     }
 
@@ -442,6 +464,15 @@ mod tests {
                 ),
             ),
             (
+                AnalysisError::InvalidProcMacroExecutionArtifact {
+                    path: "libwrapper.rlib".into(),
+                },
+                concat!(
+                    "a procedural macro execution permission does not refer to a declared ",
+                    "host dynamic library: \"libwrapper.rlib\"",
+                ),
+            ),
+            (
                 AnalysisError::ConflictingExternalCrateArtifactName {
                     file_name: "libwrapper.rlib".to_owned(),
                     first_path: "first/libwrapper.rlib".into(),
@@ -523,6 +554,7 @@ mod tests {
             cfg_names: Vec::new(),
             external_crates: Vec::new(),
             dependency_artifacts: Vec::new(),
+            allowed_proc_macro_artifacts: Vec::new(),
         };
         assert_eq!(
             validate_output(&cli),

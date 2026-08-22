@@ -126,7 +126,10 @@ pub(crate) fn collect_expansions(
             .map(|origin| selected_macro_rule_range(compiler, tcx, source, origin))
             .transpose()?
             .flatten();
-        let attribute = matches!(&data.kind, ExpnKind::Macro(MacroKind::Attr, _));
+        let attribute_like = matches!(
+            &data.kind,
+            ExpnKind::Macro(MacroKind::Attr | MacroKind::Derive, _)
+        );
         let written_invocation = if let Some(origin) =
             origin.filter(|origin| origin.discovered_in_expansion == ExpnId::root())
         {
@@ -137,7 +140,7 @@ pub(crate) fn collect_expansions(
                     node_range,
                     target_range,
                     origin,
-                    attribute,
+                    attribute_like,
                 )
                 .ok_or(ExpansionError::IncompleteOrigin)?,
             )
@@ -152,7 +155,7 @@ pub(crate) fn collect_expansions(
                     definitions,
                     origin,
                     written_invocation,
-                    attribute,
+                    attribute_like,
                 )
             })
             .transpose()?
@@ -468,7 +471,7 @@ fn expansion_source_owner(
     definitions: &CollectedDefinitions,
     origin: &MacroInvocationOrigin,
     written_invocation: Option<crate::source::SourceUnitId>,
-    attribute: bool,
+    attribute_like: bool,
 ) -> Result<Option<DefinitionId>, ExpansionError> {
     if let Some(target_span) = origin.target_span {
         if let Some(target_range) = source_range(compiler, source, target_span)? {
@@ -495,7 +498,7 @@ fn expansion_source_owner(
                 return Ok(Some(owner));
             }
             if candidates.is_empty()
-                && attribute
+                && attribute_like
                 && (origin.discovered_in_expansion != ExpnId::root()
                     || written_invocation.is_some_and(|invocation| {
                         source
@@ -531,12 +534,12 @@ fn written_invocation(
     node_range: Option<ByteRange>,
     target_range: Option<ByteRange>,
     origin: &MacroInvocationOrigin,
-    attribute: bool,
+    attribute_like: bool,
 ) -> Option<crate::source::SourceUnitId> {
     if origin.discovered_in_expansion != ExpnId::root() {
         return None;
     }
-    if attribute {
+    if attribute_like {
         return resolve_attribute_source(source, invocation_range?, node_range?, target_range?)
             .ok()?
             .invocation;

@@ -1,6 +1,6 @@
 //! Explicit, immutable compiler inputs for external Rust crates.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -52,6 +52,7 @@ impl ExternalCrate {
 pub(crate) struct PreparedExternalCrates {
     direct: Vec<PreparedExternalCrate>,
     dependencies: Vec<PreparedDependencyArtifact>,
+    proc_macro_execution_artifacts: Vec<PreparedProcMacroExecutionArtifact>,
     snapshot: Option<SnapshotDirectory>,
 }
 
@@ -64,9 +65,19 @@ impl PreparedExternalCrates {
         &self.dependencies
     }
 
+    pub(crate) fn proc_macro_execution_artifacts(&self) -> &[PreparedProcMacroExecutionArtifact] {
+        &self.proc_macro_execution_artifacts
+    }
+
     pub(crate) fn search_directory(&self) -> Option<&str> {
         self.snapshot.as_ref().map(SnapshotDirectory::argument)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ExternalArtifactKind {
+    Rlib,
+    HostDynamicLibrary,
 }
 
 #[derive(Debug)]
@@ -75,6 +86,7 @@ pub(crate) struct PreparedExternalCrate {
     file_name: String,
     artifact: PathBuf,
     digest: [u8; 32],
+    kind: ExternalArtifactKind,
 }
 
 impl PreparedExternalCrate {
@@ -95,17 +107,47 @@ impl PreparedExternalCrate {
     pub(crate) fn digest(&self) -> [u8; 32] {
         self.digest
     }
+
+    pub(crate) fn kind(&self) -> ExternalArtifactKind {
+        self.kind
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PreparedDependencyArtifact {
     file_name: String,
     digest: [u8; 32],
+    kind: ExternalArtifactKind,
 }
 
 impl PreparedDependencyArtifact {
     pub(crate) fn file_name(&self) -> &str {
         &self.file_name
+    }
+
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub(crate) fn kind(&self) -> ExternalArtifactKind {
+        self.kind
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PreparedProcMacroExecutionArtifact {
+    file_name: String,
+    artifact: PathBuf,
+    digest: [u8; 32],
+}
+
+impl PreparedProcMacroExecutionArtifact {
+    pub(crate) fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    pub(crate) fn artifact(&self) -> &Path {
+        &self.artifact
     }
 
     pub(crate) fn digest(&self) -> [u8; 32] {
@@ -180,17 +222,24 @@ struct LoadedArtifact {
 #[derive(Clone)]
 struct RequestedArtifact {
     original_path: PathBuf,
+    canonical_path: PathBuf,
     file_name: String,
     loaded: LoadedArtifact,
+    kind: ExternalArtifactKind,
 }
 
 pub(crate) fn prepare_external_crates<'a>(
     external_crates: impl Iterator<Item = &'a ExternalCrate>,
     dependency_artifacts: impl Iterator<Item = &'a Path>,
+    proc_macro_execution_artifacts: impl Iterator<Item = &'a Path>,
 ) -> Result<PreparedExternalCrates, AnalysisError> {
     let mut external_crates = external_crates.peekable();
     let mut dependency_artifacts = dependency_artifacts.peekable();
-    if external_crates.peek().is_none() && dependency_artifacts.peek().is_none() {
+    let mut proc_macro_execution_artifacts = proc_macro_execution_artifacts.peekable();
+    if external_crates.peek().is_none()
+        && dependency_artifacts.peek().is_none()
+        && proc_macro_execution_artifacts.peek().is_none()
+    {
         return Ok(PreparedExternalCrates::default());
     }
 
@@ -208,9 +257,17 @@ pub(crate) fn prepare_external_crates<'a>(
         .collect::<Result<Vec<_>, _>>()?;
 
     validate_direct_names(&direct_requests)?;
+    let proc_macro_execution_artifacts = resolve_proc_macro_execution_artifacts(
+        proc_macro_execution_artifacts,
+        direct_requests
+            .iter()
+            .map(|(_, artifact)| artifact)
+            .chain(dependency_requests.iter()),
+    )?;
     dependency_requests.retain(|dependency| {
         !direct_requests.iter().any(|(_, direct)| {
-            direct.file_name == dependency.file_name
+            direct.kind == dependency.kind
+                && direct.file_name == dependency.file_name
                 && direct.loaded.digest == dependency.loaded.digest
         })
     });
@@ -259,17 +316,20 @@ pub(crate) fn prepare_external_crates<'a>(
             extern_name,
             file_name: artifact.file_name,
             digest: artifact.loaded.digest,
+            kind: artifact.kind,
         })
         .collect::<Vec<_>>();
     direct.sort_by(|left, right| {
-        (&left.extern_name, &left.file_name, left.digest).cmp(&(
+        (&left.extern_name, left.kind, &left.file_name, left.digest).cmp(&(
             &right.extern_name,
+            right.kind,
             &right.file_name,
             right.digest,
         ))
     });
     direct.dedup_by(|left, right| {
         left.extern_name == right.extern_name
+            && left.kind == right.kind
             && left.file_name == right.file_name
             && left.digest == right.digest
     });
@@ -279,16 +339,27 @@ pub(crate) fn prepare_external_crates<'a>(
         .map(|artifact| PreparedDependencyArtifact {
             file_name: artifact.file_name,
             digest: artifact.loaded.digest,
+            kind: artifact.kind,
         })
         .collect::<Vec<_>>();
     dependencies.sort_by(|left, right| {
-        (&left.file_name, left.digest).cmp(&(&right.file_name, right.digest))
+        (left.kind, &left.file_name, left.digest).cmp(&(right.kind, &right.file_name, right.digest))
     });
     dependencies.dedup();
+
+    let proc_macro_execution_artifacts = proc_macro_execution_artifacts
+        .into_iter()
+        .map(|(file_name, digest)| PreparedProcMacroExecutionArtifact {
+            artifact: snapshot.path().join(&file_name),
+            file_name,
+            digest,
+        })
+        .collect();
 
     Ok(PreparedExternalCrates {
         direct,
         dependencies,
+        proc_macro_execution_artifacts,
         snapshot: Some(snapshot),
     })
 }
@@ -322,16 +393,11 @@ fn load_requested_artifact(
             path: path.to_owned(),
         })?
         .to_owned();
-    if Path::new(&file_name)
-        .extension()
-        .and_then(|value| value.to_str())
-        != Some("rlib")
-        || !file_name.starts_with("lib")
-    {
-        return Err(AnalysisError::UnsupportedExternalCrateArtifact {
+    let kind = artifact_kind(&file_name).ok_or_else(|| {
+        AnalysisError::UnsupportedExternalCrateArtifact {
             path: path.to_owned(),
-        });
-    }
+        }
+    })?;
 
     let canonical =
         fs::canonicalize(path).map_err(|error| artifact_unreadable(path, error.kind()))?;
@@ -339,25 +405,52 @@ fn load_requested_artifact(
         loaded.clone()
     } else {
         let loaded = read_artifact(path, &canonical)?;
-        loaded_by_path.insert(canonical, loaded.clone());
+        loaded_by_path.insert(canonical.clone(), loaded.clone());
         loaded
     };
-    if !loaded.bytes.starts_with(AR_MAGIC) {
+    if kind == ExternalArtifactKind::Rlib && !loaded.bytes.starts_with(AR_MAGIC) {
         return Err(AnalysisError::UnsupportedExternalCrateArtifact {
             path: path.to_owned(),
         });
     }
     Ok(RequestedArtifact {
         original_path: path.to_owned(),
+        canonical_path: canonical,
         file_name,
         loaded,
+        kind,
     })
 }
 
+fn artifact_kind(file_name: &str) -> Option<ExternalArtifactKind> {
+    if file_name.starts_with("lib")
+        && Path::new(file_name)
+            .extension()
+            .and_then(|value| value.to_str())
+            == Some("rlib")
+    {
+        return Some(ExternalArtifactKind::Rlib);
+    }
+
+    file_name
+        .strip_prefix(std::env::consts::DLL_PREFIX)
+        .and_then(|name| name.strip_suffix(std::env::consts::DLL_SUFFIX))
+        .filter(|name| !name.is_empty())
+        .map(|_| ExternalArtifactKind::HostDynamicLibrary)
+}
+
 fn validate_dependency_file_name(artifact: &RequestedArtifact) -> Result<(), AnalysisError> {
-    let valid = artifact
-        .file_name
-        .strip_prefix("lib")
+    let crate_name = match artifact.kind {
+        ExternalArtifactKind::Rlib => artifact
+            .file_name
+            .strip_prefix("lib")
+            .and_then(|name| name.strip_suffix(".rlib")),
+        ExternalArtifactKind::HostDynamicLibrary => artifact
+            .file_name
+            .strip_prefix(std::env::consts::DLL_PREFIX)
+            .and_then(|name| name.strip_suffix(std::env::consts::DLL_SUFFIX)),
+    };
+    let valid = crate_name
         .and_then(|name| name.bytes().next())
         .is_some_and(|first| first.is_ascii_alphanumeric() || first == b'_');
     if valid {
@@ -367,6 +460,36 @@ fn validate_dependency_file_name(artifact: &RequestedArtifact) -> Result<(), Ana
             path: artifact.original_path.clone(),
         })
     }
+}
+
+fn resolve_proc_macro_execution_artifacts<'a, 'b>(
+    artifacts: impl Iterator<Item = &'a Path>,
+    registered: impl Iterator<Item = &'b RequestedArtifact>,
+) -> Result<BTreeSet<(String, [u8; 32])>, AnalysisError> {
+    let registered = registered.collect::<Vec<_>>();
+    let mut resolved = BTreeSet::new();
+    for path in artifacts {
+        let canonical = fs::canonicalize(path).map_err(|_| {
+            AnalysisError::InvalidProcMacroExecutionArtifact {
+                path: path.to_owned(),
+            }
+        })?;
+        let mut matched = false;
+        for artifact in &registered {
+            if artifact.kind == ExternalArtifactKind::HostDynamicLibrary
+                && artifact.canonical_path == canonical
+            {
+                resolved.insert((artifact.file_name.clone(), artifact.loaded.digest));
+                matched = true;
+            }
+        }
+        if !matched {
+            return Err(AnalysisError::InvalidProcMacroExecutionArtifact {
+                path: path.to_owned(),
+            });
+        }
+    }
+    Ok(resolved)
 }
 
 fn read_artifact(path: &Path, canonical: &Path) -> Result<LoadedArtifact, AnalysisError> {
@@ -397,7 +520,8 @@ fn validate_direct_names(direct: &[(String, RequestedArtifact)]) -> Result<(), A
     let mut by_name = BTreeMap::<&str, &RequestedArtifact>::new();
     for (name, artifact) in direct {
         if let Some(previous) = by_name.insert(name, artifact)
-            && (previous.file_name != artifact.file_name
+            && (previous.kind != artifact.kind
+                || previous.file_name != artifact.file_name
                 || previous.loaded.digest != artifact.loaded.digest)
         {
             return Err(AnalysisError::ConflictingExternalCrate {
@@ -416,7 +540,7 @@ fn unique_staged_artifacts<'a>(
     let mut by_name = BTreeMap::<String, RequestedArtifact>::new();
     for artifact in artifacts {
         if let Some(previous) = by_name.get(&artifact.file_name) {
-            if previous.loaded.digest != artifact.loaded.digest {
+            if previous.kind != artifact.kind || previous.loaded.digest != artifact.loaded.digest {
                 return Err(AnalysisError::ConflictingExternalCrateArtifactName {
                     file_name: artifact.file_name.clone(),
                     first_path: previous.original_path.clone(),
@@ -520,13 +644,27 @@ mod tests {
         }
 
         fn artifact(&self, relative: &str, body: &[u8]) -> PathBuf {
+            let mut bytes = AR_MAGIC.to_vec();
+            bytes.extend_from_slice(body);
+            self.file(relative, &bytes)
+        }
+
+        fn host_dynamic_library(&self, relative_parent: &str, stem: &str, body: &[u8]) -> PathBuf {
+            let file_name = format!(
+                "{}{}{}",
+                std::env::consts::DLL_PREFIX,
+                stem,
+                std::env::consts::DLL_SUFFIX
+            );
+            self.file(Path::new(relative_parent).join(file_name), body)
+        }
+
+        fn file(&self, relative: impl AsRef<Path>, body: &[u8]) -> PathBuf {
             let path = self.0.join(relative);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).unwrap();
             }
-            let mut bytes = AR_MAGIC.to_vec();
-            bytes.extend_from_slice(body);
-            fs::write(&path, bytes).unwrap();
+            fs::write(&path, body).unwrap();
             path
         }
     }
@@ -541,11 +679,23 @@ mod tests {
         direct: &[(&str, &Path)],
         dependencies: &[&Path],
     ) -> Result<PreparedExternalCrates, AnalysisError> {
+        prepare_with_permissions(direct, dependencies, &[])
+    }
+
+    fn prepare_with_permissions(
+        direct: &[(&str, &Path)],
+        dependencies: &[&Path],
+        proc_macro_execution_artifacts: &[&Path],
+    ) -> Result<PreparedExternalCrates, AnalysisError> {
         let direct = direct
             .iter()
             .map(|(name, artifact)| ExternalCrate::new(*name, *artifact))
             .collect::<Vec<_>>();
-        prepare_external_crates(direct.iter(), dependencies.iter().copied())
+        prepare_external_crates(
+            direct.iter(),
+            dependencies.iter().copied(),
+            proc_macro_execution_artifacts.iter().copied(),
+        )
     }
 
     #[test]
@@ -587,6 +737,122 @@ mod tests {
     }
 
     #[test]
+    fn preparation_classifies_rlibs_and_host_dynamic_libraries_for_both_roles() {
+        let directory = TestDirectory::new();
+        let direct_rlib = directory.artifact("libdirect.rlib", b"direct");
+        let direct_dynamic = directory.host_dynamic_library("", "direct_macros", b"direct macros");
+        let dependency_rlib = directory.artifact("libdependency.rlib", b"dependency");
+        let dependency_dynamic =
+            directory.host_dynamic_library("", "dependency_macros", b"dependency macros");
+
+        let prepared = prepare(
+            &[("direct", &direct_rlib), ("direct_macros", &direct_dynamic)],
+            &[&dependency_rlib, &dependency_dynamic],
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared
+                .direct()
+                .iter()
+                .map(|artifact| (artifact.extern_name(), artifact.kind()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("direct", ExternalArtifactKind::Rlib),
+                ("direct_macros", ExternalArtifactKind::HostDynamicLibrary,),
+            ]
+        );
+        assert_eq!(
+            prepared
+                .dependencies()
+                .iter()
+                .map(|artifact| (artifact.file_name(), artifact.kind()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("libdependency.rlib", ExternalArtifactKind::Rlib),
+                (
+                    dependency_dynamic.file_name().unwrap().to_str().unwrap(),
+                    ExternalArtifactKind::HostDynamicLibrary,
+                ),
+            ]
+        );
+        assert!(prepared.proc_macro_execution_artifacts().is_empty());
+    }
+
+    #[test]
+    fn execution_permissions_resolve_to_registered_snapshot_artifacts() {
+        let directory = TestDirectory::new();
+        let dynamic = directory.host_dynamic_library("", "macros", b"trusted native code");
+
+        let prepared =
+            prepare_with_permissions(&[("macros", &dynamic)], &[], &[&dynamic, &dynamic]).unwrap();
+        let permissions = prepared.proc_macro_execution_artifacts();
+
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(
+            permissions[0].file_name(),
+            dynamic.file_name().unwrap().to_str().unwrap()
+        );
+        assert_eq!(permissions[0].digest(), sha256(b"trusted native code"));
+        assert_eq!(
+            fs::read(permissions[0].artifact()).unwrap(),
+            b"trusted native code"
+        );
+        assert_ne!(permissions[0].artifact(), dynamic);
+        assert_eq!(
+            permissions[0].artifact().parent().unwrap(),
+            Path::new(prepared.search_directory().unwrap())
+        );
+    }
+
+    #[test]
+    fn execution_permissions_accept_registered_transitive_artifacts() {
+        let directory = TestDirectory::new();
+        let dynamic =
+            directory.host_dynamic_library("", "transitive_macros", b"transitive native code");
+
+        let prepared = prepare_with_permissions(&[], &[&dynamic], &[&dynamic]).unwrap();
+
+        assert_eq!(prepared.dependencies().len(), 1);
+        assert_eq!(
+            prepared.dependencies()[0].kind(),
+            ExternalArtifactKind::HostDynamicLibrary
+        );
+        assert_eq!(prepared.proc_macro_execution_artifacts().len(), 1);
+        assert_eq!(
+            fs::read(prepared.proc_macro_execution_artifacts()[0].artifact()).unwrap(),
+            b"transitive native code"
+        );
+    }
+
+    #[test]
+    fn execution_permissions_require_the_registered_host_dynamic_library_path() {
+        let directory = TestDirectory::new();
+        let rlib = directory.artifact("libregular.rlib", b"regular");
+        let registered =
+            directory.host_dynamic_library("registered", "macros", b"same native code");
+        let unregistered =
+            directory.host_dynamic_library("unregistered", "macros", b"same native code");
+        let missing = directory.0.join(format!(
+            "{}missing{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_SUFFIX
+        ));
+
+        for result in [
+            prepare_with_permissions(&[("regular", &rlib)], &[], &[&rlib]),
+            prepare_with_permissions(&[("macros", &registered)], &[], &[&unregistered]),
+            prepare_with_permissions(&[("macros", &registered)], &[], &[&missing]),
+            prepare_with_permissions(&[], &[], &[&registered]),
+        ] {
+            assert!(matches!(
+                result,
+                Err(AnalysisError::InvalidProcMacroExecutionArtifact { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn direct_artifact_is_not_repeated_or_revalidated_as_a_dependency() {
         let directory = TestDirectory::new();
         let artifact = directory.artifact("libdirect.rlib", b"direct");
@@ -601,6 +867,19 @@ mod tests {
             .expect("a repeated direct artifact adds no search input");
         assert_eq!(prepared.direct().len(), 1);
         assert!(prepared.dependencies().is_empty());
+
+        let direct_only_dynamic = directory.host_dynamic_library("", "-", b"dynamic");
+        let prepared = prepare(
+            &[("dynamic", &direct_only_dynamic)],
+            &[&direct_only_dynamic],
+        )
+        .expect("a repeated direct dynamic library adds no search input");
+        assert_eq!(prepared.direct().len(), 1);
+        assert!(prepared.dependencies().is_empty());
+        assert!(matches!(
+            prepare(&[], &[&direct_only_dynamic]),
+            Err(AnalysisError::UnsupportedExternalCrateArtifact { .. })
+        ));
     }
 
     #[test]
@@ -648,6 +927,19 @@ mod tests {
         fs::write(&invalid, b"not an archive").unwrap();
         assert!(matches!(
             prepare(&[("invalid", &invalid)], &[]),
+            Err(AnalysisError::UnsupportedExternalCrateArtifact { .. })
+        ));
+
+        let empty_dynamic_name = directory.file(
+            format!(
+                "{}{}",
+                std::env::consts::DLL_PREFIX,
+                std::env::consts::DLL_SUFFIX
+            ),
+            b"dynamic",
+        );
+        assert!(matches!(
+            prepare(&[("invalid", &empty_dynamic_name)], &[]),
             Err(AnalysisError::UnsupportedExternalCrateArtifact { .. })
         ));
 

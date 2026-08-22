@@ -29,8 +29,11 @@ fn validate() -> Result<CompilerArtifact, ArtifactError> {
 
 #[cfg(rust_item_dependencies_patched)]
 fn validate() -> Result<CompilerArtifact, ArtifactError> {
-    const EXPECTED_ABI: u32 = 13;
-    if rustc_driver::RUST_ITEM_DEPENDENCIES_PATCH_ABI != EXPECTED_ABI
+    let expected_abi = include_str!("../rustc-patches/patch-abi")
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| ArtifactError::Mismatch)?;
+    if rustc_driver::RUST_ITEM_DEPENDENCIES_PATCH_ABI != expected_abi
         || rustc_driver::RUST_ITEM_DEPENDENCIES_BASE_REVISION
             != include_str!("../rustc-patches/base-revision").trim()
         || rustc_driver::RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST
@@ -45,7 +48,7 @@ fn validate() -> Result<CompilerArtifact, ArtifactError> {
     }
     let mut identity = Vec::new();
     identity.extend_from_slice(b"rust-item-dependencies-compiler-v1\0");
-    identity.extend_from_slice(&EXPECTED_ABI.to_le_bytes());
+    identity.extend_from_slice(&expected_abi.to_le_bytes());
     identity.extend_from_slice(rustc_driver::RUST_ITEM_DEPENDENCIES_BASE_REVISION.as_bytes());
     identity.extend_from_slice(rustc_driver::RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST.as_bytes());
     Ok(CompilerArtifact {

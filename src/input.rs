@@ -103,6 +103,7 @@ pub struct CompilationOptions {
     explicit_cfgs: BTreeSet<String>,
     external_crates: BTreeSet<ExternalCrate>,
     dependency_artifacts: BTreeSet<PathBuf>,
+    allowed_proc_macro_artifacts: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -123,8 +124,11 @@ impl PreparedCompilationOptions {
 
     pub(crate) fn prepare(options: CompilationOptions) -> Result<Self, AnalysisError> {
         options.validate()?;
-        let external_crates =
-            prepare_external_crates(options.external_crates(), options.dependency_artifacts())?;
+        let external_crates = prepare_external_crates(
+            options.external_crates(),
+            options.dependency_artifacts(),
+            options.allowed_proc_macro_artifacts(),
+        )?;
         Ok(Self::new(options, external_crates))
     }
 
@@ -198,6 +202,12 @@ impl CompilationOptions {
         self
     }
 
+    #[must_use]
+    pub fn allow_proc_macro_execution(mut self, artifact: impl Into<PathBuf>) -> Self {
+        self.allowed_proc_macro_artifacts.insert(artifact.into());
+        self
+    }
+
     pub fn optimization_level(&self) -> OptimizationLevel {
         self.optimization_level
     }
@@ -212,6 +222,12 @@ impl CompilationOptions {
 
     pub(crate) fn dependency_artifacts(&self) -> impl Iterator<Item = &Path> {
         self.dependency_artifacts.iter().map(PathBuf::as_path)
+    }
+
+    pub(crate) fn allowed_proc_macro_artifacts(&self) -> impl Iterator<Item = &Path> {
+        self.allowed_proc_macro_artifacts
+            .iter()
+            .map(PathBuf::as_path)
     }
 
     pub(crate) fn validate(&self) -> Result<(), AnalysisError> {
@@ -645,6 +661,8 @@ fn run_inspection(
     let expansion_complete = Arc::new(AtomicBool::new(false));
     #[cfg(rust_item_dependencies_patched)]
     let denied_resources = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(rust_item_dependencies_patched)]
+    let denied_proc_macro = Arc::new(Mutex::new(None));
     let original = Arc::<str>::from(source);
     let (_, offsets) = OriginalOffsetMap::from_source(&original)?;
     let mut callbacks = InputCallbacks {
@@ -656,6 +674,15 @@ fn run_inspection(
         diagnostics: Arc::clone(&diagnostics),
         #[cfg(rust_item_dependencies_patched)]
         denied_resources: Arc::clone(&denied_resources),
+        #[cfg(rust_item_dependencies_patched)]
+        denied_proc_macro: Arc::clone(&denied_proc_macro),
+        #[cfg(rust_item_dependencies_patched)]
+        allowed_proc_macro_artifacts: context
+            .external_crates()
+            .proc_macro_execution_artifacts()
+            .iter()
+            .map(|artifact| artifact.artifact().to_owned())
+            .collect(),
         result: Arc::clone(&result),
         inventory: None,
         collection_mode,
@@ -701,6 +728,28 @@ fn run_inspection(
                 coordinates,
             ));
         }
+    }
+
+    #[cfg(rust_item_dependencies_patched)]
+    if let Some(denied) = *denied_proc_macro
+        .lock()
+        .expect("denied procedural macro mutex is poisoned")
+    {
+        let range = diagnostics
+            .errors
+            .iter()
+            .skip(denied.diagnostic_index)
+            .filter_map(|diagnostic| diagnostic.normalized_range)
+            .min()
+            .map(|range| callbacks.offsets.original_range(range))
+            .transpose()?;
+        return Err(map_input_error(
+            InputError::UnsupportedInput {
+                reason: denied.reason,
+                range,
+            },
+            coordinates,
+        ));
     }
 
     if let Some(diagnostic) = diagnostics
@@ -885,6 +934,10 @@ struct InputCallbacks {
     diagnostics: Arc<Mutex<DiagnosticState>>,
     #[cfg(rust_item_dependencies_patched)]
     denied_resources: Arc<Mutex<Vec<Span>>>,
+    #[cfg(rust_item_dependencies_patched)]
+    denied_proc_macro: Arc<Mutex<Option<DeniedFile>>>,
+    #[cfg(rust_item_dependencies_patched)]
+    allowed_proc_macro_artifacts: BTreeSet<PathBuf>,
     result: Arc<Mutex<Option<Result<CompilerInspection, InputError>>>>,
     inventory: Option<SourceInventory>,
     collection_mode: CollectionMode,
@@ -947,6 +1000,33 @@ impl Callbacks for InputCallbacks {
                         .lock()
                         .expect("external resource mutex is poisoned")
                         .push(span);
+                }));
+
+            let allowed = self.allowed_proc_macro_artifacts.clone();
+            let denied_proc_macro = Arc::clone(&self.denied_proc_macro);
+            let diagnostics = Arc::clone(&self.diagnostics);
+            config.proc_macro_load_guard =
+                Some(rustc_driver::ProcMacroLoadGuard::new(move |artifact| {
+                    if allowed.contains(artifact) {
+                        return true;
+                    }
+                    let diagnostic_index = diagnostics
+                        .lock()
+                        .expect("diagnostic state mutex is poisoned")
+                        .errors
+                        .len();
+                    if diagnostic_index == 0 {
+                        let mut denied = denied_proc_macro
+                            .lock()
+                            .expect("denied procedural macro mutex is poisoned");
+                        if denied.is_none() {
+                            *denied = Some(DeniedFile {
+                                reason: UnsupportedReason::ProcMacro,
+                                diagnostic_index,
+                            });
+                        }
+                    }
+                    false
                 }));
         }
     }
@@ -1324,7 +1404,6 @@ fn unsupported_resolved_attribute(
 ) -> Option<UnsupportedReason> {
     match implementation {
         MacroImplementationKind::Builtin => unsupported_attribute_symbol(canonical_name),
-        MacroImplementationKind::Procedural => Some(UnsupportedReason::ProcMacro),
         _ => None,
     }
 }
@@ -2521,7 +2600,7 @@ mod tests {
 
     #[cfg(rust_item_dependencies_patched)]
     #[test]
-    fn resolved_attribute_classification_uses_the_compiler_implementation_kind() {
+    fn resolved_attribute_validation_does_not_reject_permitted_proc_macros() {
         use rustc_middle::ty::MacroImplementationKind;
         use rustc_span::sym;
 
@@ -2538,7 +2617,7 @@ mod tests {
         );
         assert_eq!(
             super::unsupported_resolved_attribute(MacroImplementationKind::Procedural, sym::test,),
-            Some(UnsupportedReason::ProcMacro)
+            None
         );
         assert!(
             inspect(concat!(

@@ -42,6 +42,9 @@ pub enum AnalysisError {
     UnsupportedExternalCrateArtifact {
         path: PathBuf,
     },
+    InvalidProcMacroExecutionArtifact {
+        path: PathBuf,
+    },
     ConflictingExternalCrateArtifactName {
         file_name: String,
         first_path: PathBuf,
@@ -157,6 +160,9 @@ impl fmt::Display for AnalysisError {
             }
             Self::UnsupportedExternalCrateArtifact { .. } => {
                 "an external crate artifact format is not supported"
+            }
+            Self::InvalidProcMacroExecutionArtifact { .. } => {
+                "a procedural macro execution permission does not refer to a declared host dynamic library"
             }
             Self::ConflictingExternalCrateArtifactName { .. } => {
                 "external crate artifacts have a conflicting file name"
