@@ -15,18 +15,12 @@ mod cli;
 
 #[cfg(test)]
 use cli::Cli;
-use cli::{CliEdition, CliOptimizationLevel, Parsed, parse_arguments, validate_output};
+use cli::{
+    CliEdition, CliOptimizationLevel, Parsed, parse_arguments, reducer_usage, render_path,
+    validate_output,
+};
 
-const USAGE: &str = r#"Usage: rust-item-dependencies [OPTIONS] INPUT.rs
-
-Options:
-  -o, --output OUTPUT    Write reduced source to OUTPUT
-      --edition YEAR     Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]
-      --target TRIPLE    Compilation target [default: compiler host]
-  -O                     Same as --opt-level 3
-      --opt-level LEVEL  Optimization level: 0, 1, 2, 3, s, or z [default: 0]
-      --cfg NAME         Enable a name-only cfg; may be repeated
-  -h, --help             Print help"#;
+const USAGE_COMMAND: &str = "Usage: rust-item-dependencies [OPTIONS] INPUT.rs";
 
 fn main() -> ExitCode {
     match run(std::env::args_os().skip(1)) {
@@ -39,19 +33,29 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
-    let Parsed::Run(cli) = parse_arguments(arguments, USAGE)? else {
-        println!("{USAGE}");
-        return Ok(());
+    let usage = reducer_usage(USAGE_COMMAND);
+    let cli = match parse_arguments(arguments, &usage)? {
+        Parsed::Run(cli) => cli,
+        Parsed::Help => {
+            println!("{usage}");
+            return Ok(());
+        }
     };
     validate_output(&cli)?;
 
     let source = std::fs::read_to_string(&cli.input)
-        .map_err(|error| format!("cannot read {}: {error}", cli.input.display()))?;
+        .map_err(|error| format!("cannot read {}: {error}", render_path(&cli.input)))?;
     let target = cli.target.map_or_else(host_target, Ok)?;
-    let options = cli.cfg_names.into_iter().fold(
+    let mut options = cli.cfg_names.into_iter().fold(
         CompilationOptions::new().with_optimization_level(cli.optimization_level.into()),
         CompilationOptions::with_cfg,
     );
+    for external_crate in cli.external_crates {
+        options = options.with_external_crate(external_crate.extern_name, external_crate.artifact);
+    }
+    for artifact in cli.dependency_artifacts {
+        options = options.with_dependency_artifact(artifact);
+    }
     let analyzer = Analyzer::new_with_options(options).map_err(render_analysis_error)?;
     let reduction = analyzer
         .reduce(&SourceInput {
@@ -62,7 +66,7 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         .map_err(render_analysis_error)?;
 
     write_output(&cli.output, reduction.reduced_source())
-        .map_err(|error| format!("cannot write {}: {error}", cli.output.display()))
+        .map_err(|error| format!("cannot write {}: {error}", render_path(&cli.output)))
 }
 
 fn render_analysis_error(error: AnalysisError) -> String {
@@ -70,6 +74,32 @@ fn render_analysis_error(error: AnalysisError) -> String {
     match &error {
         AnalysisError::InvalidCfgName { name } => {
             rendered.push_str(&format!(": {name:?}"));
+        }
+        AnalysisError::InvalidExternalCrateName { name } => {
+            rendered.push_str(&format!(": {name:?}"));
+        }
+        AnalysisError::ConflictingExternalCrate {
+            name,
+            first_path,
+            second_path,
+        } => {
+            rendered.push_str(&format!(": {name:?}: {first_path:?} and {second_path:?}",));
+        }
+        AnalysisError::ExternalCrateArtifactUnreadable { path, error }
+        | AnalysisError::ExternalCrateSnapshotFailure { path, error } => {
+            rendered.push_str(&format!(": {path:?}: {error}"));
+        }
+        AnalysisError::UnsupportedExternalCrateArtifact { path } => {
+            rendered.push_str(&format!(": {path:?}"));
+        }
+        AnalysisError::ConflictingExternalCrateArtifactName {
+            file_name,
+            first_path,
+            second_path,
+        } => {
+            rendered.push_str(&format!(
+                ": {file_name:?}: {first_path:?} and {second_path:?}",
+            ));
         }
         AnalysisError::UnsupportedInput { reason, range } => {
             rendered.push_str(&format!(": {reason:?}"));
@@ -149,7 +179,10 @@ mod tests {
     use rust_item_dependencies::{UnsupportedReason, source::ByteRange};
 
     fn parse(arguments: &[&str]) -> Result<Parsed, String> {
-        parse_arguments(arguments.iter().map(OsString::from), USAGE)
+        parse_arguments(
+            arguments.iter().map(OsString::from),
+            &reducer_usage(USAGE_COMMAND),
+        )
     }
 
     #[test]
@@ -166,6 +199,8 @@ mod tests {
                 target: None,
                 optimization_level: CliOptimizationLevel::O0,
                 cfg_names: Vec::new(),
+                external_crates: Vec::new(),
+                dependency_artifacts: Vec::new(),
             }
         );
 
@@ -187,6 +222,44 @@ mod tests {
         assert_eq!(explicit.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
         assert_eq!(explicit.optimization_level, CliOptimizationLevel::O0);
         assert!(explicit.cfg_names.is_empty());
+        assert!(explicit.external_crates.is_empty());
+        assert!(explicit.dependency_artifacts.is_empty());
+    }
+
+    #[test]
+    fn parses_repeated_direct_and_transitive_dependency_artifacts() {
+        let Parsed::Run(cli) = parse(&[
+            "--extern",
+            "wrapper=target/deps/libwrapper.rlib",
+            "--dependency-artifact",
+            "target/deps/libleaf.rlib",
+            "--extern",
+            "support=target/deps/libsupport=version.rlib",
+            "input.rs",
+            "-o",
+            "output.rs",
+        ])
+        .unwrap() else {
+            panic!("valid dependency options must run the reducer")
+        };
+
+        assert_eq!(
+            cli.external_crates,
+            [
+                cli::CliExternalCrate {
+                    extern_name: "wrapper".to_owned(),
+                    artifact: "target/deps/libwrapper.rlib".into(),
+                },
+                cli::CliExternalCrate {
+                    extern_name: "support".to_owned(),
+                    artifact: "target/deps/libsupport=version.rlib".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            cli.dependency_artifacts,
+            [std::path::PathBuf::from("target/deps/libleaf.rlib")]
+        );
     }
 
     #[test]
@@ -248,21 +321,59 @@ mod tests {
             "unsupported optimization level: fast; expected 0, 1, 2, 3, s, or z"
         );
         assert_eq!(parse(&["--cfg"]).unwrap_err(), "--cfg requires a value");
+        assert_eq!(
+            parse(&["--extern"]).unwrap_err(),
+            "--extern requires a value"
+        );
+        assert_eq!(
+            parse(&["--dependency-artifact"]).unwrap_err(),
+            "--dependency-artifact requires a value"
+        );
+        assert_eq!(
+            parse(&["--dependency-artifact", ""]).unwrap_err(),
+            "--dependency-artifact requires a nonempty path"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_direct_dependencies() {
+        assert_eq!(
+            parse(&["--extern", "wrapper", "input.rs", "-o", "output.rs"]).unwrap_err(),
+            "--extern requires NAME=PATH"
+        );
+        assert_eq!(
+            parse(&[
+                "--extern",
+                "=libwrapper.rlib",
+                "input.rs",
+                "-o",
+                "output.rs"
+            ])
+            .unwrap_err(),
+            "--extern requires a nonempty NAME in NAME=PATH"
+        );
+        assert_eq!(
+            parse(&["--extern", "wrapper=", "input.rs", "-o", "output.rs"]).unwrap_err(),
+            "--extern requires a nonempty PATH in NAME=PATH"
+        );
     }
 
     #[test]
     fn rejects_ambiguous_or_destructive_arguments() {
         assert_eq!(
             parse(&[]).unwrap_err(),
-            format!("missing input file\n\n{USAGE}")
+            format!("missing input file\n\n{}", reducer_usage(USAGE_COMMAND))
         );
         assert_eq!(
             parse(&["input.rs"]).unwrap_err(),
-            format!("missing --output\n\n{USAGE}")
+            format!("missing --output\n\n{}", reducer_usage(USAGE_COMMAND))
         );
         assert_eq!(
             parse(&["first.rs", "second.rs"]).unwrap_err(),
-            format!("expected exactly one input file\n\n{USAGE}")
+            format!(
+                "expected exactly one input file\n\n{}",
+                reducer_usage(USAGE_COMMAND)
+            )
         );
         assert_eq!(
             parse(&["--edition", "2000", "input.rs"]).unwrap_err(),
@@ -292,6 +403,103 @@ mod tests {
             }),
             "the input is outside the supported source boundary: ProcMacro at bytes 4..15"
         );
+
+        for (error, expected) in [
+            (
+                AnalysisError::InvalidExternalCrateName {
+                    name: "bad-name".to_owned(),
+                },
+                "an external crate name is invalid: \"bad-name\"",
+            ),
+            (
+                AnalysisError::ConflictingExternalCrate {
+                    name: "wrapper".to_owned(),
+                    first_path: "first/libwrapper.rlib".into(),
+                    second_path: "second/libwrapper.rlib".into(),
+                },
+                concat!(
+                    "an external crate name refers to conflicting artifacts: ",
+                    "\"wrapper\": \"first/libwrapper.rlib\" and \"second/libwrapper.rlib\"",
+                ),
+            ),
+            (
+                AnalysisError::ExternalCrateArtifactUnreadable {
+                    path: "missing/libwrapper.rlib".into(),
+                    error: std::io::ErrorKind::PermissionDenied,
+                },
+                concat!(
+                    "an external crate artifact could not be read: ",
+                    "\"missing/libwrapper.rlib\": permission denied",
+                ),
+            ),
+            (
+                AnalysisError::UnsupportedExternalCrateArtifact {
+                    path: "libwrapper.rmeta".into(),
+                },
+                concat!(
+                    "an external crate artifact format is not supported: ",
+                    "\"libwrapper.rmeta\"",
+                ),
+            ),
+            (
+                AnalysisError::ConflictingExternalCrateArtifactName {
+                    file_name: "libwrapper.rlib".to_owned(),
+                    first_path: "first/libwrapper.rlib".into(),
+                    second_path: "second/libwrapper.rlib".into(),
+                },
+                concat!(
+                    "external crate artifacts have a conflicting file name: ",
+                    "\"libwrapper.rlib\": \"first/libwrapper.rlib\" and ",
+                    "\"second/libwrapper.rlib\"",
+                ),
+            ),
+            (
+                AnalysisError::ExternalCrateSnapshotFailure {
+                    path: "libwrapper.rlib".into(),
+                    error: std::io::ErrorKind::PermissionDenied,
+                },
+                concat!(
+                    "the external crate snapshot could not be prepared: ",
+                    "\"libwrapper.rlib\": permission denied",
+                ),
+            ),
+        ] {
+            assert_eq!(render_analysis_error(error), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escapes_non_utf8_external_artifact_paths_in_errors() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = std::path::PathBuf::from(OsString::from_vec(
+            b"artifact-with-newline\n-and-\xff.rlib".to_vec(),
+        ));
+        let rendered =
+            render_analysis_error(AnalysisError::UnsupportedExternalCrateArtifact { path });
+
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.contains("\\n"));
+        assert!(rendered.contains("\\xFF"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escapes_non_utf8_input_paths_in_errors() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let input = OsString::from_vec(b"target/tests/missing-with-newline\n-and-\xff.rs".to_vec());
+        let error = run([
+            input,
+            OsString::from("-o"),
+            OsString::from("target/tests/nonexistent-output.rs"),
+        ])
+        .unwrap_err();
+
+        assert!(!error.contains('\n'));
+        assert!(error.contains("\\n"));
+        assert!(error.contains("\\xFF"));
     }
 
     #[test]
@@ -313,10 +521,12 @@ mod tests {
             target: None,
             optimization_level: CliOptimizationLevel::O0,
             cfg_names: Vec::new(),
+            external_crates: Vec::new(),
+            dependency_artifacts: Vec::new(),
         };
         assert_eq!(
             validate_output(&cli),
-            Err(format!("output already exists: {}", path.display()))
+            Err(format!("output already exists: {path:?}"))
         );
         let error = write_output(&path, "second").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);

@@ -1,15 +1,55 @@
 //! Owned public failures returned by the analyzer.
 
 use std::fmt;
+use std::io;
+use std::path::PathBuf;
 
-use crate::input::UnsupportedReason;
 use crate::source::{ByteRange, SourceUnitId};
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum UnsupportedReason {
+    UnstableLanguageFeature,
+    AdditionalSourceFile,
+    ExternalCompileTimeResource,
+    ExternalDependency,
+    ProcMacro,
+    NoStdOrNoMain,
+    Assembly,
+    NativeLinkOrCustomRuntime,
+    UnsupportedTarget,
+    MissingMain,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AnalysisError {
     InvalidCfgName {
         name: String,
+    },
+    InvalidExternalCrateName {
+        name: String,
+    },
+    ConflictingExternalCrate {
+        name: String,
+        first_path: PathBuf,
+        second_path: PathBuf,
+    },
+    ExternalCrateArtifactUnreadable {
+        path: PathBuf,
+        error: io::ErrorKind,
+    },
+    UnsupportedExternalCrateArtifact {
+        path: PathBuf,
+    },
+    ConflictingExternalCrateArtifactName {
+        file_name: String,
+        first_path: PathBuf,
+        second_path: PathBuf,
+    },
+    ExternalCrateSnapshotFailure {
+        path: PathBuf,
+        error: io::ErrorKind,
     },
     UnsupportedInput {
         reason: UnsupportedReason,
@@ -108,6 +148,22 @@ impl fmt::Display for AnalysisError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::InvalidCfgName { .. } => "an explicit cfg name is invalid",
+            Self::InvalidExternalCrateName { .. } => "an external crate name is invalid",
+            Self::ConflictingExternalCrate { .. } => {
+                "an external crate name refers to conflicting artifacts"
+            }
+            Self::ExternalCrateArtifactUnreadable { .. } => {
+                "an external crate artifact could not be read"
+            }
+            Self::UnsupportedExternalCrateArtifact { .. } => {
+                "an external crate artifact format is not supported"
+            }
+            Self::ConflictingExternalCrateArtifactName { .. } => {
+                "external crate artifacts have a conflicting file name"
+            }
+            Self::ExternalCrateSnapshotFailure { .. } => {
+                "the external crate snapshot could not be prepared"
+            }
             Self::UnsupportedInput { .. } => "the input is outside the supported source boundary",
             Self::InvalidTag { .. } => "a dependency tag has an empty name",
             Self::OriginalCompilationFailed(_) => "the original source did not compile",

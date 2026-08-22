@@ -31,6 +31,8 @@ pub mod error;
 #[allow(dead_code)]
 pub(crate) mod expansions;
 #[allow(dead_code)]
+pub(crate) mod external;
+#[allow(dead_code)]
 pub mod graph;
 #[allow(dead_code)]
 pub(crate) mod input;
@@ -54,6 +56,5 @@ pub use api::{
     Analysis, Analyzer, CompilationOptions, CompilerRecipeIdentity, Edition, OptimizationLevel,
     Reduction, SourceInput, VerificationSummary, VerifiedReduction,
 };
-pub use error::AnalysisError;
-pub use input::UnsupportedReason;
+pub use error::{AnalysisError, UnsupportedReason};
 pub use rewrite::SourcePiece;

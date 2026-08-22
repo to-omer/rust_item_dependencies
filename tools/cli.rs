@@ -1,5 +1,23 @@
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+
+pub fn reducer_usage(command: &str) -> String {
+    format!(
+        r#"{command}
+
+Options:
+  -o, --output OUTPUT    Write reduced source to OUTPUT
+      --edition YEAR     Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]
+      --target TRIPLE    Compilation target [default: compiler host]
+  -O                     Same as --opt-level 3
+      --opt-level LEVEL  Optimization level: 0, 1, 2, 3, s, or z [default: 0]
+      --cfg NAME         Enable a name-only cfg; may be repeated
+      --extern NAME=PATH Add a direct .rlib dependency; may be repeated
+      --dependency-artifact PATH
+                         Add a transitive .rlib dependency; may be repeated
+  -h, --help             Print help"#
+    )
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CliEdition {
@@ -20,6 +38,12 @@ pub enum CliOptimizationLevel {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+pub struct CliExternalCrate {
+    pub extern_name: String,
+    pub artifact: PathBuf,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct Cli {
     pub input: PathBuf,
     pub output: PathBuf,
@@ -27,6 +51,8 @@ pub struct Cli {
     pub target: Option<String>,
     pub optimization_level: CliOptimizationLevel,
     pub cfg_names: Vec<String>,
+    pub external_crates: Vec<CliExternalCrate>,
+    pub dependency_artifacts: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -46,6 +72,8 @@ pub fn parse_arguments(
     let mut target = None;
     let mut optimization_level = CliOptimizationLevel::O0;
     let mut cfg_names = Vec::new();
+    let mut external_crates = Vec::new();
+    let mut dependency_artifacts = Vec::new();
     let mut positional_only = false;
 
     while let Some(argument) = arguments.next() {
@@ -85,6 +113,21 @@ pub fn parse_arguments(
                     cfg_names.push(next_utf8(&mut arguments, "--cfg")?);
                     continue;
                 }
+                Some("--extern") => {
+                    external_crates.push(parse_external_crate(next_value(
+                        &mut arguments,
+                        "--extern",
+                    )?)?);
+                    continue;
+                }
+                Some("--dependency-artifact") => {
+                    let artifact = next_value(&mut arguments, "--dependency-artifact")?;
+                    if artifact.is_empty() {
+                        return Err("--dependency-artifact requires a nonempty path".to_owned());
+                    }
+                    dependency_artifacts.push(artifact.into());
+                    continue;
+                }
                 Some(value) if value.starts_with('-') => {
                     return Err(format!("unknown option: {value}\n\n{usage}"));
                 }
@@ -106,6 +149,8 @@ pub fn parse_arguments(
         target,
         optimization_level,
         cfg_names,
+        external_crates,
+        dependency_artifacts,
     }))
 }
 
@@ -114,13 +159,20 @@ pub fn validate_output(cli: &Cli) -> Result<(), String> {
         return Err("input and output must be different files".to_owned());
     }
     match std::fs::symlink_metadata(&cli.output) {
-        Ok(_) => Err(format!("output already exists: {}", cli.output.display())),
+        Ok(_) => Err(format!(
+            "output already exists: {}",
+            render_path(&cli.output)
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
             "cannot inspect output {}: {error}",
-            cli.output.display()
+            render_path(&cli.output)
         )),
     }
+}
+
+pub fn render_path(path: &Path) -> String {
+    format!("{path:?}")
 }
 
 fn next_value(
@@ -163,6 +215,34 @@ fn parse_optimization_level(value: String) -> Result<CliOptimizationLevel, Strin
             "unsupported optimization level: {value}; expected 0, 1, 2, 3, s, or z"
         )),
     }
+}
+
+fn parse_external_crate(value: OsString) -> Result<CliExternalCrate, String> {
+    let bytes = value.as_encoded_bytes();
+    let separator = bytes
+        .iter()
+        .position(|byte| *byte == b'=')
+        .ok_or_else(|| "--extern requires NAME=PATH".to_owned())?;
+    // SAFETY: both slices come from this OsString and are split immediately around ASCII `=`.
+    let (name, artifact) = unsafe {
+        (
+            OsStr::from_encoded_bytes_unchecked(&bytes[..separator]),
+            OsStr::from_encoded_bytes_unchecked(&bytes[separator + 1..]),
+        )
+    };
+    if name.is_empty() {
+        return Err("--extern requires a nonempty NAME in NAME=PATH".to_owned());
+    }
+    let name = name
+        .to_str()
+        .ok_or_else(|| "--extern requires a UTF-8 NAME in NAME=PATH".to_owned())?;
+    if artifact.is_empty() {
+        return Err("--extern requires a nonempty PATH in NAME=PATH".to_owned());
+    }
+    Ok(CliExternalCrate {
+        extern_name: name.to_owned(),
+        artifact: artifact.into(),
+    })
 }
 
 fn same_file(input: &std::path::Path, output: &std::path::Path) -> bool {

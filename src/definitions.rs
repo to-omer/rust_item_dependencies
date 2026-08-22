@@ -2204,7 +2204,7 @@ fn collect_import_edges(
     edges: &mut Vec<RawEdge>,
 ) -> Result<(), DefinitionError> {
     for record in &tcx.resolutions(()).resolved_import_uses {
-        let site = source_range(compiler, source, record.segment_span)?;
+        let site = import_source_range(compiler, source, record.path_span, record.segment_span)?;
         for step in &record.import_chain {
             let definition = match *step {
                 Reexport::Single(definition)
@@ -2293,7 +2293,8 @@ fn collect_import_edges(
             });
         }
         for record in &origin.resolved_import_uses {
-            let site = source_range(compiler, source, record.segment_span)?;
+            let site =
+                import_source_range(compiler, source, record.path_span, record.segment_span)?;
             let target = record
                 .target
                 .opt_def_id()
@@ -2359,6 +2360,22 @@ fn source_range(
     span: Span,
 ) -> Result<ByteRange, DefinitionError> {
     original_span_range(compiler, &source.offsets, span.source_callsite()).map_err(Into::into)
+}
+
+fn import_source_range(
+    compiler: &Compiler,
+    source: &SourceInventory,
+    path_span: Span,
+    segment_span: Span,
+) -> Result<ByteRange, DefinitionError> {
+    // An imported macro-definition token has no local expansion context by itself, while the
+    // enclosing path span retains the call-site chain into the input crate.
+    let span = if !segment_span.is_dummy() && compiler.sess.source_map().is_imported(segment_span) {
+        path_span
+    } else {
+        segment_span
+    };
+    source_range(compiler, source, span)
 }
 
 #[cfg(all(test, rust_item_dependencies_patched))]
