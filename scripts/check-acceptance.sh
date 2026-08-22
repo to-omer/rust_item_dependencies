@@ -63,6 +63,7 @@ echo "==> patched compiler observer fixtures"
         tests/ui-fulldeps/associated-item-proof.rs \
         tests/ui-fulldeps/typed-mono-successors.rs \
         tests/ui-fulldeps/typeck-impl-dependencies.rs \
+        tests/ui-fulldeps/typeck-impl-dependencies-associated-struct.rs \
         tests/ui-fulldeps/typeck-impl-dependencies-copy-coherence.rs \
         tests/ui-fulldeps/typeck-impl-dependencies-copy-use.rs \
         tests/ui-fulldeps/typeck-impl-dependencies-coroutine.rs \

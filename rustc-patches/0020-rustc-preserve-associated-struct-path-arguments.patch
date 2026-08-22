@@ -1,0 +1,497 @@
+From 6d9f0f9ef6a674a5078bb0fd6e9436f31fc16774 Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Sat, 22 Aug 2026 15:00:00 +0900
+Subject: [PATCH] rustc: preserve associated struct path arguments
+
+---
+ .../rustc_hir_typeck/src/fn_ctxt/checks.rs    |   7 +
+ .../src/typeck_impl_dependencies.rs           |  56 +++-
+ ...pl-dependencies-associated-struct-input.rs | 100 +++++++
+ ...eck-impl-dependencies-associated-struct.rs | 269 ++++++++++++++++++
+ 4 files changed, 431 insertions(+), 1 deletion(-)
+ create mode 100644 tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-associated-struct-input.rs
+ create mode 100644 tests/ui-fulldeps/typeck-impl-dependencies-associated-struct.rs
+
+diff --git a/compiler/rustc_hir_typeck/src/fn_ctxt/checks.rs b/compiler/rustc_hir_typeck/src/fn_ctxt/checks.rs
+index 46001b8b..2cc7c5df 100644
+--- a/compiler/rustc_hir_typeck/src/fn_ctxt/checks.rs
++++ b/compiler/rustc_hir_typeck/src/fn_ctxt/checks.rs
+@@ -1533,6 +1533,13 @@ fn finish_resolving_struct_path(
+ 
+                 // Write back the new resolution.
+                 self.write_resolution(hir_id, resolution);
++                if let Ok((DefKind::AssocTy, resolved)) = resolution
++                    && let ty::Alias(_, alias) = *ty.raw.kind()
++                    && let ty::AliasTyKind::Projection { def_id } = alias.kind
++                    && def_id == resolved
++                {
++                    self.write_args(hir_id, alias.args);
++                }
+ 
+                 (result.unwrap_or(Res::Err), ty)
+             }
+diff --git a/compiler/rustc_traits/src/typeck_impl_dependencies.rs b/compiler/rustc_traits/src/typeck_impl_dependencies.rs
+index dd2929f4..71073314 100644
+--- a/compiler/rustc_traits/src/typeck_impl_dependencies.rs
++++ b/compiler/rustc_traits/src/typeck_impl_dependencies.rs
+@@ -1,7 +1,8 @@
+ use rustc_hir::HirId;
+ use rustc_hir::intravisit::{self, Visitor};
+ use rustc_middle::traits::{
+-    CodegenAssociatedItemProof, ImplSource, TypeckImplDependenciesError, TypeckImplDependency,
++    CodegenAssociatedItemProof, CodegenProjectionProof, CodegenProjectionSource, ImplSource,
++    TypeckImplDependenciesError, TypeckImplDependency,
+ };
+ use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt, Unnormalized};
+ use rustc_span::Span;
+@@ -141,6 +142,46 @@ fn observe_body_associated_item<'tcx>(
+     let args = tcx
+         .try_normalize_erasing_regions(typing_env, Unnormalized::new_wip(args))
+         .map_err(|_| TypeckImplDependenciesError::Unresolved)?;
++    if tcx.def_kind(item) == rustc_hir::def::DefKind::AssocTy {
++        let goal = ty::AliasTerm::new_from_def_id(tcx, item, args);
++        let key = tcx.erase_and_anonymize_regions(typing_env.as_query_input(goal));
++        let proof = projection_proof(tcx, key)?;
++        let projection = proof
++            .trace
++            .projections
++            .iter()
++            .find(|projection| {
++                projection.param_env == key.typing_env.param_env
++                    && projection.projection == key.value
++                    && projection.owners.contains(&proof.trace.root)
++            })
++            .ok_or(TypeckImplDependenciesError::IncompleteObservation)?;
++        let CodegenProjectionSource::Selected(ImplSource::UserDefined(source)) = &projection.source
++        else {
++            return Ok(());
++        };
++        let Some(impl_def_id) = source.impl_def_id.as_local() else {
++            return Ok(());
++        };
++        let associated_item = projection
++            .selected_projection_item
++            .ok_or(TypeckImplDependenciesError::IncompleteObservation)?;
++        if !dependencies.iter().any(|dependency| {
++            dependency.source_owner == owner
++                && dependency.impl_def_id == impl_def_id
++                && dependency.associated_item == Some(associated_item)
++                && span.contains(dependency.source_span)
++        }) {
++            return Err(TypeckImplDependenciesError::IncompleteObservation);
++        }
++        dependencies.push(TypeckImplDependency {
++            source_owner: owner,
++            source_span: span,
++            impl_def_id,
++            associated_item: Some(associated_item),
++        });
++        return Ok(());
++    }
+     let trait_id =
+         tcx.trait_of_assoc(item).ok_or(TypeckImplDependenciesError::IncompleteObservation)?;
+     let trait_ref = ty::TraitRef::from_assoc(tcx, trait_id, args);
+@@ -243,6 +284,19 @@ fn associated_item_proof<'tcx>(
+         .ok_or(TypeckImplDependenciesError::IncompleteObservation)
+ }
+ 
++fn projection_proof<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    key: ty::PseudoCanonicalInput<'tcx, ty::AliasTerm<'tcx>>,
++) -> Result<&'tcx CodegenProjectionProof<'tcx>, TypeckImplDependenciesError> {
++    let cold =
++        tcx.codegen_projection_proof(key).map_err(TypeckImplDependenciesError::Projection)?;
++    let warm =
++        tcx.codegen_projection_proof(key).map_err(TypeckImplDependenciesError::Projection)?;
++    std::ptr::eq(cold, warm)
++        .then_some(cold)
++        .ok_or(TypeckImplDependenciesError::IncompleteObservation)
++}
++
+ #[derive(Default)]
+ struct ResolvedAssociatedPaths {
+     items: Vec<(DefId, HirId, Span)>,
+diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-associated-struct-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-associated-struct-input.rs
+new file mode 100644
+index 00000000..523fc832
+--- /dev/null
++++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-associated-struct-input.rs
+@@ -0,0 +1,100 @@
++#![allow(dead_code)]
++
++trait Family<Tag> {
++    type Data<'a, T: 'a, const N: usize>
++    where
++        Self: 'a;
++
++    fn make<'a, T: 'a, const N: usize>(value: &'a T) -> Self::Data<'a, T, N>;
++    fn take<'a, T: 'a, const N: usize>(data: Self::Data<'a, T, N>) -> &'a T;
++}
++
++struct Wrapper<'a, T, const N: usize> {
++    value: &'a T,
++}
++
++struct Concrete;
++
++impl<Tag> Family<Tag> for Concrete {
++    type Data<'a, T: 'a, const N: usize> = Wrapper<'a, T, N>;
++
++    fn make<'a, T: 'a, const N: usize>(value: &'a T) -> Self::Data<'a, T, N> {
++        Self::Data::<'a, T, N> { value }
++    }
++
++    fn take<'a, T: 'a, const N: usize>(data: Self::Data<'a, T, N>) -> &'a T {
++        let Self::Data::<'a, T, N> { value } = data;
++        value
++    }
++}
++
++trait Plain {
++    type Data;
++
++    fn make(value: u8) -> Self::Data;
++    fn take(data: Self::Data) -> u8;
++}
++
++struct PlainWrapper {
++    value: u8,
++}
++
++struct PlainConcrete;
++
++impl Plain for PlainConcrete {
++    type Data = PlainWrapper;
++
++    fn make(value: u8) -> Self::Data {
++        Self::Data { value }
++    }
++
++    fn take(data: Self::Data) -> u8 {
++        let Self::Data { value } = data;
++        value
++    }
++}
++
++struct OtherWrapper {
++    value: u8,
++}
++
++struct Other;
++
++impl Plain for Other {
++    type Data = OtherWrapper;
++
++    fn make(value: u8) -> Self::Data {
++        Self::Data { value }
++    }
++
++    fn take(data: Self::Data) -> u8 {
++        let Self::Data { value } = data;
++        value
++    }
++}
++
++fn generic<T: Plain<Data = PlainWrapper>>() -> T::Data {
++    T::Data { value: 9 }
++}
++
++trait EnumFamily {
++    type Data;
++
++    fn make() -> Self::Data;
++}
++
++enum Choice {
++    Value { value: u8 },
++}
++
++struct EnumConcrete;
++
++impl EnumFamily for EnumConcrete {
++    type Data = Choice;
++
++    fn make() -> Self::Data {
++        Self::Data::Value { value: 11 }
++    }
++}
++
++fn main() {}
+diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-associated-struct.rs b/tests/ui-fulldeps/typeck-impl-dependencies-associated-struct.rs
+new file mode 100644
+index 00000000..fadea6da
+--- /dev/null
++++ b/tests/ui-fulldeps/typeck-impl-dependencies-associated-struct.rs
+@@ -0,0 +1,269 @@
++//@ edition: 2024
++//@ run-pass
++//@ run-flags: --sysroot {{sysroot-base}} --edition=2024 {{src-base}}/auxiliary/typeck-impl-dependencies-associated-struct-input.rs
++//@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
++//@ ignore-cross-compile
++//@ ignore-remote
++
++#![feature(rustc_private)]
++
++extern crate rustc_driver;
++extern crate rustc_hir;
++extern crate rustc_interface;
++extern crate rustc_middle;
++extern crate rustc_span;
++
++use std::collections::HashSet;
++use std::process::ExitCode;
++
++use rustc_driver::Compilation;
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::{DefId, LocalDefId};
++use rustc_hir::intravisit::{self, Visitor};
++use rustc_hir::{Expr, ExprKind, HirId, Pat, PatKind, QPath};
++use rustc_interface::interface::Compiler;
++use rustc_middle::traits::TypeckImplDependency;
++use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
++use rustc_span::Span;
++
++fn main() -> ExitCode {
++    rustc_driver::catch_with_exit_code(move || {
++        let args: Vec<_> = std::env::args().collect();
++        rustc_driver::run_compiler(&args, &mut Callbacks);
++    })
++}
++
++struct Callbacks;
++
++impl rustc_driver::Callbacks for Callbacks {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++
++        let cold = tcx.typeck_impl_dependencies(()).unwrap();
++        let warm = tcx.typeck_impl_dependencies(()).unwrap();
++        assert!(std::ptr::eq(cold, warm));
++
++        let family = named_def(tcx, "Family", DefKind::Trait);
++        let concrete = named_def(tcx, "Concrete", DefKind::Struct);
++        let concrete_impl = only_impl_for_trait(tcx, family).expect_local();
++        let family_data = associated_item(tcx, family, "Data");
++        let family_make = associated_item(tcx, family, "make");
++        let family_take = associated_item(tcx, family, "take");
++        let implementors = tcx.impl_item_implementor_ids(concrete_impl);
++        let data_impl = implementors[&family_data];
++        let make = implementors[&family_make].expect_local();
++        let take = implementors[&family_take].expect_local();
++
++        let make_site = only_type_relative_struct_site(tcx, make);
++        let make_args = finalized_args(tcx, make, make_site.0, family_data);
++        assert_family_args(tcx, make_args, concrete);
++
++        let take_site = only_type_relative_struct_site(tcx, take);
++        let take_args = finalized_args(tcx, take, take_site.0, family_data);
++        assert_family_args(tcx, take_args, concrete);
++
++        assert_eq!(
++            exact_site_dependencies(cold, data_impl, [(make, make_site.1), (take, take_site.1)]),
++            HashSet::from([
++                (make, make_site.1, concrete_impl, Some(data_impl)),
++                (take, take_site.1, concrete_impl, Some(data_impl)),
++            ])
++        );
++
++        let plain = named_def(tcx, "Plain", DefKind::Trait);
++        assert_plain_impl_struct_sites(tcx, cold, plain, "PlainConcrete");
++        assert_plain_impl_struct_sites(tcx, cold, plain, "Other");
++
++        let plain_data = associated_item(tcx, plain, "Data");
++        let generic = named_def(tcx, "generic", DefKind::Fn).expect_local();
++        let generic_site = only_type_relative_struct_site(tcx, generic);
++        let generic_args = finalized_args(tcx, generic, generic_site.0, plain_data);
++        assert_eq!(generic_args.len(), 1);
++        assert!(matches!(*generic_args.type_at(0).kind(), ty::Param(_)));
++        assert!(cold.iter().all(|dependency| dependency.source_owner != generic));
++
++        let enum_family = named_def(tcx, "EnumFamily", DefKind::Trait);
++        let enum_impl = only_impl_for_trait(tcx, enum_family).expect_local();
++        let enum_make = tcx.impl_item_implementor_ids(enum_impl)
++            [&associated_item(tcx, enum_family, "make")]
++            .expect_local();
++        let enum_site = only_type_relative_struct_site(tcx, enum_make).0;
++        let enum_results = tcx.typeck(enum_make);
++        assert!(matches!(
++            enum_results.type_dependent_def(enum_site),
++            Some((DefKind::Variant, _))
++        ));
++        assert_eq!(enum_results.node_args_opt(enum_site), None);
++
++        Compilation::Stop
++    }
++}
++
++fn assert_family_args<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    args: ty::GenericArgsRef<'tcx>,
++    concrete: DefId,
++) {
++    assert_eq!(args.len(), 5);
++    assert_eq!(args.type_at(0).ty_adt_def().unwrap().did(), concrete);
++
++    let ty::Param(tag) = *args.type_at(1).kind() else { panic!() };
++    assert_eq!(tag.index, 0);
++    assert_eq!(tag.name.as_str(), "Tag");
++
++    assert_eq!(args.region_at(2), tcx.lifetimes.re_erased);
++
++    let ty::Param(value) = *args.type_at(3).kind() else { panic!() };
++    assert_eq!(value.index, 2);
++    assert_eq!(value.name.as_str(), "T");
++
++    let ty::ConstKind::Param(width) = args.const_at(4).kind() else { panic!() };
++    assert_eq!(width.index, 3);
++    assert_eq!(width.name.as_str(), "N");
++}
++
++fn assert_plain_impl_struct_sites(
++    tcx: TyCtxt<'_>,
++    dependencies: &[TypeckImplDependency],
++    trait_id: DefId,
++    self_name: &str,
++) {
++    let self_def = named_def(tcx, self_name, DefKind::Struct);
++    let impl_def_id = impl_for_trait_and_self(tcx, trait_id, self_def).expect_local();
++    let trait_data = associated_item(tcx, trait_id, "Data");
++    let implementors = tcx.impl_item_implementor_ids(impl_def_id);
++    let data_impl = implementors[&trait_data];
++
++    for method_name in ["make", "take"] {
++        let method = implementors[&associated_item(tcx, trait_id, method_name)].expect_local();
++        let (site, span) = only_type_relative_struct_site(tcx, method);
++        let args = finalized_args(tcx, method, site, trait_data);
++        assert_eq!(args.len(), 1);
++        assert_eq!(args.type_at(0).ty_adt_def().unwrap().did(), self_def);
++
++        let site_dependencies = dependencies
++            .iter()
++            .filter(|dependency| dependency.source_owner == method && dependency.source_span == span)
++            .collect::<Vec<_>>();
++        assert!(site_dependencies.iter().any(|dependency| {
++            dependency.impl_def_id == impl_def_id
++                && dependency.associated_item == Some(data_impl)
++        }));
++        assert!(
++            site_dependencies
++                .iter()
++                .all(|dependency| dependency.impl_def_id == impl_def_id)
++        );
++    }
++}
++
++fn finalized_args<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    owner: LocalDefId,
++    site: HirId,
++    expected_item: DefId,
++) -> ty::GenericArgsRef<'tcx> {
++    let results = tcx.typeck(owner);
++    assert_eq!(results.type_dependent_def(site), Some((DefKind::AssocTy, expected_item)));
++    let args = results.node_args_opt(site).unwrap();
++    assert!(!args.has_non_region_infer());
++    assert!(!args.has_escaping_bound_vars());
++    args
++}
++
++fn exact_site_dependencies(
++    dependencies: &[TypeckImplDependency],
++    associated_item: DefId,
++    sites: impl IntoIterator<Item = (LocalDefId, Span)>,
++) -> HashSet<(LocalDefId, Span, LocalDefId, Option<DefId>)> {
++    let sites = sites.into_iter().collect::<HashSet<_>>();
++    dependencies
++        .iter()
++        .filter(|dependency| {
++            dependency.associated_item == Some(associated_item)
++                && sites.contains(&(dependency.source_owner, dependency.source_span))
++        })
++        .map(|dependency| {
++            (
++                dependency.source_owner,
++                dependency.source_span,
++                dependency.impl_def_id,
++                dependency.associated_item,
++            )
++        })
++        .collect()
++}
++
++fn only_type_relative_struct_site(tcx: TyCtxt<'_>, owner: LocalDefId) -> (HirId, Span) {
++    let mut sites = TypeRelativeStructSites::default();
++    sites.visit_expr(tcx.hir_body_owned_by(owner).value);
++    let [site] = sites.items.as_slice() else {
++        panic!("expected exactly one type-relative struct site, got {:?}", sites.items)
++    };
++    *site
++}
++
++#[derive(Default)]
++struct TypeRelativeStructSites {
++    items: Vec<(HirId, Span)>,
++}
++
++impl<'tcx> Visitor<'tcx> for TypeRelativeStructSites {
++    fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
++        if let ExprKind::Struct(QPath::TypeRelative(..), ..) = expression.kind {
++            self.items.push((expression.hir_id, expression.span));
++        }
++        intravisit::walk_expr(self, expression);
++    }
++
++    fn visit_pat(&mut self, pattern: &'tcx Pat<'tcx>) {
++        if let PatKind::Struct(QPath::TypeRelative(..), ..) = pattern.kind {
++            self.items.push((pattern.hir_id, pattern.span));
++        }
++        intravisit::walk_pat(self, pattern);
++    }
++}
++
++fn named_def(tcx: TyCtxt<'_>, name: &str, kind: DefKind) -> DefId {
++    tcx.iter_local_def_id()
++        .map(LocalDefId::to_def_id)
++        .find(|&def_id| tcx.def_kind(def_id) == kind && tcx.item_name(def_id).as_str() == name)
++        .unwrap()
++}
++
++fn associated_item(tcx: TyCtxt<'_>, owner: DefId, name: &str) -> DefId {
++    tcx.associated_items(owner)
++        .in_definition_order()
++        .find(|item| item.opt_name().is_some_and(|item_name| item_name.as_str() == name))
++        .unwrap()
++        .def_id
++}
++
++fn only_impl_for_trait(tcx: TyCtxt<'_>, trait_id: DefId) -> DefId {
++    let mut impls = tcx
++        .iter_local_def_id()
++        .map(LocalDefId::to_def_id)
++        .filter(|&def_id| tcx.def_kind(def_id) == DefKind::Impl { of_trait: true })
++        .filter(|&def_id| tcx.impl_trait_id(def_id) == trait_id);
++    let impl_def_id = impls.next().unwrap();
++    assert_eq!(impls.next(), None);
++    impl_def_id
++}
++
++fn impl_for_trait_and_self(tcx: TyCtxt<'_>, trait_id: DefId, self_def: DefId) -> DefId {
++    let mut impls = tcx
++        .iter_local_def_id()
++        .map(LocalDefId::to_def_id)
++        .filter(|&def_id| tcx.def_kind(def_id) == DefKind::Impl { of_trait: true })
++        .filter(|&def_id| tcx.impl_trait_id(def_id) == trait_id)
++        .filter(|&def_id| {
++            tcx.type_of(def_id)
++                .instantiate_identity()
++                .skip_norm_wip()
++                .ty_adt_def()
++                .is_some_and(|adt| adt.did() == self_def)
++        });
++    let impl_def_id = impls.next().unwrap();
++    assert_eq!(impls.next(), None);
++    impl_def_id
++}
+-- 
+2.55.0
+
