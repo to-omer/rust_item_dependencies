@@ -34,7 +34,9 @@ use crate::dependency_graph::{
 };
 #[cfg(all(test, rust_item_dependencies_patched))]
 use crate::dependency_graph::{DependencyKind, EvidenceOrigin, ProofRelationKind};
+use crate::error::{AnalysisError, UnsupportedReason};
 use crate::expansions::{CollectedExpansions, ExpansionError, collect_expansions};
+use crate::external::{ExternalCrate, PreparedExternalCrates, prepare_external_crates};
 use crate::graph::{DefinitionGraph, DefinitionKind, DefinitionOrigin};
 use crate::monomorphization::{
     CollectedMonomorphization, MonomorphizationError, collect_monomorphization,
@@ -99,6 +101,40 @@ impl OptimizationLevel {
 pub struct CompilationOptions {
     optimization_level: OptimizationLevel,
     explicit_cfgs: BTreeSet<String>,
+    external_crates: BTreeSet<ExternalCrate>,
+    dependency_artifacts: BTreeSet<PathBuf>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedCompilationOptions {
+    optimization_level: OptimizationLevel,
+    explicit_cfgs: BTreeSet<String>,
+    external_crates: PreparedExternalCrates,
+}
+
+impl PreparedCompilationOptions {
+    fn new(options: CompilationOptions, external_crates: PreparedExternalCrates) -> Self {
+        Self {
+            optimization_level: options.optimization_level,
+            explicit_cfgs: options.explicit_cfgs,
+            external_crates,
+        }
+    }
+
+    pub(crate) fn prepare(options: CompilationOptions) -> Result<Self, AnalysisError> {
+        options.validate()?;
+        let external_crates =
+            prepare_external_crates(options.external_crates(), options.dependency_artifacts())?;
+        Ok(Self::new(options, external_crates))
+    }
+
+    #[cfg(test)]
+    fn empty() -> Self {
+        Self::new(
+            CompilationOptions::default(),
+            PreparedExternalCrates::default(),
+        )
+    }
 }
 
 // rustc cannot parse these semantic names as raw cfgspec identifiers.
@@ -145,6 +181,23 @@ impl CompilationOptions {
         self
     }
 
+    #[must_use]
+    pub fn with_external_crate(
+        mut self,
+        extern_name: impl Into<String>,
+        artifact: impl Into<PathBuf>,
+    ) -> Self {
+        self.external_crates
+            .insert(ExternalCrate::new(extern_name, artifact));
+        self
+    }
+
+    #[must_use]
+    pub fn with_dependency_artifact(mut self, artifact: impl Into<PathBuf>) -> Self {
+        self.dependency_artifacts.insert(artifact.into());
+        self
+    }
+
     pub fn optimization_level(&self) -> OptimizationLevel {
         self.optimization_level
     }
@@ -153,12 +206,26 @@ impl CompilationOptions {
         self.explicit_cfgs.iter().map(String::as_str)
     }
 
-    pub(crate) fn invalid_cfg_name(&self) -> Option<&str> {
-        self.cfgs().find(|name| {
+    pub(crate) fn external_crates(&self) -> impl Iterator<Item = &ExternalCrate> {
+        self.external_crates.iter()
+    }
+
+    pub(crate) fn dependency_artifacts(&self) -> impl Iterator<Item = &Path> {
+        self.dependency_artifacts.iter().map(PathBuf::as_path)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), AnalysisError> {
+        let invalid = self.cfgs().find(|name| {
             !rustc_lexer::is_ident(name)
                 || RAW_INCOMPATIBLE_CFG_NAMES.contains(name)
                 || DISALLOWED_BUILTIN_CFG_NAMES.contains(name)
-        })
+        });
+        match invalid {
+            Some(name) => Err(AnalysisError::InvalidCfgName {
+                name: name.to_owned(),
+            }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -172,38 +239,44 @@ pub struct SourceInput {
 pub(crate) struct CompilationContext<'a> {
     edition: &'a Edition,
     target: &'a str,
-    options: &'a CompilationOptions,
+    compilation: &'a PreparedCompilationOptions,
     sysroot: &'a Path,
 }
 
 impl<'a> CompilationContext<'a> {
     pub(crate) fn new(
-        input: &'a SourceInput,
-        options: &'a CompilationOptions,
+        edition: &'a Edition,
+        target: &'a str,
+        compilation: &'a PreparedCompilationOptions,
         sysroot: &'a Path,
     ) -> Self {
         Self {
-            edition: &input.edition,
-            target: &input.target,
-            options,
+            edition,
+            target,
+            compilation,
             sysroot,
         }
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[non_exhaustive]
-pub enum UnsupportedReason {
-    UnstableLanguageFeature,
-    AdditionalSourceFile,
-    ExternalCompileTimeResource,
-    ExternalDependency,
-    ProcMacro,
-    NoStdOrNoMain,
-    Assembly,
-    NativeLinkOrCustomRuntime,
-    UnsupportedTarget,
-    MissingMain,
+    pub(crate) fn edition_argument(&self) -> &'static str {
+        self.edition.as_str()
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        self.target
+    }
+
+    pub(crate) fn optimization_level_argument(&self) -> &'static str {
+        self.compilation.optimization_level.as_str()
+    }
+
+    pub(crate) fn cfgs(&self) -> impl Iterator<Item = &str> {
+        self.compilation.explicit_cfgs.iter().map(String::as_str)
+    }
+
+    pub(crate) fn external_crates(&self) -> &PreparedExternalCrates {
+        &self.compilation.external_crates
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -416,8 +489,8 @@ pub(crate) fn inspect_source(
     input: &SourceInput,
     sysroot: &Path,
 ) -> Result<SourceInventory, InputError> {
-    let options = CompilationOptions::default();
-    let context = CompilationContext::new(input, &options, sysroot);
+    let compilation = PreparedCompilationOptions::empty();
+    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
     inspect_source_in_context(&input.source, &context)
 }
 
@@ -434,8 +507,8 @@ pub(crate) fn inspect_source_with_definitions(
     input: &SourceInput,
     sysroot: &Path,
 ) -> Result<InspectedSource, InputError> {
-    let options = CompilationOptions::default();
-    let context = CompilationContext::new(input, &options, sysroot);
+    let compilation = PreparedCompilationOptions::empty();
+    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
     inspect_source_with_definitions_in_context(&input.source, &context)
 }
 
@@ -458,8 +531,8 @@ pub(crate) fn inspect_source_with_dependencies(
     input: &SourceInput,
     sysroot: &Path,
 ) -> Result<InspectedDependencies, InputError> {
-    let options = CompilationOptions::default();
-    let context = CompilationContext::new(input, &options, sysroot);
+    let compilation = PreparedCompilationOptions::empty();
+    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
     inspect_source_with_dependencies_inner(&input.source, &context, None)
 }
 
@@ -472,8 +545,8 @@ pub(crate) fn inspect_source_with_dependencies_at_original_coordinates(
     sysroot: &Path,
     coordinates: &SourceRewrite,
 ) -> Result<InspectedDependencies, InputError> {
-    let options = CompilationOptions::default();
-    let context = CompilationContext::new(input, &options, sysroot);
+    let compilation = PreparedCompilationOptions::empty();
+    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
     inspect_source_with_dependencies_at_original_coordinates_in_context(
         &input.source,
         &context,
@@ -521,8 +594,8 @@ pub(crate) fn inspect_source_with_reduction(
     input: &SourceInput,
     sysroot: &Path,
 ) -> Result<InspectedReduction, InputError> {
-    let options = CompilationOptions::default();
-    let context = CompilationContext::new(input, &options, sysroot);
+    let compilation = PreparedCompilationOptions::empty();
+    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
     inspect_source_with_reduction_in_context(&input.source, &context)
 }
 
@@ -564,7 +637,7 @@ fn run_inspection(
 ) -> Result<CompilerInspection, InputError> {
     #[cfg(test)]
     INSPECTION_COUNT.set(INSPECTION_COUNT.get() + 1);
-    validate_target(context.sysroot, context.target)?;
+    validate_target(context.sysroot, context.target())?;
 
     let result = Arc::new(Mutex::new(None));
     let diagnostics = Arc::new(Mutex::new(DiagnosticState::default()));
@@ -587,6 +660,12 @@ fn run_inspection(
         inventory: None,
         collection_mode,
         coordinates: coordinates.cloned(),
+        direct_external_crates: context
+            .external_crates()
+            .direct()
+            .iter()
+            .map(|external| external.extern_name().to_owned())
+            .collect(),
     };
 
     let arguments = compiler_arguments(context);
@@ -747,23 +826,28 @@ fn compiler_arguments(context: &CompilationContext<'_>) -> Vec<String> {
         "main.rs".to_owned(),
         "--crate-name=main".to_owned(),
         "--crate-type=bin".to_owned(),
-        format!("--edition={}", context.edition.as_str()),
-        format!("--target={}", context.target),
-        format!(
-            "-Copt-level={}",
-            context.options.optimization_level.as_str()
-        ),
+        format!("--edition={}", context.edition_argument()),
+        format!("--target={}", context.target()),
+        format!("-Copt-level={}", context.optimization_level_argument()),
         "--sysroot".to_owned(),
         context.sysroot.to_string_lossy().into_owned(),
         "--emit=metadata=-".to_owned(),
     ];
-    arguments.extend(
-        context
-            .options
-            .explicit_cfgs
-            .iter()
-            .map(|cfg| format!("--cfg=r#{cfg}")),
-    );
+    arguments.extend(context.cfgs().map(|cfg| format!("--cfg=r#{cfg}")));
+    for external in context.external_crates().direct() {
+        arguments.push("--extern".to_owned());
+        arguments.push(format!(
+            "{}={}",
+            external.extern_name(),
+            external.artifact_argument()
+        ));
+    }
+    if let Some(directory) = context.external_crates().search_directory() {
+        arguments.push("-L".to_owned());
+        arguments.push(format!("dependency={directory}"));
+        arguments.push("-L".to_owned());
+        arguments.push(format!("crate={directory}"));
+    }
     arguments
 }
 
@@ -805,6 +889,7 @@ struct InputCallbacks {
     inventory: Option<SourceInventory>,
     collection_mode: CollectionMode,
     coordinates: Option<SourceRewrite>,
+    direct_external_crates: BTreeSet<String>,
 }
 
 impl InputCallbacks {
@@ -889,7 +974,9 @@ impl Callbacks for InputCallbacks {
             Ok(inventory) => inventory,
             Err(error) => return self.finish(Err(error.into())),
         };
-        if let Err(error) = validate_unexpanded(compiler, krate, &inventory) {
+        if let Err(error) =
+            validate_unexpanded(compiler, krate, &inventory, &self.direct_external_crates)
+        {
             return self.finish(Err(error));
         }
         self.inventory = Some(inventory);
@@ -914,6 +1001,7 @@ impl Callbacks for InputCallbacks {
                 self.inventory
                     .as_ref()
                     .expect("source inventory must be collected before expansion"),
+                &self.direct_external_crates,
             ) {
                 return self.finish(Err(error));
             }
@@ -1245,6 +1333,7 @@ fn validate_unexpanded(
     compiler: &Compiler,
     krate: &ast::Crate,
     inventory: &SourceInventory,
+    direct_external_crates: &BTreeSet<String>,
 ) -> Result<(), InputError> {
     let configured_attrs = pre_configure_attrs(&compiler.sess, &krate.attrs);
     if let Some(attribute) = configured_attrs
@@ -1280,6 +1369,7 @@ fn validate_unexpanded(
         inventory,
         features,
         active_stack: vec![root_active],
+        direct_external_crates,
         errors: Vec::new(),
     };
     if root_active {
@@ -1294,6 +1384,7 @@ struct UnexpandedValidator<'a> {
     inventory: &'a SourceInventory,
     features: Features,
     active_stack: Vec<bool>,
+    direct_external_crates: &'a BTreeSet<String>,
     errors: Vec<InputError>,
 }
 
@@ -1358,7 +1449,7 @@ impl<'ast> Visitor<'ast> for UnexpandedValidator<'_> {
             ast::ItemKind::GlobalAsm(_) => self.reject(UnsupportedReason::Assembly, item.span),
             ast::ItemKind::ExternCrate(original, identifier) => {
                 let name = original.unwrap_or(identifier.name);
-                if !matches!(name.as_str(), "std" | "core" | "alloc" | "self") {
+                if !supported_external_crate(name, self.direct_external_crates) {
                     self.reject(external_crate_reason(name), item.span);
                 }
             }
@@ -1474,10 +1565,12 @@ fn validate_expanded(
     compiler: &Compiler,
     krate: &ast::Crate,
     inventory: &SourceInventory,
+    direct_external_crates: &BTreeSet<String>,
 ) -> Result<(), InputError> {
     let mut validator = ExpandedValidator {
         compiler,
         inventory,
+        direct_external_crates,
         errors: Vec::new(),
     };
     validator.visit_crate(krate);
@@ -1493,6 +1586,7 @@ fn validate_expanded(
 struct ExpandedValidator<'a> {
     compiler: &'a Compiler,
     inventory: &'a SourceInventory,
+    direct_external_crates: &'a BTreeSet<String>,
     errors: Vec<InputError>,
 }
 
@@ -1522,8 +1616,13 @@ impl<'ast> Visitor<'ast> for ExpandedValidator<'_> {
             ast::ItemKind::GlobalAsm(_) => self.reject(UnsupportedReason::Assembly, item.span),
             ast::ItemKind::ExternCrate(original, identifier) => {
                 let name = original.unwrap_or(identifier.name);
-                if !matches!(name.as_str(), "std" | "core" | "alloc" | "self") {
-                    self.reject(external_crate_reason(name), item.span);
+                let reason = external_crate_reason(name);
+                let provided_by_external_macro = reason == UnsupportedReason::ExternalDependency
+                    && item.span.in_external_macro(self.compiler.sess.source_map());
+                if !supported_external_crate(name, self.direct_external_crates)
+                    && !provided_by_external_macro
+                {
+                    self.reject(reason, item.span);
                 }
             }
             _ => {}
@@ -1588,6 +1687,14 @@ fn external_crate_reason(name: Symbol) -> UnsupportedReason {
     } else {
         UnsupportedReason::ExternalDependency
     }
+}
+
+fn supported_external_crate(name: Symbol, direct_external_crates: &BTreeSet<String>) -> bool {
+    supported_external_crate_name(name.as_str(), direct_external_crates)
+}
+
+fn supported_external_crate_name(name: &str, direct_external_crates: &BTreeSet<String>) -> bool {
+    matches!(name, "std" | "core" | "alloc" | "self") || direct_external_crates.contains(name)
 }
 
 fn unsupported(
@@ -1793,6 +1900,7 @@ mod tests {
     use super::{
         DenyExternalFiles, DiagnosticState, Edition, InputError, ObservedDiagnostic, SourceInput,
         UnsupportedReason, inspect_source, inspect_source_with_definitions,
+        supported_external_crate_name,
     };
     #[cfg(not(rust_item_dependencies_patched))]
     use crate::definitions::DefinitionError;
@@ -2824,6 +2932,16 @@ mod tests {
                 "dependency!()",
             );
         }
+    }
+
+    #[test]
+    fn external_crate_allowlist_contains_only_builtins_and_direct_dependencies() {
+        let direct = BTreeSet::from(["configured".to_owned()]);
+
+        for name in ["std", "core", "alloc", "self", "configured"] {
+            assert!(supported_external_crate_name(name, &direct), "{name}");
+        }
+        assert!(!supported_external_crate_name("dependency_only", &direct));
     }
 
     #[cfg(rust_item_dependencies_patched)]

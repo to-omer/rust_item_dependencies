@@ -47,6 +47,7 @@ echo "==> source format"
 RUSTFMT="$rustfmt" \
     "$cargo_fmt" fmt \
     --manifest-path "$repository_root/Cargo.toml" --all -- --check
+"$rustfmt" --edition 2024 --check "$repository_root/tools/rid.rs"
 git -C "$repository_root" diff --check
 
 echo "==> stock compiler boundary"

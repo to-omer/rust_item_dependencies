@@ -7,23 +7,15 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
 
 mod cli;
 
-use cli::{Parsed, parse_arguments, validate_output};
+use cli::{Parsed, parse_arguments, reducer_usage, render_path, validate_output};
 
 const RUST_REPOSITORY: &str = "https://github.com/rust-lang/rust.git";
-const USAGE: &str = r#"Usage: cargo rid [OPTIONS] INPUT.rs
-
-Options:
-  -o, --output OUTPUT    Write reduced source to OUTPUT
-      --edition YEAR     Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]
-      --target TRIPLE    Compilation target [default: compiler host]
-  -O                     Same as --opt-level 3
-      --opt-level LEVEL  Optimization level: 0, 1, 2, 3, s, or z [default: 0]
-      --cfg NAME         Enable a name-only cfg; may be repeated
-  -h, --help             Print help"#;
+const USAGE_COMMAND: &str =
+    "Usage: cargo rid [OPTIONS] INPUT.rs\n       cargo rid rustc [RUSTC_OPTIONS]...";
 const RUSTC_PRIVATE_CRATES: &[&str] = &[
     "rustc_ast",
     "rustc_data_structures",
@@ -42,7 +34,12 @@ const RUSTC_PRIVATE_CRATES: &[&str] = &[
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(RunOutcome::Success) => ExitCode::SUCCESS,
+        Ok(RunOutcome::Rustc(status)) if status.success() => ExitCode::SUCCESS,
+        Ok(RunOutcome::Rustc(status)) => match status.code() {
+            Some(code) => std::process::exit(code),
+            None => ExitCode::FAILURE,
+        },
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE
@@ -50,13 +47,29 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
+enum RunOutcome {
+    Success,
+    Rustc(ExitStatus),
+}
+
+fn run() -> Result<RunOutcome, String> {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
-    let Parsed::Run(cli) = parse_arguments(arguments.iter().cloned(), USAGE)? else {
-        println!("{USAGE}");
-        return Ok(());
+    let rustc_arguments = if arguments
+        .first()
+        .is_some_and(|argument| argument == "rustc")
+    {
+        Some(arguments[1..].to_vec())
+    } else {
+        let usage = reducer_usage(USAGE_COMMAND);
+        match parse_arguments(arguments.iter().cloned(), &usage)? {
+            Parsed::Run(cli) => validate_output(&cli)?,
+            Parsed::Help => {
+                println!("{usage}");
+                return Ok(RunOutcome::Success);
+            }
+        }
+        None
     };
-    validate_output(&cli)?;
 
     let tools_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repository_root = tools_directory
@@ -65,7 +78,7 @@ fn run() -> Result<(), String> {
     let generated = repository_root.join("target/rid");
     let rust_source = generated.join("rustc");
     fs::create_dir_all(&generated)
-        .map_err(|error| format!("cannot create {}: {error}", generated.display()))?;
+        .map_err(|error| format!("cannot create {}: {error}", render_path(&generated)))?;
 
     ensure_patched_checkout(repository_root, &rust_source)?;
     let host = active_host()?;
@@ -76,6 +89,13 @@ fn run() -> Result<(), String> {
     if !stage2_rustc.is_file() {
         build_compiler(repository_root, &rust_source)?;
     }
+    if let Some(arguments) = rustc_arguments {
+        let status = Command::new(&stage2_rustc)
+            .args(arguments)
+            .status()
+            .map_err(|error| format!("cannot start the configured rustc: {error}"))?;
+        return Ok(RunOutcome::Rustc(status));
+    }
     let (rustc, compiler_library, compiler_metadata, rustc_driver) = compiler_paths(&stage2)?;
     run_reducer(
         repository_root,
@@ -85,7 +105,8 @@ fn run() -> Result<(), String> {
         &compiler_metadata,
         &rustc_driver,
         &arguments,
-    )
+    )?;
+    Ok(RunOutcome::Success)
 }
 
 fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result<(), String> {
@@ -94,7 +115,7 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
 
     if !rust_source.join(".git").exists() {
         fs::create_dir_all(rust_source)
-            .map_err(|error| format!("cannot create {}: {error}", rust_source.display()))?;
+            .map_err(|error| format!("cannot create {}: {error}", render_path(rust_source)))?;
         run_command(
             Command::new("git").arg("init").arg(rust_source),
             "initialize the Rust checkout",
@@ -147,7 +168,7 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
     if !changes.is_empty() {
         return Err(format!(
             "the generated Rust checkout is not clean: {}",
-            rust_source.display()
+            render_path(rust_source)
         ));
     }
     if revision == patched_revision {
@@ -156,7 +177,7 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
     if revision != base_revision {
         return Err(format!(
             "the generated Rust checkout has an unexpected revision; remove {} and run the command again",
-            rust_source.display()
+            render_path(rust_source)
         ));
     }
 
@@ -170,7 +191,7 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
     {
         let patch = patch_directory.join(patch_name);
         if !patch.is_file() {
-            return Err(format!("patch does not exist: {}", patch.display()));
+            return Err(format!("patch does not exist: {}", render_path(&patch)));
         }
         let result = run_command(
             Command::new("git")
@@ -269,7 +290,7 @@ fn compiler_paths(stage2: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf),
         .join("bin")
         .join(format!("rustc{}", env::consts::EXE_SUFFIX));
     if !rustc.is_file() {
-        return Err(format!("stage2 rustc is missing: {}", rustc.display()));
+        return Err(format!("stage2 rustc is missing: {}", render_path(&rustc)));
     }
     let version = command_output(Command::new(&rustc).arg("-Vv"), "query stage2 rustc")?;
     let host = version
@@ -290,7 +311,7 @@ fn compiler_paths(stage2: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf),
     if !compiler_metadata.is_dir() {
         return Err(format!(
             "stage1 compiler metadata is missing: {}",
-            compiler_metadata.display()
+            render_path(&compiler_metadata)
         ));
     }
     let driver_prefix = format!("{}rustc_driver-", env::consts::DLL_PREFIX);
@@ -311,7 +332,7 @@ fn run_reducer(
 ) -> Result<(), String> {
     let mut rustflags = vec![
         OsString::from("--extern"),
-        OsString::from(format!("rustc_driver={}", rustc_driver.display())),
+        prefixed_path("rustc_driver=", rustc_driver),
     ];
     for crate_name in RUSTC_PRIVATE_CRATES {
         let prefix = format!("lib{crate_name}-");
@@ -319,16 +340,10 @@ fn run_reducer(
             name.starts_with(&prefix) && name.ends_with(".rmeta")
         })?;
         rustflags.push(OsString::from("--extern"));
-        rustflags.push(OsString::from(format!(
-            "{crate_name}={}",
-            metadata.display()
-        )));
+        rustflags.push(prefixed_path(&format!("{crate_name}="), &metadata));
     }
     rustflags.push(OsString::from("-L"));
-    rustflags.push(OsString::from(format!(
-        "dependency={}",
-        compiler_metadata.display()
-    )));
+    rustflags.push(prefixed_path("dependency=", compiler_metadata));
     let mut encoded = OsString::new();
     for argument in rustflags {
         if !encoded.is_empty() {
@@ -361,6 +376,12 @@ fn run_reducer(
     run_command(&mut command, "run rust-item-dependencies")
 }
 
+fn prefixed_path(prefix: &str, path: &Path) -> OsString {
+    let mut value = OsString::from(prefix);
+    value.push(path);
+    value
+}
+
 fn prepend_path(command: &mut Command, directory: &Path) -> Result<(), String> {
     let inherited = env::var_os("PATH");
     let paths = std::iter::once(directory.to_path_buf()).chain(
@@ -377,7 +398,7 @@ fn prepend_path(command: &mut Command, directory: &Path) -> Result<(), String> {
 
 fn unique_file(directory: &Path, predicate: impl Fn(&str) -> bool) -> Result<PathBuf, String> {
     let mut matches = fs::read_dir(directory)
-        .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+        .map_err(|error| format!("cannot read {}: {error}", render_path(directory)))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -390,7 +411,7 @@ fn unique_file(directory: &Path, predicate: impl Fn(&str) -> bool) -> Result<Pat
     if matches.len() != 1 {
         return Err(format!(
             "expected exactly one compiler artifact in {}",
-            directory.display()
+            render_path(directory)
         ));
     }
     Ok(matches.remove(0))
@@ -399,7 +420,7 @@ fn unique_file(directory: &Path, predicate: impl Fn(&str) -> bool) -> Result<Pat
 fn read_trimmed(path: PathBuf) -> Result<String, String> {
     fs::read_to_string(&path)
         .map(|value| value.trim().to_owned())
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))
+        .map_err(|error| format!("cannot read {}: {error}", render_path(&path)))
 }
 
 fn git_output(repository: &Path, arguments: &[&str]) -> Result<String, String> {

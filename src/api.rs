@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 #[cfg(all(test, rust_item_dependencies_patched))]
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::artifact::compiler_artifact;
 use crate::dependency_graph::{DependencyGraph, GraphNode, RootRecord};
@@ -14,8 +15,8 @@ use crate::error::{
 };
 use crate::graph::DefinitionId;
 use crate::input::{
-    CompilationContext, InputError, InspectedReduction, inspect_source_in_context,
-    inspect_source_with_dependencies_at_original_coordinates_in_context,
+    CompilationContext, InputError, InspectedReduction, PreparedCompilationOptions,
+    inspect_source_in_context, inspect_source_with_dependencies_at_original_coordinates_in_context,
     inspect_source_with_reduction_in_context,
 };
 use crate::rewrite::{SourcePiece, SourceRewriteError};
@@ -32,7 +33,7 @@ pub struct CompilerRecipeIdentity(pub [u8; 32]);
 pub struct Analyzer {
     sysroot: PathBuf,
     artifact_digest: [u8; 32],
-    options: CompilationOptions,
+    compilation: Arc<PreparedCompilationOptions>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,11 +76,7 @@ impl Analyzer {
     }
 
     pub fn new_with_options(options: CompilationOptions) -> Result<Self, AnalysisError> {
-        if let Some(name) = options.invalid_cfg_name() {
-            return Err(AnalysisError::InvalidCfgName {
-                name: name.to_owned(),
-            });
-        }
+        options.validate()?;
         artifact_context(options)
     }
 
@@ -87,7 +84,7 @@ impl Analyzer {
         let context = self.compilation_context(input);
         let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
-        Ok(self.analysis(input, &inspected))
+        Ok(self.analysis(input, &context, &inspected))
     }
 
     pub fn reduce(&self, input: &SourceInput) -> Result<Reduction, AnalysisError> {
@@ -96,7 +93,7 @@ impl Analyzer {
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
         inspect_source_in_context(&inspected.rewrite.source, &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
-        Ok(self.reduction(input, &inspected))
+        Ok(self.reduction(input, &context, &inspected))
     }
 
     #[doc(hidden)]
@@ -133,7 +130,7 @@ impl Analyzer {
         let reduced_snapshot_hash = reduced_snapshot.hash();
         debug_assert_eq!(original_snapshot_hash, reduced_snapshot_hash);
         Ok(VerifiedReduction {
-            reduction: self.reduction(input, &inspected),
+            reduction: self.reduction(input, &context, &inspected),
             verification: VerificationSummary {
                 original_snapshot_hash,
                 reduced_snapshot_hash,
@@ -142,19 +139,34 @@ impl Analyzer {
     }
 
     fn compilation_context<'a>(&'a self, input: &'a SourceInput) -> CompilationContext<'a> {
-        CompilationContext::new(input, &self.options, &self.sysroot)
+        CompilationContext::new(
+            &input.edition,
+            &input.target,
+            &self.compilation,
+            &self.sysroot,
+        )
     }
 
-    fn reduction(&self, input: &SourceInput, inspected: &InspectedReduction) -> Reduction {
+    fn reduction(
+        &self,
+        input: &SourceInput,
+        context: &CompilationContext<'_>,
+        inspected: &InspectedReduction,
+    ) -> Reduction {
         Reduction {
-            original: self.analysis(input, inspected),
+            original: self.analysis(input, context, inspected),
             reduced_source_digest: sha256(inspected.rewrite.source.as_bytes()),
             reduced_source: inspected.rewrite.source.clone(),
             pieces: inspected.rewrite.pieces.clone(),
         }
     }
 
-    fn analysis(&self, input: &SourceInput, inspected: &InspectedReduction) -> Analysis {
+    fn analysis(
+        &self,
+        input: &SourceInput,
+        context: &CompilationContext<'_>,
+        inspected: &InspectedReduction,
+    ) -> Analysis {
         let semantic_definitions = inspected
             .retention
             .main_semantic
@@ -181,7 +193,7 @@ impl Analyzer {
             .cloned()
             .collect();
         Analysis {
-            recipe: recipe_identity(self.artifact_digest, input, &self.options),
+            recipe: recipe_identity(self.artifact_digest, context),
             source_digest: sha256(input.source.as_bytes()),
             graph: inspected.graph.clone(),
             source_units: inspected.source.units.clone(),
@@ -291,31 +303,43 @@ impl VerificationSummary {
 
 fn artifact_context(options: CompilationOptions) -> Result<Analyzer, AnalysisError> {
     let artifact = compiler_artifact().map_err(|_| AnalysisError::CompilerArtifactMismatch)?;
+    let compilation = PreparedCompilationOptions::prepare(options)?;
     Ok(Analyzer {
         sysroot: artifact.sysroot,
         artifact_digest: artifact.identity,
-        options,
+        compilation: Arc::new(compilation),
     })
 }
 
-fn recipe_identity(
-    artifact: [u8; 32],
-    input: &SourceInput,
-    options: &CompilationOptions,
-) -> CompilerRecipeIdentity {
+fn recipe_identity(artifact: [u8; 32], context: &CompilationContext<'_>) -> CompilerRecipeIdentity {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"rust-item-dependencies-recipe-v2\0");
+    bytes.extend_from_slice(b"rust-item-dependencies-recipe-v3\0");
     bytes.extend_from_slice(&artifact);
-    bytes.push(input.edition as u8);
-    bytes.extend_from_slice(&(input.target.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(input.target.as_bytes());
-    bytes.push(options.optimization_level() as u8);
-    bytes.extend_from_slice(&(options.cfgs().count() as u64).to_le_bytes());
-    for cfg in options.cfgs() {
-        bytes.extend_from_slice(&(cfg.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(cfg.as_bytes());
+    append_recipe_bytes(&mut bytes, context.edition_argument().as_bytes());
+    append_recipe_bytes(&mut bytes, context.target().as_bytes());
+    append_recipe_bytes(&mut bytes, context.optimization_level_argument().as_bytes());
+    bytes.extend_from_slice(&(context.cfgs().count() as u64).to_le_bytes());
+    for cfg in context.cfgs() {
+        append_recipe_bytes(&mut bytes, cfg.as_bytes());
+    }
+    let external_crates = context.external_crates();
+    bytes.extend_from_slice(&(external_crates.direct().len() as u64).to_le_bytes());
+    for external in external_crates.direct() {
+        append_recipe_bytes(&mut bytes, external.extern_name().as_bytes());
+        append_recipe_bytes(&mut bytes, external.file_name().as_bytes());
+        bytes.extend_from_slice(&external.digest());
+    }
+    bytes.extend_from_slice(&(external_crates.dependencies().len() as u64).to_le_bytes());
+    for dependency in external_crates.dependencies() {
+        append_recipe_bytes(&mut bytes, dependency.file_name().as_bytes());
+        bytes.extend_from_slice(&dependency.digest());
     }
     CompilerRecipeIdentity(sha256(bytes))
+}
+
+fn append_recipe_bytes(recipe: &mut Vec<u8>, value: &[u8]) {
+    recipe.extend_from_slice(&(value.len() as u64).to_le_bytes());
+    recipe.extend_from_slice(value);
 }
 
 #[derive(Clone, Copy)]
