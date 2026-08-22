@@ -9,12 +9,24 @@ pub enum CliEdition {
     Rust2024,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CliOptimizationLevel {
+    O0,
+    O1,
+    O2,
+    O3,
+    Size,
+    SizeMin,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct Cli {
     pub input: PathBuf,
     pub output: PathBuf,
     pub edition: CliEdition,
     pub target: Option<String>,
+    pub optimization_level: CliOptimizationLevel,
+    pub cfg_names: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -32,6 +44,8 @@ pub fn parse_arguments(
     let mut output = None;
     let mut edition = CliEdition::Rust2024;
     let mut target = None;
+    let mut optimization_level = CliOptimizationLevel::O0;
+    let mut cfg_names = Vec::new();
     let mut positional_only = false;
 
     while let Some(argument) = arguments.next() {
@@ -58,6 +72,19 @@ pub fn parse_arguments(
                     target = Some(value);
                     continue;
                 }
+                Some("-O") => {
+                    optimization_level = CliOptimizationLevel::O3;
+                    continue;
+                }
+                Some("--opt-level") => {
+                    optimization_level =
+                        parse_optimization_level(next_utf8(&mut arguments, "--opt-level")?)?;
+                    continue;
+                }
+                Some("--cfg") => {
+                    cfg_names.push(next_utf8(&mut arguments, "--cfg")?);
+                    continue;
+                }
                 Some(value) if value.starts_with('-') => {
                     return Err(format!("unknown option: {value}\n\n{usage}"));
                 }
@@ -77,6 +104,8 @@ pub fn parse_arguments(
         output,
         edition,
         target,
+        optimization_level,
+        cfg_names,
     }))
 }
 
@@ -119,6 +148,20 @@ fn parse_edition(value: String) -> Result<CliEdition, String> {
         "2021" => Ok(CliEdition::Rust2021),
         "2024" => Ok(CliEdition::Rust2024),
         _ => Err(format!("unsupported Rust edition: {value}")),
+    }
+}
+
+fn parse_optimization_level(value: String) -> Result<CliOptimizationLevel, String> {
+    match value.as_str() {
+        "0" => Ok(CliOptimizationLevel::O0),
+        "1" => Ok(CliOptimizationLevel::O1),
+        "2" => Ok(CliOptimizationLevel::O2),
+        "3" => Ok(CliOptimizationLevel::O3),
+        "s" => Ok(CliOptimizationLevel::Size),
+        "z" => Ok(CliOptimizationLevel::SizeMin),
+        _ => Err(format!(
+            "unsupported optimization level: {value}; expected 0, 1, 2, 3, s, or z"
+        )),
     }
 }
 

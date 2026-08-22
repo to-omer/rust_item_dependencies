@@ -14,15 +14,16 @@ use crate::error::{
 };
 use crate::graph::DefinitionId;
 use crate::input::{
-    InputError, InspectedReduction, inspect_source,
-    inspect_source_with_dependencies_at_original_coordinates, inspect_source_with_reduction,
+    CompilationContext, InputError, InspectedReduction, inspect_source_in_context,
+    inspect_source_with_dependencies_at_original_coordinates_in_context,
+    inspect_source_with_reduction_in_context,
 };
 use crate::rewrite::{SourcePiece, SourceRewriteError};
 use crate::snapshot::{CompilerDecisionSnapshot, SnapshotDiff, SnapshotError};
 use crate::source::{SourceUnitId, WrittenUnit};
 use crate::tags::TagError;
 
-pub use crate::input::{Edition, SourceInput};
+pub use crate::input::{CompilationOptions, Edition, OptimizationLevel, SourceInput};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CompilerRecipeIdentity(pub [u8; 32]);
@@ -31,6 +32,7 @@ pub struct CompilerRecipeIdentity(pub [u8; 32]);
 pub struct Analyzer {
     sysroot: PathBuf,
     artifact_digest: [u8; 32],
+    options: CompilationOptions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,27 +71,31 @@ pub struct VerificationSummary {
 
 impl Analyzer {
     pub fn new() -> Result<Self, AnalysisError> {
-        artifact_context()
+        Self::new_with_options(CompilationOptions::default())
+    }
+
+    pub fn new_with_options(options: CompilationOptions) -> Result<Self, AnalysisError> {
+        if let Some(name) = options.invalid_cfg_name() {
+            return Err(AnalysisError::InvalidCfgName {
+                name: name.to_owned(),
+            });
+        }
+        artifact_context(options)
     }
 
     pub fn analyze(&self, input: &SourceInput) -> Result<Analysis, AnalysisError> {
-        let inspected = inspect_source_with_reduction(input, &self.sysroot)
+        let context = self.compilation_context(input);
+        let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
         Ok(self.analysis(input, &inspected))
     }
 
     pub fn reduce(&self, input: &SourceInput) -> Result<Reduction, AnalysisError> {
-        let inspected = inspect_source_with_reduction(input, &self.sysroot)
+        let context = self.compilation_context(input);
+        let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
-        inspect_source(
-            &SourceInput {
-                source: inspected.rewrite.source.clone(),
-                edition: input.edition,
-                target: input.target.clone(),
-            },
-            &self.sysroot,
-        )
-        .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
+        inspect_source_in_context(&inspected.rewrite.source, &context)
+            .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
         Ok(self.reduction(input, &inspected))
     }
 
@@ -98,7 +104,8 @@ impl Analyzer {
         &self,
         input: &SourceInput,
     ) -> Result<VerifiedReduction, AnalysisError> {
-        let inspected = inspect_source_with_reduction(input, &self.sysroot)
+        let context = self.compilation_context(input);
+        let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
         let original_snapshot = CompilerDecisionSnapshot::original(
             &inspected.graph,
@@ -108,14 +115,9 @@ impl Analyzer {
         )
         .map_err(snapshot_error)?;
 
-        let reduced_input = SourceInput {
-            source: inspected.rewrite.source.clone(),
-            edition: input.edition,
-            target: input.target.clone(),
-        };
-        let reduced = inspect_source_with_dependencies_at_original_coordinates(
-            &reduced_input,
-            &self.sysroot,
+        let reduced = inspect_source_with_dependencies_at_original_coordinates_in_context(
+            &inspected.rewrite.source,
+            &context,
             &inspected.rewrite,
         )
         .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
@@ -137,6 +139,10 @@ impl Analyzer {
                 reduced_snapshot_hash,
             },
         })
+    }
+
+    fn compilation_context<'a>(&'a self, input: &'a SourceInput) -> CompilationContext<'a> {
+        CompilationContext::new(input, &self.options, &self.sysroot)
     }
 
     fn reduction(&self, input: &SourceInput, inspected: &InspectedReduction) -> Reduction {
@@ -175,7 +181,7 @@ impl Analyzer {
             .cloned()
             .collect();
         Analysis {
-            recipe: recipe_identity(self.artifact_digest, input),
+            recipe: recipe_identity(self.artifact_digest, input, &self.options),
             source_digest: sha256(input.source.as_bytes()),
             graph: inspected.graph.clone(),
             source_units: inspected.source.units.clone(),
@@ -283,21 +289,32 @@ impl VerificationSummary {
     }
 }
 
-fn artifact_context() -> Result<Analyzer, AnalysisError> {
+fn artifact_context(options: CompilationOptions) -> Result<Analyzer, AnalysisError> {
     let artifact = compiler_artifact().map_err(|_| AnalysisError::CompilerArtifactMismatch)?;
     Ok(Analyzer {
         sysroot: artifact.sysroot,
         artifact_digest: artifact.identity,
+        options,
     })
 }
 
-fn recipe_identity(artifact: [u8; 32], input: &SourceInput) -> CompilerRecipeIdentity {
+fn recipe_identity(
+    artifact: [u8; 32],
+    input: &SourceInput,
+    options: &CompilationOptions,
+) -> CompilerRecipeIdentity {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"rust-item-dependencies-recipe-v1\0");
+    bytes.extend_from_slice(b"rust-item-dependencies-recipe-v2\0");
     bytes.extend_from_slice(&artifact);
     bytes.push(input.edition as u8);
     bytes.extend_from_slice(&(input.target.len() as u64).to_le_bytes());
     bytes.extend_from_slice(input.target.as_bytes());
+    bytes.push(options.optimization_level() as u8);
+    bytes.extend_from_slice(&(options.cfgs().count() as u64).to_le_bytes());
+    for cfg in options.cfgs() {
+        bytes.extend_from_slice(&(cfg.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(cfg.as_bytes());
+    }
     CompilerRecipeIdentity(sha256(bytes))
 }
 
@@ -419,6 +436,106 @@ fn snapshot_difference(difference: SnapshotDiff) -> PublicSnapshotDiff {
 }
 
 #[cfg(test)]
+mod compilation_options_tests {
+    use super::*;
+
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn new_with_options_accepts_supported_cfg_names_and_duplicates() {
+        let options = CompilationOptions::new()
+            .with_cfg("ONLINE_JUDGE")
+            .with_cfg("日本語")
+            .with_cfg("panic")
+            .with_cfg("target_arch")
+            .with_cfg("target_feature")
+            .with_cfg("test")
+            .with_cfg("ONLINE_JUDGE");
+
+        let result = Analyzer::new_with_options(options);
+
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn new_with_options_rejects_non_identifiers_and_raw_incompatible_names() {
+        for name in [
+            "",
+            "r#ONLINE_JUDGE",
+            "ONLINE-JUDGE",
+            "feature=\"judge\"",
+            "_",
+            "Self",
+            "crate",
+            "self",
+            "super",
+        ] {
+            assert_invalid_options(name);
+        }
+    }
+
+    #[test]
+    fn new_with_options_rejects_builtin_cfg_names() {
+        for name in [
+            "overflow_checks",
+            "debug_assertions",
+            "ub_checks",
+            "contract_checks",
+            "sanitize",
+            "sanitizer_cfi_generalize_pointers",
+            "sanitizer_cfi_normalize_integers",
+            "proc_macro",
+            "unix",
+            "windows",
+            "target_abi",
+            "target_env",
+            "target_vendor",
+            "target_has_threads",
+            "target_has_reliable_f16",
+            "target_has_reliable_f16_math",
+            "target_has_reliable_f128",
+            "target_has_reliable_f128_math",
+            "target_thread_local",
+            "fmt_debug",
+        ] {
+            assert_invalid_options(name);
+        }
+    }
+
+    #[test]
+    fn builtin_cfg_is_rejected_before_an_input_lint_can_allow_the_rustc_flag() {
+        let input = SourceInput {
+            source: "#![allow(explicit_builtin_cfgs_in_flags)]\nfn main() {}\n".to_owned(),
+            edition: Edition::Rust2024,
+            target: "unused-before-compilation".to_owned(),
+        };
+
+        let result =
+            Analyzer::new_with_options(CompilationOptions::new().with_cfg("debug_assertions"))
+                .and_then(|analyzer| analyzer.analyze(&input));
+
+        assert_eq!(
+            result,
+            Err(AnalysisError::InvalidCfgName {
+                name: "debug_assertions".to_owned()
+            })
+        );
+    }
+
+    fn assert_invalid_options(name: &str) {
+        let result = Analyzer::new_with_options(CompilationOptions::new().with_cfg(name));
+        let error = result.expect_err("an invalid cfg name must be rejected");
+
+        assert_eq!(
+            error,
+            AnalysisError::InvalidCfgName {
+                name: name.to_owned()
+            }
+        );
+        assert_eq!(error.to_string(), "an explicit cfg name is invalid");
+    }
+}
+
+#[cfg(test)]
 mod error_mapping_tests {
     use super::*;
 
@@ -453,6 +570,64 @@ mod tests {
             .find_map(|line| line.strip_prefix("host: "))
             .unwrap()
             .to_owned()
+    }
+
+    #[test]
+    fn plain_cfg_names_activate_plain_source_predicates() {
+        let target = host_target();
+        let analyzer = Analyzer::new_with_options(
+            CompilationOptions::new()
+                .with_cfg("ONLINE_JUDGE")
+                .with_cfg("日本語")
+                .with_cfg("macro_rules"),
+        )
+        .unwrap();
+        let input = SourceInput {
+            source: concat!(
+                "#[cfg(all(ONLINE_JUDGE, 日本語, macro_rules))]\n",
+                "fn selected() {}\n",
+                "fn main() { selected(); }\n",
+            )
+            .to_owned(),
+            edition: Edition::Rust2024,
+            target,
+        };
+
+        let result = analyzer.analyze(&input);
+
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn keyword_cfg_names_activate_raw_source_predicates_in_every_edition() {
+        let target = host_target();
+        let options = [
+            "fn", "true", "abstract", "async", "await", "dyn", "try", "gen",
+        ]
+        .into_iter()
+        .fold(CompilationOptions::new(), CompilationOptions::with_cfg);
+        let analyzer = Analyzer::new_with_options(options).unwrap();
+        for edition in [
+            Edition::Rust2015,
+            Edition::Rust2018,
+            Edition::Rust2021,
+            Edition::Rust2024,
+        ] {
+            let input = SourceInput {
+                source: concat!(
+                    "#[cfg(all(r#fn, r#true, r#abstract, r#async, r#await, r#dyn, r#try, r#gen))]\n",
+                    "fn selected() {}\n",
+                    "fn main() { selected(); }\n",
+                )
+                .to_owned(),
+                edition,
+                target: target.clone(),
+            };
+
+            let result = analyzer.analyze(&input);
+
+            assert!(result.is_ok(), "{edition:?}: {result:?}");
+        }
     }
 
     #[test]
