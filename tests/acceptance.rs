@@ -84,6 +84,57 @@ fn a_complex_macro_reduction_is_deterministic_and_byte_idempotent() {
     assert_eq!(fixed.reduced_source(), first.reduced_source());
 }
 
+#[cfg(all(rust_item_dependencies_patched, target_arch = "x86_64"))]
+#[test]
+fn x86_sysroot_sources_are_not_treated_as_user_inputs() {
+    let cases = [
+        (
+            "x86 feature detection",
+            concat!(
+                "fn unused() {}\n",
+                "fn main() {\n",
+                "    let _ = std::is_x86_feature_detected!(\"avx2\");\n",
+                "}\n",
+            ),
+            concat!(
+                "\n",
+                "fn main() {\n",
+                "    let _ = std::is_x86_feature_detected!(\"avx2\");\n",
+                "}\n",
+            ),
+        ),
+        (
+            "x86 intrinsic",
+            concat!(
+                "fn unused() {}\n",
+                "fn main() {\n",
+                "    unsafe { core::arch::x86_64::_mm_pause() };\n",
+                "}\n",
+            ),
+            concat!(
+                "\n",
+                "fn main() {\n",
+                "    unsafe { core::arch::x86_64::_mm_pause() };\n",
+                "}\n",
+            ),
+        ),
+    ];
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+
+    for (case, source, expected) in cases {
+        let verified = analyzer
+            .reduce_and_verify(&input(source, &target))
+            .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_verified(case, source, expected, &verified);
+
+        let fixed = analyzer
+            .reduce_and_verify(&input(verified.reduced_source(), &target))
+            .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
+        assert_eq!(fixed.reduced_source(), expected, "{case}");
+    }
+}
+
 #[cfg(rust_item_dependencies_patched)]
 #[test]
 fn an_external_proc_macro_is_rejected_at_the_written_attribute() {

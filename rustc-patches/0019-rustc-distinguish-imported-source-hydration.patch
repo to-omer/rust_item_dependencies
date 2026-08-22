@@ -1,0 +1,161 @@
+From 080c5b17c85b6f890e6f341d99f4b0360453b69e Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Sat, 22 Aug 2026 09:12:25 +0900
+Subject: [PATCH] rustc_span: distinguish imported source hydration
+
+---
+ compiler/rustc_driver_impl/src/lib.rs       |  2 +-
+ compiler/rustc_span/src/source_map.rs       | 10 ++-
+ compiler/rustc_span/src/source_map/tests.rs | 89 +++++++++++++++++++++
+ 3 files changed, 99 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 2381668e..2bee8f8b 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 12;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 13;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_span/src/source_map.rs b/compiler/rustc_span/src/source_map.rs
+index 80d1bae7..c8fbd9d2 100644
+--- a/compiler/rustc_span/src/source_map.rs
++++ b/compiler/rustc_span/src/source_map.rs
+@@ -87,6 +87,14 @@ pub trait FileLoader {
+     /// source files, which may require resizing.
+     fn read_file(&self, path: &Path) -> io::Result<String>;
+ 
++    /// Read the contents of a source file imported from another crate.
++    ///
++    /// Imported source is loaded on a best-effort basis to improve diagnostics
++    /// and debug information. The compiler can continue when this fails.
++    fn read_imported_source_file(&self, path: &Path) -> io::Result<String> {
++        self.read_file(path)
++    }
++
+     /// Read the contents of a potentially non-UTF-8 file into memory.
+     /// We don't normalize binary files, so we can start in an Arc.
+     fn read_binary_file(&self, path: &Path) -> io::Result<Arc<[u8]>>;
+@@ -1112,7 +1120,7 @@ pub fn ensure_source_file_source_present(&self, source_file: &SourceFile) -> boo
+                 }
+             };
+ 
+-            self.file_loader.read_file(&local_path).ok()
++            self.file_loader.read_imported_source_file(&local_path).ok()
+         })
+     }
+ 
+diff --git a/compiler/rustc_span/src/source_map/tests.rs b/compiler/rustc_span/src/source_map/tests.rs
+index 4cc24366..36ca61c3 100644
+--- a/compiler/rustc_span/src/source_map/tests.rs
++++ b/compiler/rustc_span/src/source_map/tests.rs
+@@ -1,5 +1,35 @@
++use std::sync::atomic::{AtomicUsize, Ordering};
++
+ use super::*;
+ 
++struct ImportedSourceLoader {
++    contents: String,
++    reads: Arc<AtomicUsize>,
++}
++
++impl FileLoader for ImportedSourceLoader {
++    fn file_exists(&self, path: &Path) -> bool {
++        panic!("unexpected existence check for {}", path.display());
++    }
++
++    fn read_file(&self, path: &Path) -> io::Result<String> {
++        panic!("unexpected ordinary source read for {}", path.display());
++    }
++
++    fn read_imported_source_file(&self, _path: &Path) -> io::Result<String> {
++        self.reads.fetch_add(1, Ordering::Relaxed);
++        Ok(self.contents.clone())
++    }
++
++    fn read_binary_file(&self, path: &Path) -> io::Result<Arc<[u8]>> {
++        panic!("unexpected binary source read for {}", path.display());
++    }
++
++    fn current_directory(&self) -> io::Result<PathBuf> {
++        Ok(PathBuf::new())
++    }
++}
++
+ fn filename(sm: &SourceMap, path: &str) -> FileName {
+     FileName::Real(sm.path_mapping().to_real_filename(sm.working_dir(), PathBuf::from(path)))
+ }
+@@ -263,6 +293,65 @@ fn t10() {
+     );
+ }
+ 
++#[test]
++fn imported_source_hydration_uses_the_imported_source_loader() {
++    let source_map = SourceMap::new(FilePathMapping::empty());
++    let contents = "first line.\r\nsecond line";
++    let source_file =
++        source_map.new_source_file(filename(&source_map, "imported.rs"), contents.to_owned());
++    let SourceFile {
++        name,
++        src_hash,
++        checksum_hash,
++        normalized_source_len,
++        unnormalized_source_len,
++        lines,
++        multibyte_chars,
++        normalized_pos,
++        stable_id,
++        ..
++    } = (*source_file).clone();
++
++    let reads = Arc::new(AtomicUsize::new(0));
++    let imported_source_map = SourceMap::with_inputs(SourceMapInputs {
++        file_loader: Box::new(ImportedSourceLoader {
++            contents: contents.to_owned(),
++            reads: Arc::clone(&reads),
++        }),
++        path_mapping: FilePathMapping::empty(),
++        hash_kind: SourceFileHashAlgorithm::Md5,
++        checksum_hash_kind: None,
++    });
++    let imported_source_file = imported_source_map.new_imported_source_file(
++        name,
++        src_hash,
++        checksum_hash,
++        stable_id,
++        normalized_source_len.to_u32(),
++        unnormalized_source_len,
++        CrateNum::ZERO,
++        FreezeLock::new(lines.read().clone()),
++        multibyte_chars,
++        normalized_pos,
++        0,
++    );
++
++    assert!(imported_source_map.ensure_source_file_source_present(&imported_source_file));
++    assert_eq!(reads.load(Ordering::Relaxed), 1);
++    assert_eq!(
++        imported_source_file.external_src.borrow().get_source().unwrap(),
++        "first line.\nsecond line"
++    );
++}
++
++#[test]
++fn real_file_loader_reads_imported_sources_by_default() {
++    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/source_map/tests.rs");
++    let expected = std::fs::read_to_string(&path).unwrap();
++
++    assert_eq!(RealFileLoader.read_imported_source_file(&path).unwrap(), expected);
++}
++
+ // Takes a unix-style path and returns a platform specific path.
+ fn path(p: &str) -> PathBuf {
+     path_str(p).into()
+-- 
+2.55.0
+
