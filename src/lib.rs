@@ -51,8 +51,8 @@ pub mod source;
 pub(crate) mod tags;
 
 pub use api::{
-    Analysis, Analyzer, CompilerRecipeIdentity, Edition, Reduction, SourceInput,
-    VerificationSummary, VerifiedReduction,
+    Analysis, Analyzer, CompilationOptions, CompilerRecipeIdentity, Edition, OptimizationLevel,
+    Reduction, SourceInput, VerificationSummary, VerifiedReduction,
 };
 pub use error::AnalysisError;
 pub use input::UnsupportedReason;

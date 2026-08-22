@@ -6,7 +6,7 @@ use rust_item_dependencies::dependency_graph::{
 };
 use rust_item_dependencies::{AnalysisError, Analyzer};
 #[cfg(rust_item_dependencies_patched)]
-use rust_item_dependencies::{Edition, SourceInput};
+use rust_item_dependencies::{CompilationOptions, Edition, OptimizationLevel, SourceInput};
 
 #[cfg(not(rust_item_dependencies_patched))]
 #[test]
@@ -97,6 +97,77 @@ fn analysis_and_verified_reduction_are_owned_read_only_results() {
         })
         .expect("an already reduced source must remain byte-identical");
     assert_eq!(second.reduced_source(), verified.reduced_source());
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn compiler_recipe_identifies_normalized_compilation_options_but_not_source_text() {
+    let target = host_target();
+    let input = SourceInput {
+        source: "fn unused() {}\nfn main() {}\n".to_owned(),
+        edition: Edition::Rust2024,
+        target: target.clone(),
+    };
+    let reordered_options = CompilationOptions::new()
+        .with_optimization_level(OptimizationLevel::O2)
+        .with_cfg("SECOND")
+        .with_cfg("ONLINE_JUDGE");
+    let ordered_analysis = Analyzer::new_with_options(
+        CompilationOptions::new()
+            .with_cfg("ONLINE_JUDGE")
+            .with_cfg("SECOND")
+            .with_cfg("ONLINE_JUDGE")
+            .with_optimization_level(OptimizationLevel::O2),
+    )
+    .expect("valid compilation options must be accepted")
+    .analyze(&input)
+    .expect("the first source must compile");
+    let reordered_analyzer = Analyzer::new_with_options(reordered_options)
+        .expect("the reordered compilation options must be accepted");
+    let reordered_analysis = reordered_analyzer
+        .analyze(&input)
+        .expect("the first source must compile with reordered options");
+
+    assert_eq!(reordered_analysis.recipe(), ordered_analysis.recipe());
+    assert_eq!(
+        reordered_analysis.source_digest(),
+        ordered_analysis.source_digest()
+    );
+
+    let other_source = SourceInput {
+        source: "fn main() { let _ = 1_u32; }\n".to_owned(),
+        edition: Edition::Rust2024,
+        target,
+    };
+    let other_source_analysis = reordered_analyzer
+        .analyze(&other_source)
+        .expect("the second source must compile with the same options");
+    assert_eq!(other_source_analysis.recipe(), ordered_analysis.recipe());
+    assert_ne!(
+        other_source_analysis.source_digest(),
+        ordered_analysis.source_digest()
+    );
+
+    let different_cfg = Analyzer::new_with_options(
+        CompilationOptions::new()
+            .with_optimization_level(OptimizationLevel::O2)
+            .with_cfg("ONLINE_JUDGE"),
+    )
+    .expect("a different valid cfg set must be accepted")
+    .analyze(&input)
+    .expect("the first source must compile with a different cfg set");
+    assert_ne!(different_cfg.recipe(), ordered_analysis.recipe());
+
+    let different_optimization = Analyzer::new_with_options(
+        CompilationOptions::new()
+            .with_optimization_level(OptimizationLevel::O3)
+            .with_cfg("SECOND")
+            .with_cfg("ONLINE_JUDGE"),
+    )
+    .expect("a different optimization level must be accepted")
+    .analyze(&input)
+    .expect("the first source must compile with a different optimization level");
+    assert_ne!(different_optimization.recipe(), ordered_analysis.recipe());
 }
 
 #[cfg(rust_item_dependencies_patched)]

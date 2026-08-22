@@ -8,6 +8,9 @@ use crate::source::{ByteRange, SourceUnitId};
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AnalysisError {
+    InvalidCfgName {
+        name: String,
+    },
     UnsupportedInput {
         reason: UnsupportedReason,
         range: Option<ByteRange>,
@@ -104,6 +107,7 @@ pub enum CompilerFailure {
 impl fmt::Display for AnalysisError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
+            Self::InvalidCfgName { .. } => "an explicit cfg name is invalid",
             Self::UnsupportedInput { .. } => "the input is outside the supported source boundary",
             Self::InvalidTag { .. } => "a dependency tag has an empty name",
             Self::OriginalCompilationFailed(_) => "the original source did not compile",

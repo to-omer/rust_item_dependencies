@@ -57,6 +57,70 @@ fn reduced_cli_output_compiles_and_preserves_program_output() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn cli_applies_optimization_and_explicit_cfg_to_the_reduction() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let work = repository.join("target/tests").join(format!(
+        "rust-item-dependencies-cli-options-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&work).unwrap();
+
+    let input = repository.join("tests/fixtures/retention/compilation_context.input.rs");
+    let reduced = work.join("reduced.rs");
+
+    let reduction = std::process::Command::new(env!("CARGO_BIN_EXE_rust-item-dependencies"))
+        .arg("-O")
+        .arg("--cfg")
+        .arg("ONLINE_JUDGE")
+        .arg("--cfg")
+        .arg("fn")
+        .arg(&input)
+        .arg("-o")
+        .arg(&reduced)
+        .output()
+        .unwrap();
+    assert!(
+        reduction.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reduction.stderr)
+    );
+    assert!(reduction.stdout.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&reduced).unwrap(),
+        include_str!("fixtures/retention/compilation_context.expected.rs")
+    );
+
+    let binary = work.join(format!("reduced{}", std::env::consts::EXE_SUFFIX));
+    let compilation = std::process::Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+        .arg("--edition=2024")
+        .arg("-O")
+        .arg("--cfg=r#ONLINE_JUDGE")
+        .arg("--cfg=r#fn")
+        .arg(&reduced)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+
+    let execution = std::process::Command::new(&binary).output().unwrap();
+    assert!(execution.status.success());
+    assert_eq!(execution.stdout, b"7\n");
+    assert!(execution.stderr.is_empty());
+
+    std::fs::remove_dir_all(work).unwrap();
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn cli_failures_report_reasons_ranges_and_all_compiler_diagnostics() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

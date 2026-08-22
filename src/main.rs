@@ -6,22 +6,27 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use rust_item_dependencies::{AnalysisError, Analyzer, Edition, SourceInput};
+use rust_item_dependencies::{
+    AnalysisError, Analyzer, CompilationOptions, Edition, OptimizationLevel, SourceInput,
+};
 
 #[path = "../tools/cli.rs"]
 mod cli;
 
 #[cfg(test)]
 use cli::Cli;
-use cli::{CliEdition, Parsed, parse_arguments, validate_output};
+use cli::{CliEdition, CliOptimizationLevel, Parsed, parse_arguments, validate_output};
 
-const USAGE: &str = "Usage: rust-item-dependencies [OPTIONS] INPUT.rs\n\
-\n\
-Options:\n\
-  -o, --output OUTPUT  Write reduced source to OUTPUT\n\
-      --edition YEAR   Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]\n\
-      --target TRIPLE  Compilation target [default: compiler host]\n\
-  -h, --help           Print help";
+const USAGE: &str = r#"Usage: rust-item-dependencies [OPTIONS] INPUT.rs
+
+Options:
+  -o, --output OUTPUT    Write reduced source to OUTPUT
+      --edition YEAR     Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]
+      --target TRIPLE    Compilation target [default: compiler host]
+  -O                     Same as --opt-level 3
+      --opt-level LEVEL  Optimization level: 0, 1, 2, 3, s, or z [default: 0]
+      --cfg NAME         Enable a name-only cfg; may be repeated
+  -h, --help             Print help"#;
 
 fn main() -> ExitCode {
     match run(std::env::args_os().skip(1)) {
@@ -43,7 +48,11 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let source = std::fs::read_to_string(&cli.input)
         .map_err(|error| format!("cannot read {}: {error}", cli.input.display()))?;
     let target = cli.target.map_or_else(host_target, Ok)?;
-    let analyzer = Analyzer::new().map_err(render_analysis_error)?;
+    let options = cli.cfg_names.into_iter().fold(
+        CompilationOptions::new().with_optimization_level(cli.optimization_level.into()),
+        CompilationOptions::with_cfg,
+    );
+    let analyzer = Analyzer::new_with_options(options).map_err(render_analysis_error)?;
     let reduction = analyzer
         .reduce(&SourceInput {
             source,
@@ -59,6 +68,9 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
 fn render_analysis_error(error: AnalysisError) -> String {
     let mut rendered = error.to_string();
     match &error {
+        AnalysisError::InvalidCfgName { name } => {
+            rendered.push_str(&format!(": {name:?}"));
+        }
         AnalysisError::UnsupportedInput { reason, range } => {
             rendered.push_str(&format!(": {reason:?}"));
             append_range(&mut rendered, *range);
@@ -101,6 +113,19 @@ impl From<CliEdition> for Edition {
     }
 }
 
+impl From<CliOptimizationLevel> for OptimizationLevel {
+    fn from(level: CliOptimizationLevel) -> Self {
+        match level {
+            CliOptimizationLevel::O0 => Self::O0,
+            CliOptimizationLevel::O1 => Self::O1,
+            CliOptimizationLevel::O2 => Self::O2,
+            CliOptimizationLevel::O3 => Self::O3,
+            CliOptimizationLevel::Size => Self::Size,
+            CliOptimizationLevel::SizeMin => Self::SizeMin,
+        }
+    }
+}
+
 fn host_target() -> Result<String, String> {
     let output = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
         .arg("-Vv")
@@ -139,6 +164,8 @@ mod tests {
                 output: "output.rs".into(),
                 edition: CliEdition::Rust2024,
                 target: None,
+                optimization_level: CliOptimizationLevel::O0,
+                cfg_names: Vec::new(),
             }
         );
 
@@ -158,6 +185,69 @@ mod tests {
         assert_eq!(explicit.output, Path::new("output.rs"));
         assert_eq!(explicit.edition, CliEdition::Rust2021);
         assert_eq!(explicit.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(explicit.optimization_level, CliOptimizationLevel::O0);
+        assert!(explicit.cfg_names.is_empty());
+    }
+
+    #[test]
+    fn parses_optimization_and_repeated_cfg_options() {
+        let Parsed::Run(cli) = parse(&[
+            "--opt-level",
+            "s",
+            "--cfg",
+            "LOCAL",
+            "-O",
+            "--cfg",
+            "ONLINE_JUDGE",
+            "input.rs",
+            "-o",
+            "output.rs",
+        ])
+        .unwrap() else {
+            panic!("valid options must run the reducer")
+        };
+
+        assert_eq!(cli.optimization_level, CliOptimizationLevel::O3);
+        assert_eq!(cli.cfg_names, ["LOCAL", "ONLINE_JUDGE"]);
+
+        let Parsed::Run(cli) =
+            parse(&["-O", "--opt-level", "z", "input.rs", "-o", "output.rs"]).unwrap()
+        else {
+            panic!("valid options must run the reducer")
+        };
+        assert_eq!(cli.optimization_level, CliOptimizationLevel::SizeMin);
+    }
+
+    #[test]
+    fn parses_each_explicit_optimization_level() {
+        for (value, expected) in [
+            ("0", CliOptimizationLevel::O0),
+            ("1", CliOptimizationLevel::O1),
+            ("2", CliOptimizationLevel::O2),
+            ("3", CliOptimizationLevel::O3),
+            ("s", CliOptimizationLevel::Size),
+            ("z", CliOptimizationLevel::SizeMin),
+        ] {
+            let Parsed::Run(cli) =
+                parse(&["--opt-level", value, "input.rs", "-o", "output.rs"]).unwrap()
+            else {
+                panic!("valid options must run the reducer")
+            };
+            assert_eq!(cli.optimization_level, expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_or_invalid_compilation_options() {
+        assert_eq!(
+            parse(&["--opt-level"]).unwrap_err(),
+            "--opt-level requires a value"
+        );
+        assert_eq!(
+            parse(&["--opt-level", "fast"]).unwrap_err(),
+            "unsupported optimization level: fast; expected 0, 1, 2, 3, s, or z"
+        );
+        assert_eq!(parse(&["--cfg"]).unwrap_err(), "--cfg requires a value");
     }
 
     #[test]
@@ -188,7 +278,13 @@ mod tests {
     }
 
     #[test]
-    fn renders_an_unsupported_reason_and_range() {
+    fn renders_structured_analysis_error_details() {
+        assert_eq!(
+            render_analysis_error(AnalysisError::InvalidCfgName {
+                name: "feature=\"judge\"".to_owned(),
+            }),
+            "an explicit cfg name is invalid: \"feature=\\\"judge\\\"\""
+        );
         assert_eq!(
             render_analysis_error(AnalysisError::UnsupportedInput {
                 reason: UnsupportedReason::ProcMacro,
@@ -215,6 +311,8 @@ mod tests {
             output: path.clone(),
             edition: CliEdition::Rust2024,
             target: None,
+            optimization_level: CliOptimizationLevel::O0,
+            cfg_names: Vec::new(),
         };
         assert_eq!(
             validate_output(&cli),

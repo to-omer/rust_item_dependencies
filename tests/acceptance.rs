@@ -1,7 +1,10 @@
 #![feature(rustc_private)]
 
 #[cfg(rust_item_dependencies_patched)]
-use rust_item_dependencies::{AnalysisError, Analyzer, Edition, SourceInput, VerifiedReduction};
+use rust_item_dependencies::{
+    AnalysisError, Analyzer, CompilationOptions, Edition, OptimizationLevel, SourceInput,
+    VerifiedReduction,
+};
 
 #[cfg(rust_item_dependencies_patched)]
 const CASES: &[(&str, &str, &str)] = &[
@@ -103,6 +106,51 @@ fn a_complex_macro_reduction_is_deterministic_and_byte_idempotent() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn compilation_context_is_shared_by_reduction_fixed_point_and_linking() {
+    let options = CompilationOptions::new()
+        .with_optimization_level(OptimizationLevel::O2)
+        .with_cfg("ONLINE_JUDGE")
+        .with_cfg("fn");
+    let analyzer = Analyzer::new_with_options(options.clone())
+        .expect("the compilation options must be accepted");
+    let target = host_target();
+    let source = include_str!("fixtures/retention/compilation_context.input.rs");
+    let expected = include_str!("fixtures/retention/compilation_context.expected.rs");
+    let original_input = input(source, &target);
+
+    let verified = analyzer
+        .reduce_and_verify(&original_input)
+        .expect("the configured source must preserve compiler decisions");
+    assert_verified("shared compilation context", source, expected, &verified);
+
+    let mut reduced_input = original_input.clone();
+    reduced_input.source = verified.reduced_source().to_owned();
+    let fixed = analyzer
+        .reduce_and_verify(&reduced_input)
+        .expect("the configured reduction must be byte-idempotent");
+    assert_eq!(fixed.reduced_source(), verified.reduced_source());
+    assert_eq!(
+        fixed.original_analysis().recipe(),
+        verified.original_analysis().recipe()
+    );
+    assert_ne!(
+        fixed.original_analysis().source_digest(),
+        verified.original_analysis().source_digest()
+    );
+
+    let original_output =
+        compile_and_run(&original_input, &options, "compilation_context_original");
+    let reduced_output = compile_and_run(&reduced_input, &options, "compilation_context_reduced");
+    assert!(original_output.status.success());
+    assert_eq!(original_output.stdout, b"7\n");
+    assert!(original_output.stderr.is_empty());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn external_symbol_roots_preserve_linked_entry_points() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();
@@ -119,8 +167,17 @@ fn external_symbol_roots_preserve_linked_entry_points() {
         .expect("external symbol roots must be byte-idempotent");
     assert_eq!(fixed.reduced_source(), expected);
 
-    let original_output = compile_and_run(source, &target, "external_symbols_original");
-    let reduced_output = compile_and_run(expected, &target, "external_symbols_reduced");
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(
+        &input(source, &target),
+        &options,
+        "external_symbols_original",
+    );
+    let reduced_output = compile_and_run(
+        &input(expected, &target),
+        &options,
+        "external_symbols_reduced",
+    );
     assert!(original_output.status.success());
     assert_eq!(original_output.stdout, b"10\n");
     assert!(original_output.stderr.is_empty());
@@ -161,8 +218,17 @@ fn a_global_allocator_and_its_generated_entry_points_survive_reduction() {
         .expect("a reduced global allocator must remain byte-idempotent");
     assert_eq!(fixed.reduced_source(), expected);
 
-    let original_output = compile_and_run(source, &target, "global_allocator_original");
-    let reduced_output = compile_and_run(expected, &target, "global_allocator_reduced");
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(
+        &input(source, &target),
+        &options,
+        "global_allocator_original",
+    );
+    let reduced_output = compile_and_run(
+        &input(expected, &target),
+        &options,
+        "global_allocator_reduced",
+    );
     assert!(original_output.status.success());
     assert_eq!(original_output.stdout, b"7\n");
     assert!(original_output.stderr.is_empty());
@@ -201,8 +267,11 @@ fn foreign_items_are_reduced_independently_and_preserve_linked_behavior() {
         assert_eq!(fixed.reduced_source(), expected, "Rust {edition_name}");
     }
 
-    let original_output = compile_and_run(source, &target, "foreign_block_original");
-    let reduced_output = compile_and_run(expected, &target, "foreign_block_reduced");
+    let options = CompilationOptions::default();
+    let original_output =
+        compile_and_run(&input(source, &target), &options, "foreign_block_original");
+    let reduced_output =
+        compile_and_run(&input(expected, &target), &options, "foreign_block_reduced");
     assert!(original_output.status.success());
     assert_eq!(original_output.stdout, b"7\n");
     assert!(original_output.stderr.is_empty());
@@ -471,10 +540,15 @@ fn main() {
         .expect("a reduced constructor static must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 
-    let original_output = compile_and_run(source, &target, "constructor_static_original");
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(
+        &input(source, &target),
+        &options,
+        "constructor_static_original",
+    );
     let reduced_output = compile_and_run(
-        verified.reduced_source(),
-        &target,
+        &input(verified.reduced_source(), &target),
+        &options,
         "constructor_static_reduced",
     );
     assert!(original_output.status.success());
@@ -622,7 +696,11 @@ fn assert_verified(case: &str, original: &str, expected: &str, verified: &Verifi
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn compile_and_run(source: &str, target: &str, crate_name: &str) -> std::process::Output {
+fn compile_and_run(
+    input: &SourceInput,
+    options: &CompilationOptions,
+    artifact_name: &str,
+) -> std::process::Output {
     use std::process::Command;
 
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -630,26 +708,60 @@ fn compile_and_run(source: &str, target: &str, crate_name: &str) -> std::process
         .join("acceptance")
         .join("linked-programs");
     std::fs::create_dir_all(&directory).expect("the acceptance output directory must be writable");
-    let source_path = directory.join(format!("{crate_name}.rs"));
-    std::fs::write(&source_path, source).expect("the acceptance source must be writable");
-    let executable = directory.join(format!("{crate_name}{}", std::env::consts::EXE_SUFFIX));
-    let compiled = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+    let source_path = directory.join(format!("{artifact_name}.rs"));
+    std::fs::write(&source_path, &input.source).expect("the acceptance source must be writable");
+    let executable = directory.join(format!("{artifact_name}{}", std::env::consts::EXE_SUFFIX));
+    let mut compiler = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"));
+    compiler
         .arg(source_path)
-        .args(["--crate-name", crate_name, "--crate-type=bin"])
-        .arg("--edition=2024")
-        .args(["--target", target, "-Awarnings", "-o"])
+        .args(["--crate-name", "main", "--crate-type=bin"])
+        .arg(format!("--edition={}", edition_name(input.edition)))
+        .args(["--target", &input.target])
+        .arg(format!(
+            "-Copt-level={}",
+            optimization_level_name(options.optimization_level())
+        ));
+    for cfg in options.cfgs() {
+        compiler.arg(format!("--cfg=r#{cfg}"));
+    }
+    let compiled = compiler
+        .args(["-Awarnings", "-o"])
         .arg(&executable)
         .output()
         .expect("the acceptance compiler must finish");
     assert!(
         compiled.status.success(),
-        "linking {crate_name} failed:\n{}",
+        "linking {artifact_name} failed:\n{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
 
     Command::new(executable)
         .output()
         .expect("the linked acceptance program must start")
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn edition_name(edition: Edition) -> &'static str {
+    match edition {
+        Edition::Rust2015 => "2015",
+        Edition::Rust2018 => "2018",
+        Edition::Rust2021 => "2021",
+        Edition::Rust2024 => "2024",
+        unsupported => panic!("unsupported acceptance-test edition: {unsupported:?}"),
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn optimization_level_name(level: OptimizationLevel) -> &'static str {
+    match level {
+        OptimizationLevel::O0 => "0",
+        OptimizationLevel::O1 => "1",
+        OptimizationLevel::O2 => "2",
+        OptimizationLevel::O3 => "3",
+        OptimizationLevel::Size => "s",
+        OptimizationLevel::SizeMin => "z",
+        unsupported => panic!("unsupported acceptance-test optimization level: {unsupported:?}"),
+    }
 }
 
 #[cfg(rust_item_dependencies_patched)]

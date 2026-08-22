@@ -2,6 +2,7 @@
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,11 +70,125 @@ impl Edition {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum OptimizationLevel {
+    #[default]
+    O0,
+    O1,
+    O2,
+    O3,
+    Size,
+    SizeMin,
+}
+
+impl OptimizationLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::O0 => "0",
+            Self::O1 => "1",
+            Self::O2 => "2",
+            Self::O3 => "3",
+            Self::Size => "s",
+            Self::SizeMin => "z",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompilationOptions {
+    optimization_level: OptimizationLevel,
+    explicit_cfgs: BTreeSet<String>,
+}
+
+// rustc cannot parse these semantic names as raw cfgspec identifiers.
+const RAW_INCOMPATIBLE_CFG_NAMES: &[&str] = &["_", "Self", "crate", "self", "super"];
+
+// Mirrors the `(name, None)` arms in rustc_session::config::cfg::disallow_cfgs.
+const DISALLOWED_BUILTIN_CFG_NAMES: &[&str] = &[
+    "contract_checks",
+    "debug_assertions",
+    "fmt_debug",
+    "overflow_checks",
+    "proc_macro",
+    "sanitize",
+    "sanitizer_cfi_generalize_pointers",
+    "sanitizer_cfi_normalize_integers",
+    "target_abi",
+    "target_env",
+    "target_has_reliable_f128",
+    "target_has_reliable_f128_math",
+    "target_has_reliable_f16",
+    "target_has_reliable_f16_math",
+    "target_has_threads",
+    "target_thread_local",
+    "target_vendor",
+    "ub_checks",
+    "unix",
+    "windows",
+];
+
+impl CompilationOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_optimization_level(mut self, optimization_level: OptimizationLevel) -> Self {
+        self.optimization_level = optimization_level;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cfg(mut self, name: impl Into<String>) -> Self {
+        self.explicit_cfgs.insert(name.into());
+        self
+    }
+
+    pub fn optimization_level(&self) -> OptimizationLevel {
+        self.optimization_level
+    }
+
+    pub fn cfgs(&self) -> impl Iterator<Item = &str> {
+        self.explicit_cfgs.iter().map(String::as_str)
+    }
+
+    pub(crate) fn invalid_cfg_name(&self) -> Option<&str> {
+        self.cfgs().find(|name| {
+            !rustc_lexer::is_ident(name)
+                || RAW_INCOMPATIBLE_CFG_NAMES.contains(name)
+                || DISALLOWED_BUILTIN_CFG_NAMES.contains(name)
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceInput {
     pub source: String,
     pub edition: Edition,
     pub target: String,
+}
+
+pub(crate) struct CompilationContext<'a> {
+    edition: &'a Edition,
+    target: &'a str,
+    options: &'a CompilationOptions,
+    sysroot: &'a Path,
+}
+
+impl<'a> CompilationContext<'a> {
+    pub(crate) fn new(
+        input: &'a SourceInput,
+        options: &'a CompilationOptions,
+        sysroot: &'a Path,
+    ) -> Self {
+        Self {
+            edition: &input.edition,
+            target: &input.target,
+            options,
+            sysroot,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -296,18 +411,40 @@ pub(crate) fn with_one_missing_macro_rule_selection<T>(source: &str, f: impl FnO
     f()
 }
 
+#[cfg(test)]
 pub(crate) fn inspect_source(
     input: &SourceInput,
     sysroot: &Path,
 ) -> Result<SourceInventory, InputError> {
-    run_inspection(input, sysroot, CollectionMode::Source, None).map(|inspection| inspection.source)
+    let options = CompilationOptions::default();
+    let context = CompilationContext::new(input, &options, sysroot);
+    inspect_source_in_context(&input.source, &context)
 }
 
+pub(crate) fn inspect_source_in_context(
+    source: &str,
+    context: &CompilationContext<'_>,
+) -> Result<SourceInventory, InputError> {
+    run_inspection(source, context, CollectionMode::Source, None)
+        .map(|inspection| inspection.source)
+}
+
+#[cfg(test)]
 pub(crate) fn inspect_source_with_definitions(
     input: &SourceInput,
     sysroot: &Path,
 ) -> Result<InspectedSource, InputError> {
-    let inspection = run_inspection(input, sysroot, CollectionMode::Definitions, None)?;
+    let options = CompilationOptions::default();
+    let context = CompilationContext::new(input, &options, sysroot);
+    inspect_source_with_definitions_in_context(&input.source, &context)
+}
+
+#[cfg(test)]
+fn inspect_source_with_definitions_in_context(
+    source: &str,
+    context: &CompilationContext<'_>,
+) -> Result<InspectedSource, InputError> {
+    let inspection = run_inspection(source, context, CollectionMode::Definitions, None)?;
     Ok(InspectedSource {
         source: inspection.source,
         definitions: inspection
@@ -316,40 +453,58 @@ pub(crate) fn inspect_source_with_definitions(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn inspect_source_with_dependencies(
     input: &SourceInput,
     sysroot: &Path,
 ) -> Result<InspectedDependencies, InputError> {
-    inspect_source_with_dependencies_inner(input, sysroot, None)
+    let options = CompilationOptions::default();
+    let context = CompilationContext::new(input, &options, sysroot);
+    inspect_source_with_dependencies_inner(&input.source, &context, None)
 }
 
 /// Inspects a rewritten source while expressing every compiler-decision
 /// identity and source observation in the coordinates of its original source.
 /// `coordinates` must be the piece map that produced `input.source`.
+#[cfg(test)]
 pub(crate) fn inspect_source_with_dependencies_at_original_coordinates(
     input: &SourceInput,
     sysroot: &Path,
     coordinates: &SourceRewrite,
 ) -> Result<InspectedDependencies, InputError> {
-    inspect_source_with_dependencies_inner(input, sysroot, Some(coordinates))
+    let options = CompilationOptions::default();
+    let context = CompilationContext::new(input, &options, sysroot);
+    inspect_source_with_dependencies_at_original_coordinates_in_context(
+        &input.source,
+        &context,
+        coordinates,
+    )
+}
+
+pub(crate) fn inspect_source_with_dependencies_at_original_coordinates_in_context(
+    source: &str,
+    context: &CompilationContext<'_>,
+    coordinates: &SourceRewrite,
+) -> Result<InspectedDependencies, InputError> {
+    inspect_source_with_dependencies_inner(source, context, Some(coordinates))
 }
 
 fn inspect_source_with_dependencies_inner(
-    input: &SourceInput,
-    sysroot: &Path,
+    source: &str,
+    context: &CompilationContext<'_>,
     coordinates: Option<&SourceRewrite>,
 ) -> Result<InspectedDependencies, InputError> {
     if let Some(coordinates) = coordinates {
-        if coordinates.source != input.source {
+        if coordinates.source != source {
             return Err(InputError::Rewrite(SourceRewriteError::InvalidInventory));
         }
         coordinates.original_crate_range(ByteRange {
             start: 0,
-            end: u32::try_from(input.source.len())
+            end: u32::try_from(source.len())
                 .map_err(|_| InputError::Rewrite(SourceRewriteError::InvalidInventory))?,
         })?;
     }
-    let inspection = run_inspection(input, sysroot, CollectionMode::Dependencies, coordinates)?;
+    let inspection = run_inspection(source, context, CollectionMode::Dependencies, coordinates)?;
     let dependencies = inspection
         .dependencies
         .ok_or(InputError::CompilerProtocolFailure)?;
@@ -361,11 +516,21 @@ fn inspect_source_with_dependencies_inner(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn inspect_source_with_reduction(
     input: &SourceInput,
     sysroot: &Path,
 ) -> Result<InspectedReduction, InputError> {
-    let inspected = inspect_source_with_dependencies(input, sysroot)?;
+    let options = CompilationOptions::default();
+    let context = CompilationContext::new(input, &options, sysroot);
+    inspect_source_with_reduction_in_context(&input.source, &context)
+}
+
+pub(crate) fn inspect_source_with_reduction_in_context(
+    source: &str,
+    context: &CompilationContext<'_>,
+) -> Result<InspectedReduction, InputError> {
+    let inspected = inspect_source_with_dependencies_inner(source, context, None)?;
     let retention = compute_retention(&inspected.source, &inspected.graph, &inspected.constraints)?;
     let rewrite = rewrite_source(&inspected.source, &retention.retained_units)?;
     Ok(InspectedReduction {
@@ -392,14 +557,14 @@ struct CompilerInspection {
 }
 
 fn run_inspection(
-    input: &SourceInput,
-    sysroot: &Path,
+    source: &str,
+    context: &CompilationContext<'_>,
     collection_mode: CollectionMode,
     coordinates: Option<&SourceRewrite>,
 ) -> Result<CompilerInspection, InputError> {
     #[cfg(test)]
     INSPECTION_COUNT.set(INSPECTION_COUNT.get() + 1);
-    validate_target(sysroot, &input.target)?;
+    validate_target(context.sysroot, context.target)?;
 
     let result = Arc::new(Mutex::new(None));
     let diagnostics = Arc::new(Mutex::new(DiagnosticState::default()));
@@ -407,7 +572,7 @@ fn run_inspection(
     let expansion_complete = Arc::new(AtomicBool::new(false));
     #[cfg(rust_item_dependencies_patched)]
     let denied_resources = Arc::new(Mutex::new(Vec::new()));
-    let original = Arc::<str>::from(input.source.as_str());
+    let original = Arc::<str>::from(source);
     let (_, offsets) = OriginalOffsetMap::from_source(&original)?;
     let mut callbacks = InputCallbacks {
         original: Arc::clone(&original),
@@ -424,7 +589,7 @@ fn run_inspection(
         coordinates: coordinates.cloned(),
     };
 
-    let arguments = compiler_arguments(input, sysroot);
+    let arguments = compiler_arguments(context);
     let _ =
         rustc_driver::catch_fatal_errors(|| rustc_driver::run_compiler(&arguments, &mut callbacks));
 
@@ -576,18 +741,30 @@ fn map_input_error(error: InputError, coordinates: Option<&SourceRewrite>) -> In
     }
 }
 
-fn compiler_arguments(input: &SourceInput, sysroot: &Path) -> Vec<String> {
-    vec![
+fn compiler_arguments(context: &CompilationContext<'_>) -> Vec<String> {
+    let mut arguments = vec![
         "rust-item-dependencies".to_owned(),
         "main.rs".to_owned(),
         "--crate-name=main".to_owned(),
         "--crate-type=bin".to_owned(),
-        format!("--edition={}", input.edition.as_str()),
-        format!("--target={}", input.target),
+        format!("--edition={}", context.edition.as_str()),
+        format!("--target={}", context.target),
+        format!(
+            "-Copt-level={}",
+            context.options.optimization_level.as_str()
+        ),
         "--sysroot".to_owned(),
-        sysroot.to_string_lossy().into_owned(),
+        context.sysroot.to_string_lossy().into_owned(),
         "--emit=metadata=-".to_owned(),
-    ]
+    ];
+    arguments.extend(
+        context
+            .options
+            .explicit_cfgs
+            .iter()
+            .map(|cfg| format!("--cfg=r#{cfg}")),
+    );
+    arguments
 }
 
 fn validate_target(sysroot: &Path, target: &str) -> Result<(), InputError> {
@@ -1615,7 +1792,7 @@ mod tests {
     use super::inspect_source_with_dependencies;
     use super::{
         DenyExternalFiles, DiagnosticState, Edition, InputError, ObservedDiagnostic, SourceInput,
-        UnsupportedReason, compiler_arguments, inspect_source, inspect_source_with_definitions,
+        UnsupportedReason, inspect_source, inspect_source_with_definitions,
     };
     #[cfg(not(rust_item_dependencies_patched))]
     use crate::definitions::DefinitionError;
@@ -2076,29 +2253,6 @@ mod tests {
         let parent = &inventory.units[invocation.parent.unwrap().0 as usize];
         assert_eq!(parent.kind, WrittenUnitKind::Item);
         assert_eq!(invocation.atomic_group, parent.atomic_group);
-    }
-
-    #[test]
-    fn compiler_arguments_forward_the_exact_edition_and_target() {
-        let input = SourceInput {
-            source: "fn main() {}\n".to_owned(),
-            edition: Edition::Rust2021,
-            target: "sentinel-target".to_owned(),
-        };
-        assert_eq!(
-            compiler_arguments(&input, PathBuf::from("sentinel-sysroot").as_path()),
-            vec![
-                "rust-item-dependencies",
-                "main.rs",
-                "--crate-name=main",
-                "--crate-type=bin",
-                "--edition=2021",
-                "--target=sentinel-target",
-                "--sysroot",
-                "sentinel-sysroot",
-                "--emit=metadata=-",
-            ]
-        );
     }
 
     #[test]

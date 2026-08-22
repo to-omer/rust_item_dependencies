@@ -11,10 +11,19 @@ use std::process::{Command, ExitCode, Stdio};
 
 mod cli;
 
-use cli::{parse_arguments, validate_output, Parsed};
+use cli::{Parsed, parse_arguments, validate_output};
 
 const RUST_REPOSITORY: &str = "https://github.com/rust-lang/rust.git";
-const USAGE: &str = "Usage: cargo rid INPUT.rs -o OUTPUT [--edition YEAR] [--target TRIPLE]";
+const USAGE: &str = r#"Usage: cargo rid [OPTIONS] INPUT.rs
+
+Options:
+  -o, --output OUTPUT    Write reduced source to OUTPUT
+      --edition YEAR     Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]
+      --target TRIPLE    Compilation target [default: compiler host]
+  -O                     Same as --opt-level 3
+      --opt-level LEVEL  Optimization level: 0, 1, 2, 3, s, or z [default: 0]
+      --cfg NAME         Enable a name-only cfg; may be repeated
+  -h, --help             Print help"#;
 const RUSTC_PRIVATE_CRATES: &[&str] = &[
     "rustc_ast",
     "rustc_data_structures",
