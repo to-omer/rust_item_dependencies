@@ -1591,6 +1591,14 @@ impl FileLoader for DenyExternalFiles {
         ))
     }
 
+    #[cfg(rust_item_dependencies_patched)]
+    fn read_imported_source_file(&self, path: &Path) -> io::Result<String> {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("imported source is unavailable: {}", path.display()),
+        ))
+    }
+
     fn read_binary_file(&self, path: &Path) -> io::Result<Arc<[u8]>> {
         self.deny(UnsupportedReason::ExternalCompileTimeResource);
         Err(io::Error::new(
@@ -1606,11 +1614,15 @@ impl FileLoader for DenyExternalFiles {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(rust_item_dependencies_patched)]
+    use std::path::Path;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
+    #[cfg(rust_item_dependencies_patched)]
+    use super::FileLoader;
     #[cfg(not(rust_item_dependencies_patched))]
     use super::inspect_source_with_dependencies;
     use super::{
@@ -2436,6 +2448,30 @@ mod tests {
         );
     }
 
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn in_memory_loader_does_not_classify_imported_source_hydration_as_user_input() {
+        let denied_file = Arc::new(Mutex::new(None));
+        let loader = DenyExternalFiles {
+            working_directory: PathBuf::new(),
+            denied_file: Arc::clone(&denied_file),
+            expansion_complete: Arc::new(AtomicBool::new(false)),
+            diagnostics: Arc::new(Mutex::new(DiagnosticState::default())),
+        };
+
+        let error = loader
+            .read_imported_source_file(Path::new("dependency.rs"))
+            .expect_err("imported source hydration must remain unavailable");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            denied_file
+                .lock()
+                .expect("denied file mutex is poisoned")
+                .is_none()
+        );
+    }
+
     #[test]
     fn unresolved_imported_macro_is_an_original_compilation_failure() {
         let source = "use unavailable::input;\nfn main() { input!(); }\n";
@@ -2452,7 +2488,7 @@ mod tests {
     }
 
     #[test]
-    fn source_inclusion_is_rejected_at_the_written_site() {
+    fn in_memory_source_input_rejects_source_inclusion_at_the_written_site() {
         for (source, snippet) in [
             (
                 "fn main() { include!(\"missing-source.rs\"); }\n",
@@ -2471,6 +2507,24 @@ mod tests {
                     "macro_rules! module { () => { #[path = \"missing.rs\"] mod child; }; }\n",
                     "module!();\n",
                     "fn main() {}\n",
+                ),
+                "module!()",
+            ),
+            (
+                concat!(
+                    "macro_rules! source { () => { ",
+                    "include!(\"tests/fixtures/compiler/external_source.rs\"); }; }\n",
+                    "source!();\n",
+                    "fn main() { marker(); }\n",
+                ),
+                "source!()",
+            ),
+            (
+                concat!(
+                    "macro_rules! module { () => { ",
+                    "#[path = \"tests/fixtures/compiler/external_source.rs\"] mod child; }; }\n",
+                    "module!();\n",
+                    "fn main() { child::marker(); }\n",
                 ),
                 "module!()",
             ),

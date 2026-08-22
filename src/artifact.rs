@@ -29,7 +29,7 @@ fn validate() -> Result<CompilerArtifact, ArtifactError> {
 
 #[cfg(rust_item_dependencies_patched)]
 fn validate() -> Result<CompilerArtifact, ArtifactError> {
-    const EXPECTED_ABI: u32 = 12;
+    const EXPECTED_ABI: u32 = 13;
     if rustc_driver::RUST_ITEM_DEPENDENCIES_PATCH_ABI != EXPECTED_ABI
         || rustc_driver::RUST_ITEM_DEPENDENCIES_BASE_REVISION
             != include_str!("../rustc-patches/base-revision").trim()

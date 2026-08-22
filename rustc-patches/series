@@ -17,3 +17,4 @@
 0016-ignore-bound-projection-only-dependency-origins.patch
 0017-ignore-unresolved-imported-path-provenance.patch
 0018-rustc-expose-selected-declarative-macro-rules.patch
+0019-rustc-distinguish-imported-source-hydration.patch
