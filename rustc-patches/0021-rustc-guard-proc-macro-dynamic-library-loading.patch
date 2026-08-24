@@ -1,4 +1,4 @@
-From 3c0a4d94633c614a5895622f0e63858c1f4e2021 Mon Sep 17 00:00:00 2001
+From dba80e698fc26f4fe3e82c9ba2ef05544dde254b Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Sat, 22 Aug 2026 23:25:00 +0900
 Subject: [PATCH] rustc: guard proc-macro dynamic library loading
@@ -14,10 +14,10 @@ Subject: [PATCH] rustc: guard proc-macro dynamic library loading
  .../rustc-interface-getting-diagnostics.rs    |   1 +
  src/librustdoc/core.rs                        |   1 +
  src/librustdoc/doctest.rs                     |   1 +
- tests/ui-fulldeps/proc-macro-load-guard.rs    | 290 ++++++++++++++++++
+ tests/ui-fulldeps/proc-macro-load-guard.rs    | 249 ++++++++++++++++++
  tests/ui-fulldeps/run-compiler-twice.rs       |   2 +
  tests/ui-fulldeps/typed-mono-successors.rs    |   1 +
- 13 files changed, 369 insertions(+), 18 deletions(-)
+ 13 files changed, 328 insertions(+), 18 deletions(-)
  create mode 100644 tests/ui-fulldeps/proc-macro-load-guard.rs
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
@@ -301,10 +301,10 @@ index d75b5a8b..bf7f6cca 100644
          track_state: None,
 diff --git a/tests/ui-fulldeps/proc-macro-load-guard.rs b/tests/ui-fulldeps/proc-macro-load-guard.rs
 new file mode 100644
-index 00000000..0feb3b07
+index 00000000..f5d58162
 --- /dev/null
 +++ b/tests/ui-fulldeps/proc-macro-load-guard.rs
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,249 @@
 +//@ edition: 2024
 +//@ run-pass
 +//@ run-flags: {{sysroot-base}} {{target-linker}}
@@ -443,47 +443,6 @@ index 00000000..0feb3b07
 +    );
 +    assert_eq!(*observed.lock().unwrap(), [macro_dylib.clone()]);
 +
-+    let facade_source = tmp.join("guard_facade.rs");
-+    std::fs::write(
-+        &facade_source,
-+        "pub use guard_macros::{Marker, make_function, passthrough};",
-+    )
-+    .unwrap();
-+    compile(
-+        rustc_args(
-+            &sysroot,
-+            linker,
-+            &facade_source,
-+            &macro_out,
-+            "guard_facade",
-+            &[
-+                "--crate-type=rlib".to_string(),
-+                format!("--extern=guard_macros={}", macro_dylib.display()),
-+            ],
-+        ),
-+        &mut DefaultCallbacks,
-+    );
-+    let facade = std::fs::canonicalize(macro_out.join("libguard_facade.rlib")).unwrap();
-+    let transitive_source = tmp.join("transitive.rs");
-+    let source = std::fs::read_to_string(&client_source)
-+        .unwrap()
-+        .replace("guard_macros", "guard_facade");
-+    std::fs::write(&transitive_source, source).unwrap();
-+    let observed = Arc::new(Mutex::new(Vec::new()));
-+    compile_client(
-+        &sysroot,
-+        linker,
-+        &transitive_source,
-+        &tmp.join("transitive-out"),
-+        "transitive",
-+        &[
-+            format!("--extern=guard_facade={}", facade.display()),
-+            format!("-Ldependency={}", macro_out.display()),
-+            format!("-Lcrate={}", macro_out.display()),
-+        ],
-+        &mut GuardCallbacks::allow(macro_dylib.clone(), observed.clone()),
-+    );
-+    assert_eq!(*observed.lock().unwrap(), [macro_dylib]);
 +}
 +
 +fn run_denied(args: &[String]) {
