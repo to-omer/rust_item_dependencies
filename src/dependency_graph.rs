@@ -137,6 +137,56 @@ pub struct ExpansionNode {
     pub macro_definition: Option<DefinitionTarget>,
 }
 
+pub(crate) fn expansion_source_survival(
+    expansions: &[ExpansionNode],
+    mut written_unit_survives: impl FnMut(SourceUnitId) -> Option<bool>,
+) -> Option<Vec<bool>> {
+    let mut surviving = expansions
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            if node.id.0 as usize != index {
+                return None;
+            }
+            node.written_invocation
+                .map(&mut written_unit_survives)
+                .unwrap_or(Some(true))
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    loop {
+        let mut changed = false;
+        for node in expansions {
+            let index = node.id.0 as usize;
+            if !surviving[index] {
+                continue;
+            }
+            for parent in [
+                node.discovered_in,
+                node.semantic_parent,
+                node.source_call_parent,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let parent_survives = expansions
+                    .get(parent.0 as usize)
+                    .filter(|parent_node| parent_node.id == parent && parent != node.id)
+                    .and_then(|_| surviving.get(parent.0 as usize))
+                    .copied()?;
+                if !parent_survives {
+                    surviving[index] = false;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if !changed {
+            return Some(surviving);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SelectionSourceKind {
     UserDefined,

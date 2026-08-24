@@ -42,7 +42,8 @@ use crate::monomorphization::{
     CollectedMonomorphization, MonomorphizationError, collect_monomorphization,
 };
 use crate::retention::{
-    Retention, RetentionError, SourceConstraints, collect_source_constraints, compute_retention,
+    Retention, RetentionError, SourceConstraints, collect_macro_rule_expansion_constraints,
+    collect_source_constraints, compute_retention,
 };
 use crate::rewrite::{SourceRewrite, SourceRewriteError, rewrite_source};
 use crate::source::{
@@ -1211,8 +1212,14 @@ fn collect_dependency_graph(
         main_instance,
         compiler_required_roots,
     } = collect_monomorphization(compiler, tcx, source, &mut definitions)?;
-    let constraints =
+    let mut constraints =
         constraints.map_or_else(|| collect_source_constraints(tcx, source, &definitions), Ok)?;
+    collect_macro_rule_expansion_constraints(
+        source,
+        &definitions.graph,
+        &expansions,
+        &mut constraints,
+    )?;
     edges.extend(mono_edges);
     #[cfg(all(test, rust_item_dependencies_patched))]
     let omit_selected_impl = {
