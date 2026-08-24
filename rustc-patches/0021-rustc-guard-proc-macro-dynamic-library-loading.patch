@@ -1,4 +1,4 @@
-From 9eda55be6fc89f73623503d49aabc157a8868d00 Mon Sep 17 00:00:00 2001
+From 3c0a4d94633c614a5895622f0e63858c1f4e2021 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Sat, 22 Aug 2026 23:25:00 +0900
 Subject: [PATCH] rustc: guard proc-macro dynamic library loading
@@ -14,10 +14,10 @@ Subject: [PATCH] rustc: guard proc-macro dynamic library loading
  .../rustc-interface-getting-diagnostics.rs    |   1 +
  src/librustdoc/core.rs                        |   1 +
  src/librustdoc/doctest.rs                     |   1 +
- tests/ui-fulldeps/proc-macro-load-guard.rs    | 289 ++++++++++++++++++
+ tests/ui-fulldeps/proc-macro-load-guard.rs    | 290 ++++++++++++++++++
  tests/ui-fulldeps/run-compiler-twice.rs       |   2 +
  tests/ui-fulldeps/typed-mono-successors.rs    |   1 +
- 13 files changed, 368 insertions(+), 18 deletions(-)
+ 13 files changed, 369 insertions(+), 18 deletions(-)
  create mode 100644 tests/ui-fulldeps/proc-macro-load-guard.rs
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
@@ -301,10 +301,10 @@ index d75b5a8b..bf7f6cca 100644
          track_state: None,
 diff --git a/tests/ui-fulldeps/proc-macro-load-guard.rs b/tests/ui-fulldeps/proc-macro-load-guard.rs
 new file mode 100644
-index 00000000..0534512e
+index 00000000..0feb3b07
 --- /dev/null
 +++ b/tests/ui-fulldeps/proc-macro-load-guard.rs
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,290 @@
 +//@ edition: 2024
 +//@ run-pass
 +//@ run-flags: {{sysroot-base}} {{target-linker}}
@@ -479,6 +479,7 @@ index 00000000..0534512e
 +        &[
 +            format!("--extern=guard_facade={}", facade.display()),
 +            format!("-Ldependency={}", macro_out.display()),
++            format!("-Lcrate={}", macro_out.display()),
 +        ],
 +        &mut GuardCallbacks::allow(macro_dylib.clone(), observed.clone()),
 +    );
