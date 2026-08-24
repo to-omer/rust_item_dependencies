@@ -1,4 +1,4 @@
-From 8d4ee81d70aa51a9954893a3bb0ed1f86e183eb6 Mon Sep 17 00:00:00 2001
+From 18fdd126511edff16b04608dfc8afed1f05a3dc8 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Sat, 22 Aug 2026 23:25:00 +0900
 Subject: [PATCH] rustc: guard proc-macro dynamic library loading
@@ -14,10 +14,10 @@ Subject: [PATCH] rustc: guard proc-macro dynamic library loading
  .../rustc-interface-getting-diagnostics.rs    |   1 +
  src/librustdoc/core.rs                        |   1 +
  src/librustdoc/doctest.rs                     |   1 +
- tests/ui-fulldeps/proc-macro-load-guard.rs    | 291 ++++++++++++++++++
+ tests/ui-fulldeps/proc-macro-load-guard.rs    | 292 ++++++++++++++++++
  tests/ui-fulldeps/run-compiler-twice.rs       |   2 +
  tests/ui-fulldeps/typed-mono-successors.rs    |   1 +
- 13 files changed, 370 insertions(+), 18 deletions(-)
+ 13 files changed, 371 insertions(+), 18 deletions(-)
  create mode 100644 tests/ui-fulldeps/proc-macro-load-guard.rs
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
@@ -301,10 +301,10 @@ index d75b5a8b..bf7f6cca 100644
          track_state: None,
 diff --git a/tests/ui-fulldeps/proc-macro-load-guard.rs b/tests/ui-fulldeps/proc-macro-load-guard.rs
 new file mode 100644
-index 00000000..08593973
+index 00000000..c8a1b9f2
 --- /dev/null
 +++ b/tests/ui-fulldeps/proc-macro-load-guard.rs
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,292 @@
 +//@ edition: 2024
 +//@ run-pass
 +//@ run-flags: {{sysroot-base}} {{target-linker}}
@@ -480,6 +480,7 @@ index 00000000..08593973
 +        "transitive",
 +        &[
 +            format!("--extern=guard_facade={}", facade.display()),
++            format!("-Ldependency={}", facade_out.display()),
 +            format!("-Ldependency={}", macro_out.display()),
 +        ],
 +        &mut GuardCallbacks::allow(macro_dylib.clone(), observed.clone()),
@@ -623,4 +624,3 @@ index d1c4c9fd..9ef6dfd6 100644
      interface::run_compiler(config, |compiler| {
 -- 
 2.55.0
-
