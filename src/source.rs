@@ -62,6 +62,7 @@ pub enum WrittenUnitKind {
     MacroInvocation,
     NestedItem,
     MacroRule,
+    NoEffectCfgAttr,
 }
 
 impl WrittenUnitKind {
@@ -78,6 +79,7 @@ impl WrittenUnitKind {
             Self::MacroInvocation => 8,
             Self::NestedItem => 9,
             Self::MacroRule => 10,
+            Self::NoEffectCfgAttr => 11,
         }
     }
 }
@@ -239,7 +241,27 @@ enum ObservedProceduralMacro {
         invocation_range: ByteRange,
         node_range: ByteRange,
         target_range: ByteRange,
+        kind: ProceduralTargetKind,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ProceduralTargetKind {
+    Attribute,
+    Derive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ProceduralMacroAnchorKind {
+    Invocation,
+    AttributeTarget { target_range: ByteRange },
+    DeriveTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProceduralMacroAnchor {
+    range: ByteRange,
+    kind: ProceduralMacroAnchorKind,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -514,7 +536,7 @@ pub(crate) fn collect_source(
         root_active,
         original.len(),
     )?;
-    collector.record_configured_attribute_macros(&krate.attrs, &configured_attrs, root_active);
+    collector.record_configured_attributes(&krate.attrs, &configured_attrs, root_active);
     collector.visit_crate(krate);
     let units = collector.finish()?;
     let pieces = own_lexical_pieces(&original, &units)?;
@@ -907,6 +929,10 @@ pub(crate) fn refine_macro_rules_from_compiler(
 ) -> Result<(), SourceError> {
     let procedural = collect_procedural_macro_observations(compiler, tcx, inventory)?;
     let opaque_anchors = resolve_procedural_macro_anchors(inventory, procedural)?;
+    let opaque_ranges = opaque_anchors
+        .iter()
+        .map(|anchor| anchor.range)
+        .collect::<BTreeSet<_>>();
     let resolutions = tcx.resolutions(());
     let definitions = &resolutions.macro_rules_definitions;
     let ordered_definitions = definitions
@@ -976,7 +1002,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
         }
         let definition_span = tcx.def_span(definition);
         let definition_range = original_span_range(compiler, &inventory.offsets, definition_span)?;
-        if opaque_anchors
+        if opaque_ranges
             .iter()
             .any(|anchor| anchor.contains(definition_range))
         {
@@ -1014,7 +1040,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
     if !selected.is_empty() {
         return Err(SourceError::IncompleteMacroRuleObservation);
     }
-    refine_macro_rules_outside_opaque_anchors(inventory, observations, &opaque_anchors)?;
+    refine_macro_rules_outside_opaque_anchors(inventory, observations, &opaque_ranges)?;
     merge_procedural_macro_atomic_groups(inventory, &opaque_anchors)
 }
 
@@ -1091,6 +1117,11 @@ fn collect_procedural_macro_observations(
                         container_origin.invocation_node_span,
                     )?,
                     target_range,
+                    kind: match kind {
+                        MacroKind::Attr => ProceduralTargetKind::Attribute,
+                        MacroKind::Derive => ProceduralTargetKind::Derive,
+                        MacroKind::Bang => unreachable!(),
+                    },
                 }
             }
             MacroKind::Bang => continue,
@@ -1128,7 +1159,7 @@ fn written_builtin_attribute_ancestor<'a>(
 fn resolve_procedural_macro_anchors(
     inventory: &SourceInventory,
     observations: Vec<ObservedProceduralMacro>,
-) -> Result<BTreeSet<ByteRange>, SourceError> {
+) -> Result<BTreeSet<ProceduralMacroAnchor>, SourceError> {
     validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
     validate_ownerless_attribute_invocations(
         &inventory.units,
@@ -1137,15 +1168,18 @@ fn resolve_procedural_macro_anchors(
 
     let mut anchors = BTreeSet::new();
     for observation in observations {
-        let anchor = match observation {
+        let (anchor, kind) = match observation {
             ObservedProceduralMacro::Invocation {
                 invocation_range,
                 node_range,
-            } => resolve_bang_macro_source(inventory, invocation_range, node_range)?,
+            } => resolve_written_bang_macro_source(inventory, invocation_range, node_range)
+                .map(|anchor| (anchor, ProceduralMacroAnchorKind::Invocation))
+                .ok_or(SourceError::IncompleteProceduralMacroObservation)?,
             ObservedProceduralMacro::Target {
                 invocation_range,
                 node_range,
                 target_range,
+                kind,
             } => {
                 let source =
                     resolve_attribute_source(inventory, invocation_range, node_range, target_range)
@@ -1153,23 +1187,33 @@ fn resolve_procedural_macro_anchors(
                 source
                     .invocation
                     .ok_or(SourceError::IncompleteProceduralMacroObservation)?;
-                source.target
+                let anchor_kind = match kind {
+                    ProceduralTargetKind::Attribute => {
+                        ProceduralMacroAnchorKind::AttributeTarget { target_range }
+                    }
+                    ProceduralTargetKind::Derive => ProceduralMacroAnchorKind::DeriveTarget,
+                };
+                (source.target, anchor_kind)
             }
         };
-        anchors.insert(
-            inventory
-                .units
-                .get(anchor.0 as usize)
-                .ok_or(SourceError::IncompleteProceduralMacroObservation)?
-                .full_range,
-        );
+        let range = inventory
+            .units
+            .get(anchor.0 as usize)
+            .ok_or(SourceError::IncompleteProceduralMacroObservation)?
+            .full_range;
+        if let ProceduralMacroAnchorKind::AttributeTarget { target_range } = kind
+            && (!range.contains(target_range) || target_range.is_empty())
+        {
+            return Err(SourceError::IncompleteProceduralMacroObservation);
+        }
+        anchors.insert(ProceduralMacroAnchor { range, kind });
     }
     Ok(anchors)
 }
 
 fn merge_procedural_macro_atomic_groups(
     inventory: &mut SourceInventory,
-    anchors: &BTreeSet<ByteRange>,
+    anchors: &BTreeSet<ProceduralMacroAnchor>,
 ) -> Result<(), SourceError> {
     validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
     validate_macro_rule_facts(&inventory.units, &inventory.macro_rules)?;
@@ -1183,7 +1227,8 @@ fn merge_procedural_macro_atomic_groups(
         .iter()
         .map(|unit| (unit.atomic_group, unit.atomic_group))
         .collect::<BTreeMap<_, _>>();
-    for &anchor_range in anchors {
+    for &anchor in anchors {
+        let anchor_range = anchor.range;
         inventory
             .units
             .iter()
@@ -1192,7 +1237,10 @@ fn merge_procedural_macro_atomic_groups(
         let components = inventory
             .units
             .iter()
-            .filter(|unit| anchor_range.contains(unit.full_range))
+            .filter(|unit| {
+                anchor_range.contains(unit.full_range)
+                    && procedural_macro_observes_unit(anchor, unit)
+            })
             .map(|unit| representatives[&unit.atomic_group])
             .collect::<BTreeSet<_>>();
         let representative = components
@@ -1216,13 +1264,26 @@ fn merge_procedural_macro_atomic_groups(
     Ok(())
 }
 
-fn resolve_bang_macro_source(
+fn procedural_macro_observes_unit(anchor: ProceduralMacroAnchor, unit: &WrittenUnit) -> bool {
+    if unit.kind != WrittenUnitKind::NoEffectCfgAttr {
+        return true;
+    }
+    match anchor.kind {
+        ProceduralMacroAnchorKind::Invocation => false,
+        ProceduralMacroAnchorKind::AttributeTarget { target_range } => {
+            target_range.contains(unit.full_range)
+        }
+        ProceduralMacroAnchorKind::DeriveTarget => false,
+    }
+}
+
+pub(crate) fn resolve_written_bang_macro_source(
     inventory: &SourceInventory,
     invocation_range: ByteRange,
     node_range: ByteRange,
-) -> Result<SourceUnitId, SourceError> {
+) -> Option<SourceUnitId> {
     if invocation_range.is_empty() || !node_range.contains(invocation_range) {
-        return Err(SourceError::IncompleteProceduralMacroObservation);
+        return None;
     }
     let mut candidates = inventory
         .units
@@ -1234,16 +1295,12 @@ fn resolve_bang_macro_source(
                 && unit.full_range.contains(node_range)
         })
         .collect::<Vec<_>>();
-    let smallest = candidates
-        .iter()
-        .map(|unit| unit.full_range.len())
-        .min()
-        .ok_or(SourceError::IncompleteProceduralMacroObservation)?;
+    let smallest = candidates.iter().map(|unit| unit.full_range.len()).min()?;
     candidates.retain(|unit| unit.full_range.len() == smallest);
     let [invocation] = candidates.as_slice() else {
-        return Err(SourceError::IncompleteProceduralMacroObservation);
+        return None;
     };
-    Ok(invocation.id)
+    Some(invocation.id)
 }
 
 fn valid_source_range(source: &str, range: ByteRange) -> bool {
@@ -1411,6 +1468,7 @@ struct UnitCollector<'a> {
     active_stack: Vec<bool>,
     body_depth: u32,
     seen_macro_ranges: BTreeMap<ByteRange, u32>,
+    seen_no_effect_cfg_attrs: BTreeSet<(ast::AttrId, ByteRange)>,
     next_syntax_ordinal: u32,
     error: Option<SourceError>,
 }
@@ -1450,6 +1508,7 @@ impl<'a> UnitCollector<'a> {
             active_stack: vec![root_active],
             body_depth: 0,
             seen_macro_ranges: BTreeMap::new(),
+            seen_no_effect_cfg_attrs: BTreeSet::new(),
             next_syntax_ordinal: 1,
             error: None,
         })
@@ -1499,12 +1558,58 @@ impl<'a> UnitCollector<'a> {
         .configure(node.clone())
     }
 
-    fn record_configured_attribute_macros(
+    fn record_configured_attributes(
         &mut self,
         original: &[ast::Attribute],
         configured: &[ast::Attribute],
         active: bool,
     ) {
+        for attribute in original {
+            let traces = configured
+                .iter()
+                .filter(|configured| {
+                    configured.id == attribute.id && configured.span == attribute.span
+                })
+                .filter_map(|configured| match &configured.kind {
+                    ast::AttrKind::Synthetic(synthetic) => match synthetic.as_ref() {
+                        ast::SyntheticAttr::CfgAttrTrace(predicate) => Some(predicate),
+                        ast::SyntheticAttr::CfgTrace(_) => None,
+                    },
+                    ast::AttrKind::Normal(_) | ast::AttrKind::DocComment(..) => None,
+                })
+                .collect::<Vec<_>>();
+            let [_trace] = traces.as_slice() else {
+                continue;
+            };
+            let has_effective_attribute = configured.iter().any(|configured| {
+                attribute.span.contains(configured.span)
+                    && !matches!(
+                        &configured.kind,
+                        ast::AttrKind::Synthetic(synthetic)
+                            if matches!(synthetic.as_ref(), ast::SyntheticAttr::CfgAttrTrace(_))
+                    )
+            });
+            if has_effective_attribute {
+                continue;
+            }
+            let range = match self.span_range(attribute.span) {
+                Ok(range) => range,
+                Err(error) => {
+                    self.fail(error);
+                    continue;
+                }
+            };
+            if !self.seen_no_effect_cfg_attrs.insert((attribute.id, range)) {
+                continue;
+            }
+            let parent = self.current_parent();
+            if !self.units[parent as usize].full_range.contains(range) {
+                self.fail(SourceError::InvalidInventory);
+                continue;
+            }
+            self.add_unit(WrittenUnitKind::NoEffectCfgAttr, range, false, parent, None);
+        }
+
         struct AttributeMacroCollector<'a, 'b> {
             units: &'a mut UnitCollector<'b>,
             active: bool,
@@ -1755,7 +1860,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         self.parent_stack.push(id);
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(item.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(item.attrs(), configured.attrs(), active);
         }
         visit::walk_item(self, item);
         self.active_stack.pop();
@@ -1798,7 +1903,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         self.parent_stack.push(id);
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(item.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(item.attrs(), configured.attrs(), active);
         }
         visit::walk_assoc_item(self, item, context);
         self.active_stack.pop();
@@ -1838,7 +1943,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         self.parent_stack.push(id);
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(item.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(item.attrs(), configured.attrs(), active);
         }
         visit::walk_item(self, item);
         self.active_stack.pop();
@@ -1864,7 +1969,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         if let Some(configured) = &configured
             && !matches!(&statement.kind, ast::StmtKind::Item(_))
         {
-            self.record_configured_attribute_macros(statement.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(statement.attrs(), configured.attrs(), active);
         }
         visit::walk_stmt(self, statement);
         self.active_stack.pop();
@@ -1880,7 +1985,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         }
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(expression.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(expression.attrs(), configured.attrs(), active);
         }
         visit::walk_expr(self, expression);
         self.active_stack.pop();
@@ -1891,7 +1996,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         let active = configured.is_some();
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(arm.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(arm.attrs(), configured.attrs(), active);
         }
         visit::walk_arm(self, arm);
         self.active_stack.pop();
@@ -1902,7 +2007,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         let active = configured.is_some();
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(field.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(field.attrs(), configured.attrs(), active);
         }
         visit::walk_expr_field(self, field);
         self.active_stack.pop();
@@ -1913,7 +2018,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         let active = configured.is_some();
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(field.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(field.attrs(), configured.attrs(), active);
         }
         visit::walk_field_def(self, field);
         self.active_stack.pop();
@@ -1924,7 +2029,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         let active = configured.is_some();
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(parameter.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(parameter.attrs(), configured.attrs(), active);
         }
         visit::walk_generic_param(self, parameter);
         self.active_stack.pop();
@@ -1935,7 +2040,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         let active = configured.is_some();
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(parameter.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(parameter.attrs(), configured.attrs(), active);
         }
         visit::walk_param(self, parameter);
         self.active_stack.pop();
@@ -1946,7 +2051,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         let active = configured.is_some();
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(field.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(field.attrs(), configured.attrs(), active);
         }
         visit::walk_pat_field(self, field);
         self.active_stack.pop();
@@ -1957,7 +2062,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         let active = configured.is_some();
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(variant.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(variant.attrs(), configured.attrs(), active);
         }
         visit::walk_variant(self, variant);
         self.active_stack.pop();
@@ -1968,7 +2073,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         let active = configured.is_some();
         self.active_stack.push(active);
         if let Some(configured) = &configured {
-            self.record_configured_attribute_macros(predicate.attrs(), configured.attrs(), active);
+            self.record_configured_attributes(predicate.attrs(), configured.attrs(), active);
         }
         visit::walk_where_predicate(self, predicate);
         self.active_stack.pop();
@@ -2180,10 +2285,11 @@ mod tests {
 
     use super::{
         AtomicGroupId, ByteRange, CfgState, MacroRuleSourceFacts, ObservedMacroRules,
-        ObservedProceduralMacro, OriginalOffsetMap, PieceKind, SourceError, SourceInventory,
-        SourceUnitId, WrittenUnit, WrittenUnitKind, merge_procedural_macro_atomic_groups,
-        own_lexical_pieces, refine_macro_rules, refine_macro_rules_outside_opaque_anchors,
-        resolve_procedural_macro_anchors, validate_macro_rule_facts,
+        ObservedProceduralMacro, OriginalOffsetMap, PieceKind, ProceduralTargetKind, SourceError,
+        SourceInventory, SourceUnitId, WrittenUnit, WrittenUnitKind,
+        merge_procedural_macro_atomic_groups, own_lexical_pieces, refine_macro_rules,
+        refine_macro_rules_outside_opaque_anchors, resolve_procedural_macro_anchors,
+        validate_macro_rule_facts,
     };
     use crate::rewrite::rewrite_source;
 
@@ -2566,9 +2672,14 @@ mod tests {
                 invocation_range: attribute,
                 node_range: target,
                 target_range: target_without_attribute,
+                kind: ProceduralTargetKind::Attribute,
             }],
         )
         .unwrap();
+        let anchor_ranges = anchors
+            .iter()
+            .map(|anchor| anchor.range)
+            .collect::<BTreeSet<_>>();
         refine_macro_rules_outside_opaque_anchors(
             &mut inventory,
             vec![
@@ -2583,7 +2694,7 @@ mod tests {
                     selected_rule_indices: vec![0],
                 },
             ],
-            &anchors,
+            &anchor_ranges,
         )
         .unwrap();
 
@@ -2691,6 +2802,7 @@ mod tests {
                 invocation_range,
                 node_range: target,
                 target_range: target_without_attribute,
+                kind: ProceduralTargetKind::Derive,
             }],
         )
         .unwrap();
@@ -2704,6 +2816,85 @@ mod tests {
             inventory.units[1].atomic_group,
             inventory.units[4].atomic_group
         );
+    }
+
+    #[test]
+    fn procedural_targets_only_merge_cfg_attrs_visible_in_their_input() {
+        fn inventory_for(
+            kind: ProceduralTargetKind,
+        ) -> (SourceInventory, BTreeSet<super::ProceduralMacroAnchor>) {
+            let source = Arc::<str>::from(concat!(
+                "#[cfg_attr(any(), allow(dead_code))]\n",
+                "#[proc]\n",
+                "struct Subject { #[cfg_attr(any(), allow(dead_code))] field: u8 }\n",
+                "fn main() {}\n",
+            ));
+            let target = marker(
+                &source,
+                concat!(
+                    "#[cfg_attr(any(), allow(dead_code))]\n",
+                    "#[proc]\n",
+                    "struct Subject { #[cfg_attr(any(), allow(dead_code))] field: u8 }",
+                ),
+            );
+            let target_without_attributes = marker(
+                &source,
+                "struct Subject { #[cfg_attr(any(), allow(dead_code))] field: u8 }",
+            );
+            let direct = marker(&source, "#[cfg_attr(any(), allow(dead_code))]");
+            let invocation = marker(&source, "#[proc]");
+            let nested_start = source
+                .rfind("#[cfg_attr(any(), allow(dead_code))]")
+                .unwrap() as u32;
+            let nested = ByteRange {
+                start: nested_start,
+                end: nested_start + "#[cfg_attr(any(), allow(dead_code))]".len() as u32,
+            };
+            let units = vec![
+                unit(
+                    0,
+                    WrittenUnitKind::CrateRoot,
+                    ByteRange {
+                        start: 0,
+                        end: source.len() as u32,
+                    },
+                    None,
+                    0,
+                ),
+                unit(1, WrittenUnitKind::Item, target, Some(0), 1),
+                unit(2, WrittenUnitKind::MacroInvocation, invocation, Some(1), 1),
+                unit(3, WrittenUnitKind::NoEffectCfgAttr, direct, Some(1), 2),
+                unit(4, WrittenUnitKind::NoEffectCfgAttr, nested, Some(1), 3),
+            ];
+            let inventory = test_inventory(source, units, Vec::new());
+            let anchors = resolve_procedural_macro_anchors(
+                &inventory,
+                vec![ObservedProceduralMacro::Target {
+                    invocation_range: invocation,
+                    node_range: target,
+                    target_range: target_without_attributes,
+                    kind,
+                }],
+            )
+            .unwrap();
+            (inventory, anchors)
+        }
+
+        let (mut attribute, anchors) = inventory_for(ProceduralTargetKind::Attribute);
+        merge_procedural_macro_atomic_groups(&mut attribute, &anchors).unwrap();
+        assert_ne!(
+            attribute.units[1].atomic_group,
+            attribute.units[3].atomic_group
+        );
+        assert_eq!(
+            attribute.units[1].atomic_group,
+            attribute.units[4].atomic_group
+        );
+
+        let (mut derive, anchors) = inventory_for(ProceduralTargetKind::Derive);
+        merge_procedural_macro_atomic_groups(&mut derive, &anchors).unwrap();
+        assert_ne!(derive.units[1].atomic_group, derive.units[3].atomic_group);
+        assert_ne!(derive.units[1].atomic_group, derive.units[4].atomic_group);
     }
 
     #[test]

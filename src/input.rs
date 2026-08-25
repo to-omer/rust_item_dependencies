@@ -2712,6 +2712,57 @@ mod tests {
     }
 
     #[test]
+    fn cfg_attrs_without_an_effect_have_independent_source_units() {
+        let source = concat!(
+            "#![cfg_attr(any(), allow(dead_code))]\n",
+            "#[cfg_attr(any(), allow(unused_variables))]\n",
+            "#[cfg_attr(all(), allow(dead_code))]\n",
+            "struct Adjacent;\n",
+            "#[cfg_attr(all(), cfg_attr(any(), allow(unused_mut)))]\n",
+            "struct NestedInactive;\n",
+            "#[cfg_attr(all(), cfg_attr(all(), allow(dead_code)))]\n",
+            "struct NestedActive;\n",
+            "#[cfg_attr(all(),)]\n",
+            "struct Empty;\n",
+            "#[cfg_attr(all(), cfg(all()))]\n",
+            "struct CfgActive;\n",
+            "#[cfg_attr(all(), cfg(any()))]\n",
+            "struct CfgInactive;\n",
+            "struct Field { #[cfg_attr(any(), allow(unused_assignments))] value: u8 }\n",
+            "fn expression() { #[cfg_attr(any(), allow(unused_must_use))] {} }\n",
+            "fn main() {}\n",
+        );
+        let inventory = inspect(source).unwrap();
+        let expected = [
+            "#![cfg_attr(any(), allow(dead_code))]",
+            "#[cfg_attr(any(), allow(unused_variables))]",
+            "#[cfg_attr(all(), cfg_attr(any(), allow(unused_mut)))]",
+            "#[cfg_attr(all(),)]",
+            "#[cfg_attr(any(), allow(unused_assignments))]",
+            "#[cfg_attr(any(), allow(unused_must_use))]",
+        ]
+        .map(|snippet| {
+            let start = source.find(snippet).unwrap() as u32;
+            range(start, start + snippet.len() as u32)
+        });
+        let units = inventory
+            .units
+            .iter()
+            .filter(|unit| unit.kind == WrittenUnitKind::NoEffectCfgAttr)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            units.iter().map(|unit| unit.full_range).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(units.iter().all(|unit| {
+            let parent = &inventory.units[unit.parent.unwrap().0 as usize];
+            unit.cfg_state == CfgState::Inactive
+                && parent.cfg_state == CfgState::Active
+                && unit.atomic_group != parent.atomic_group
+        }));
+    }
+
+    #[test]
     fn derive_helper_attributes_are_not_mistaken_for_attribute_macros() {
         let source = concat!(
             "#[cfg_attr(all(), derive(Default))]\n",

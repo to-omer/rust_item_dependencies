@@ -27,7 +27,9 @@ use crate::dependency_graph::{DependencyEdge, ExpansionNode};
 use crate::graph::{DefinitionId, DefinitionOrigin, DefinitionTarget};
 use crate::source::SourceInventory;
 #[cfg(rust_item_dependencies_patched)]
-use crate::source::{ByteRange, original_span_range, resolve_attribute_source};
+use crate::source::{
+    ByteRange, original_span_range, resolve_attribute_source, resolve_written_bang_macro_source,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExpansionError {
@@ -544,18 +546,7 @@ fn written_invocation(
             .ok()?
             .invocation;
     }
-    let mut matches = source
-        .units
-        .iter()
-        .filter(|unit| {
-            unit.kind == crate::source::WrittenUnitKind::MacroInvocation
-                && unit.cfg_state == crate::source::CfgState::Active
-                && (Some(unit.full_range) == invocation_range
-                    || Some(unit.full_range) == node_range)
-        })
-        .map(|unit| unit.id);
-    let invocation = matches.next()?;
-    matches.next().is_none().then_some(invocation)
+    resolve_written_bang_macro_source(source, invocation_range?, node_range?)
 }
 
 #[cfg(rust_item_dependencies_patched)]

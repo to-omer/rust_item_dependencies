@@ -2,6 +2,14 @@ extern crate proc_macro;
 
 use proc_macro::{TokenStream, TokenTree};
 
+fn contains_identifier(input: TokenStream, expected: &str) -> bool {
+    input.into_iter().any(|token| match token {
+        TokenTree::Group(group) => contains_identifier(group.stream(), expected),
+        TokenTree::Ident(identifier) => identifier.to_string() == expected,
+        TokenTree::Literal(_) | TokenTree::Punct(_) => false,
+    })
+}
+
 #[proc_macro]
 pub fn one(_input: TokenStream) -> TokenStream {
     "1".parse().expect("the generated expression must parse")
@@ -14,8 +22,22 @@ pub fn make_unused(_input: TokenStream) -> TokenStream {
         .expect("the generated item must parse")
 }
 
+#[proc_macro]
+pub fn configured_bang(input: TokenStream) -> TokenStream {
+    assert!(!contains_identifier(input, "cfg_attr"));
+    "fn generated() -> i32 { 1 }"
+        .parse()
+        .expect("the generated item must parse")
+}
+
 #[proc_macro_attribute]
 pub fn passthrough(_attribute: TokenStream, item: TokenStream) -> TokenStream {
+    item
+}
+
+#[proc_macro_attribute]
+pub fn require_nested_cfg_attr(_attribute: TokenStream, item: TokenStream) -> TokenStream {
+    assert!(contains_identifier(item.clone(), "cfg_attr"));
     item
 }
 
@@ -38,6 +60,12 @@ pub fn answer(input: TokenStream) -> TokenStream {
     format!("impl {name} {{ fn answer() -> i32 {{ 1 }} }}")
         .parse()
         .expect("the generated impl must parse")
+}
+
+#[proc_macro_derive(ConfiguredInput)]
+pub fn configured_input(input: TokenStream) -> TokenStream {
+    assert!(!contains_identifier(input, "cfg_attr"));
+    TokenStream::new()
 }
 
 #[proc_macro]
