@@ -7,7 +7,8 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use rust_item_dependencies::{
-    AnalysisError, Analyzer, CompilationOptions, Edition, OptimizationLevel, SourceInput,
+    AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel,
+    SourceInput,
 };
 
 #[path = "../tools/cli.rs"]
@@ -16,8 +17,8 @@ mod cli;
 #[cfg(test)]
 use cli::Cli;
 use cli::{
-    CliEdition, CliOptimizationLevel, Parsed, parse_arguments, reducer_usage, render_path,
-    validate_output,
+    CliCrateType, CliEdition, CliOptimizationLevel, Parsed, parse_arguments, reducer_usage,
+    render_path, validate_output,
 };
 
 const USAGE_COMMAND: &str = "Usage: rust-item-dependencies [OPTIONS] INPUT.rs";
@@ -59,14 +60,19 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     for artifact in cli.allowed_proc_macro_artifacts {
         options = options.allow_proc_macro_execution(artifact);
     }
+    let input = match cli.crate_type {
+        CliCrateType::Binary => {
+            SourceInput::binary(source, cli.edition.into(), target).with_crate_name(cli.crate_name)
+        }
+        CliCrateType::Library => {
+            SourceInput::library(source, cli.edition.into(), target, cli.crate_name)
+        }
+    };
+    let input = cli.entry_points.into_iter().fold(input, |input, path| {
+        input.with_entry_point(EntryPoint::new(path))
+    });
     let analyzer = Analyzer::new_with_options(options).map_err(render_analysis_error)?;
-    let reduction = analyzer
-        .reduce(&SourceInput {
-            source,
-            edition: cli.edition.into(),
-            target,
-        })
-        .map_err(render_analysis_error)?;
+    let reduction = analyzer.reduce(&input).map_err(render_analysis_error)?;
 
     write_output(&cli.output, reduction.reduced_source())
         .map_err(|error| format!("cannot write {}: {error}", render_path(&cli.output)))
@@ -77,6 +83,12 @@ fn render_analysis_error(error: AnalysisError) -> String {
     match &error {
         AnalysisError::InvalidCfgName { name } => {
             rendered.push_str(&format!(": {name:?}"));
+        }
+        AnalysisError::InvalidCrateName { name } => {
+            rendered.push_str(&format!(": {name:?}"));
+        }
+        AnalysisError::InvalidEntryPoint { path, reason } => {
+            rendered.push_str(&format!(": {path:?}: {reason}"));
         }
         AnalysisError::InvalidExternalCrateName { name } => {
             rendered.push_str(&format!(": {name:?}"));
@@ -182,7 +194,7 @@ fn host_target() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_item_dependencies::{UnsupportedReason, source::ByteRange};
+    use rust_item_dependencies::{EntryPointError, UnsupportedReason, source::ByteRange};
 
     fn parse(arguments: &[&str]) -> Result<Parsed, String> {
         parse_arguments(
@@ -197,12 +209,15 @@ mod tests {
             panic!("input must run the reducer")
         };
         assert_eq!(
-            defaults,
+            *defaults,
             Cli {
                 input: "input.rs".into(),
                 output: "output.rs".into(),
                 edition: CliEdition::Rust2024,
                 target: None,
+                crate_type: CliCrateType::Binary,
+                crate_name: "main".to_owned(),
+                entry_points: Vec::new(),
                 optimization_level: CliOptimizationLevel::O0,
                 cfg_names: Vec::new(),
                 external_crates: Vec::new(),
@@ -227,11 +242,41 @@ mod tests {
         assert_eq!(explicit.output, Path::new("output.rs"));
         assert_eq!(explicit.edition, CliEdition::Rust2021);
         assert_eq!(explicit.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(explicit.crate_type, CliCrateType::Binary);
+        assert_eq!(explicit.crate_name, "main");
+        assert!(explicit.entry_points.is_empty());
         assert_eq!(explicit.optimization_level, CliOptimizationLevel::O0);
         assert!(explicit.cfg_names.is_empty());
         assert!(explicit.external_crates.is_empty());
         assert!(explicit.dependency_artifacts.is_empty());
         assert!(explicit.allowed_proc_macro_artifacts.is_empty());
+    }
+
+    #[test]
+    fn parses_library_crate_name_and_repeated_entry_points() {
+        let Parsed::Run(cli) = parse(&[
+            "--crate-type",
+            "lib",
+            "--crate-name",
+            "competitive",
+            "--entry",
+            "competitive::largest_rectangle",
+            "--entry",
+            "competitive::LIMIT",
+            "input.rs",
+            "-o",
+            "output.rs",
+        ])
+        .unwrap() else {
+            panic!("valid library options must run the reducer")
+        };
+
+        assert_eq!(cli.crate_type, CliCrateType::Library);
+        assert_eq!(cli.crate_name, "competitive");
+        assert_eq!(
+            cli.entry_points,
+            ["competitive::largest_rectangle", "competitive::LIMIT"]
+        );
     }
 
     #[test]
@@ -336,6 +381,19 @@ mod tests {
         );
         assert_eq!(parse(&["--cfg"]).unwrap_err(), "--cfg requires a value");
         assert_eq!(
+            parse(&["--crate-type"]).unwrap_err(),
+            "--crate-type requires a value"
+        );
+        assert_eq!(
+            parse(&["--crate-type", "rlib", "input.rs", "-o", "output.rs"]).unwrap_err(),
+            "unsupported crate type: rlib; expected bin or lib"
+        );
+        assert_eq!(
+            parse(&["--crate-name"]).unwrap_err(),
+            "--crate-name requires a value"
+        );
+        assert_eq!(parse(&["--entry"]).unwrap_err(), "--entry requires a value");
+        assert_eq!(
             parse(&["--extern"]).unwrap_err(),
             "--extern requires a value"
         );
@@ -412,6 +470,26 @@ mod tests {
 
     #[test]
     fn renders_structured_analysis_error_details() {
+        assert_eq!(
+            render_analysis_error(AnalysisError::InvalidCrateName {
+                name: "bad-name".to_owned(),
+            }),
+            "the crate name is invalid: \"bad-name\""
+        );
+        assert_eq!(
+            render_analysis_error(AnalysisError::MissingLibraryEntryPoint),
+            "a library input requires at least one entry point"
+        );
+        assert_eq!(
+            render_analysis_error(AnalysisError::InvalidEntryPoint {
+                path: "competitive::missing".to_owned(),
+                reason: EntryPointError::NotFound,
+            }),
+            concat!(
+                "an explicit entry point is invalid: \"competitive::missing\": ",
+                "the path does not resolve to an item",
+            )
+        );
         assert_eq!(
             render_analysis_error(AnalysisError::InvalidCfgName {
                 name: "feature=\"judge\"".to_owned(),
@@ -550,6 +628,9 @@ mod tests {
             output: path.clone(),
             edition: CliEdition::Rust2024,
             target: None,
+            crate_type: CliCrateType::Binary,
+            crate_name: "main".to_owned(),
+            entry_points: Vec::new(),
             optimization_level: CliOptimizationLevel::O0,
             cfg_names: Vec::new(),
             external_crates: Vec::new(),

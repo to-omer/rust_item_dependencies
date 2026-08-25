@@ -184,22 +184,21 @@ fn macro_generated_associated_direct_call_builds_a_valid_graph() {
 fn external_symbols_are_compiler_roots_with_their_dependencies() {
     let (sysroot, target) = compiler_context();
     let reduction = inspect_source_with_reduction(
-        &SourceInput {
-            source: EXTERNAL_SYMBOL_ROOTS.to_owned(),
-            edition: Edition::Rust2024,
-            target,
-        },
+        &SourceInput::binary(EXTERNAL_SYMBOL_ROOTS.to_owned(), Edition::Rust2024, target),
         &sysroot,
     )
     .expect("external symbols must be reducible");
 
     let roots = reduction
         .graph
-        .compiler_required_roots
+        .roots
         .iter()
         .filter(|root| root.reason == RootReason::ExternalSymbol)
         .map(|root| {
-            reduction.graph.mono_nodes[root.node.0 as usize]
+            let GraphNode::Mono(node) = root.node else {
+                panic!("external symbol roots must be monomorphic")
+            };
+            reduction.graph.mono_nodes[node.0 as usize]
                 .materialized_definition
                 .map(|target| target_label(&reduction.graph.definitions, target))
                 .expect("external symbol roots must materialize definitions")
@@ -226,11 +225,7 @@ fn overlapping_compiler_root_reasons_do_not_duplicate_main_or_used_statics() {
     );
     let (sysroot, target) = compiler_context();
     let reduction = inspect_source_with_reduction(
-        &SourceInput {
-            source: source.to_owned(),
-            edition: Edition::Rust2024,
-            target,
-        },
+        &SourceInput::binary(source.to_owned(), Edition::Rust2024, target),
         &sysroot,
     )
     .expect("overlapping compiler roots must be reducible");
@@ -238,14 +233,19 @@ fn overlapping_compiler_root_reasons_do_not_duplicate_main_or_used_statics() {
     assert_eq!(reduction.rewrite.source, source);
     let mut reasons = reduction
         .graph
-        .compiler_required_roots
+        .roots
         .iter()
         .map(|root| root.reason)
         .collect::<Vec<_>>();
     reasons.sort();
     assert_eq!(
         reasons,
-        vec![RootReason::StartInstance, RootReason::UsedAttribute]
+        vec![
+            RootReason::Main,
+            RootReason::StartInstance,
+            RootReason::UsedAttribute,
+            RootReason::ExternalSymbol,
+        ]
     );
 }
 
@@ -253,35 +253,32 @@ fn overlapping_compiler_root_reasons_do_not_duplicate_main_or_used_statics() {
 fn rewritten_collection_uses_original_coordinates_for_compiler_identity() {
     let (sysroot, target) = compiler_context();
     let original = inspect_source_with_reduction(
-        &SourceInput {
-            source: REWRITTEN_COORDINATES.to_owned(),
-            edition: Edition::Rust2024,
-            target: target.clone(),
-        },
+        &SourceInput::binary(
+            REWRITTEN_COORDINATES.to_owned(),
+            Edition::Rust2024,
+            target.clone(),
+        ),
         &sysroot,
     )
     .expect("the original source must reduce");
     assert!(!original.rewrite.source.contains("unused_prefix"));
 
     let reduced = inspect_source_with_dependencies_at_original_coordinates(
-        &SourceInput {
-            source: original.rewrite.source.clone(),
-            edition: Edition::Rust2024,
-            target,
-        },
+        &SourceInput::binary(original.rewrite.source.clone(), Edition::Rust2024, target),
         &sysroot,
         &original.rewrite,
     )
     .expect("the rewritten source must be observed once in original coordinates");
 
+    let (original_main_instance, original_main_definition) = main_nodes(&original.graph);
+    let (reduced_main_instance, reduced_main_definition) = main_nodes(&reduced.graph);
     let original_main =
-        &original.graph.definitions.definitions[original.graph.main_definition.0 as usize];
-    let reduced_main =
-        &reduced.graph.definitions.definitions[reduced.graph.main_definition.0 as usize];
+        &original.graph.definitions.definitions[original_main_definition.0 as usize];
+    let reduced_main = &reduced.graph.definitions.definitions[reduced_main_definition.0 as usize];
     assert_eq!(reduced_main.key, original_main.key);
     assert_eq!(
-        reduced.graph.mono_nodes[reduced.graph.main_instance.0 as usize].key,
-        original.graph.mono_nodes[original.graph.main_instance.0 as usize].key
+        reduced.graph.mono_nodes[reduced_main_instance.0 as usize].key,
+        original.graph.mono_nodes[original_main_instance.0 as usize].key
     );
     for node in &reduced.graph.mono_nodes {
         assert!(
@@ -308,21 +305,17 @@ fn rewritten_collection_uses_original_coordinates_for_compiler_identity() {
 fn rewritten_macro_rule_requirements_keep_their_collected_source_ids() {
     let (sysroot, target) = compiler_context();
     let original = inspect_source_with_reduction(
-        &SourceInput {
-            source: REWRITTEN_MACRO_RULE_COORDINATES.to_owned(),
-            edition: Edition::Rust2024,
-            target: target.clone(),
-        },
+        &SourceInput::binary(
+            REWRITTEN_MACRO_RULE_COORDINATES.to_owned(),
+            Edition::Rust2024,
+            target.clone(),
+        ),
         &sysroot,
     )
     .expect("the original macro source must reduce");
 
     let reduced = inspect_source_with_dependencies_at_original_coordinates(
-        &SourceInput {
-            source: original.rewrite.source.clone(),
-            edition: Edition::Rust2024,
-            target,
-        },
+        &SourceInput::binary(original.rewrite.source.clone(), Edition::Rust2024, target),
         &sysroot,
         &original.rewrite,
     )
@@ -350,30 +343,27 @@ fn rewritten_macro_rule_requirements_keep_their_collected_source_ids() {
 fn a_remaining_full_range_item_is_not_mistaken_for_the_crate_root() {
     let (sysroot, target) = compiler_context();
     let original = inspect_source_with_reduction(
-        &SourceInput {
-            source: FULL_RANGE_REMAINING_ITEM.to_owned(),
-            edition: Edition::Rust2024,
-            target: target.clone(),
-        },
+        &SourceInput::binary(
+            FULL_RANGE_REMAINING_ITEM.to_owned(),
+            Edition::Rust2024,
+            target.clone(),
+        ),
         &sysroot,
     )
     .expect("the original source must reduce");
     assert_eq!(original.rewrite.source, "fn main() {}");
 
     let reduced = inspect_source_with_dependencies_at_original_coordinates(
-        &SourceInput {
-            source: original.rewrite.source.clone(),
-            edition: Edition::Rust2024,
-            target,
-        },
+        &SourceInput::binary(original.rewrite.source.clone(), Edition::Rust2024, target),
         &sysroot,
         &original.rewrite,
     )
     .expect("the remaining full-range item must map independently of the crate root");
+    let (_, original_main_definition) = main_nodes(&original.graph);
+    let (_, reduced_main_definition) = main_nodes(&reduced.graph);
     let original_main =
-        &original.graph.definitions.definitions[original.graph.main_definition.0 as usize];
-    let reduced_main =
-        &reduced.graph.definitions.definitions[reduced.graph.main_definition.0 as usize];
+        &original.graph.definitions.definitions[original_main_definition.0 as usize];
+    let reduced_main = &reduced.graph.definitions.definitions[reduced_main_definition.0 as usize];
     assert_eq!(reduced_main.key, original_main.key);
     assert_ne!(reduced_main.key.0.last(), reduced_main.key.0.first());
 }
@@ -381,11 +371,11 @@ fn a_remaining_full_range_item_is_not_mistaken_for_the_crate_root() {
 #[test]
 fn hirless_opaque_lifetime_keeps_its_graph_node_without_breaking_tag_collection() {
     let (sysroot, target) = compiler_context();
-    let input = SourceInput {
-        source: OPAQUE_LIFETIME_TAG_FIXTURE.to_owned(),
-        edition: Edition::Rust2024,
+    let input = SourceInput::binary(
+        OPAQUE_LIFETIME_TAG_FIXTURE.to_owned(),
+        Edition::Rust2024,
         target,
-    };
+    );
 
     let first = inspect_source_with_reduction(&input, &sysroot)
         .expect("a synthetic opaque lifetime must not be queried as a HIR node");
@@ -405,7 +395,7 @@ fn hirless_opaque_lifetime_keeps_its_graph_node_without_breaking_tag_collection(
     assert!(
         first
             .retention
-            .main_semantic
+            .semantic_required
             .contains(&GraphNode::Definition(tagged_definition))
     );
     assert!(
@@ -436,11 +426,7 @@ fn hirless_opaque_lifetime_keeps_its_graph_node_without_breaking_tag_collection(
 fn inspect_source(source: &str) -> DependencyGraph {
     let (sysroot, target) = compiler_context();
     inspect_source_with_dependencies(
-        &SourceInput {
-            source: source.to_owned(),
-            edition: Edition::Rust2024,
-            target,
-        },
+        &SourceInput::binary(source.to_owned(), Edition::Rust2024, target),
         &sysroot,
     )
     .expect("complete compiler observations must produce a dependency graph")
@@ -449,6 +435,26 @@ fn inspect_source(source: &str) -> DependencyGraph {
 
 fn inspect_fixture() -> DependencyGraph {
     inspect_source(FIXTURE)
+}
+
+fn main_nodes(graph: &DependencyGraph) -> (MonoId, DefinitionId) {
+    let roots = graph
+        .roots
+        .iter()
+        .filter(|root| root.reason == RootReason::Main)
+        .collect::<Vec<_>>();
+    let [root] = roots.as_slice() else {
+        panic!("a binary graph must have exactly one main root")
+    };
+    let GraphNode::Mono(instance) = root.node else {
+        panic!("the main root must be monomorphic")
+    };
+    let Some(DefinitionTarget::Local(definition)) =
+        graph.mono_nodes[instance.0 as usize].materialized_definition
+    else {
+        panic!("the main root must materialize a local definition")
+    };
+    (instance, definition)
 }
 
 fn assert_const_materializations(graph: &DependencyGraph) {
@@ -1787,7 +1793,8 @@ fn assert_roots_and_nodes(graph: &DependencyGraph) {
         ])
     );
 
-    let main = &graph.mono_nodes[graph.main_instance.0 as usize];
+    let (main_instance, main_definition) = main_nodes(graph);
+    let main = &graph.mono_nodes[main_instance.0 as usize];
     assert_eq!(
         main.materialized_definition
             .map(|target| target_label(&graph.definitions, target)),
@@ -1798,8 +1805,8 @@ fn assert_roots_and_nodes(graph: &DependencyGraph) {
             .edges
             .iter()
             .filter(|edge| {
-                edge.from == GraphNode::Mono(graph.main_instance)
-                    && edge.to == GraphNode::Definition(graph.main_definition)
+                edge.from == GraphNode::Mono(main_instance)
+                    && edge.to == GraphNode::Definition(main_definition)
                     && edge.kind == DependencyKind::MaterializesDefinition
             })
             .count(),
@@ -1807,10 +1814,14 @@ fn assert_roots_and_nodes(graph: &DependencyGraph) {
     );
 
     let mut roots = graph
-        .compiler_required_roots
+        .roots
         .iter()
+        .filter(|root| !root.reason.is_semantic())
         .map(|root| {
-            let node = &graph.mono_nodes[root.node.0 as usize];
+            let GraphNode::Mono(node) = root.node else {
+                panic!("compiler-required roots must be monomorphic")
+            };
+            let node = &graph.mono_nodes[node.0 as usize];
             (
                 root.reason,
                 node.materialized_definition

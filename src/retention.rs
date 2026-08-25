@@ -9,7 +9,7 @@ use rustc_middle::ty::{self, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisi
 use crate::definitions::CollectedDefinitions;
 use crate::dependency_graph::{
     DependencyGraph, DependencyKind, ExpansionNode, GraphNode, MacroImplementationKind,
-    expansion_source_survival,
+    expansion_source_survival, valid_roots,
 };
 use crate::graph::{
     DefinitionGraph, DefinitionId, DefinitionKind, DefinitionOrigin, DefinitionTarget,
@@ -599,7 +599,7 @@ fn optional_compiler_definition_unit(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Retention {
-    pub main_semantic: BTreeSet<GraphNode>,
+    pub semantic_required: BTreeSet<GraphNode>,
     pub compile_required: BTreeSet<GraphNode>,
     pub retained_units: BTreeSet<SourceUnitId>,
 }
@@ -622,23 +622,20 @@ pub(crate) fn compute_retention(
     let definition_units = definition_source_units(source, graph)?;
     let validated = validate_constraints(source, graph, constraints)?;
 
-    let main_roots = BTreeSet::from([
-        GraphNode::Definition(graph.main_definition),
-        GraphNode::Mono(graph.main_instance),
-    ]);
-    let main_semantic =
-        semantic_closure_for_source(graph, source, &definition_units, &validated, main_roots)?;
+    let semantic_roots = graph
+        .roots
+        .iter()
+        .filter(|root| root.reason.is_semantic())
+        .map(|root| root.node)
+        .collect();
+    let semantic_required =
+        semantic_closure_for_source(graph, source, &definition_units, &validated, semantic_roots)?;
 
-    let mut compile_roots = BTreeSet::from([
-        GraphNode::Definition(graph.main_definition),
-        GraphNode::Mono(graph.main_instance),
-    ]);
-    compile_roots.extend(
-        graph
-            .compiler_required_roots
-            .iter()
-            .map(|root| GraphNode::Mono(root.node)),
-    );
+    let compile_roots = graph
+        .roots
+        .iter()
+        .map(|root| root.node)
+        .collect::<BTreeSet<_>>();
     let mut compile_required = compile_roots;
     let mut retained_units = BTreeSet::new();
 
@@ -687,7 +684,7 @@ pub(crate) fn compute_retention(
     validate_retained_macro_definitions(source, &validated, &compile_required, &retained_units)?;
 
     Ok(Retention {
-        main_semantic,
+        semantic_required,
         compile_required,
         retained_units,
     })
@@ -1566,8 +1563,7 @@ fn validate_source(source: &SourceInventory) -> Result<(), RetentionError> {
 }
 
 fn validate_graph(graph: &DependencyGraph) -> Result<(), RetentionError> {
-    if graph.main_definition.0 as usize >= graph.definitions.definitions.len()
-        || graph.main_instance.0 as usize >= graph.mono_nodes.len()
+    if !valid_roots(&graph.roots, &graph.definitions, &graph.mono_nodes)
         || graph
             .definitions
             .definitions
@@ -1600,9 +1596,6 @@ fn validate_graph(graph: &DependencyGraph) -> Result<(), RetentionError> {
             .iter()
             .enumerate()
             .any(|(index, node)| node.id.0 as usize != index)
-        || graph.compiler_required_roots.iter().any(|root| {
-            root.node.0 as usize >= graph.mono_nodes.len() || root.node == graph.main_instance
-        })
         || graph
             .edges
             .iter()
@@ -1861,12 +1854,16 @@ mod tests {
             proofs: Vec::new(),
             mono_nodes,
             edges,
-            main_definition: main_id,
-            main_instance: MonoId(0),
-            compiler_required_roots: vec![RootRecord {
-                node: MonoId(1),
-                reason: RootReason::StartInstance,
-            }],
+            roots: vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::StartInstance,
+                },
+            ],
         }
     }
 
@@ -2001,12 +1998,13 @@ mod tests {
     }
 
     #[test]
-    fn compiler_roots_do_not_pollute_main_semantic() {
+    fn compiler_roots_do_not_pollute_semantic_requirements() {
         let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         let units = vec![
             unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
             unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
             unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
+            unit(3, WrittenUnitKind::Item, (21, 30), Some(0), 3),
         ];
         let inventory = inventory(source, units.clone());
         let definitions = vec![
@@ -2019,6 +2017,7 @@ mod tests {
                 Some(0),
                 "compiler_root",
             ),
+            written_definition(3, DefinitionKind::Function, &units[3], Some(0), "entry"),
         ];
         let mut graph = graph(
             definitions,
@@ -2036,9 +2035,13 @@ mod tests {
             materialized_definition: Some(crate::graph::DefinitionTarget::Local(DefinitionId(2))),
             allocation_observation: None,
         });
-        graph.compiler_required_roots.push(RootRecord {
-            node: compiler_root,
+        graph.roots.push(RootRecord {
+            node: GraphNode::Mono(compiler_root),
             reason: RootReason::UsedAttribute,
+        });
+        graph.roots.push(RootRecord {
+            node: GraphNode::Definition(DefinitionId(3)),
+            reason: RootReason::ExplicitEntry,
         });
         graph.edges.push(edge(
             GraphNode::Mono(compiler_root),
@@ -2052,10 +2055,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            retention.main_semantic,
+            retention.semantic_required,
             BTreeSet::from([
                 GraphNode::Definition(DefinitionId(0)),
                 GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(3)),
                 GraphNode::Mono(MonoId(0)),
             ])
         );
@@ -2063,6 +2067,73 @@ mod tests {
             retention
                 .compile_required
                 .contains(&GraphNode::Definition(DefinitionId(2)))
+        );
+    }
+
+    #[test]
+    fn a_reexport_definition_root_retains_a_generic_function_without_a_mono_node() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 40), None, 0),
+            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
+            unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
+            unit(3, WrittenUnitKind::Item, (21, 30), Some(0), 3),
+        ];
+        let inventory = inventory(source, units.clone());
+        let definitions = vec![
+            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "generic"),
+            written_definition(2, DefinitionKind::Use, &units[2], Some(0), "export"),
+            written_definition(3, DefinitionKind::Function, &units[3], Some(0), "unused"),
+        ];
+        let graph = DependencyGraph::new(
+            DefinitionGraph {
+                definitions,
+                external_definitions: Vec::new(),
+                edges: Vec::new(),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                edge(
+                    GraphNode::Definition(DefinitionId(2)),
+                    GraphNode::Definition(DefinitionId(1)),
+                ),
+                edge(
+                    GraphNode::Definition(DefinitionId(2)),
+                    GraphNode::Definition(DefinitionId(0)),
+                ),
+                edge(
+                    GraphNode::Definition(DefinitionId(1)),
+                    GraphNode::Definition(DefinitionId(0)),
+                ),
+            ],
+            vec![RootRecord {
+                node: GraphNode::Definition(DefinitionId(2)),
+                reason: RootReason::ExplicitEntry,
+            }],
+        )
+        .unwrap();
+        let retention = compute_retention(
+            &inventory,
+            &graph,
+            &complete_constraints(&inventory, &graph),
+        )
+        .unwrap();
+
+        assert!(graph.mono_nodes.is_empty());
+        assert_eq!(
+            retention.semantic_required,
+            BTreeSet::from([
+                GraphNode::Definition(DefinitionId(0)),
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(2)),
+            ])
+        );
+        assert_eq!(
+            retention.retained_units,
+            BTreeSet::from([SourceUnitId(0), SourceUnitId(1), SourceUnitId(2)])
         );
     }
 

@@ -487,7 +487,17 @@ pub(crate) fn collect_source(
     }
 
     let configured_attrs = pre_configure_attrs(&compiler.sess, &krate.attrs);
-    let features = features(&compiler.sess, &configured_attrs, Symbol::intern("main"));
+    let crate_name = compiler
+        .sess
+        .opts
+        .crate_name
+        .as_deref()
+        .ok_or(SourceError::InvalidInventory)?;
+    let features = features(
+        &compiler.sess,
+        &configured_attrs,
+        Symbol::intern(crate_name),
+    );
     let root_active = StripUnconfigured {
         sess: &compiler.sess,
         features: Some(&features),

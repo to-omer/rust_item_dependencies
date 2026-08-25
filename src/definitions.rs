@@ -7271,11 +7271,7 @@ mod exact_tests {
     fn inspect(source: &str) -> DefinitionGraph {
         let (sysroot, target) = compiler_context();
         inspect_source_with_definitions(
-            &SourceInput {
-                source: source.to_owned(),
-                edition: Edition::Rust2024,
-                target,
-            },
+            &SourceInput::binary(source.to_owned(), Edition::Rust2024, target),
             &sysroot,
         )
         .expect("the fixture must compile and produce a complete definition graph")
@@ -7689,11 +7685,7 @@ mod unpatched_tests {
             .to_owned();
 
         let error = inspect_source_with_definitions(
-            &SourceInput {
-                source: source.to_owned(),
-                edition: Edition::Rust2024,
-                target,
-            },
+            &SourceInput::binary(source.to_owned(), Edition::Rust2024, target),
             &sysroot,
         )
         .expect_err("an unpatched compiler cannot provide import provenance");

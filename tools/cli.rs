@@ -9,6 +9,9 @@ Options:
   -o, --output OUTPUT    Write reduced source to OUTPUT
       --edition YEAR     Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]
       --target TRIPLE    Compilation target [default: compiler host]
+      --crate-type TYPE  Crate type: bin or lib [default: bin]
+      --crate-name NAME  Crate name [default: main]
+      --entry PATH       Preserve a fully qualified function or static; may be repeated
   -O                     Same as --opt-level 3
       --opt-level LEVEL  Optimization level: 0, 1, 2, 3, s, or z [default: 0]
       --cfg NAME         Enable a name-only cfg; may be repeated
@@ -39,6 +42,12 @@ pub enum CliOptimizationLevel {
     SizeMin,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CliCrateType {
+    Binary,
+    Library,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct CliExternalCrate {
     pub extern_name: String,
@@ -51,6 +60,9 @@ pub struct Cli {
     pub output: PathBuf,
     pub edition: CliEdition,
     pub target: Option<String>,
+    pub crate_type: CliCrateType,
+    pub crate_name: String,
+    pub entry_points: Vec<String>,
     pub optimization_level: CliOptimizationLevel,
     pub cfg_names: Vec<String>,
     pub external_crates: Vec<CliExternalCrate>,
@@ -60,7 +72,7 @@ pub struct Cli {
 
 #[derive(Debug)]
 pub enum Parsed {
-    Run(Cli),
+    Run(Box<Cli>),
     Help,
 }
 
@@ -73,6 +85,9 @@ pub fn parse_arguments(
     let mut output = None;
     let mut edition = CliEdition::Rust2024;
     let mut target = None;
+    let mut crate_type = CliCrateType::Binary;
+    let mut crate_name = "main".to_owned();
+    let mut entry_points = Vec::new();
     let mut optimization_level = CliOptimizationLevel::O0;
     let mut cfg_names = Vec::new();
     let mut external_crates = Vec::new();
@@ -102,6 +117,18 @@ pub fn parse_arguments(
                         return Err("--target requires a nonempty value".to_owned());
                     }
                     target = Some(value);
+                    continue;
+                }
+                Some("--crate-type") => {
+                    crate_type = parse_crate_type(next_utf8(&mut arguments, "--crate-type")?)?;
+                    continue;
+                }
+                Some("--crate-name") => {
+                    crate_name = next_utf8(&mut arguments, "--crate-name")?;
+                    continue;
+                }
+                Some("--entry") => {
+                    entry_points.push(next_utf8(&mut arguments, "--entry")?);
                     continue;
                 }
                 Some("-O") => {
@@ -154,17 +181,20 @@ pub fn parse_arguments(
 
     let input = input.ok_or_else(|| format!("missing input file\n\n{usage}"))?;
     let output = output.ok_or_else(|| format!("missing --output\n\n{usage}"))?;
-    Ok(Parsed::Run(Cli {
+    Ok(Parsed::Run(Box::new(Cli {
         input,
         output,
         edition,
         target,
+        crate_type,
+        crate_name,
+        entry_points,
         optimization_level,
         cfg_names,
         external_crates,
         dependency_artifacts,
         allowed_proc_macro_artifacts,
-    }))
+    })))
 }
 
 pub fn validate_output(cli: &Cli) -> Result<(), String> {
@@ -226,6 +256,16 @@ fn parse_optimization_level(value: String) -> Result<CliOptimizationLevel, Strin
         "z" => Ok(CliOptimizationLevel::SizeMin),
         _ => Err(format!(
             "unsupported optimization level: {value}; expected 0, 1, 2, 3, s, or z"
+        )),
+    }
+}
+
+fn parse_crate_type(value: String) -> Result<CliCrateType, String> {
+    match value.as_str() {
+        "bin" => Ok(CliCrateType::Binary),
+        "lib" => Ok(CliCrateType::Library),
+        _ => Err(format!(
+            "unsupported crate type: {value}; expected bin or lib"
         )),
     }
 }

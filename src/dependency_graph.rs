@@ -523,14 +523,26 @@ pub struct DependencyEdge {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RootReason {
+    Main,
+    ExplicitEntry,
+    DownstreamSelection,
     StartInstance,
     UsedAttribute,
     ExternalSymbol,
 }
 
+impl RootReason {
+    pub(crate) fn is_semantic(self) -> bool {
+        matches!(
+            self,
+            Self::Main | Self::ExplicitEntry | Self::DownstreamSelection
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RootRecord {
-    pub node: MonoId,
+    pub node: GraphNode,
     pub reason: RootReason,
 }
 
@@ -541,9 +553,7 @@ pub struct DependencyGraph {
     pub proofs: Vec<ProofNode>,
     pub mono_nodes: Vec<MonoNode>,
     pub edges: Vec<DependencyEdge>,
-    pub main_definition: DefinitionId,
-    pub main_instance: MonoId,
-    pub compiler_required_roots: Vec<RootRecord>,
+    pub roots: Vec<RootRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -561,27 +571,18 @@ impl DependencyGraph {
         self.edges.iter().filter(move |edge| edge.from == from)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         definitions: DefinitionGraph,
         mut expansions: Vec<ExpansionNode>,
         mut proofs: Vec<ProofNode>,
         mut mono_nodes: Vec<MonoNode>,
         edges: Vec<DependencyEdge>,
-        main_definition: DefinitionId,
-        main_instance: MonoId,
-        mut compiler_required_roots: Vec<RootRecord>,
+        mut roots: Vec<RootRecord>,
     ) -> Result<Self, DependencyGraphError> {
         expansions.sort_by_key(|node| node.id);
         proofs.sort_by_key(|node| node.id);
         mono_nodes.sort_by_key(|node| node.id);
-        compiler_required_roots.sort();
-        if compiler_required_roots
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
-        {
-            return Err(DependencyGraphError::InvalidRoot);
-        }
+        roots.sort();
 
         if !dense(&expansions, |node| node.id.0)
             || expansions
@@ -632,47 +633,7 @@ impl DependencyGraph {
             return Err(DependencyGraphError::InvalidMonoNode);
         }
 
-        if main_definition.0 as usize >= definitions.definitions.len()
-            || main_instance.0 as usize >= mono_nodes.len()
-            || !matches!(
-                &mono_nodes[main_instance.0 as usize].key,
-                MonoKey::Instance {
-                    instance: MonoInstanceKey {
-                        definition: DefinitionReferenceKey::Local(key),
-                        ..
-                    },
-                    role: MonoInstanceRole::Callable,
-                } if *key == definitions.definitions[main_definition.0 as usize].key
-            )
-            || compiler_required_roots.iter().any(|root| {
-                root.node.0 as usize >= mono_nodes.len()
-                    || root.node == main_instance
-                    || match root.reason {
-                        RootReason::StartInstance => !matches!(
-                            mono_nodes[root.node.0 as usize].key,
-                            MonoKey::Instance {
-                                role: MonoInstanceRole::Callable,
-                                ..
-                            }
-                        ),
-                        RootReason::UsedAttribute => {
-                            !matches!(mono_nodes[root.node.0 as usize].key, MonoKey::Static { .. })
-                        }
-                        RootReason::ExternalSymbol => !matches!(
-                            mono_nodes[root.node.0 as usize].key,
-                            MonoKey::Instance {
-                                role: MonoInstanceRole::Callable,
-                                ..
-                            } | MonoKey::Static { .. }
-                        ),
-                    }
-            })
-            || compiler_required_roots
-                .iter()
-                .filter(|root| root.reason == RootReason::StartInstance)
-                .count()
-                != 1
-        {
+        if !valid_roots(&roots, &definitions, &mono_nodes) {
             return Err(DependencyGraphError::InvalidRoot);
         }
 
@@ -723,8 +684,12 @@ impl DependencyGraph {
             return Err(DependencyGraphError::InvalidProof);
         }
 
-        let mono_roots = std::iter::once(main_instance)
-            .chain(compiler_required_roots.iter().map(|root| root.node))
+        let mono_roots = roots
+            .iter()
+            .filter_map(|root| match root.node {
+                GraphNode::Mono(node) => Some(node),
+                _ => None,
+            })
             .collect::<Vec<_>>();
         let reachable_mono = reachable_mono_nodes(&mono_roots, &edges);
         if reachable_mono.len() != mono_nodes.len() {
@@ -782,11 +747,128 @@ impl DependencyGraph {
             proofs,
             mono_nodes,
             edges,
-            main_definition,
-            main_instance,
-            compiler_required_roots,
+            roots,
         })
     }
+}
+
+pub(crate) fn valid_roots(
+    roots: &[RootRecord],
+    definitions: &DefinitionGraph,
+    mono_nodes: &[MonoNode],
+) -> bool {
+    let records = roots.iter().copied().collect::<BTreeSet<_>>();
+    if records.len() != roots.len() {
+        return false;
+    }
+
+    let main_count = roots
+        .iter()
+        .filter(|root| root.reason == RootReason::Main)
+        .count();
+    let start_count = roots
+        .iter()
+        .filter(|root| root.reason == RootReason::StartInstance)
+        .count();
+    if main_count > 1 || start_count > 1 || main_count != start_count {
+        return false;
+    }
+
+    roots.iter().all(|root| {
+        let mono_node = |node| match node {
+            GraphNode::Mono(node) => mono_nodes.get(node.0 as usize),
+            _ => None,
+        };
+        match root.reason {
+            RootReason::Main => matches!(
+                mono_node(root.node).map(|node| &node.key),
+                Some(MonoKey::Instance {
+                    instance: MonoInstanceKey {
+                        definition: DefinitionReferenceKey::Local(_),
+                        ..
+                    },
+                    role: MonoInstanceRole::Callable,
+                })
+            ),
+            RootReason::ExplicitEntry => match root.node {
+                GraphNode::Definition(definition) => definitions
+                    .definitions
+                    .get(definition.0 as usize)
+                    .is_some_and(|definition| {
+                        matches!(
+                            definition.kind,
+                            crate::graph::DefinitionKind::Function
+                                | crate::graph::DefinitionKind::Use
+                        )
+                    }),
+                node => matches!(
+                    mono_node(node).map(|node| &node.key),
+                    Some(
+                        MonoKey::Instance {
+                            instance: MonoInstanceKey {
+                                definition: DefinitionReferenceKey::Local(_),
+                                ..
+                            },
+                            role: MonoInstanceRole::Callable,
+                        } | MonoKey::Static { .. }
+                    )
+                ),
+            },
+            RootReason::DownstreamSelection => matches!(
+                root.node,
+                GraphNode::Definition(definition)
+                    if is_downstream_selection_candidate(definitions, definition)
+            ),
+            RootReason::StartInstance => matches!(
+                mono_node(root.node).map(|node| &node.key),
+                Some(MonoKey::Instance {
+                    role: MonoInstanceRole::Callable,
+                    ..
+                })
+            ),
+            RootReason::UsedAttribute => matches!(
+                mono_node(root.node).map(|node| &node.key),
+                Some(MonoKey::Static { .. })
+            ),
+            RootReason::ExternalSymbol => matches!(
+                mono_node(root.node).map(|node| &node.key),
+                Some(
+                    MonoKey::Instance {
+                        role: MonoInstanceRole::Callable,
+                        ..
+                    } | MonoKey::Static { .. }
+                )
+            ),
+        }
+    })
+}
+
+pub(crate) fn is_downstream_selection_candidate(
+    definitions: &DefinitionGraph,
+    id: DefinitionId,
+) -> bool {
+    let Some(definition) = definitions.definitions.get(id.0 as usize) else {
+        return false;
+    };
+    matches!(
+        definition.kind,
+        crate::graph::DefinitionKind::Trait | crate::graph::DefinitionKind::Impl
+    ) || matches!(
+        definition.kind,
+        crate::graph::DefinitionKind::AssociatedType
+            | crate::graph::DefinitionKind::AssociatedFunction
+            | crate::graph::DefinitionKind::AssociatedConst
+    ) && definition.parent.is_some_and(|parent| {
+        definitions
+            .definitions
+            .get(parent.0 as usize)
+            .is_some_and(|parent| {
+                matches!(
+                    parent.kind,
+                    crate::graph::DefinitionKind::Trait | crate::graph::DefinitionKind::Impl
+                )
+            })
+    })
 }
 
 fn reachable_mono_nodes(roots: &[MonoId], edges: &[DependencyEdge]) -> BTreeSet<MonoId> {
@@ -2121,6 +2203,27 @@ mod tests {
         mono_nodes: Vec<MonoNode>,
         edges: Vec<DependencyEdge>,
     ) -> Result<DependencyGraph, DependencyGraphError> {
+        allocation_graph_with_roots(
+            mono_nodes,
+            edges,
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::StartInstance,
+                },
+            ],
+        )
+    }
+
+    fn allocation_graph_with_roots(
+        mono_nodes: Vec<MonoNode>,
+        edges: Vec<DependencyEdge>,
+        roots: Vec<RootRecord>,
+    ) -> Result<DependencyGraph, DependencyGraphError> {
         let (definitions, _, _) = allocation_graph_parts();
         DependencyGraph::new(
             definitions,
@@ -2128,12 +2231,7 @@ mod tests {
             Vec::new(),
             mono_nodes,
             edges,
-            DefinitionId(0),
-            MonoId(0),
-            vec![RootRecord {
-                node: MonoId(1),
-                reason: RootReason::StartInstance,
-            }],
+            roots,
         )
     }
 
@@ -2395,12 +2493,16 @@ mod tests {
             proofs,
             mono_nodes,
             edges,
-            DefinitionId(0),
-            MonoId(0),
-            vec![RootRecord {
-                node: MonoId(1),
-                reason: RootReason::StartInstance,
-            }],
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::StartInstance,
+                },
+            ],
         )
     }
 
@@ -2550,6 +2652,284 @@ mod tests {
             allocation_graph(reversed_nodes, reversed_edges).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn roots_keep_distinct_reasons_for_the_same_node() {
+        let (_, nodes, edges) = allocation_graph_parts();
+        let graph = allocation_graph_with_roots(
+            nodes,
+            edges,
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::ExternalSymbol,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::StartInstance,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::ExplicitEntry,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            graph.roots,
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::ExplicitEntry,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::ExternalSymbol,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::StartInstance,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_definition_roots_accept_functions_and_uses() {
+        for kind in [DefinitionKind::Function, DefinitionKind::Use] {
+            let (mut definitions, _, _) = allocation_graph_parts();
+            definitions.definitions[0].kind = kind;
+            definitions.definitions[0].key.0[0].kind = kind;
+
+            let graph = DependencyGraph::new(
+                definitions,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![RootRecord {
+                    node: GraphNode::Definition(DefinitionId(0)),
+                    reason: RootReason::ExplicitEntry,
+                }],
+            )
+            .unwrap();
+
+            assert_eq!(
+                graph.roots,
+                vec![RootRecord {
+                    node: GraphNode::Definition(DefinitionId(0)),
+                    reason: RootReason::ExplicitEntry,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_definition_roots_reject_other_definition_kinds() {
+        let (mut definitions, _, _) = allocation_graph_parts();
+        definitions.definitions[0].kind = DefinitionKind::Static;
+        definitions.definitions[0].key.0[0].kind = DefinitionKind::Static;
+
+        assert_eq!(
+            DependencyGraph::new(
+                definitions,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![RootRecord {
+                    node: GraphNode::Definition(DefinitionId(0)),
+                    reason: RootReason::ExplicitEntry,
+                }],
+            ),
+            Err(DependencyGraphError::InvalidRoot)
+        );
+    }
+
+    #[test]
+    fn downstream_selection_candidates_are_containers_and_their_direct_members() {
+        let (mut definitions, _, _) = allocation_graph_parts();
+        definitions.definitions[0].kind = DefinitionKind::Trait;
+        assert!(is_downstream_selection_candidate(
+            &definitions,
+            DefinitionId(0)
+        ));
+
+        let mut member = definitions.definitions[0].clone();
+        member.id = DefinitionId(1);
+        member.kind = DefinitionKind::AssociatedFunction;
+        member.parent = Some(DefinitionId(0));
+        definitions.definitions.push(member);
+        assert!(is_downstream_selection_candidate(
+            &definitions,
+            DefinitionId(1)
+        ));
+
+        definitions.definitions[0].kind = DefinitionKind::Function;
+        assert!(!is_downstream_selection_candidate(
+            &definitions,
+            DefinitionId(0)
+        ));
+        assert!(!is_downstream_selection_candidate(
+            &definitions,
+            DefinitionId(1)
+        ));
+    }
+
+    #[test]
+    fn an_explicit_static_root_uses_the_local_mono_node() {
+        let (mut definitions, _, _) = allocation_graph_parts();
+        definitions.definitions[0].kind = DefinitionKind::Static;
+        definitions.definitions[0].key.0[0].kind = DefinitionKind::Static;
+        let definition_key = definitions.definitions[0].key.clone();
+        let mono_nodes = vec![MonoNode {
+            id: MonoId(0),
+            key: MonoKey::Static {
+                definition: definition_key,
+            },
+            materialized_definition: Some(DefinitionTarget::Local(DefinitionId(0))),
+            allocation_observation: None,
+        }];
+        let edges = vec![DependencyEdge {
+            from: GraphNode::Mono(MonoId(0)),
+            to: GraphNode::Definition(DefinitionId(0)),
+            kind: DependencyKind::MaterializesDefinition,
+            sites: Vec::new(),
+            evidence: EvidenceOrigin::Derived,
+        }];
+
+        assert!(
+            DependencyGraph::new(
+                definitions,
+                Vec::new(),
+                Vec::new(),
+                mono_nodes,
+                edges,
+                vec![RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::ExplicitEntry,
+                }],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn roots_reject_duplicate_records_and_unpaired_binary_roots() {
+        for roots in [
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::StartInstance,
+                },
+            ],
+            vec![RootRecord {
+                node: GraphNode::Mono(MonoId(0)),
+                reason: RootReason::Main,
+            }],
+            vec![RootRecord {
+                node: GraphNode::Mono(MonoId(1)),
+                reason: RootReason::StartInstance,
+            }],
+        ] {
+            let (_, nodes, edges) = allocation_graph_parts();
+            assert_eq!(
+                allocation_graph_with_roots(nodes, edges, roots),
+                Err(DependencyGraphError::InvalidRoot)
+            );
+        }
+    }
+
+    #[test]
+    fn roots_reject_an_invalid_reason_shape() {
+        for roots in [
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::StartInstance,
+                },
+            ],
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::StartInstance,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(2)),
+                    reason: RootReason::ExplicitEntry,
+                },
+            ],
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(2)),
+                    reason: RootReason::StartInstance,
+                },
+            ],
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::StartInstance,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::UsedAttribute,
+                },
+            ],
+            vec![
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(0)),
+                    reason: RootReason::Main,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(1)),
+                    reason: RootReason::StartInstance,
+                },
+                RootRecord {
+                    node: GraphNode::Mono(MonoId(2)),
+                    reason: RootReason::ExternalSymbol,
+                },
+            ],
+        ] {
+            let (_, nodes, edges) = allocation_graph_parts();
+            assert_eq!(
+                allocation_graph_with_roots(nodes, edges, roots),
+                Err(DependencyGraphError::InvalidRoot)
+            );
+        }
     }
 
     #[test]
