@@ -56,6 +56,9 @@ fn main() {
 }
 "#;
 
+const REWRITTEN_MACRO_RULE_COORDINATES: &str =
+    include_str!("../../tests/fixtures/compiler/macro_rule_expansion_retention.rs");
+
 const FULL_RANGE_REMAINING_ITEM: &str = "fn dead() {}fn main() {}";
 
 const EXTERNAL_SYMBOL_ROOTS: &str =
@@ -299,6 +302,48 @@ fn rewritten_collection_uses_original_coordinates_for_compiler_identity() {
                 0,
             ))]
     }));
+}
+
+#[test]
+fn rewritten_macro_rule_requirements_keep_their_collected_source_ids() {
+    let (sysroot, target) = compiler_context();
+    let original = inspect_source_with_reduction(
+        &SourceInput {
+            source: REWRITTEN_MACRO_RULE_COORDINATES.to_owned(),
+            edition: Edition::Rust2024,
+            target: target.clone(),
+        },
+        &sysroot,
+    )
+    .expect("the original macro source must reduce");
+
+    let reduced = inspect_source_with_dependencies_at_original_coordinates(
+        &SourceInput {
+            source: original.rewrite.source.clone(),
+            edition: Edition::Rust2024,
+            target,
+        },
+        &sysroot,
+        &original.rewrite,
+    )
+    .expect("the reduced macro source must map compiler identities to original coordinates");
+
+    assert!(
+        reduced
+            .constraints
+            .macro_rule_selection_requirements
+            .iter()
+            .any(|requirement| {
+                let selected_range = reduced.graph.expansions[requirement.expansion.0 as usize]
+                    .key
+                    .0
+                    .last()
+                    .and_then(|part| part.selected_macro_rule)
+                    .expect("a selected macro rule must remain in the compiler identity");
+                selected_range != reduced.source.units[requirement.rule.0 as usize].full_range
+            }),
+        "the fixture must exercise different compiler-identity and source-unit coordinates"
+    );
 }
 
 #[test]

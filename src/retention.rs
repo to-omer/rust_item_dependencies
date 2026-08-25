@@ -7,10 +7,15 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::ty::{self, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
 
 use crate::definitions::CollectedDefinitions;
-use crate::dependency_graph::{DependencyGraph, DependencyKind, GraphNode};
-use crate::graph::{DefinitionGraph, DefinitionId, DefinitionKind, DefinitionOrigin};
+use crate::dependency_graph::{
+    DependencyGraph, DependencyKind, ExpansionNode, GraphNode, MacroImplementationKind,
+    expansion_source_survival,
+};
+use crate::graph::{
+    DefinitionGraph, DefinitionId, DefinitionKind, DefinitionOrigin, DefinitionTarget,
+};
 use crate::source::{
-    CfgState, MacroRuleSourceFacts, SourceInventory, SourceUnitId, WrittenUnitKind,
+    CfgState, MacroRuleSourceFacts, SourceInventory, SourceUnitId, WrittenUnit, WrittenUnitKind,
     validate_macro_rule_facts, validate_ownerless_attribute_invocations,
 };
 
@@ -18,6 +23,18 @@ use crate::source::{
 pub(crate) struct SourceRequirement {
     pub trigger: SourceUnitId,
     pub required: SourceUnitId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompilerSourceRequirement {
+    trigger: GraphNode,
+    required: SourceUnitId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MacroRuleSelectionRequirement {
+    pub expansion: crate::dependency_graph::ExpansionId,
+    pub rule: SourceUnitId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -43,12 +60,14 @@ fn source_macro_rule_requirements(
             MacroRuleSourceFacts::Whole { .. } => None,
             MacroRuleSourceFacts::Refined {
                 definition,
-                required_rules,
+                rules,
+                observed_selections,
                 ..
-            } => Some((*definition, required_rules.as_slice())),
+            } if observed_selections.is_empty() => Some((*definition, rules.as_slice())),
+            MacroRuleSourceFacts::Refined { .. } => None,
         })
-        .flat_map(|(trigger, required_rules)| {
-            required_rules
+        .flat_map(|(trigger, rules)| {
+            rules
                 .iter()
                 .copied()
                 .map(move |required| SourceRequirement { trigger, required })
@@ -58,12 +77,13 @@ fn source_macro_rule_requirements(
 /// Owned source-domain constraints collected before leaving the compiler
 /// session.
 ///
-/// `member_containers` and `classified_members` are coverage witnesses.  They
-/// make an omitted trait/impl classification an error instead of silently
-/// retaining a wider source unit.
+/// Compiler-to-source facts remain producer-specific here so each producer
+/// can prove its own coverage before validation projects them into the shared
+/// retention fixed point.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceConstraints {
     pub atomic_groups: Vec<Vec<SourceUnitId>>,
+    pub macro_rule_selection_requirements: Vec<MacroRuleSelectionRequirement>,
     pub ancestor_requirements: Vec<SourceRequirement>,
     pub shell_requirements: Vec<SourceRequirement>,
     pub macro_rule_requirements: Vec<SourceRequirement>,
@@ -88,6 +108,7 @@ impl SourceConstraints {
         }
         Self {
             atomic_groups: groups.into_values().collect(),
+            macro_rule_selection_requirements: Vec::new(),
             ancestor_requirements: source
                 .units
                 .iter()
@@ -663,6 +684,7 @@ pub(crate) fn compute_retention(
     if !retained_units.contains(&root.id) {
         return Err(RetentionError::InvalidGraph);
     }
+    validate_retained_macro_definitions(source, &validated, &compile_required, &retained_units)?;
 
     Ok(Retention {
         main_semantic,
@@ -692,6 +714,11 @@ fn close_deterministic_constraints(
         for node in compile_required.iter().copied().collect::<Vec<_>>() {
             if let GraphNode::Definition(definition) = node {
                 retained_units.insert(definition_units[definition.0 as usize]);
+            }
+        }
+        for requirement in constraints.compiler_source_requirements() {
+            if compile_required.contains(&requirement.trigger) {
+                retained_units.insert(requirement.required);
             }
         }
         close_source_requirements(constraints, retained_units);
@@ -776,6 +803,18 @@ fn compiler_closure_for_source(
     retained_units: &BTreeSet<SourceUnitId>,
     reachable: BTreeSet<GraphNode>,
 ) -> Result<BTreeSet<GraphNode>, RetentionError> {
+    let surviving_expansions = expansion_source_survival(&graph.expansions, |unit| {
+        source
+            .units
+            .get(unit.0 as usize)
+            .filter(|written| {
+                written.id == unit
+                    && written.kind == WrittenUnitKind::MacroInvocation
+                    && written.cfg_state == CfgState::Active
+            })
+            .map(|written| retained_units.contains(&written.id))
+    })
+    .ok_or(RetentionError::InvalidGraph)?;
     let mut reachable = reachable;
     let mut work = reachable.iter().copied().collect::<Vec<_>>();
     while let Some(from) = work.pop() {
@@ -804,6 +843,16 @@ fn compiler_closure_for_source(
                     _ => true,
                 }
             };
+            let active = active
+                && match (&edge.kind, edge.to) {
+                    (DependencyKind::ExpansionUse, GraphNode::Expansion(expansion)) => {
+                        surviving_expansions
+                            .get(expansion.0 as usize)
+                            .copied()
+                            .ok_or(RetentionError::InvalidGraph)?
+                    }
+                    _ => true,
+                };
             if active && reachable.insert(edge.to) {
                 work.push(edge.to);
             }
@@ -885,12 +934,24 @@ fn is_compiler_dependency(kind: &DependencyKind) -> bool {
 #[derive(Clone)]
 struct ValidatedConstraints {
     atomic_groups: Vec<Vec<SourceUnitId>>,
+    macro_rule_selection_requirements: Vec<MacroRuleSelectionRequirement>,
     ancestor_requirements: Vec<SourceRequirement>,
     shell_requirements: Vec<SourceRequirement>,
     macro_rule_requirements: Vec<SourceRequirement>,
     member_requirements: Vec<SourceRequirement>,
     conditional_member_requirements: Vec<ConditionalSourceRequirement>,
     disjunctions: Vec<SourceDisjunction>,
+}
+
+impl ValidatedConstraints {
+    fn compiler_source_requirements(&self) -> impl Iterator<Item = CompilerSourceRequirement> + '_ {
+        self.macro_rule_selection_requirements
+            .iter()
+            .map(|requirement| CompilerSourceRequirement {
+                trigger: GraphNode::Expansion(requirement.expansion),
+                required: requirement.rule,
+            })
+    }
 }
 
 fn validate_constraints(
@@ -962,6 +1023,11 @@ fn validate_constraints(
     if macro_rules.iter().copied().collect::<BTreeSet<_>>() != expected_macro_rules {
         return Err(RetentionError::InvalidConstraint);
     }
+    let macro_rule_selection_requirements = validate_macro_rule_selection_requirements(
+        source,
+        graph,
+        &constraints.macro_rule_selection_requirements,
+    )?;
     let members = validate_requirements(
         source,
         &constraints.member_requirements,
@@ -1054,6 +1120,7 @@ fn validate_constraints(
             .into_iter()
             .map(|group| group.into_iter().collect())
             .collect(),
+        macro_rule_selection_requirements,
         ancestor_requirements: ancestors,
         shell_requirements: shells,
         macro_rule_requirements: macro_rules,
@@ -1061,6 +1128,220 @@ fn validate_constraints(
         conditional_member_requirements: conditional_members,
         disjunctions,
     })
+}
+
+pub(crate) fn collect_macro_rule_expansion_constraints(
+    source: &SourceInventory,
+    definitions: &DefinitionGraph,
+    expansions: &[ExpansionNode],
+    constraints: &mut SourceConstraints,
+) -> Result<(), RetentionError> {
+    if !constraints.macro_rule_selection_requirements.is_empty() {
+        return Err(RetentionError::InvalidConstraint);
+    }
+    let mut requirements = BTreeSet::new();
+    for expansion in expansions {
+        let Some(selected_range) = expansion
+            .key
+            .0
+            .last()
+            .and_then(|part| part.selected_macro_rule)
+        else {
+            continue;
+        };
+        let Some(rule) = selected_macro_rule_unit(source, selected_range)? else {
+            continue;
+        };
+        let requirement = MacroRuleSelectionRequirement {
+            expansion: expansion.id,
+            rule: rule.id,
+        };
+        if !macro_rule_requirement_matches(source, definitions, expansion, requirement.rule)
+            || !requirements.insert(requirement)
+        {
+            return Err(RetentionError::InvalidConstraint);
+        }
+    }
+
+    if macro_rule_selection_counts(requirements.iter().map(|requirement| requirement.rule))
+        != observed_macro_rule_selection_counts(source)
+    {
+        return Err(RetentionError::InvalidConstraint);
+    }
+    constraints
+        .macro_rule_selection_requirements
+        .extend(requirements);
+    Ok(())
+}
+
+fn selected_macro_rule_unit(
+    source: &SourceInventory,
+    selected_range: crate::source::ByteRange,
+) -> Result<Option<&WrittenUnit>, RetentionError> {
+    let matching_rules = source
+        .units
+        .iter()
+        .filter(|unit| {
+            unit.kind == WrittenUnitKind::MacroRule
+                && unit.cfg_state == CfgState::Active
+                && unit.full_range == selected_range
+        })
+        .collect::<Vec<_>>();
+    if let [rule] = matching_rules.as_slice() {
+        return Ok(Some(rule));
+    }
+    if !matching_rules.is_empty() {
+        return Err(RetentionError::InvalidConstraint);
+    }
+
+    let enclosing_whole_definitions = source
+        .macro_rules
+        .iter()
+        .filter_map(|facts| match facts {
+            MacroRuleSourceFacts::Whole { definition } => source.units.get(definition.0 as usize),
+            MacroRuleSourceFacts::Refined { .. } => None,
+        })
+        .filter(|definition| definition.full_range.contains(selected_range))
+        .count();
+    match enclosing_whole_definitions {
+        1 => Ok(None),
+        _ => Err(RetentionError::InvalidConstraint),
+    }
+}
+
+fn validate_macro_rule_selection_requirements(
+    source: &SourceInventory,
+    graph: &DependencyGraph,
+    requirements: &[MacroRuleSelectionRequirement],
+) -> Result<Vec<MacroRuleSelectionRequirement>, RetentionError> {
+    let requirement_count = requirements.len();
+    let requirements = requirements.iter().copied().collect::<BTreeSet<_>>();
+    let expansion_count = requirements
+        .iter()
+        .map(|requirement| requirement.expansion)
+        .collect::<BTreeSet<_>>()
+        .len();
+    if requirements.len() != requirement_count
+        || expansion_count != requirements.len()
+        || requirements.iter().any(|requirement| {
+            graph
+                .expansions
+                .get(requirement.expansion.0 as usize)
+                .filter(|expansion| expansion.id == requirement.expansion)
+                .is_none_or(|expansion| {
+                    !macro_rule_requirement_matches(
+                        source,
+                        &graph.definitions,
+                        expansion,
+                        requirement.rule,
+                    )
+                })
+        })
+    {
+        return Err(RetentionError::InvalidConstraint);
+    }
+    if macro_rule_selection_counts(requirements.iter().map(|requirement| requirement.rule))
+        != observed_macro_rule_selection_counts(source)
+    {
+        return Err(RetentionError::InvalidConstraint);
+    }
+    Ok(requirements.into_iter().collect())
+}
+
+fn macro_rule_selection_definition(
+    source: &SourceInventory,
+    definitions: &DefinitionGraph,
+    expansion: &ExpansionNode,
+) -> Option<SourceUnitId> {
+    if expansion.implementation != Some(MacroImplementationKind::Declarative) {
+        return None;
+    }
+    let DefinitionTarget::Local(definition) = expansion.macro_definition? else {
+        return None;
+    };
+    let definition = definitions.definitions.get(definition.0 as usize)?;
+    let DefinitionOrigin::Written { unit, .. } = &definition.origin else {
+        return None;
+    };
+    (definition.kind == DefinitionKind::Macro
+        && source.macro_rules.iter().any(|facts| {
+            matches!(facts, MacroRuleSourceFacts::Refined { definition, .. } if definition == unit)
+        }))
+    .then_some(*unit)
+}
+
+fn macro_rule_requirement_matches(
+    source: &SourceInventory,
+    definitions: &DefinitionGraph,
+    expansion: &ExpansionNode,
+    required: SourceUnitId,
+) -> bool {
+    let Some(rule) = source.units.get(required.0 as usize).filter(|rule| {
+        rule.id == required
+            && rule.kind == WrittenUnitKind::MacroRule
+            && rule.cfg_state == CfgState::Active
+    }) else {
+        return false;
+    };
+    macro_rule_selection_definition(source, definitions, expansion)
+        .is_some_and(|definition_unit| rule.parent == Some(definition_unit))
+}
+
+fn macro_rule_selection_counts(
+    selections: impl Iterator<Item = SourceUnitId>,
+) -> BTreeMap<SourceUnitId, usize> {
+    let mut counts = BTreeMap::new();
+    for selection in selections {
+        *counts.entry(selection).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn observed_macro_rule_selection_counts(source: &SourceInventory) -> BTreeMap<SourceUnitId, usize> {
+    macro_rule_selection_counts(
+        source
+            .macro_rules
+            .iter()
+            .flat_map(|facts| match facts {
+                MacroRuleSourceFacts::Whole { .. } => &[][..],
+                MacroRuleSourceFacts::Refined {
+                    observed_selections,
+                    ..
+                } => observed_selections.as_slice(),
+            })
+            .copied(),
+    )
+}
+
+fn validate_retained_macro_definitions(
+    source: &SourceInventory,
+    constraints: &ValidatedConstraints,
+    compile_required: &BTreeSet<GraphNode>,
+    retained_units: &BTreeSet<SourceUnitId>,
+) -> Result<(), RetentionError> {
+    let definitions_with_reachable_selection = constraints
+        .macro_rule_selection_requirements
+        .iter()
+        .filter(|requirement| {
+            compile_required.contains(&GraphNode::Expansion(requirement.expansion))
+        })
+        .filter_map(|requirement| source.units[requirement.rule.0 as usize].parent)
+        .collect::<BTreeSet<_>>();
+    if source.macro_rules.iter().any(|facts| match facts {
+        MacroRuleSourceFacts::Whole { .. } => false,
+        MacroRuleSourceFacts::Refined {
+            definition,
+            observed_selections,
+            ..
+        } => {
+            !observed_selections.is_empty()
+                && retained_units.contains(definition)
+                && !definitions_with_reachable_selection.contains(definition)
+        }
+    }) {
+        return Err(RetentionError::InvalidConstraint);
+    }
+    Ok(())
 }
 
 fn validate_conditional_requirements(
@@ -1350,8 +1631,9 @@ mod tests {
 
     use crate::compiler_terms::CanonicalCompilerTerm;
     use crate::dependency_graph::{
-        DefinitionReferenceKey, DependencyEdge, EvidenceOrigin, MonoInstanceKey, MonoInstanceRole,
-        MonoKey, MonoNode, ObservationSite, RootReason, RootRecord,
+        DefinitionReferenceKey, DependencyEdge, EvidenceOrigin, ExpansionFragmentKind, ExpansionId,
+        ExpansionKey, ExpansionKeyPart, ExpansionKind, ExpansionNode, MacroStyle, MonoInstanceKey,
+        MonoInstanceRole, MonoKey, MonoNode, ObservationSite, RootReason, RootRecord,
     };
     use crate::graph::{
         Definition, DefinitionGraph, DefinitionKey, DefinitionKeyPart,
@@ -1620,6 +1902,13 @@ mod tests {
             })
             .map(|unit| unit.id)
             .collect();
+        collect_macro_rule_expansion_constraints(
+            source,
+            &graph.definitions,
+            &graph.expansions,
+            &mut constraints,
+        )
+        .unwrap();
         constraints
     }
 
@@ -2025,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_macro_definition_requires_only_observed_rules() {
+    fn reachable_macro_expansion_requires_only_its_selected_rule() {
         let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         let units = vec![
             unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
@@ -2038,7 +2327,182 @@ mod tests {
         inventory.macro_rules = vec![MacroRuleSourceFacts::Refined {
             definition: SourceUnitId(2),
             rules: vec![SourceUnitId(3), SourceUnitId(4)],
-            required_rules: vec![SourceUnitId(3)],
+            observed_selections: vec![SourceUnitId(3), SourceUnitId(3)],
+        }];
+        let mut graph = graph(
+            vec![
+                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+                written_definition(2, DefinitionKind::Macro, &units[2], Some(0), "m"),
+            ],
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+        let expansion_kind = ExpansionKind::Macro {
+            style: MacroStyle::Bang,
+            name: "m".into(),
+        };
+        graph.expansions.push(ExpansionNode {
+            id: ExpansionId(0),
+            key: ExpansionKey(vec![ExpansionKeyPart {
+                kind: expansion_kind.clone(),
+                fragment: Some(ExpansionFragmentKind::Expression),
+                implementation: Some(MacroImplementationKind::Declarative),
+                invocation_range: Some(ByteRange { start: 24, end: 25 }),
+                node_range: Some(ByteRange { start: 24, end: 25 }),
+                target_range: None,
+                macro_definition: Some(DefinitionReferenceKey::Local(
+                    graph.definitions.definitions[2].key.clone(),
+                )),
+                selected_macro_rule: Some(units[3].full_range),
+                same_role_ordinal: 0,
+            }]),
+            kind: expansion_kind,
+            fragment: Some(ExpansionFragmentKind::Expression),
+            implementation: Some(MacroImplementationKind::Declarative),
+            discovered_in: None,
+            semantic_parent: None,
+            source_call_parent: None,
+            written_invocation: None,
+            source_owner: Some(DefinitionId(1)),
+            macro_definition: Some(DefinitionTarget::Local(DefinitionId(2))),
+        });
+        let mut repeated_expansion = graph.expansions[0].clone();
+        repeated_expansion.id = ExpansionId(1);
+        repeated_expansion.key.0[0].invocation_range = Some(ByteRange { start: 25, end: 26 });
+        repeated_expansion.key.0[0].node_range = Some(ByteRange { start: 25, end: 26 });
+        repeated_expansion.key.0[0].same_role_ordinal = 1;
+        graph.expansions.push(repeated_expansion);
+        graph.edges.extend([
+            DependencyEdge {
+                from: GraphNode::Definition(DefinitionId(1)),
+                to: GraphNode::Expansion(ExpansionId(0)),
+                kind: DependencyKind::ExpansionUse,
+                sites: vec![ObservationSite::CompilerGenerated],
+                evidence: EvidenceOrigin::Compiler,
+            },
+            DependencyEdge {
+                from: GraphNode::Expansion(ExpansionId(0)),
+                to: GraphNode::Definition(DefinitionId(2)),
+                kind: DependencyKind::MacroDefinition,
+                sites: Vec::new(),
+                evidence: EvidenceOrigin::Compiler,
+            },
+            DependencyEdge {
+                from: GraphNode::Definition(DefinitionId(1)),
+                to: GraphNode::Expansion(ExpansionId(1)),
+                kind: DependencyKind::ExpansionUse,
+                sites: vec![ObservationSite::CompilerGenerated],
+                evidence: EvidenceOrigin::Compiler,
+            },
+            DependencyEdge {
+                from: GraphNode::Expansion(ExpansionId(1)),
+                to: GraphNode::Definition(DefinitionId(2)),
+                kind: DependencyKind::MacroDefinition,
+                sites: Vec::new(),
+                evidence: EvidenceOrigin::Compiler,
+            },
+        ]);
+
+        let mut missing_selection_graph = graph.clone();
+        missing_selection_graph.expansions[0].key.0[0].selected_macro_rule = None;
+        let mut incomplete_constraints = SourceConstraints::from_source(&inventory);
+        assert_eq!(
+            collect_macro_rule_expansion_constraints(
+                &inventory,
+                &missing_selection_graph.definitions,
+                &missing_selection_graph.expansions,
+                &mut incomplete_constraints,
+            ),
+            Err(RetentionError::InvalidConstraint),
+            "every in-scope expansion needs a collected rule selection"
+        );
+
+        let mut missing_definition_graph = graph.clone();
+        missing_definition_graph.expansions[1].macro_definition = None;
+        missing_definition_graph.expansions[1].key.0[0].macro_definition = None;
+        let mut incomplete_constraints = SourceConstraints::from_source(&inventory);
+        assert_eq!(
+            collect_macro_rule_expansion_constraints(
+                &inventory,
+                &missing_definition_graph.definitions,
+                &missing_definition_graph.expansions,
+                &mut incomplete_constraints,
+            ),
+            Err(RetentionError::InvalidConstraint),
+            "coverage must not depend on the macro-definition relation being present"
+        );
+
+        let constraints = complete_constraints(&inventory, &graph);
+        assert_eq!(
+            constraints.macro_rule_selection_requirements,
+            vec![
+                MacroRuleSelectionRequirement {
+                    expansion: ExpansionId(0),
+                    rule: SourceUnitId(3),
+                },
+                MacroRuleSelectionRequirement {
+                    expansion: ExpansionId(1),
+                    rule: SourceUnitId(3),
+                },
+            ]
+        );
+        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
+        assert!(retention.retained_units.contains(&SourceUnitId(2)));
+        assert!(retention.retained_units.contains(&SourceUnitId(3)));
+        assert!(!retention.retained_units.contains(&SourceUnitId(4)));
+
+        let mut missing_repeated_selection = constraints.clone();
+        missing_repeated_selection
+            .macro_rule_selection_requirements
+            .pop();
+        assert_eq!(
+            compute_retention(&inventory, &graph, &missing_repeated_selection),
+            Err(RetentionError::InvalidConstraint),
+            "every expansion must keep its own selection even when the rule is shared"
+        );
+
+        let mut normalized_graph = graph.clone();
+        for expansion in &mut normalized_graph.expansions {
+            expansion.key.0[0].selected_macro_rule = Some(ByteRange { start: 6, end: 13 });
+        }
+        let normalized_retention =
+            compute_retention(&inventory, &normalized_graph, &constraints).unwrap();
+        assert_eq!(normalized_retention, retention);
+
+        let mut orphaned_graph = graph.clone();
+        orphaned_graph.edges.retain(|edge| {
+            !(edge.from == GraphNode::Definition(DefinitionId(1))
+                && matches!(edge.to, GraphNode::Expansion(_)))
+        });
+        orphaned_graph.edges.push(edge(
+            GraphNode::Definition(DefinitionId(1)),
+            GraphNode::Definition(DefinitionId(2)),
+        ));
+        assert_eq!(
+            compute_retention(&inventory, &orphaned_graph, &constraints),
+            Err(RetentionError::InvalidConstraint),
+            "an observed definition cannot survive without a reachable selecting expansion"
+        );
+    }
+
+    #[test]
+    fn retained_unobserved_macro_definition_keeps_every_rule() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
+            unit(1, WrittenUnitKind::Item, (24, 32), Some(0), 1),
+            unit(2, WrittenUnitKind::MacroDefinition, (0, 23), Some(0), 2),
+            unit(3, WrittenUnitKind::MacroRule, (5, 12), Some(2), 3),
+            unit(4, WrittenUnitKind::MacroRule, (13, 22), Some(2), 4),
+        ];
+        let mut inventory = inventory(source, units.clone());
+        inventory.macro_rules = vec![MacroRuleSourceFacts::Refined {
+            definition: SourceUnitId(2),
+            rules: vec![SourceUnitId(3), SourceUnitId(4)],
+            observed_selections: Vec::new(),
         }];
         let graph = graph(
             vec![
@@ -2066,10 +2530,10 @@ mod tests {
         .unwrap();
         assert!(retention.retained_units.contains(&SourceUnitId(2)));
         assert!(retention.retained_units.contains(&SourceUnitId(3)));
-        assert!(!retention.retained_units.contains(&SourceUnitId(4)));
+        assert!(retention.retained_units.contains(&SourceUnitId(4)));
 
         let mut missing = complete_constraints(&inventory, &graph);
-        missing.macro_rule_requirements.clear();
+        missing.macro_rule_requirements.pop();
         assert_eq!(
             compute_retention(&inventory, &graph, &missing),
             Err(RetentionError::InvalidConstraint)

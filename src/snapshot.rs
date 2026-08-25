@@ -768,63 +768,15 @@ fn surviving_expansions(
     source: &SourceInventory,
     retained_units: &BTreeSet<crate::source::SourceUnitId>,
 ) -> Result<Vec<bool>, SnapshotError> {
-    let mut surviving = graph
-        .expansions
-        .iter()
-        .enumerate()
-        .map(|(index, node)| {
-            if node.id.0 as usize != index {
-                return Err(SnapshotError::InvalidNode);
-            }
-            let Some(unit) = node.written_invocation else {
-                return Ok(true);
-            };
-            let written = source
-                .units
-                .get(unit.0 as usize)
-                .filter(|written| {
-                    written.id == unit
-                        && written.kind == crate::source::WrittenUnitKind::MacroInvocation
-                        && written.cfg_state == crate::source::CfgState::Active
-                })
-                .ok_or(SnapshotError::InvalidNode)?;
-            Ok(retained_units.contains(&written.id))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    loop {
-        let mut changed = false;
-        for node in &graph.expansions {
-            let index = node.id.0 as usize;
-            if !surviving[index] {
-                continue;
-            }
-            for parent in [
-                node.discovered_in,
-                node.semantic_parent,
-                node.source_call_parent,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let parent_survives = graph
-                    .expansions
-                    .get(parent.0 as usize)
-                    .filter(|node| node.id == parent)
-                    .and_then(|_| surviving.get(parent.0 as usize))
-                    .copied()
-                    .ok_or(SnapshotError::InvalidNode)?;
-                if !parent_survives {
-                    surviving[index] = false;
-                    changed = true;
-                    break;
-                }
-            }
-        }
-        if !changed {
-            return Ok(surviving);
-        }
-    }
+    crate::dependency_graph::expansion_source_survival(&graph.expansions, |unit| {
+        let written = source.units.get(unit.0 as usize).filter(|written| {
+            written.id == unit
+                && written.kind == crate::source::WrittenUnitKind::MacroInvocation
+                && written.cfg_state == crate::source::CfgState::Active
+        })?;
+        Some(retained_units.contains(&written.id))
+    })
+    .ok_or(SnapshotError::InvalidNode)
 }
 
 fn snapshot_observation_site(site: &ObservationSite) -> SnapshotObservationSite {

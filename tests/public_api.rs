@@ -265,6 +265,33 @@ fn unselected_macro_rules_are_physically_removed_and_idempotent() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn unreachable_macro_expansions_and_their_selected_rules_are_removed_together() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let source = include_str!("fixtures/compiler/macro_rule_expansion_retention.rs");
+    let expected = include_str!("fixtures/compiler/macro_rule_expansion_retention.expected.rs");
+    let input = SourceInput {
+        source: source.to_owned(),
+        edition: Edition::Rust2024,
+        target: host_target(),
+    };
+
+    let verified = analyzer
+        .reduce_and_verify(&input)
+        .expect("an unreachable expansion and its private rule must be removed together");
+    assert_eq!(verified.reduced_source(), expected);
+
+    let second = analyzer
+        .reduce_and_verify(&SourceInput {
+            source: verified.reduced_source().to_owned(),
+            edition: input.edition,
+            target: input.target,
+        })
+        .expect("the first reduction must already be a fixed point");
+    assert_eq!(second.reduced_source(), expected);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn same_rule_expansion_subtrees_stabilize_repeated_identity() {
     use rust_item_dependencies::source::WrittenUnitKind;
 

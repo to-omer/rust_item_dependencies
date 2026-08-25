@@ -200,10 +200,9 @@ pub(crate) enum MacroRuleSourceFacts {
     Refined {
         definition: SourceUnitId,
         rules: Vec<SourceUnitId>,
-        /// Rules required whenever the definition is retained. This is the
-        /// observed selection union, except that a definition with no observed
-        /// selections keeps every rule so that it cannot become an empty macro.
-        required_rules: Vec<SourceUnitId>,
+        /// One rule ID per observed expansion. Repeated IDs preserve the
+        /// coverage needed when several expansions select the same rule.
+        observed_selections: Vec<SourceUnitId>,
     },
 }
 
@@ -783,18 +782,14 @@ fn refine_macro_rules_outside_opaque_anchors(
         {
             return Err(SourceError::InvalidInventory);
         }
-        let selected = observation
-            .selected_rule_indices
+        let mut selected = observation.selected_rule_indices;
+        if selected
             .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if selected.len() != observation.selected_rule_indices.len()
-            || selected
-                .iter()
-                .any(|index| *index >= observation.rule_ranges.len())
+            .any(|index| *index >= observation.rule_ranges.len())
         {
             return Err(SourceError::InvalidInventory);
         }
+        selected.sort_unstable();
 
         let candidates = inventory
             .units
@@ -829,12 +824,11 @@ fn refine_macro_rules_outside_opaque_anchors(
             });
             rules.push(temporary_id);
         }
-        let required = if selected.is_empty() {
-            rules.clone()
-        } else {
-            selected.into_iter().map(|index| rules[index]).collect()
-        };
-        refined_facts.push((definition.id.0, rules, required));
+        let observed = selected
+            .into_iter()
+            .map(|index| rules[index])
+            .collect::<Vec<_>>();
+        refined_facts.push((definition.id.0, rules, observed));
     }
     for definition in inventory.units.iter().filter(|unit| {
         unit.kind == WrittenUnitKind::MacroDefinition
@@ -866,11 +860,11 @@ fn refine_macro_rules_outside_opaque_anchors(
             definition: id_map[&definition],
         });
     }
-    for (definition, rules, required_rules) in refined_facts {
+    for (definition, rules, observed_selections) in refined_facts {
         macro_rules.push(MacroRuleSourceFacts::Refined {
             definition: id_map[&definition],
             rules: rules.into_iter().map(|rule| id_map[&rule]).collect(),
-            required_rules: required_rules
+            observed_selections: observed_selections
                 .into_iter()
                 .map(|rule| id_map[&rule])
                 .collect(),
@@ -911,7 +905,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
         .into_sorted_stable_ord_by_key(|record| &record.0);
     let mut selected = ordered_definitions
         .iter()
-        .map(|(index, _, _)| (*index, BTreeSet::new()))
+        .map(|(index, _, _)| (*index, Vec::new()))
         .collect::<BTreeMap<_, _>>();
 
     let origins = resolutions
@@ -952,7 +946,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
             selected
                 .get_mut(&definition.local_def_index.as_u32())
                 .ok_or(SourceError::IncompleteMacroRuleObservation)?
-                .insert(selection.rule_index);
+                .push(selection.rule_index);
         } else if observed.is_some() {
             return Err(SourceError::IncompleteMacroRuleObservation);
         }
@@ -963,9 +957,10 @@ pub(crate) fn refine_macro_rules_from_compiler(
 
     let mut observations = Vec::new();
     for (_, definition, rules) in ordered_definitions {
-        let selected_rule_indices = selected
+        let mut selected_rule_indices = selected
             .remove(&definition.local_def_index.as_u32())
             .ok_or(SourceError::IncompleteMacroRuleObservation)?;
+        selected_rule_indices.sort_unstable();
         if resolutions.expn_that_defined.contains_key(&definition) {
             continue;
         }
@@ -1003,7 +998,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
         observations.push(ObservedMacroRules {
             definition_range,
             rule_ranges,
-            selected_rule_indices: selected_rule_indices.into_iter().collect(),
+            selected_rule_indices,
         });
     }
     if !selected.is_empty() {
@@ -1270,16 +1265,15 @@ pub(crate) fn validate_macro_rule_facts(
             MacroRuleSourceFacts::Whole { .. } => {}
             MacroRuleSourceFacts::Refined {
                 rules,
-                required_rules,
+                observed_selections,
                 ..
             } => {
                 let unique_rules = rules.iter().copied().collect::<BTreeSet<_>>();
-                let unique_required = required_rules.iter().copied().collect::<BTreeSet<_>>();
+                let unique_observed = observed_selections.iter().copied().collect::<BTreeSet<_>>();
                 if rules.is_empty()
-                    || required_rules.is_empty()
                     || unique_rules.len() != rules.len()
-                    || unique_required.len() != required_rules.len()
-                    || !unique_required.is_subset(&unique_rules)
+                    || !unique_observed.is_subset(&unique_rules)
+                    || observed_selections.windows(2).any(|pair| pair[0] > pair[1])
                 {
                     return Err(SourceError::InvalidInventory);
                 }
@@ -2361,7 +2355,7 @@ mod tests {
             vec![ObservedMacroRules {
                 definition_range: definition,
                 rule_ranges: vec![first, second],
-                selected_rule_indices: vec![0],
+                selected_rule_indices: vec![0, 0],
             }],
         )
         .unwrap();
@@ -2369,13 +2363,13 @@ mod tests {
         let MacroRuleSourceFacts::Refined {
             definition: facts_definition,
             rules,
-            required_rules,
+            observed_selections,
         } = &inventory.macro_rules[0]
         else {
             panic!("an observed definition must be refined")
         };
         assert_eq!(rules.len(), 2);
-        assert_eq!(required_rules.as_slice(), &[rules[0]]);
+        assert_eq!(observed_selections.as_slice(), &[rules[0], rules[0]]);
         assert_eq!(inventory.units[rules[0].0 as usize].full_range, first);
         assert_eq!(inventory.units[rules[1].0 as usize].full_range, second);
         assert_ne!(
@@ -2412,16 +2406,14 @@ mod tests {
         .unwrap();
         let MacroRuleSourceFacts::Refined {
             rules,
-            required_rules,
+            observed_selections,
             ..
         } = &unselected_inventory.macro_rules[0]
         else {
             panic!("an observed definition must be refined")
         };
-        assert_eq!(
-            required_rules, rules,
-            "a retained definition with no observed selections must not become an empty macro"
-        );
+        assert!(observed_selections.is_empty());
+        assert_eq!(rules.len(), 2);
     }
 
     #[test]
