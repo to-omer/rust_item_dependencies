@@ -53,8 +53,8 @@ pub mod source;
 pub(crate) mod tags;
 
 pub use api::{
-    Analysis, Analyzer, CompilationOptions, CompilerRecipeIdentity, Edition, OptimizationLevel,
-    Reduction, SourceInput, VerificationSummary, VerifiedReduction,
+    Analysis, Analyzer, CompilationOptions, CompilerRecipeIdentity, CrateType, Edition, EntryPoint,
+    OptimizationLevel, Reduction, SourceInput, VerificationSummary, VerifiedReduction,
 };
-pub use error::{AnalysisError, UnsupportedReason};
+pub use error::{AnalysisError, EntryPointError, UnsupportedReason};
 pub use rewrite::SourcePiece;

@@ -21,9 +21,26 @@ pub enum UnsupportedReason {
     MissingMain,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum EntryPointError {
+    InvalidPath,
+    WrongCrate,
+    NotFound,
+    UnsupportedItem,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AnalysisError {
+    InvalidCrateName {
+        name: String,
+    },
+    MissingLibraryEntryPoint,
+    InvalidEntryPoint {
+        path: String,
+        reason: EntryPointError,
+    },
     InvalidCfgName {
         name: String,
     },
@@ -150,6 +167,9 @@ pub enum CompilerFailure {
 impl fmt::Display for AnalysisError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
+            Self::InvalidCrateName { .. } => "the crate name is invalid",
+            Self::MissingLibraryEntryPoint => "a library input requires at least one entry point",
+            Self::InvalidEntryPoint { .. } => "an explicit entry point is invalid",
             Self::InvalidCfgName { .. } => "an explicit cfg name is invalid",
             Self::InvalidExternalCrateName { .. } => "an external crate name is invalid",
             Self::ConflictingExternalCrate { .. } => {
@@ -184,6 +204,18 @@ impl fmt::Display for AnalysisError {
             Self::ReducedCompilationFailed(_) => "the reduced source did not compile",
             Self::DecisionMismatch(_) => "the reduced compiler decisions differ from the original",
             Self::CompilerFailure(_) => "the compiler driver failed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl fmt::Display for EntryPointError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidPath => "the path is not a fully qualified Rust item path",
+            Self::WrongCrate => "the path starts with a different crate name",
+            Self::NotFound => "the path does not resolve to an item",
+            Self::UnsupportedItem => "the path does not name a free function or static item",
         };
         formatter.write_str(message)
     }

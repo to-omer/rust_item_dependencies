@@ -16,10 +16,14 @@ use rustc_errors::formatting::format_diag_messages;
 use rustc_errors::{DiagInner, E0463, E0554, E0658, ErrCode, Level};
 use rustc_expand::config::{StripUnconfigured, features, pre_configure_attrs};
 use rustc_feature::{Features, UnstableFeatures};
+use rustc_hir as hir;
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::{CRATE_DEF_ID, LocalDefId};
 use rustc_interface::interface::{Compiler, Config};
+use rustc_middle::metadata::Reexport;
 #[cfg(rust_item_dependencies_patched)]
 use rustc_middle::ty::MacroImplementationKind;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{self, GenericArgKind, TyCtxt};
 use rustc_session::config::Input;
 use rustc_span::source_map::{FileLoader, SourceMap};
 use rustc_span::{FileName, RealFileName, Span, Symbol, sym};
@@ -30,11 +34,12 @@ use crate::definitions::{
 };
 use crate::dependency_graph::{
     AllocationPathSite, DependencyEdge, DependencyGraph, DependencyGraphError, ExpansionNode,
-    MonoKey, MonoNode, ObservationSite,
+    GraphNode, MonoKey, MonoNode, ObservationSite, RootReason, RootRecord,
+    is_downstream_selection_candidate,
 };
 #[cfg(all(test, rust_item_dependencies_patched))]
 use crate::dependency_graph::{DependencyKind, EvidenceOrigin, ProofRelationKind};
-use crate::error::{AnalysisError, UnsupportedReason};
+use crate::error::{AnalysisError, EntryPointError, UnsupportedReason};
 use crate::expansions::{CollectedExpansions, ExpansionError, collect_expansions};
 use crate::external::{ExternalCrate, PreparedExternalCrates, prepare_external_crates};
 use crate::graph::{DefinitionGraph, DefinitionKind, DefinitionOrigin};
@@ -60,6 +65,36 @@ pub enum Edition {
     Rust2018,
     Rust2021,
     Rust2024,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum CrateType {
+    #[default]
+    Binary,
+    Library,
+}
+
+impl CrateType {
+    fn compiler_argument(self) -> &'static str {
+        match self {
+            Self::Binary => "bin",
+            Self::Library => "rlib",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct EntryPoint(String);
+
+impl EntryPoint {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self(path.into())
+    }
+
+    pub fn path(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Edition {
@@ -251,36 +286,93 @@ pub struct SourceInput {
     pub source: String,
     pub edition: Edition,
     pub target: String,
+    pub crate_type: CrateType,
+    pub crate_name: String,
+    pub entry_points: Vec<EntryPoint>,
+}
+
+impl SourceInput {
+    pub fn binary(source: impl Into<String>, edition: Edition, target: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            edition,
+            target: target.into(),
+            crate_type: CrateType::Binary,
+            crate_name: "main".to_owned(),
+            entry_points: Vec::new(),
+        }
+    }
+
+    pub fn library(
+        source: impl Into<String>,
+        edition: Edition,
+        target: impl Into<String>,
+        crate_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            source: source.into(),
+            edition,
+            target: target.into(),
+            crate_type: CrateType::Library,
+            crate_name: crate_name.into(),
+            entry_points: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_crate_name(mut self, crate_name: impl Into<String>) -> Self {
+        self.crate_name = crate_name.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_entry_point(mut self, entry_point: EntryPoint) -> Self {
+        self.entry_points.push(entry_point);
+        self
+    }
 }
 
 pub(crate) struct CompilationContext<'a> {
-    edition: &'a Edition,
-    target: &'a str,
+    input: &'a SourceInput,
     compilation: &'a PreparedCompilationOptions,
     sysroot: &'a Path,
 }
 
 impl<'a> CompilationContext<'a> {
     pub(crate) fn new(
-        edition: &'a Edition,
-        target: &'a str,
+        input: &'a SourceInput,
         compilation: &'a PreparedCompilationOptions,
         sysroot: &'a Path,
     ) -> Self {
         Self {
-            edition,
-            target,
+            input,
             compilation,
             sysroot,
         }
     }
 
     pub(crate) fn edition_argument(&self) -> &'static str {
-        self.edition.as_str()
+        self.input.edition.as_str()
     }
 
     pub(crate) fn target(&self) -> &str {
-        self.target
+        &self.input.target
+    }
+
+    pub(crate) fn crate_type(&self) -> CrateType {
+        self.input.crate_type
+    }
+
+    pub(crate) fn crate_type_argument(&self) -> &'static str {
+        self.input.crate_type.compiler_argument()
+    }
+
+    pub(crate) fn crate_name(&self) -> &str {
+        &self.input.crate_name
+    }
+
+    pub(crate) fn entry_points(&self) -> impl Iterator<Item = &EntryPoint> {
+        self.input.entry_points.iter()
     }
 
     pub(crate) fn optimization_level_argument(&self) -> &'static str {
@@ -298,6 +390,14 @@ impl<'a> CompilationContext<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum InputError {
+    InvalidCrateName {
+        name: String,
+    },
+    MissingLibraryEntryPoint,
+    InvalidEntryPoint {
+        path: String,
+        reason: EntryPointError,
+    },
     UnsupportedInput {
         reason: UnsupportedReason,
         range: Option<ByteRange>,
@@ -310,6 +410,12 @@ pub(crate) enum InputError {
     Dependency(DependencyError),
     Rewrite(SourceRewriteError),
     Tag(TagError),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedEntryPoint {
+    pub(crate) definition: LocalDefId,
+    pub(crate) reexports: Vec<LocalDefId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -507,7 +613,7 @@ pub(crate) fn inspect_source(
     sysroot: &Path,
 ) -> Result<SourceInventory, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot);
     inspect_source_in_context(&input.source, &context)
 }
 
@@ -525,7 +631,7 @@ pub(crate) fn inspect_source_with_definitions(
     sysroot: &Path,
 ) -> Result<InspectedSource, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot);
     inspect_source_with_definitions_in_context(&input.source, &context)
 }
 
@@ -549,7 +655,7 @@ pub(crate) fn inspect_source_with_dependencies(
     sysroot: &Path,
 ) -> Result<InspectedDependencies, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot);
     inspect_source_with_dependencies_inner(&input.source, &context, None)
 }
 
@@ -563,7 +669,7 @@ pub(crate) fn inspect_source_with_dependencies_at_original_coordinates(
     coordinates: &SourceRewrite,
 ) -> Result<InspectedDependencies, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot);
     inspect_source_with_dependencies_at_original_coordinates_in_context(
         &input.source,
         &context,
@@ -612,7 +718,7 @@ pub(crate) fn inspect_source_with_reduction(
     sysroot: &Path,
 ) -> Result<InspectedReduction, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(&input.edition, &input.target, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot);
     inspect_source_with_reduction_in_context(&input.source, &context)
 }
 
@@ -654,6 +760,7 @@ fn run_inspection(
 ) -> Result<CompilerInspection, InputError> {
     #[cfg(test)]
     INSPECTION_COUNT.set(INSPECTION_COUNT.get() + 1);
+    validate_crate_configuration(context)?;
     validate_target(context.sysroot, context.target())?;
 
     let result = Arc::new(Mutex::new(None));
@@ -694,6 +801,9 @@ fn run_inspection(
             .iter()
             .map(|external| external.extern_name().to_owned())
             .collect(),
+        crate_type: context.crate_type(),
+        crate_name: context.crate_name().to_owned(),
+        entry_points: context.entry_points().cloned().collect(),
     };
 
     let arguments = compiler_arguments(context);
@@ -839,6 +949,9 @@ fn map_input_error(error: InputError, coordinates: Option<&SourceRewrite>) -> In
     };
     let map = |range: ByteRange| coordinates.original_range(range);
     match error {
+        error @ (InputError::InvalidCrateName { .. }
+        | InputError::MissingLibraryEntryPoint
+        | InputError::InvalidEntryPoint { .. }) => error,
         InputError::UnsupportedInput { reason, range } => match range.map(map).transpose() {
             Ok(range) => InputError::UnsupportedInput { reason, range },
             Err(error) => InputError::Rewrite(error),
@@ -874,8 +987,8 @@ fn compiler_arguments(context: &CompilationContext<'_>) -> Vec<String> {
     let mut arguments = vec![
         "rust-item-dependencies".to_owned(),
         "main.rs".to_owned(),
-        "--crate-name=main".to_owned(),
-        "--crate-type=bin".to_owned(),
+        format!("--crate-name={}", context.crate_name()),
+        format!("--crate-type={}", context.crate_type_argument()),
         format!("--edition={}", context.edition_argument()),
         format!("--target={}", context.target()),
         format!("-Copt-level={}", context.optimization_level_argument()),
@@ -899,6 +1012,23 @@ fn compiler_arguments(context: &CompilationContext<'_>) -> Vec<String> {
         arguments.push(format!("crate={directory}"));
     }
     arguments
+}
+
+fn validate_crate_configuration(context: &CompilationContext<'_>) -> Result<(), InputError> {
+    let crate_name = context.crate_name();
+    if crate_name.is_empty()
+        || crate_name
+            .chars()
+            .any(|character| !character.is_alphanumeric() && character != '_')
+    {
+        return Err(InputError::InvalidCrateName {
+            name: crate_name.to_owned(),
+        });
+    }
+    if context.crate_type() == CrateType::Library && context.entry_points().next().is_none() {
+        return Err(InputError::MissingLibraryEntryPoint);
+    }
+    Ok(())
 }
 
 fn validate_target(sysroot: &Path, target: &str) -> Result<(), InputError> {
@@ -944,6 +1074,9 @@ struct InputCallbacks {
     collection_mode: CollectionMode,
     coordinates: Option<SourceRewrite>,
     direct_external_crates: BTreeSet<String>,
+    crate_type: CrateType,
+    crate_name: String,
+    entry_points: Vec<EntryPoint>,
 }
 
 impl InputCallbacks {
@@ -963,6 +1096,140 @@ impl InputCallbacks {
             .errors
             .is_empty()
     }
+}
+
+fn resolve_entry_points(
+    tcx: TyCtxt<'_>,
+    crate_name: &str,
+    entry_points: &[EntryPoint],
+) -> Result<Vec<ResolvedEntryPoint>, InputError> {
+    let mut resolved = Vec::new();
+    let paths = entry_points
+        .iter()
+        .map(EntryPoint::path)
+        .collect::<BTreeSet<_>>();
+    for path in paths {
+        let segments = parse_entry_point_path(tcx, crate_name, path).map_err(|reason| {
+            InputError::InvalidEntryPoint {
+                path: path.to_owned(),
+                reason,
+            }
+        })?;
+        let mut module = CRATE_DEF_ID;
+        let mut reexports = Vec::new();
+        let mut definition = None;
+
+        for (index, name) in segments.iter().copied().enumerate() {
+            let last = index + 1 == segments.len();
+            let named = tcx
+                .module_children_local(module)
+                .iter()
+                .filter(|child| child.ident.name == name)
+                .collect::<Vec<_>>();
+            let candidates = named
+                .iter()
+                .copied()
+                .filter_map(|child| match child.res {
+                    Res::Def(DefKind::Mod, target) if !last => {
+                        target.as_local().map(|target| (child, target))
+                    }
+                    Res::Def(DefKind::Fn | DefKind::Static { .. }, target) if last => target
+                        .as_local()
+                        .filter(|target| is_free_entry_item(tcx, *target))
+                        .map(|target| (child, target)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let (child, target) = match candidates.as_slice() {
+                [(child, target)] => (*child, *target),
+                [] if named.is_empty() => {
+                    return Err(InputError::InvalidEntryPoint {
+                        path: path.to_owned(),
+                        reason: EntryPointError::NotFound,
+                    });
+                }
+                _ => {
+                    return Err(InputError::InvalidEntryPoint {
+                        path: path.to_owned(),
+                        reason: EntryPointError::UnsupportedItem,
+                    });
+                }
+            };
+            for step in &child.reexport_chain {
+                let reexport = match *step {
+                    Reexport::Single(definition)
+                    | Reexport::Glob(definition)
+                    | Reexport::ExternCrate(definition) => definition.as_local(),
+                    Reexport::MacroUse | Reexport::MacroExport => None,
+                }
+                .ok_or_else(|| InputError::InvalidEntryPoint {
+                    path: path.to_owned(),
+                    reason: EntryPointError::UnsupportedItem,
+                })?;
+                if !reexports.contains(&reexport) {
+                    reexports.push(reexport);
+                }
+            }
+            if last {
+                definition = Some(target);
+            } else {
+                module = target;
+            }
+        }
+
+        resolved.push(ResolvedEntryPoint {
+            definition: definition.ok_or_else(|| InputError::InvalidEntryPoint {
+                path: path.to_owned(),
+                reason: EntryPointError::NotFound,
+            })?,
+            reexports,
+        });
+    }
+    Ok(resolved)
+}
+
+fn is_free_entry_item(tcx: TyCtxt<'_>, definition: LocalDefId) -> bool {
+    matches!(
+        tcx.hir_node_by_def_id(definition),
+        hir::Node::Item(hir::Item {
+            kind: hir::ItemKind::Fn { .. } | hir::ItemKind::Static(..),
+            ..
+        })
+    )
+}
+
+fn parse_entry_point_path(
+    tcx: TyCtxt<'_>,
+    crate_name: &str,
+    path: &str,
+) -> Result<Vec<Symbol>, EntryPointError> {
+    let segments = path.split("::").collect::<Vec<_>>();
+    if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(EntryPointError::InvalidPath);
+    }
+    if segments[0] != crate_name {
+        return Err(EntryPointError::WrongCrate);
+    }
+    segments[1..]
+        .iter()
+        .map(|segment| {
+            let (name, raw) = segment
+                .strip_prefix("r#")
+                .map_or((*segment, false), |name| (name, true));
+            if !rustc_lexer::is_ident(name) {
+                return Err(EntryPointError::InvalidPath);
+            }
+            let symbol = Symbol::intern(name);
+            if raw {
+                if !symbol.can_be_raw() {
+                    return Err(EntryPointError::InvalidPath);
+                }
+            } else if symbol.is_reserved(|| tcx.sess.edition()) {
+                return Err(EntryPointError::InvalidPath);
+            }
+            Ok(symbol)
+        })
+        .collect()
 }
 
 impl Callbacks for InputCallbacks {
@@ -1134,7 +1401,7 @@ impl Callbacks for InputCallbacks {
             }
         }
         tcx.ensure_ok().early_lint_checks(());
-        if tcx.entry_fn(()).is_none() {
+        if self.crate_type == CrateType::Binary && tcx.entry_fn(()).is_none() {
             return self.finish(Err(InputError::UnsupportedInput {
                 reason: UnsupportedReason::MissingMain,
                 range: None,
@@ -1145,12 +1412,16 @@ impl Callbacks for InputCallbacks {
 
     fn after_analysis<'tcx>(&mut self, compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         tcx.sess.dcx().abort_if_errors();
-        if tcx.entry_fn(()).is_none() {
+        if self.crate_type == CrateType::Binary && tcx.entry_fn(()).is_none() {
             return self.finish(Err(InputError::UnsupportedInput {
                 reason: UnsupportedReason::MissingMain,
                 range: None,
             }));
         }
+        let entry_points = match resolve_entry_points(tcx, &self.crate_name, &self.entry_points) {
+            Ok(entry_points) => entry_points,
+            Err(error) => return self.finish(Err(error)),
+        };
         let inventory = self
             .inventory
             .as_ref()
@@ -1163,8 +1434,14 @@ impl Callbacks for InputCallbacks {
                 Err(error) => return self.finish(Err(error.into())),
             },
             CollectionMode::Dependencies => {
-                match collect_dependency_graph(compiler, tcx, inventory, self.coordinates.as_ref())
-                {
+                match collect_dependency_graph(
+                    compiler,
+                    tcx,
+                    inventory,
+                    self.coordinates.as_ref(),
+                    self.crate_type,
+                    &entry_points,
+                ) {
                     Ok(dependencies) => (None, Some(dependencies)),
                     Err(error) => return self.finish(Err(error.into())),
                 }
@@ -1187,6 +1464,8 @@ fn collect_dependency_graph(
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
     coordinates: Option<&SourceRewrite>,
+    crate_type: CrateType,
+    entry_points: &[ResolvedEntryPoint],
 ) -> Result<CollectedDependencies, DependencyError> {
     let mut definitions = collect_definitions(compiler, tcx, source)?;
     let tags = collect_definition_tags(compiler, tcx, source, &definitions)?;
@@ -1204,14 +1483,35 @@ fn collect_dependency_graph(
         nodes: mut expansions,
         mut edges,
     } = collect_expansions(compiler, tcx, source, &mut definitions)?;
+    let needs_downstream_selection = if crate_type == CrateType::Library {
+        entry_points.iter().try_fold(false, |needed, entry| {
+            if needed {
+                Ok(true)
+            } else {
+                entry_requires_downstream_selection(tcx, &definitions, entry.definition)
+            }
+        })?
+    } else {
+        false
+    };
     let CollectedMonomorphization {
         proofs,
         mut mono_nodes,
         edges: mono_edges,
-        main_definition,
-        main_instance,
-        compiler_required_roots,
-    } = collect_monomorphization(compiler, tcx, source, &mut definitions)?;
+        mut roots,
+    } = collect_monomorphization(
+        compiler,
+        tcx,
+        source,
+        &mut definitions,
+        crate_type,
+        entry_points,
+    )?;
+    if needs_downstream_selection {
+        roots.extend(downstream_selection_roots(&definitions.graph));
+        roots.sort();
+        roots.dedup();
+    }
     let mut constraints =
         constraints.map_or_else(|| collect_source_constraints(tcx, source, &definitions), Ok)?;
     collect_macro_rule_expansion_constraints(
@@ -1262,15 +1562,90 @@ fn collect_dependency_graph(
         proofs,
         mono_nodes,
         edges,
-        main_definition,
-        main_instance,
-        compiler_required_roots,
+        roots,
     )?;
     Ok(CollectedDependencies {
         graph,
         constraints,
         tags,
     })
+}
+
+fn entry_requires_downstream_selection(
+    tcx: TyCtxt<'_>,
+    definitions: &crate::definitions::CollectedDefinitions,
+    entry: LocalDefId,
+) -> Result<bool, DefinitionError> {
+    if matches!(tcx.def_kind(entry), DefKind::Fn)
+        && tcx.generics_of(entry).requires_monomorphization(tcx)
+    {
+        return Ok(true);
+    }
+
+    let entry_definition = definitions
+        .definition_id(entry)
+        .ok_or(DefinitionError::IncompleteDefinition)?;
+    match definitions.graph.definitions[entry_definition.0 as usize].kind {
+        DefinitionKind::Function => {
+            let signature = tcx.fn_sig(entry).instantiate_identity().skip_norm_wip();
+            Ok(signature
+                .inputs_and_output()
+                .skip_binder()
+                .iter()
+                .any(type_exposes_local_definition))
+        }
+        DefinitionKind::Static => Ok(type_exposes_local_definition(
+            tcx.type_of(entry).instantiate_identity().skip_norm_wip(),
+        )),
+        _ => Ok(false),
+    }
+}
+
+fn type_exposes_local_definition(value: ty::Ty<'_>) -> bool {
+    value.walk().any(|argument| {
+        let GenericArgKind::Type(value) = argument.kind() else {
+            return false;
+        };
+        match *value.kind() {
+            ty::Adt(definition, _) => definition.did().is_local(),
+            ty::Foreign(definition)
+            | ty::FnDef(definition, _)
+            | ty::Closure(definition, _)
+            | ty::CoroutineClosure(definition, _)
+            | ty::Coroutine(definition, _)
+            | ty::CoroutineWitness(definition, _) => definition.is_local(),
+            ty::Alias(_, alias) => match alias.kind {
+                ty::AliasTyKind::Projection { def_id }
+                | ty::AliasTyKind::Inherent { def_id }
+                | ty::AliasTyKind::Opaque { def_id }
+                | ty::AliasTyKind::Free { def_id } => def_id.is_local(),
+            },
+            ty::Dynamic(predicates, ..) => {
+                predicates
+                    .iter()
+                    .any(|predicate| match predicate.skip_binder() {
+                        ty::ExistentialPredicate::Trait(reference) => reference.def_id.is_local(),
+                        ty::ExistentialPredicate::Projection(projection) => {
+                            projection.def_id.is_local()
+                        }
+                        ty::ExistentialPredicate::AutoTrait(definition) => definition.is_local(),
+                    })
+            }
+            _ => false,
+        }
+    })
+}
+
+fn downstream_selection_roots(graph: &DefinitionGraph) -> Vec<RootRecord> {
+    graph
+        .definitions
+        .iter()
+        .filter(|definition| is_downstream_selection_candidate(graph, definition.id))
+        .map(|definition| RootRecord {
+            node: GraphNode::Definition(definition.id),
+            reason: RootReason::DownstreamSelection,
+        })
+        .collect()
 }
 
 fn normalize_definition_graph(
@@ -1433,7 +1808,17 @@ fn validate_unexpanded(
             attribute.span,
         ));
     }
-    let features = features(&compiler.sess, &configured_attrs, Symbol::intern("main"));
+    let crate_name = compiler
+        .sess
+        .opts
+        .crate_name
+        .as_deref()
+        .ok_or(InputError::CompilerProtocolFailure)?;
+    let features = features(
+        &compiler.sess,
+        &configured_attrs,
+        Symbol::intern(crate_name),
+    );
     if let Some((_, span)) = features
         .enabled_features_iter_stable_order()
         .min_by_key(|(_, span)| (span.lo(), span.hi()))
@@ -2023,11 +2408,11 @@ mod tests {
     fn definition_collection_accepts_resolved_local_and_external_paths() {
         let (sysroot, target) = compiler_context();
         let result = inspect_source_with_definitions(
-            &SourceInput {
-                source: include_str!("../tests/fixtures/definitions/path_resolution.rs").to_owned(),
-                edition: Edition::Rust2024,
+            &SourceInput::binary(
+                include_str!("../tests/fixtures/definitions/path_resolution.rs").to_owned(),
+                Edition::Rust2024,
                 target,
-            },
+            ),
             &sysroot,
         );
         assert!(result.is_ok(), "{result:?}");
@@ -2038,11 +2423,11 @@ mod tests {
     fn definition_collection_requires_import_provenance() {
         let (sysroot, target) = compiler_context();
         let result = inspect_source_with_definitions(
-            &SourceInput {
-                source: include_str!("../tests/fixtures/definitions/path_resolution.rs").to_owned(),
-                edition: Edition::Rust2024,
+            &SourceInput::binary(
+                include_str!("../tests/fixtures/definitions/path_resolution.rs").to_owned(),
+                Edition::Rust2024,
                 target,
-            },
+            ),
             &sysroot,
         );
         assert_eq!(
@@ -2058,11 +2443,7 @@ mod tests {
     fn dependency_collection_fails_without_complete_compiler_observation() {
         let (sysroot, target) = compiler_context();
         let result = inspect_source_with_dependencies(
-            &SourceInput {
-                source: "fn main() {}\n".to_owned(),
-                edition: Edition::Rust2024,
-                target,
-            },
+            &SourceInput::binary("fn main() {}\n".to_owned(), Edition::Rust2024, target),
             &sysroot,
         );
         assert!(
@@ -2576,11 +2957,11 @@ mod tests {
         let (sysroot, target) = compiler_context();
         assert_eq!(
             inspect_source(
-                &SourceInput {
-                    source: "fn main() {}\n".to_owned(),
-                    edition: Edition::Rust2024,
-                    target: "not-a-rust-target".to_owned(),
-                },
+                &SourceInput::binary(
+                    "fn main() {}\n".to_owned(),
+                    Edition::Rust2024,
+                    "not-a-rust-target".to_owned()
+                ),
                 &sysroot,
             ),
             Err(InputError::UnsupportedInput {
@@ -2591,11 +2972,11 @@ mod tests {
         assert!(!target.is_empty());
         assert_eq!(
             inspect_source(
-                &SourceInput {
-                    source: "fn main() {}\n".to_owned(),
-                    edition: Edition::Rust2024,
-                    target: "thumbv7em-none-eabi".to_owned(),
-                },
+                &SourceInput::binary(
+                    "fn main() {}\n".to_owned(),
+                    Edition::Rust2024,
+                    "thumbv7em-none-eabi".to_owned()
+                ),
                 &sysroot,
             ),
             Err(InputError::UnsupportedInput {
@@ -3113,11 +3494,7 @@ mod tests {
     ) -> Result<crate::source::SourceInventory, super::InputError> {
         let (sysroot, target) = compiler_context();
         inspect_source(
-            &SourceInput {
-                source: source.to_owned(),
-                edition,
-                target,
-            },
+            &SourceInput::binary(source.to_owned(), edition, target),
             &sysroot,
         )
     }

@@ -4,8 +4,8 @@ use rustc_interface::interface::Compiler;
 use rustc_middle::ty::TyCtxt;
 
 use crate::definitions::{CollectedDefinitions, DefinitionError};
-use crate::dependency_graph::{DependencyEdge, MonoId, MonoNode, ProofNode, RootRecord};
-use crate::graph::DefinitionId;
+use crate::dependency_graph::{DependencyEdge, MonoNode, ProofNode, RootRecord};
+use crate::input::{CrateType, ResolvedEntryPoint};
 use crate::source::SourceInventory;
 
 #[cfg(rust_item_dependencies_patched)]
@@ -38,8 +38,8 @@ use crate::compiler_terms::{CompilerTermError, CompilerTermKind, TermHasher};
 #[cfg(rust_item_dependencies_patched)]
 use crate::dependency_graph::{
     AllocationDescriptor, AllocationKey, AllocationPathPart, AllocationPathSite, AllocationRootKey,
-    DependencyKind, EvidenceOrigin, GraphNode, MonoCollection, MonoDependencyKind, MonoInstanceKey,
-    MonoInstanceRole, MonoKey, ObservationSite, RootReason,
+    DependencyKind, EvidenceOrigin, GraphNode, MonoCollection, MonoDependencyKind, MonoId,
+    MonoInstanceKey, MonoInstanceRole, MonoKey, ObservationSite, RootReason,
 };
 #[cfg(rust_item_dependencies_patched)]
 use crate::graph::DefinitionTarget;
@@ -53,9 +53,7 @@ pub(crate) struct CollectedMonomorphization {
     pub(crate) proofs: Vec<ProofNode>,
     pub(crate) mono_nodes: Vec<MonoNode>,
     pub(crate) edges: Vec<DependencyEdge>,
-    pub(crate) main_definition: DefinitionId,
-    pub(crate) main_instance: MonoId,
-    pub(crate) compiler_required_roots: Vec<RootRecord>,
+    pub(crate) roots: Vec<RootRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +98,8 @@ pub(crate) fn collect_monomorphization(
     _tcx: TyCtxt<'_>,
     _source: &SourceInventory,
     _definitions: &mut CollectedDefinitions,
+    _crate_type: CrateType,
+    _entry_points: &[ResolvedEntryPoint],
 ) -> Result<CollectedMonomorphization, MonomorphizationError> {
     Err(MonomorphizationError::IncompleteObservation)
 }
@@ -110,15 +110,17 @@ pub(crate) fn collect_monomorphization<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
     source: &SourceInventory,
     definitions: &'a mut CollectedDefinitions,
+    crate_type: CrateType,
+    entry_points: &[ResolvedEntryPoint],
 ) -> Result<CollectedMonomorphization, MonomorphizationError> {
-    MonoCollector::new(compiler, tcx, source, definitions)?.collect()
+    MonoCollector::new(compiler, tcx, source, definitions, crate_type, entry_points)?.collect()
 }
 
 #[cfg(rust_item_dependencies_patched)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Seed<'tcx> {
     root: MonoTraceRoot<'tcx>,
-    reason: Option<RootReason>,
+    reasons: Vec<RootReason>,
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -172,6 +174,7 @@ struct MonoCollector<'a, 'tcx> {
     source: &'a SourceInventory,
     definitions: &'a mut CollectedDefinitions,
     seeds: Vec<Seed<'tcx>>,
+    definition_roots: Vec<(rustc_hir::def_id::LocalDefId, RootReason)>,
     roots: Vec<MonoTraceNode<'tcx>>,
     facts: Vec<rustc_middle::mono::MonoUseFact<'tcx>>,
     proofs: Vec<RawProof<'tcx>>,
@@ -189,44 +192,76 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         source: &'a SourceInventory,
         definitions: &'a mut CollectedDefinitions,
+        crate_type: CrateType,
+        entry_points: &[ResolvedEntryPoint],
     ) -> Result<Self, MonomorphizationError> {
-        let (main, EntryFnType::Main { .. }) =
-            tcx.entry_fn(()).ok_or(MonomorphizationError::InvalidRoot)?;
-        let main = Instance::mono(tcx, main);
-        let start_definition = tcx
-            .lang_items()
-            .start_fn()
+        let mut seeds = Vec::new();
+        if crate_type == CrateType::Binary {
+            let (main, EntryFnType::Main { .. }) =
+                tcx.entry_fn(()).ok_or(MonomorphizationError::InvalidRoot)?;
+            let main = Instance::mono(tcx, main);
+            let start_definition = tcx
+                .lang_items()
+                .start_fn()
+                .ok_or(MonomorphizationError::InvalidRoot)?;
+            let output = tcx
+                .fn_sig(main.def_id())
+                .no_bound_vars()
+                .ok_or(MonomorphizationError::InvalidRoot)?
+                .output()
+                .no_bound_vars()
+                .ok_or(MonomorphizationError::InvalidRoot)?;
+            let typing_env = ty::TypingEnv::fully_monomorphized();
+            let output = tcx
+                .try_normalize_erasing_regions(typing_env, ty::Unnormalized::new_wip(output))
+                .map_err(|_| MonomorphizationError::InvalidRoot)?;
+            let start = Instance::try_resolve(
+                tcx,
+                typing_env,
+                start_definition,
+                tcx.mk_args(&[output.into()]),
+            )
+            .map_err(|_| MonomorphizationError::InvalidRoot)?
             .ok_or(MonomorphizationError::InvalidRoot)?;
-        let output = tcx
-            .fn_sig(main.def_id())
-            .no_bound_vars()
-            .ok_or(MonomorphizationError::InvalidRoot)?
-            .output()
-            .no_bound_vars()
-            .ok_or(MonomorphizationError::InvalidRoot)?;
-        let typing_env = ty::TypingEnv::fully_monomorphized();
-        let output = tcx
-            .try_normalize_erasing_regions(typing_env, ty::Unnormalized::new_wip(output))
-            .map_err(|_| MonomorphizationError::InvalidRoot)?;
-        let start = Instance::try_resolve(
-            tcx,
-            typing_env,
-            start_definition,
-            tcx.mk_args(&[output.into()]),
-        )
-        .map_err(|_| MonomorphizationError::InvalidRoot)?
-        .ok_or(MonomorphizationError::InvalidRoot)?;
 
-        let mut seeds = vec![
-            Seed {
-                root: MonoTraceRoot::Fn(main),
-                reason: None,
-            },
-            Seed {
-                root: MonoTraceRoot::Fn(start),
-                reason: Some(RootReason::StartInstance),
-            },
-        ];
+            insert_seed(&mut seeds, MonoTraceRoot::Fn(main), RootReason::Main);
+            insert_seed(
+                &mut seeds,
+                MonoTraceRoot::Fn(start),
+                RootReason::StartInstance,
+            );
+        }
+
+        let mut definition_roots = Vec::new();
+        for entry in entry_points {
+            for &reexport in &entry.reexports {
+                definition_roots.push((reexport, RootReason::ExplicitEntry));
+            }
+            match tcx.def_kind(entry.definition) {
+                DefKind::Fn
+                    if tcx
+                        .generics_of(entry.definition)
+                        .requires_monomorphization(tcx) =>
+                {
+                    definition_roots.push((entry.definition, RootReason::ExplicitEntry));
+                }
+                DefKind::Fn => insert_seed(
+                    &mut seeds,
+                    MonoTraceRoot::Fn(Instance::mono(tcx, entry.definition.to_def_id())),
+                    RootReason::ExplicitEntry,
+                ),
+                DefKind::Static { .. } => insert_seed(
+                    &mut seeds,
+                    MonoTraceRoot::Static {
+                        def_id: entry.definition.to_def_id(),
+                        trigger_span: tcx.def_span(entry.definition),
+                    },
+                    RootReason::ExplicitEntry,
+                ),
+                _ => return Err(MonomorphizationError::InvalidRoot),
+            }
+        }
+
         for definition in tcx.iter_local_def_id() {
             let kind = tcx.def_kind(definition);
             if !matches!(
@@ -263,13 +298,7 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
                 },
                 _ => unreachable!("filtered above"),
             };
-            if seeds.iter().any(|seed| seed.root == root) {
-                continue;
-            }
-            seeds.push(Seed {
-                root,
-                reason: Some(reason),
-            });
+            insert_seed(&mut seeds, root, reason);
         }
         Ok(Self {
             compiler,
@@ -278,6 +307,7 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
             definitions,
             roots: seeds.iter().map(|seed| trace_root(seed.root)).collect(),
             seeds,
+            definition_roots,
             facts: Vec::new(),
             proofs: Vec::new(),
             required_consts: Vec::new(),
@@ -838,33 +868,34 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
         let (proofs, proof_edges) = selected.into_graph_parts();
         edges.extend(proof_edges);
 
-        let main_raw = trace_root(self.seeds[0].root);
-        let main_instance = node_id(RawIdentity::Trace(main_raw))?;
-        let main_definition = self
-            .tcx
-            .entry_fn(())
-            .and_then(|(definition, _)| definition.as_local())
-            .and_then(|definition| self.definitions.definition_id(definition))
-            .ok_or(MonomorphizationError::InvalidRoot)?;
-        let compiler_required_roots = self
-            .seeds
-            .iter()
-            .filter_map(|seed| seed.reason.map(|reason| (seed.root, reason)))
-            .map(|(root, reason)| {
-                Ok(RootRecord {
-                    node: node_id(RawIdentity::Trace(trace_root(root)))?,
-                    reason,
-                })
-            })
-            .collect::<Result<Vec<_>, MonomorphizationError>>()?;
+        let mut roots = Vec::new();
+        for seed in &self.seeds {
+            let node = GraphNode::Mono(node_id(RawIdentity::Trace(trace_root(seed.root)))?);
+            roots.extend(
+                seed.reasons
+                    .iter()
+                    .copied()
+                    .map(|reason| RootRecord { node, reason }),
+            );
+        }
+        for &(definition, reason) in &self.definition_roots {
+            let definition = self
+                .definitions
+                .definition_id(definition)
+                .ok_or(MonomorphizationError::InvalidRoot)?;
+            roots.push(RootRecord {
+                node: GraphNode::Definition(definition),
+                reason,
+            });
+        }
+        roots.sort();
+        roots.dedup();
 
         Ok(CollectedMonomorphization {
             proofs,
             mono_nodes,
             edges,
-            main_definition,
-            main_instance,
-            compiler_required_roots,
+            roots,
         })
     }
 
@@ -1166,6 +1197,20 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
                     .canonicalize(CompilerTermKind::Type, &ty)?,
             },
         })
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn insert_seed<'tcx>(seeds: &mut Vec<Seed<'tcx>>, root: MonoTraceRoot<'tcx>, reason: RootReason) {
+    if let Some(seed) = seeds.iter_mut().find(|seed| seed.root == root) {
+        if !seed.reasons.contains(&reason) {
+            seed.reasons.push(reason);
+        }
+    } else {
+        seeds.push(Seed {
+            root,
+            reasons: vec![reason],
+        });
     }
 }
 

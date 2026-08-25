@@ -25,7 +25,9 @@ use crate::snapshot::{CompilerDecisionSnapshot, SnapshotDiff, SnapshotError};
 use crate::source::{SourceUnitId, WrittenUnit};
 use crate::tags::TagError;
 
-pub use crate::input::{CompilationOptions, Edition, OptimizationLevel, SourceInput};
+pub use crate::input::{
+    CompilationOptions, CrateType, Edition, EntryPoint, OptimizationLevel, SourceInput,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CompilerRecipeIdentity(pub [u8; 32]);
@@ -139,12 +141,7 @@ impl Analyzer {
     }
 
     fn compilation_context<'a>(&'a self, input: &'a SourceInput) -> CompilationContext<'a> {
-        CompilationContext::new(
-            &input.edition,
-            &input.target,
-            &self.compilation,
-            &self.sysroot,
-        )
+        CompilationContext::new(input, &self.compilation, &self.sysroot)
     }
 
     fn reduction(
@@ -169,7 +166,7 @@ impl Analyzer {
     ) -> Analysis {
         let semantic_definitions = inspected
             .retention
-            .main_semantic
+            .semantic_required
             .iter()
             .filter_map(|node| match node {
                 GraphNode::Definition(definition) => Some(*definition),
@@ -218,16 +215,8 @@ impl Analysis {
         &self.graph
     }
 
-    pub fn main_definition(&self) -> DefinitionId {
-        self.graph.main_definition
-    }
-
-    pub fn main_instance(&self) -> crate::dependency_graph::MonoId {
-        self.graph.main_instance
-    }
-
-    pub fn compiler_required_roots(&self) -> &[RootRecord] {
-        &self.graph.compiler_required_roots
+    pub fn roots(&self) -> &[RootRecord] {
+        &self.graph.roots
     }
 
     pub fn semantic_definitions(&self) -> &BTreeSet<DefinitionId> {
@@ -313,8 +302,18 @@ fn artifact_context(options: CompilationOptions) -> Result<Analyzer, AnalysisErr
 
 fn recipe_identity(artifact: [u8; 32], context: &CompilationContext<'_>) -> CompilerRecipeIdentity {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"rust-item-dependencies-recipe-v4\0");
+    bytes.extend_from_slice(b"rust-item-dependencies-recipe-v5\0");
     bytes.extend_from_slice(&artifact);
+    append_recipe_bytes(&mut bytes, context.crate_type_argument().as_bytes());
+    append_recipe_bytes(&mut bytes, context.crate_name().as_bytes());
+    let entry_points = context
+        .entry_points()
+        .map(|entry| entry.path())
+        .collect::<BTreeSet<_>>();
+    bytes.extend_from_slice(&(entry_points.len() as u64).to_le_bytes());
+    for entry_point in entry_points {
+        append_recipe_bytes(&mut bytes, entry_point.as_bytes());
+    }
     append_recipe_bytes(&mut bytes, context.edition_argument().as_bytes());
     append_recipe_bytes(&mut bytes, context.target().as_bytes());
     append_recipe_bytes(&mut bytes, context.optimization_level_argument().as_bytes());
@@ -365,6 +364,11 @@ enum CompilationPhase {
 
 fn analysis_error(error: InputError, phase: CompilationPhase) -> AnalysisError {
     match error {
+        InputError::InvalidCrateName { name } => AnalysisError::InvalidCrateName { name },
+        InputError::MissingLibraryEntryPoint => AnalysisError::MissingLibraryEntryPoint,
+        InputError::InvalidEntryPoint { path, reason } => {
+            AnalysisError::InvalidEntryPoint { path, reason }
+        }
         InputError::UnsupportedInput { reason, range } => {
             AnalysisError::UnsupportedInput { reason, range }
         }
@@ -436,18 +440,8 @@ fn snapshot_error(error: SnapshotError) -> AnalysisError {
 
 fn snapshot_difference(difference: SnapshotDiff) -> PublicSnapshotDiff {
     let (kind, original, reduced) = match difference {
-        SnapshotDiff::MainDefinition { original, reduced } => (
-            "main definition".to_owned(),
-            format!("{original:?}"),
-            format!("{reduced:?}"),
-        ),
-        SnapshotDiff::MainInstance { original, reduced } => (
-            "main instance".to_owned(),
-            format!("{original:?}"),
-            format!("{reduced:?}"),
-        ),
-        SnapshotDiff::CompilerRequiredRoot { original, reduced } => (
-            "compiler-required root".to_owned(),
+        SnapshotDiff::Root { original, reduced } => (
+            "compiler decision root".to_owned(),
             format!("{original:?}"),
             format!("{reduced:?}"),
         ),
@@ -542,11 +536,11 @@ mod compilation_options_tests {
 
     #[test]
     fn builtin_cfg_is_rejected_before_an_input_lint_can_allow_the_rustc_flag() {
-        let input = SourceInput {
-            source: "#![allow(explicit_builtin_cfgs_in_flags)]\nfn main() {}\n".to_owned(),
-            edition: Edition::Rust2024,
-            target: "unused-before-compilation".to_owned(),
-        };
+        let input = SourceInput::binary(
+            "#![allow(explicit_builtin_cfgs_in_flags)]\nfn main() {}\n".to_owned(),
+            Edition::Rust2024,
+            "unused-before-compilation".to_owned(),
+        );
 
         let result =
             Analyzer::new_with_options(CompilationOptions::new().with_cfg("debug_assertions"))
@@ -621,16 +615,16 @@ mod tests {
                 .with_cfg("macro_rules"),
         )
         .unwrap();
-        let input = SourceInput {
-            source: concat!(
+        let input = SourceInput::binary(
+            concat!(
                 "#[cfg(all(ONLINE_JUDGE, 日本語, macro_rules))]\n",
                 "fn selected() {}\n",
                 "fn main() { selected(); }\n",
             )
             .to_owned(),
-            edition: Edition::Rust2024,
+            Edition::Rust2024,
             target,
-        };
+        );
 
         let result = analyzer.analyze(&input);
 
@@ -652,16 +646,16 @@ mod tests {
             Edition::Rust2021,
             Edition::Rust2024,
         ] {
-            let input = SourceInput {
-                source: concat!(
+            let input = SourceInput::binary(
+                concat!(
                     "#[cfg(all(r#fn, r#true, r#abstract, r#async, r#await, r#dyn, r#try, r#gen))]\n",
                     "fn selected() {}\n",
                     "fn main() { selected(); }\n",
                 )
                 .to_owned(),
                 edition,
-                target: target.clone(),
-            };
+                target.clone(),
+            );
 
             let result = analyzer.analyze(&input);
 
@@ -673,11 +667,11 @@ mod tests {
     fn verified_reduction_runs_original_and_reduced_compilers_once_each() {
         crate::input::reset_inspection_count();
         let analyzer = Analyzer::new().unwrap();
-        let input = SourceInput {
-            source: "fn dead() {}\nfn main() {}\n".to_owned(),
-            edition: Edition::Rust2024,
-            target: host_target(),
-        };
+        let input = SourceInput::binary(
+            "fn dead() {}\nfn main() {}\n".to_owned(),
+            Edition::Rust2024,
+            host_target(),
+        );
 
         analyzer.reduce_and_verify(&input).unwrap();
         assert_eq!(crate::input::inspection_count(), 2);
@@ -687,11 +681,11 @@ mod tests {
     fn reduction_compiles_the_original_and_reduced_sources_once_each() {
         crate::input::reset_inspection_count();
         let analyzer = Analyzer::new().unwrap();
-        let input = SourceInput {
-            source: "fn dead() {}\nfn main() {}\n".to_owned(),
-            edition: Edition::Rust2024,
-            target: host_target(),
-        };
+        let input = SourceInput::binary(
+            "fn dead() {}\nfn main() {}\n".to_owned(),
+            Edition::Rust2024,
+            host_target(),
+        );
 
         let reduction = analyzer.reduce(&input).unwrap();
         assert_eq!(reduction.reduced_source(), "\nfn main() {}\n");
@@ -708,11 +702,11 @@ mod tests {
             std::env::set_current_dir(&directory).unwrap();
             let analyzer = Analyzer::new().unwrap();
             analyzer
-                .reduce(&SourceInput {
-                    source: "fn dead() {}\nfn main() {}\n".to_owned(),
-                    edition: Edition::Rust2024,
-                    target: host_target(),
-                })
+                .reduce(&SourceInput::binary(
+                    "fn dead() {}\nfn main() {}\n".to_owned(),
+                    Edition::Rust2024,
+                    host_target(),
+                ))
                 .unwrap();
             assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
             return;
@@ -753,17 +747,17 @@ mod tests {
     #[test]
     fn a_missing_selected_impl_fact_cannot_produce_an_analysis() {
         let analyzer = Analyzer::new().unwrap();
-        let input = SourceInput {
-            source: concat!(
+        let input = SourceInput::binary(
+            concat!(
                 "trait Value { fn value(&self) -> u32; }\n",
                 "struct Selected;\n",
                 "impl Value for Selected { fn value(&self) -> u32 { 1 } }\n",
                 "fn main() { let _ = Selected.value(); }\n",
             )
             .to_owned(),
-            edition: Edition::Rust2024,
-            target: host_target(),
-        };
+            Edition::Rust2024,
+            host_target(),
+        );
 
         let result = crate::input::with_one_missing_selected_impl_fact(&input.source, || {
             analyzer.analyze(&input)
@@ -780,11 +774,11 @@ mod tests {
     fn a_missing_macro_rule_selection_stops_before_reduced_compilation() {
         crate::input::reset_inspection_count();
         let analyzer = Analyzer::new().unwrap();
-        let input = SourceInput {
-            source: include_str!("../tests/fixtures/compiler/macro_rule_reduction.rs").to_owned(),
-            edition: Edition::Rust2024,
-            target: host_target(),
-        };
+        let input = SourceInput::binary(
+            include_str!("../tests/fixtures/compiler/macro_rule_reduction.rs").to_owned(),
+            Edition::Rust2024,
+            host_target(),
+        );
 
         let result = crate::input::with_one_missing_macro_rule_selection(&input.source, || {
             analyzer.reduce_and_verify(&input)

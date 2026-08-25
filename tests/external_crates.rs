@@ -614,11 +614,7 @@ mod patched {
     }
 
     fn input(source: &str, edition: Edition, target: &str) -> SourceInput {
-        SourceInput {
-            source: source.to_owned(),
-            edition,
-            target: target.to_owned(),
-        }
+        SourceInput::binary(source.to_owned(), edition, target)
     }
 
     fn edition_name(edition: Edition) -> &'static str {

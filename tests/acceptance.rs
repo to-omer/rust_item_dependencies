@@ -657,11 +657,11 @@ fn an_edition_error_is_reported_before_the_recovery_ast_is_inspected() {
         "fn main() {}\n",
     );
     let error = analyzer
-        .analyze(&SourceInput {
-            source: source.to_owned(),
-            edition: Edition::Rust2024,
-            target: host_target(),
-        })
+        .analyze(&SourceInput::binary(
+            source.to_owned(),
+            Edition::Rust2024,
+            host_target(),
+        ))
         .unwrap_err();
     let AnalysisError::OriginalCompilationFailed(diagnostics) = error else {
         panic!("unexpected parser-error result: {error:?}");
@@ -771,11 +771,7 @@ fn input(source: &str, target: &str) -> SourceInput {
 
 #[cfg(rust_item_dependencies_patched)]
 fn input_with_edition(source: &str, target: &str, edition: Edition) -> SourceInput {
-    SourceInput {
-        source: source.to_owned(),
-        edition,
-        target: target.to_owned(),
-    }
+    SourceInput::binary(source.to_owned(), edition, target)
 }
 
 #[cfg(rust_item_dependencies_patched)]

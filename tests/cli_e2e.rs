@@ -57,6 +57,83 @@ fn reduced_cli_output_compiles_and_preserves_program_output() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn library_cli_keeps_the_selected_entry_and_emits_a_compilable_rlib() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let work = repository.join("target/tests").join(format!(
+        "rust-item-dependencies-cli-library-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&work).unwrap();
+
+    let input = work.join("library.rs");
+    let reduced = work.join("reduced.rs");
+    std::fs::write(
+        &input,
+        concat!(
+            "pub fn kept() -> u8 { helper() }\n",
+            "fn helper() -> u8 { 7 }\n",
+            "pub fn dead() -> u8 { 0 }\n",
+        ),
+    )
+    .unwrap();
+
+    let reduction = std::process::Command::new(env!("CARGO_BIN_EXE_rust-item-dependencies"))
+        .args([
+            "--crate-type",
+            "lib",
+            "--crate-name",
+            "cli_library",
+            "--entry",
+            "cli_library::kept",
+        ])
+        .arg(&input)
+        .arg("-o")
+        .arg(&reduced)
+        .output()
+        .unwrap();
+    assert!(
+        reduction.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reduction.stderr)
+    );
+    assert!(reduction.stdout.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&reduced).unwrap(),
+        concat!(
+            "pub fn kept() -> u8 { helper() }\n",
+            "fn helper() -> u8 { 7 }\n",
+            "\n",
+        )
+    );
+
+    let library = work.join("libcli_library.rlib");
+    let compilation = std::process::Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+        .arg(&reduced)
+        .args([
+            "--crate-name=cli_library",
+            "--crate-type=rlib",
+            "--edition=2024",
+            "-o",
+        ])
+        .arg(&library)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    assert!(library.is_file());
+
+    std::fs::remove_dir_all(work).unwrap();
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn cli_applies_optimization_and_explicit_cfg_to_the_reduction() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

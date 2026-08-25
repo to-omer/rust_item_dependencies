@@ -2,7 +2,7 @@
 
 #[cfg(rust_item_dependencies_patched)]
 use rust_item_dependencies::dependency_graph::{
-    DependencyKind, ExpansionKind, GraphNode, ProofNodeKind, ProofRelationKind,
+    DependencyKind, ExpansionKind, GraphNode, ProofNodeKind, ProofRelationKind, RootReason,
 };
 use rust_item_dependencies::{AnalysisError, Analyzer};
 #[cfg(rust_item_dependencies_patched)]
@@ -30,18 +30,14 @@ fn analysis_and_verified_reduction_are_owned_read_only_results() {
         "fn value(value: Kept) -> u32 { value.0 }\n",
         "fn main() { let _ = value(Kept(1)); }\n",
     );
-    let input = SourceInput {
-        source: source.to_owned(),
-        edition: Edition::Rust2024,
-        target,
-    };
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, target);
 
     let analysis = analyzer.analyze(&input).expect("analysis must succeed");
     assert!(analysis.tags().contains("kept"));
     assert!(!analysis.tags().contains("dead"));
     assert!(!analysis.removed_source_units().is_empty());
     assert_eq!(analysis.source_digest().len(), 32);
-    assert_eq!(analysis.graph().main_definition, analysis.main_definition());
+    assert_eq!(analysis.graph().roots, analysis.roots());
     assert!(
         analysis
             .retained_source_units()
@@ -51,15 +47,12 @@ fn analysis_and_verified_reduction_are_owned_read_only_results() {
         analysis.retained_source_units().len() + analysis.removed_source_units().len(),
         analysis.source_units().len()
     );
-    assert!(
-        analysis
-            .graph()
-            .outgoing(rust_item_dependencies::dependency_graph::GraphNode::Mono(
-                analysis.main_instance()
-            ))
-            .next()
-            .is_some()
-    );
+    let main = analysis
+        .roots()
+        .iter()
+        .find(|root| root.reason == RootReason::Main)
+        .expect("a binary analysis must expose its main root");
+    assert!(analysis.graph().outgoing(main.node).next().is_some());
     assert_eq!(analyzer.analyze(&input).unwrap(), analysis);
 
     let verified = analyzer
@@ -90,11 +83,11 @@ fn analysis_and_verified_reduction_are_owned_read_only_results() {
     assert_eq!(rebuilt, verified.reduced_source());
 
     let second = analyzer
-        .reduce_and_verify(&SourceInput {
-            source: verified.reduced_source().to_owned(),
-            edition: input.edition,
-            target: input.target.clone(),
-        })
+        .reduce_and_verify(&SourceInput::binary(
+            verified.reduced_source().to_owned(),
+            input.edition,
+            input.target.clone(),
+        ))
         .expect("an already reduced source must remain byte-identical");
     assert_eq!(second.reduced_source(), verified.reduced_source());
 }
@@ -103,11 +96,11 @@ fn analysis_and_verified_reduction_are_owned_read_only_results() {
 #[test]
 fn compiler_recipe_identifies_normalized_compilation_options_but_not_source_text() {
     let target = host_target();
-    let input = SourceInput {
-        source: "fn unused() {}\nfn main() {}\n".to_owned(),
-        edition: Edition::Rust2024,
-        target: target.clone(),
-    };
+    let input = SourceInput::binary(
+        "fn unused() {}\nfn main() {}\n".to_owned(),
+        Edition::Rust2024,
+        target.clone(),
+    );
     let reordered_options = CompilationOptions::new()
         .with_optimization_level(OptimizationLevel::O2)
         .with_cfg("SECOND")
@@ -134,11 +127,11 @@ fn compiler_recipe_identifies_normalized_compilation_options_but_not_source_text
         ordered_analysis.source_digest()
     );
 
-    let other_source = SourceInput {
-        source: "fn main() { let _ = 1_u32; }\n".to_owned(),
-        edition: Edition::Rust2024,
+    let other_source = SourceInput::binary(
+        "fn main() { let _ = 1_u32; }\n".to_owned(),
+        Edition::Rust2024,
         target,
-    };
+    );
     let other_source_analysis = reordered_analyzer
         .analyze(&other_source)
         .expect("the second source must compile with the same options");
@@ -178,11 +171,7 @@ fn unselected_macro_rules_are_physically_removed_and_idempotent() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let source = include_str!("fixtures/compiler/macro_rule_reduction.rs");
     let expected = include_str!("fixtures/compiler/macro_rule_reduction.expected.rs");
-    let input = SourceInput {
-        source: source.to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
     let verified = analyzer
         .reduce_and_verify(&input)
@@ -254,11 +243,11 @@ fn unselected_macro_rules_are_physically_removed_and_idempotent() {
     );
 
     let second = analyzer
-        .reduce_and_verify(&SourceInput {
-            source: expected.to_owned(),
-            edition: input.edition,
-            target: input.target,
-        })
+        .reduce_and_verify(&SourceInput::binary(
+            expected.to_owned(),
+            input.edition,
+            input.target,
+        ))
         .expect("a reduced macro rule inventory must be byte-idempotent");
     assert_eq!(second.reduced_source(), expected);
 }
@@ -269,11 +258,7 @@ fn unreachable_macro_expansions_and_their_selected_rules_are_removed_together() 
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let source = include_str!("fixtures/compiler/macro_rule_expansion_retention.rs");
     let expected = include_str!("fixtures/compiler/macro_rule_expansion_retention.expected.rs");
-    let input = SourceInput {
-        source: source.to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
     let verified = analyzer
         .reduce_and_verify(&input)
@@ -281,11 +266,11 @@ fn unreachable_macro_expansions_and_their_selected_rules_are_removed_together() 
     assert_eq!(verified.reduced_source(), expected);
 
     let second = analyzer
-        .reduce_and_verify(&SourceInput {
-            source: verified.reduced_source().to_owned(),
-            edition: input.edition,
-            target: input.target,
-        })
+        .reduce_and_verify(&SourceInput::binary(
+            verified.reduced_source().to_owned(),
+            input.edition,
+            input.target,
+        ))
         .expect("the first reduction must already be a fixed point");
     assert_eq!(second.reduced_source(), expected);
 }
@@ -298,11 +283,7 @@ fn same_rule_expansion_subtrees_stabilize_repeated_identity() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let source = include_str!("fixtures/compiler/macro_rule_expansion_identity.rs");
     let expected = include_str!("fixtures/compiler/macro_rule_expansion_identity.expected.rs");
-    let input = SourceInput {
-        source: source.to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
     let verified = analyzer
         .reduce_and_verify(&input)
@@ -361,11 +342,11 @@ fn same_rule_expansion_subtrees_stabilize_repeated_identity() {
     );
 
     let second = analyzer
-        .reduce_and_verify(&SourceInput {
-            source: expected.to_owned(),
-            edition: input.edition,
-            target: input.target,
-        })
+        .reduce_and_verify(&SourceInput::binary(
+            expected.to_owned(),
+            input.edition,
+            input.target,
+        ))
         .expect("an already reduced same-rule fixture must remain byte-identical");
     assert_eq!(second.reduced_source(), expected);
     assert_eq!(
@@ -378,11 +359,11 @@ fn same_rule_expansion_subtrees_stabilize_repeated_identity() {
 #[test]
 fn fulfillment_dependencies_are_canonical_across_codegen_queries() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
-    let input = SourceInput {
-        source: include_str!("fixtures/compiler/fulfillment_order.rs").to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+    let input = SourceInput::binary(
+        include_str!("fixtures/compiler/fulfillment_order.rs").to_owned(),
+        Edition::Rust2024,
+        host_target(),
+    );
 
     let analysis = analyzer
         .analyze(&input)
@@ -444,8 +425,8 @@ fn fulfillment_dependencies_are_canonical_across_codegen_queries() {
 #[test]
 fn runtime_location_changes_do_not_change_the_decision_snapshot() {
     let analyzer = Analyzer::new().unwrap();
-    let input = SourceInput {
-        source: concat!(
+    let input = SourceInput::binary(
+        concat!(
             "fn dead() {}\n",
             "#[track_caller] fn caller() -> (&'static str, u32, u32, u32) {\n",
             "    let location = std::panic::Location::caller();\n",
@@ -454,9 +435,9 @@ fn runtime_location_changes_do_not_change_the_decision_snapshot() {
             "fn main() { let _ = caller(); }\n",
         )
         .to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+        Edition::Rust2024,
+        host_target(),
+    );
 
     let verified = analyzer.reduce_and_verify(&input).unwrap();
     assert!(!verified.reduced_source().contains("fn dead"));
@@ -470,8 +451,7 @@ fn runtime_location_changes_do_not_change_the_decision_snapshot() {
 #[test]
 fn compiler_decision_changes_caused_by_line_are_rejected() {
     let analyzer = Analyzer::new().unwrap();
-    let input = SourceInput {
-        source: concat!(
+    let input = SourceInput::binary(concat!(
             "trait Pick { fn value() -> u32; }\n",
             "struct Line<const N: u32>;\n",
             "macro_rules! impls { () => { impl Pick for Line<6> { fn value()->u32{6} } impl Pick for Line<8> { fn value()->u32{8} } }; }\n",
@@ -481,10 +461,7 @@ fn compiler_decision_changes_caused_by_line_are_rejected() {
             "}\n",
             "fn main() { let _ = <Line<{ line!() }> as Pick>::value(); }\n",
         )
-        .to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+        .to_owned(), Edition::Rust2024, host_target());
 
     let result = analyzer.reduce_and_verify(&input);
     let Err(AnalysisError::DecisionMismatch(difference)) = result else {
@@ -499,15 +476,15 @@ fn compiler_decision_changes_caused_by_line_are_rejected() {
 #[test]
 fn deleted_nested_use_prefix_is_not_a_compiler_decision_mismatch() {
     let analyzer = Analyzer::new().unwrap();
-    let input = SourceInput {
-        source: concat!(
+    let input = SourceInput::binary(
+        concat!(
             "use std::{fmt::{Debug}, marker::{PhantomData}, collections::HashMap};\n",
             "fn main() { let _: PhantomData<u8> = PhantomData; }\n",
         )
         .to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+        Edition::Rust2024,
+        host_target(),
+    );
 
     let verified = analyzer
         .reduce_and_verify(&input)
@@ -526,11 +503,7 @@ fn deleted_nested_use_prefix_is_not_a_compiler_decision_mismatch() {
 fn empty_tag_is_a_typed_error() {
     let analyzer = Analyzer::new().unwrap();
     let source = "#[doc = \"rust-item-dependencies:tag=\"]\nfn main() {}\n";
-    let input = SourceInput {
-        source: source.to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
     let error = analyzer.analyze(&input).unwrap_err();
     let AnalysisError::InvalidTag { range } = error else {
@@ -547,11 +520,7 @@ fn empty_tag_is_a_typed_error() {
 fn original_compiler_diagnostics_are_owned_and_source_anchored() {
     let analyzer = Analyzer::new().unwrap();
     let source = "fn main() { let value: u32 = \"not a number\"; }\n";
-    let input = SourceInput {
-        source: source.to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
     let AnalysisError::OriginalCompilationFailed(diagnostics) =
         analyzer.analyze(&input).unwrap_err()
@@ -577,11 +546,7 @@ fn original_compiler_diagnostics_are_owned_and_source_anchored() {
 fn deny_by_default_lints_reject_the_original_source() {
     let analyzer = Analyzer::new().unwrap();
     let source = "fn main() { let value: u8 = 256; println!(\"{value}\"); }\n";
-    let input = SourceInput {
-        source: source.to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
     let AnalysisError::OriginalCompilationFailed(diagnostics) =
         analyzer.reduce(&input).unwrap_err()
@@ -605,11 +570,7 @@ fn reduction_rejects_new_unfulfilled_lint_expectations() {
         "use std::fmt::{Debug, Display};\n",
         "fn main() { let _: &dyn Debug = &0; }\n",
     );
-    let input = SourceInput {
-        source: source.to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
     analyzer
         .analyze(&input)
@@ -639,11 +600,7 @@ fn reduced_compiler_diagnostics_use_original_source_coordinates() {
         "fn require<T: Pick>() {}\n",
         "fn main() { require::<Line<{ line!() }>>(); }\n",
     );
-    let input = SourceInput {
-        source: source.to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
     let AnalysisError::ReducedCompilationFailed(diagnostics) =
         analyzer.reduce_and_verify(&input).unwrap_err()
@@ -662,8 +619,7 @@ fn reduced_compiler_diagnostics_use_original_source_coordinates() {
 #[test]
 fn tags_follow_expanded_definitions_and_semantic_reachability() {
     let analyzer = Analyzer::new().unwrap();
-    let input = SourceInput {
-        source: concat!(
+    let input = SourceInput::binary(concat!(
             "#![doc = \"rust-item-dependencies:tag=inner-is-ignored\"]\n",
             "macro_rules! tagged { () => { #[doc = concat!(\"rust-item-dependencies:\", \"tag=generated\")] struct Generated; }; }\n",
             "tagged!();\n",
@@ -673,10 +629,7 @@ fn tags_follow_expanded_definitions_and_semantic_reachability() {
             "#[doc = \"rust-item-dependencies:tag=dead\"] fn dead() {}\n",
             "fn main() { use_generated(Generated); }\n",
         )
-        .to_owned(),
-        edition: Edition::Rust2024,
-        target: host_target(),
-    };
+        .to_owned(), Edition::Rust2024, host_target());
 
     let analysis = analyzer.analyze(&input).unwrap();
     assert_eq!(

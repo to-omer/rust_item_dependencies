@@ -634,7 +634,7 @@ fn dead_top_level_macro_does_not_follow_crate_expansion_use() {
     assert_retained_units(&reduced, DIRECT_MACRO_RETAINED);
     assert_eq!(
         written_expansion_ranges(
-            &reduced.retention.main_semantic,
+            &reduced.retention.semantic_required,
             &reduced.graph,
             &reduced.source,
         ),
@@ -665,7 +665,7 @@ fn semantic_and_compile_closures_are_not_conflated() {
         "main".to_owned(),
     ]);
     assert_eq!(
-        local_definitions(&item.retention.main_semantic, &item.graph.definitions),
+        local_definitions(&item.retention.semantic_required, &item.graph.definitions),
         expected_item
     );
     assert_eq!(
@@ -673,14 +673,14 @@ fn semantic_and_compile_closures_are_not_conflated() {
         expected_item
     );
     assert_eq!(
-        injected_definitions(&item.retention.main_semantic, &item.graph.definitions),
+        injected_definitions(&item.retention.semantic_required, &item.graph.definitions),
         BTreeSet::new()
     );
 
     let generated = inspect_reduction(MACRO_INPUT);
     assert_eq!(
         local_definitions(
-            &generated.retention.main_semantic,
+            &generated.retention.semantic_required,
             &generated.graph.definitions
         ),
         BTreeSet::from([
@@ -710,7 +710,7 @@ fn semantic_and_compile_closures_are_not_conflated() {
     }]);
     assert_eq!(
         written_expansion_ranges(
-            &generated.retention.main_semantic,
+            &generated.retention.semantic_required,
             &generated.graph,
             &generated.source,
         ),
@@ -726,7 +726,7 @@ fn semantic_and_compile_closures_are_not_conflated() {
     );
     assert_eq!(
         injected_definitions(
-            &generated.retention.main_semantic,
+            &generated.retention.semantic_required,
             &generated.graph.definitions
         ),
         BTreeSet::new()
@@ -1052,11 +1052,7 @@ fn contains(source: &[u8], needle: &[u8]) -> bool {
 fn inspect_inventory(source: &str) -> SourceInventory {
     let (sysroot, target) = compiler_context();
     inspect_source(
-        &SourceInput {
-            source: source.to_owned(),
-            edition: Edition::Rust2024,
-            target,
-        },
+        &SourceInput::binary(source.to_owned(), Edition::Rust2024, target),
         &sysroot,
     )
     .expect("a retention fixture must have a complete source inventory")
@@ -1066,11 +1062,7 @@ fn inspect_inventory(source: &str) -> SourceInventory {
 fn inspect_definitions(source: &str) -> DefinitionGraph {
     let (sysroot, target) = compiler_context();
     inspect_source_with_definitions(
-        &SourceInput {
-            source: source.to_owned(),
-            edition: Edition::Rust2024,
-            target,
-        },
+        &SourceInput::binary(source.to_owned(), Edition::Rust2024, target),
         &sysroot,
     )
     .expect("the reduced use fixture must retain resolution observations")
@@ -1091,11 +1083,7 @@ fn assert_generated_sibling_unchanged(source: &str) {
 fn inspect_reduction(source: &str) -> super::InspectedReduction {
     let (sysroot, target) = compiler_context();
     inspect_source_with_reduction(
-        &SourceInput {
-            source: source.to_owned(),
-            edition: Edition::Rust2024,
-            target,
-        },
+        &SourceInput::binary(source.to_owned(), Edition::Rust2024, target),
         &sysroot,
     )
     .expect("the fixture must produce a complete reduction")

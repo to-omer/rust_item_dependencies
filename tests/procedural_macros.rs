@@ -666,11 +666,7 @@ mod patched {
     }
 
     fn input(source: &str) -> SourceInput {
-        SourceInput {
-            source: source.to_owned(),
-            edition: Edition::Rust2024,
-            target: host_target(),
-        }
+        SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target())
     }
 
     fn dynamic_library_path(directory: &Path, crate_name: &str) -> PathBuf {

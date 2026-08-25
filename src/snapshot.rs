@@ -26,7 +26,7 @@ use crate::retention::{Retention, source_site_is_retained};
 use crate::rewrite::SourceRewrite;
 use crate::source::{ByteRange, SourceInventory};
 
-const SNAPSHOT_SCHEMA: u8 = 3;
+const SNAPSHOT_SCHEMA: u8 = 4;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum SnapshotNodeKey {
@@ -152,15 +152,13 @@ pub(crate) struct SnapshotEdge {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SnapshotRoot {
-    pub node: MonoKey,
+    pub node: SnapshotNodeKey,
     pub reason: RootReason,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CompilerDecisionSnapshot {
-    main_definition: DefinitionKey,
-    main_instance: MonoKey,
-    compiler_required_roots: BTreeSet<SnapshotRoot>,
+    roots: BTreeSet<SnapshotRoot>,
     nodes: BTreeMap<SnapshotNodeKey, SnapshotNodeDecision>,
     edges: BTreeSet<SnapshotEdge>,
 }
@@ -177,15 +175,7 @@ pub(crate) enum SnapshotError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum SnapshotDiff {
-    MainDefinition {
-        original: DefinitionKey,
-        reduced: DefinitionKey,
-    },
-    MainInstance {
-        original: MonoKey,
-        reduced: MonoKey,
-    },
-    CompilerRequiredRoot {
+    Root {
         original: Option<SnapshotRoot>,
         reduced: Option<SnapshotRoot>,
     },
@@ -227,13 +217,7 @@ impl CompilerDecisionSnapshot {
             .copied()
             .filter(|node| matches!(node, GraphNode::Definition(_)))
             .collect::<BTreeSet<_>>();
-        selected.insert(GraphNode::Mono(graph.main_instance));
-        selected.extend(
-            graph
-                .compiler_required_roots
-                .iter()
-                .map(|root| GraphNode::Mono(root.node)),
-        );
+        selected.extend(graph.roots.iter().map(|root| root.node));
         if !selected.is_subset(&permitted) {
             return Err(SnapshotError::InvalidRoot);
         }
@@ -258,7 +242,7 @@ impl CompilerDecisionSnapshot {
 
     /// Builds the observed decision set from the reduced analysis.  Every
     /// local definition is a root so a newly introduced retained definition
-    /// cannot hide merely because it is not reachable from `main`.
+    /// cannot hide merely because it is not reachable from an entry root.
     pub(crate) fn reduced(graph: &DependencyGraph) -> Result<Self, SnapshotError> {
         let mut selected = graph
             .definitions
@@ -266,13 +250,7 @@ impl CompilerDecisionSnapshot {
             .iter()
             .map(|definition| GraphNode::Definition(definition.id))
             .collect::<BTreeSet<_>>();
-        selected.insert(GraphNode::Mono(graph.main_instance));
-        selected.extend(
-            graph
-                .compiler_required_roots
-                .iter()
-                .map(|root| GraphNode::Mono(root.node)),
-        );
+        selected.extend(graph.roots.iter().map(|root| root.node));
 
         let mut work = selected.iter().copied().collect::<Vec<_>>();
         while let Some(from) = work.pop() {
@@ -289,10 +267,8 @@ impl CompilerDecisionSnapshot {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"RIDSNAP");
         put_u8(&mut bytes, SNAPSHOT_SCHEMA);
-        put_definition_key(&mut bytes, &self.main_definition);
-        put_mono_key(&mut bytes, &self.main_instance);
-        put_len(&mut bytes, self.compiler_required_roots.len());
-        for root in &self.compiler_required_roots {
+        put_len(&mut bytes, self.roots.len());
+        for root in &self.roots {
             put_snapshot_root(&mut bytes, root);
         }
         put_len(&mut bytes, self.nodes.len());
@@ -309,23 +285,8 @@ impl CompilerDecisionSnapshot {
     }
 
     pub(crate) fn first_difference(&self, reduced: &Self) -> Option<SnapshotDiff> {
-        if self.main_definition != reduced.main_definition {
-            return Some(SnapshotDiff::MainDefinition {
-                original: self.main_definition.clone(),
-                reduced: reduced.main_definition.clone(),
-            });
-        }
-        if self.main_instance != reduced.main_instance {
-            return Some(SnapshotDiff::MainInstance {
-                original: self.main_instance.clone(),
-                reduced: reduced.main_instance.clone(),
-            });
-        }
-        if let Some((original, reduced)) = first_set_difference(
-            &self.compiler_required_roots,
-            &reduced.compiler_required_roots,
-        ) {
-            return Some(SnapshotDiff::CompilerRequiredRoot { original, reduced });
+        if let Some((original, reduced)) = first_set_difference(&self.roots, &reduced.roots) {
+            return Some(SnapshotDiff::Root { original, reduced });
         }
         if let Some((key, original, reduced)) = first_map_difference(&self.nodes, &reduced.nodes) {
             return Some(SnapshotDiff::Node {
@@ -344,19 +305,11 @@ impl CompilerDecisionSnapshot {
         source_filter: Option<(&SourceInventory, &BTreeSet<crate::source::SourceUnitId>)>,
     ) -> Result<Self, SnapshotError> {
         let expansion_keys = snapshot_expansion_keys(graph, selected, source_filter)?;
-        let main_definition = definition_key(graph, graph.main_definition)?.clone();
-        let main_instance = mono_key(graph, graph.main_instance)?.clone();
-        if !selected.contains(&GraphNode::Definition(graph.main_definition))
-            || !selected.contains(&GraphNode::Mono(graph.main_instance))
-        {
-            return Err(SnapshotError::InvalidRoot);
-        }
-
-        let mut compiler_required_roots = BTreeSet::new();
-        for root in &graph.compiler_required_roots {
-            if !selected.contains(&GraphNode::Mono(root.node))
-                || !compiler_required_roots.insert(SnapshotRoot {
-                    node: mono_key(graph, root.node)?.clone(),
+        let mut roots = BTreeSet::new();
+        for root in &graph.roots {
+            if !selected.contains(&root.node)
+                || !roots.insert(SnapshotRoot {
+                    node: node_key(graph, &expansion_keys, root.node)?,
                     reason: root.reason,
                 })
             {
@@ -390,9 +343,7 @@ impl CompilerDecisionSnapshot {
         }
 
         Ok(Self {
-            main_definition,
-            main_instance,
-            compiler_required_roots,
+            roots,
             nodes,
             edges,
         })
@@ -1231,8 +1182,20 @@ fn first_map_difference<K: Clone + Ord, V: Clone + Eq>(
 }
 
 fn put_snapshot_root(bytes: &mut Vec<u8>, root: &SnapshotRoot) {
-    put_mono_key(bytes, &root.node);
-    put_u8(bytes, root.reason as u8);
+    put_snapshot_node_key(bytes, &root.node);
+    put_root_reason(bytes, root.reason);
+}
+
+fn put_root_reason(bytes: &mut Vec<u8>, reason: RootReason) {
+    let tag = match reason {
+        RootReason::Main => 0,
+        RootReason::ExplicitEntry => 1,
+        RootReason::DownstreamSelection => 2,
+        RootReason::StartInstance => 3,
+        RootReason::UsedAttribute => 4,
+        RootReason::ExternalSymbol => 5,
+    };
+    put_u8(bytes, tag);
 }
 
 fn put_snapshot_node_key(bytes: &mut Vec<u8>, key: &SnapshotNodeKey) {
@@ -1787,7 +1750,7 @@ mod tests {
     use super::*;
     use crate::dependency_graph::{
         DependencyEdge, EvidenceOrigin, ExpansionFragmentKind, ExpansionKeyPart, ExpansionNode,
-        MacroStyle, MonoNode, ProofNode,
+        MacroStyle, MonoNode, ProofNode, RootRecord,
     };
     use crate::graph::{
         Definition, DefinitionGraph, DefinitionKeyPart, DefinitionKind, DefinitionOrigin,
@@ -1843,21 +1806,22 @@ mod tests {
     }
 
     fn snapshot() -> CompilerDecisionSnapshot {
-        let main_definition = definition_key("main", 0);
-        let main_instance = MonoKey::Static {
-            definition: main_definition.clone(),
+        let entry_definition = definition_key("entry", 0);
+        let entry_instance = MonoKey::Static {
+            definition: entry_definition.clone(),
         };
         CompilerDecisionSnapshot {
-            main_definition: main_definition.clone(),
-            main_instance: main_instance.clone(),
-            compiler_required_roots: BTreeSet::new(),
+            roots: BTreeSet::from([SnapshotRoot {
+                node: SnapshotNodeKey::Mono(entry_instance.clone()),
+                reason: RootReason::ExplicitEntry,
+            }]),
             nodes: BTreeMap::from([
                 (
-                    SnapshotNodeKey::Definition(main_definition),
+                    SnapshotNodeKey::Definition(entry_definition),
                     SnapshotNodeDecision::Definition,
                 ),
                 (
-                    SnapshotNodeKey::Mono(main_instance),
+                    SnapshotNodeKey::Mono(entry_instance),
                     SnapshotNodeDecision::Mono {
                         materialized_definition: None,
                     },
@@ -1865,6 +1829,25 @@ mod tests {
             ]),
             edges: BTreeSet::new(),
         }
+    }
+
+    fn snapshot_entry_instance(snapshot: &CompilerDecisionSnapshot) -> &MonoKey {
+        let SnapshotNodeKey::Mono(instance) = &snapshot
+            .roots
+            .first()
+            .expect("the fixture snapshot has one entry root")
+            .node
+        else {
+            panic!("the fixture entry root must be a mono node")
+        };
+        instance
+    }
+
+    fn snapshot_entry_definition(snapshot: &CompilerDecisionSnapshot) -> &DefinitionKey {
+        let MonoKey::Static { definition } = snapshot_entry_instance(snapshot) else {
+            panic!("the fixture entry root must be a static mono node")
+        };
+        definition
     }
 
     fn term(value: u8) -> CanonicalCompilerTerm {
@@ -1959,9 +1942,10 @@ mod tests {
                     evidence: EvidenceOrigin::PatchedObserver,
                 },
             ],
-            main_definition: DefinitionId(0),
-            main_instance: MonoId(0),
-            compiler_required_roots: Vec::new(),
+            roots: vec![RootRecord {
+                node: GraphNode::Mono(MonoId(0)),
+                reason: RootReason::ExternalSymbol,
+            }],
         }
     }
 
@@ -2447,9 +2431,10 @@ mod tests {
                 allocation_observation: None,
             }],
             edges,
-            main_definition: DefinitionId(0),
-            main_instance: MonoId(0),
-            compiler_required_roots: Vec::new(),
+            roots: vec![RootRecord {
+                node: GraphNode::Mono(MonoId(0)),
+                reason: RootReason::ExternalSymbol,
+            }],
         }
     }
 
@@ -2728,7 +2713,7 @@ mod tests {
             ..retained_edge
         });
         let retention = Retention {
-            main_semantic: BTreeSet::new(),
+            semantic_required: BTreeSet::new(),
             compile_required: BTreeSet::from([
                 GraphNode::Definition(DefinitionId(0)),
                 GraphNode::Proof(ProofId(0)),
@@ -2751,6 +2736,67 @@ mod tests {
     }
 
     #[test]
+    fn original_and_reduced_snapshots_preserve_generic_function_and_use_roots() {
+        // Generic functions and re-export paths have no monomorphic entry node;
+        // their compiler-selected definitions are the semantic root witnesses.
+        let definitions = vec![
+            written_definition(0, DefinitionKind::Function, WrittenUnitKind::Item, 0, 1),
+            written_definition(1, DefinitionKind::Use, WrittenUnitKind::UseItem, 1, 2),
+        ];
+        let expected_roots = definitions
+            .iter()
+            .map(|definition| SnapshotRoot {
+                node: SnapshotNodeKey::Definition(definition.key.clone()),
+                reason: RootReason::ExplicitEntry,
+            })
+            .collect::<BTreeSet<_>>();
+        let graph = DependencyGraph {
+            definitions: DefinitionGraph {
+                definitions,
+                external_definitions: Vec::new(),
+                edges: Vec::new(),
+            },
+            expansions: Vec::new(),
+            proofs: Vec::new(),
+            mono_nodes: Vec::new(),
+            edges: Vec::new(),
+            roots: vec![
+                RootRecord {
+                    node: GraphNode::Definition(DefinitionId(0)),
+                    reason: RootReason::ExplicitEntry,
+                },
+                RootRecord {
+                    node: GraphNode::Definition(DefinitionId(1)),
+                    reason: RootReason::ExplicitEntry,
+                },
+            ],
+        };
+        let inventory = two_item_inventory();
+        let retained_units = BTreeSet::from([SourceUnitId(0), SourceUnitId(1), SourceUnitId(2)]);
+        let retention = Retention {
+            semantic_required: BTreeSet::from([
+                GraphNode::Definition(DefinitionId(0)),
+                GraphNode::Definition(DefinitionId(1)),
+            ]),
+            compile_required: BTreeSet::from([
+                GraphNode::Definition(DefinitionId(0)),
+                GraphNode::Definition(DefinitionId(1)),
+            ]),
+            retained_units,
+        };
+        let rewrite =
+            crate::rewrite::rewrite_source(&inventory, &retention.retained_units).unwrap();
+
+        let original =
+            CompilerDecisionSnapshot::original(&graph, &inventory, &retention, &rewrite).unwrap();
+        let reduced = CompilerDecisionSnapshot::reduced(&graph).unwrap();
+
+        assert_eq!(original.roots, expected_roots);
+        assert_eq!(original, reduced);
+        assert_eq!(original.hash(), reduced.hash());
+    }
+
+    #[test]
     fn original_snapshot_excludes_only_removed_use_item_prefixes() {
         let graph = DependencyGraph {
             definitions: DefinitionGraph {
@@ -2767,9 +2813,7 @@ mod tests {
             proofs: Vec::new(),
             mono_nodes: Vec::new(),
             edges: Vec::new(),
-            main_definition: DefinitionId(0),
-            main_instance: MonoId(0),
-            compiler_required_roots: Vec::new(),
+            roots: Vec::new(),
         };
         let pieces = vec![crate::rewrite::SourcePiece {
             output_range: ByteRange { start: 0, end: 1 },
@@ -2871,9 +2915,10 @@ mod tests {
             proofs: Vec::new(),
             mono_nodes: vec![mono.clone()],
             edges,
-            main_definition: DefinitionId(0),
-            main_instance: MonoId(0),
-            compiler_required_roots: Vec::new(),
+            roots: vec![RootRecord {
+                node: GraphNode::Mono(MonoId(0)),
+                reason: RootReason::ExternalSymbol,
+            }],
         };
         let reduced_graph = DependencyGraph {
             definitions: DefinitionGraph {
@@ -2885,9 +2930,10 @@ mod tests {
             proofs: Vec::new(),
             mono_nodes: vec![mono],
             edges: retained_edges,
-            main_definition: DefinitionId(0),
-            main_instance: MonoId(0),
-            compiler_required_roots: Vec::new(),
+            roots: vec![RootRecord {
+                node: GraphNode::Mono(MonoId(0)),
+                reason: RootReason::ExternalSymbol,
+            }],
         };
         let compile_required = BTreeSet::from_iter(
             [
@@ -2899,7 +2945,7 @@ mod tests {
             .chain((0..4).map(|id| GraphNode::Expansion(ExpansionId(id)))),
         );
         let retention = Retention {
-            main_semantic: BTreeSet::new(),
+            semantic_required: BTreeSet::new(),
             compile_required,
             retained_units: BTreeSet::from([SourceUnitId(0), SourceUnitId(1)]),
         };
@@ -3287,11 +3333,74 @@ mod tests {
     }
 
     #[test]
+    fn reduced_snapshot_preserves_every_reason_for_a_root_node() {
+        let mut graph = graph_with_proof_ids(ProofId(0), ProofId(1));
+        graph.roots.push(RootRecord {
+            node: GraphNode::Mono(MonoId(0)),
+            reason: RootReason::ExplicitEntry,
+        });
+        let node = graph.mono_nodes[0].key.clone();
+
+        let snapshot = CompilerDecisionSnapshot::reduced(&graph).unwrap();
+
+        assert_eq!(
+            snapshot.roots,
+            BTreeSet::from([
+                SnapshotRoot {
+                    node: SnapshotNodeKey::Mono(node.clone()),
+                    reason: RootReason::ExternalSymbol,
+                },
+                SnapshotRoot {
+                    node: SnapshotNodeKey::Mono(node),
+                    reason: RootReason::ExplicitEntry,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn first_difference_reports_a_missing_root() {
+        let original = snapshot();
+        let mut reduced = original.clone();
+        let root = reduced
+            .roots
+            .pop_first()
+            .expect("the fixture snapshot has one entry root");
+
+        assert_ne!(original.hash(), reduced.hash());
+        assert_eq!(
+            original.first_difference(&reduced),
+            Some(SnapshotDiff::Root {
+                original: Some(root),
+                reduced: None,
+            })
+        );
+    }
+
+    #[test]
+    fn first_difference_reports_a_root_reason_change() {
+        let original = snapshot();
+        let mut reduced = original.clone();
+        let mut root = reduced
+            .roots
+            .pop_first()
+            .expect("the fixture snapshot has one entry root");
+        root.reason = RootReason::ExternalSymbol;
+        reduced.roots.insert(root);
+
+        assert_ne!(original.hash(), reduced.hash());
+        assert!(matches!(
+            original.first_difference(&reduced),
+            Some(SnapshotDiff::Root { .. })
+        ));
+    }
+
+    #[test]
     fn first_difference_reports_the_exact_typed_edge() {
         let mut original = snapshot();
         let mut reduced = original.clone();
-        let definition = SnapshotNodeKey::Definition(original.main_definition.clone());
-        let mono = SnapshotNodeKey::Mono(original.main_instance.clone());
+        let definition = SnapshotNodeKey::Definition(snapshot_entry_definition(&original).clone());
+        let mono = SnapshotNodeKey::Mono(snapshot_entry_instance(&original).clone());
         let source = vec![SnapshotObservationSite::Source(ByteRange {
             start: 4,
             end: 8,
@@ -3325,8 +3434,8 @@ mod tests {
     fn node_payload_difference_is_reported_under_the_semantic_key() {
         let original = snapshot();
         let mut reduced = original.clone();
-        let mono = SnapshotNodeKey::Mono(original.main_instance.clone());
-        let target = DefinitionReferenceKey::Local(original.main_definition.clone());
+        let mono = SnapshotNodeKey::Mono(snapshot_entry_instance(&original).clone());
+        let target = DefinitionReferenceKey::Local(snapshot_entry_definition(&original).clone());
         reduced.nodes.insert(
             mono.clone(),
             SnapshotNodeDecision::Mono {
@@ -3343,7 +3452,7 @@ mod tests {
                 }),
                 reduced: Some(SnapshotNodeDecision::Mono {
                     materialized_definition: Some(DefinitionReferenceKey::Local(
-                        original.main_definition.clone(),
+                        snapshot_entry_definition(&original).clone(),
                     )),
                 }),
             })
