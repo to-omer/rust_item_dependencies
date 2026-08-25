@@ -1,0 +1,583 @@
+From dba80e698fc26f4fe3e82c9ba2ef05544dde254b Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Sat, 22 Aug 2026 23:25:00 +0900
+Subject: [PATCH] rustc: guard proc-macro dynamic library loading
+
+---
+ compiler/rustc_driver_impl/src/lib.rs         |   7 +-
+ compiler/rustc_interface/src/interface.rs     |  10 +-
+ compiler/rustc_metadata/src/creader.rs        |  38 ++-
+ compiler/rustc_metadata/src/diagnostics.rs    |   8 +
+ compiler/rustc_metadata/src/locator.rs        |   4 +
+ compiler/rustc_session/src/session.rs         |  23 +-
+ .../examples/rustc-interface-example.rs       |   1 +
+ .../rustc-interface-getting-diagnostics.rs    |   1 +
+ src/librustdoc/core.rs                        |   1 +
+ src/librustdoc/doctest.rs                     |   1 +
+ tests/ui-fulldeps/proc-macro-load-guard.rs    | 249 ++++++++++++++++++
+ tests/ui-fulldeps/run-compiler-twice.rs       |   2 +
+ tests/ui-fulldeps/typed-mono-successors.rs    |   1 +
+ 13 files changed, 328 insertions(+), 18 deletions(-)
+ create mode 100644 tests/ui-fulldeps/proc-macro-load-guard.rs
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 2bee8f8b..9a741579 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 13;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 14;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+@@ -131,7 +131,9 @@ pub(super) fn install() {}
+     env!("RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST");
+ 
+ pub use rustc_interface::interface::Config as CompilerConfig;
+-pub use rustc_session::{ExternalResourceGuard, ExternalResourceKind, ExternalResourceUse};
++pub use rustc_session::{
++    ExternalResourceGuard, ExternalResourceKind, ExternalResourceUse, ProcMacroLoadGuard,
++};
+ 
+ pub const DEFAULT_BUG_REPORT_URL: &str = "https://github.com/rust-lang/rust/issues/new\
+     ?labels=C-bug%2C+I-ICE%2C+T-compiler&template=ice.md";
+@@ -234,6 +236,7 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send))
+         ice_file,
+         file_loader: None,
+         external_resource_guard: None,
++        proc_macro_load_guard: None,
+         lint_caps: Default::default(),
+         psess_created: None,
+         track_state: None,
+diff --git a/compiler/rustc_interface/src/interface.rs b/compiler/rustc_interface/src/interface.rs
+index a9c759ee..d691c04e 100644
+--- a/compiler/rustc_interface/src/interface.rs
++++ b/compiler/rustc_interface/src/interface.rs
+@@ -17,7 +17,9 @@
+ use rustc_query_impl::print_query_stack;
+ use rustc_session::config::{self, Cfg, CheckCfg, ExpectedValues, Input, OutFileName};
+ use rustc_session::parse::ParseSess;
+-use rustc_session::{CompilerIO, EarlyDiagCtxt, ExternalResourceGuard, Session, lint};
++use rustc_session::{
++    CompilerIO, EarlyDiagCtxt, ExternalResourceGuard, ProcMacroLoadGuard, Session, lint,
++};
+ use rustc_span::source_map::{FileLoader, RealFileLoader, SourceMapInputs};
+ use rustc_span::{FileName, sym};
+ use tracing::trace;
+@@ -330,6 +332,10 @@ pub struct Config {
+     /// is read and reports the attempted access to the driver.
+     pub external_resource_guard: Option<ExternalResourceGuard>,
+ 
++    /// Authorizes selected proc-macro dynamic libraries before crate registration
++    /// mutates compiler state or loads them into the compiler process.
++    pub proc_macro_load_guard: Option<ProcMacroLoadGuard>,
++
+     pub lint_caps: FxHashMap<lint::LintId, lint::Level>,
+ 
+     /// This is a callback from the driver that is called when [`ParseSess`] is created.
+@@ -414,6 +420,7 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
+             let temps_dir = config.opts.unstable_opts.temps_dir.as_deref().map(PathBuf::from);
+ 
+             let external_resource_guard = config.external_resource_guard;
++            let proc_macro_load_guard = config.proc_macro_load_guard;
+             let mut sess = rustc_session::build_session(
+                 config.opts,
+                 CompilerIO {
+@@ -429,6 +436,7 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
+                 config.using_internal_features,
+             );
+             sess.external_resource_guard = external_resource_guard;
++            sess.proc_macro_load_guard = proc_macro_load_guard;
+ 
+             let codegen_backend = match config.make_codegen_backend {
+                 None => util::get_codegen_backend(
+diff --git a/compiler/rustc_metadata/src/creader.rs b/compiler/rustc_metadata/src/creader.rs
+index 8879c175..90d6f6ab 100644
+--- a/compiler/rustc_metadata/src/creader.rs
++++ b/compiler/rustc_metadata/src/creader.rs
+@@ -604,6 +604,27 @@ fn register_crate<'tcx>(
+         let host_hash = host_lib.as_ref().map(|lib| lib.metadata.get_root().hash());
+         let private_dep = self.is_private_dep(&tcx.sess.opts.externs, name, private_dep);
+ 
++        // Authorize the proc-macro load before claiming a crate number. Extern-prelude lookup may
++        // speculatively attempt this registration and retry it later with a diagnostic span. Keep
++        // the selected path and stable ID together so the authorization is consumed by that load.
++        let authorized_proc_macro_load = if crate_root.is_proc_macro_crate() {
++            let temp_root;
++            let (dlsym_source, dlsym_root) = match &host_lib {
++                Some(host_lib) => (&host_lib.source, {
++                    temp_root = host_lib.metadata.get_root();
++                    &temp_root
++                }),
++                None => (&source, &crate_root),
++            };
++            let dlsym_dylib = dlsym_source.dylib.as_ref().expect("no dylib for a proc-macro crate");
++            if !tcx.sess.is_proc_macro_load_allowed(dlsym_dylib) {
++                return Err(CrateError::ProcMacroLoadDenied(dlsym_dylib.clone()));
++            }
++            Some((dlsym_dylib.clone(), dlsym_root.stable_crate_id()))
++        } else {
++            None
++        };
++
+         // Claim this crate number and cache it
+         let feed = self.intern_stable_crate_id(tcx, &crate_root)?;
+         let cnum = feed.key();
+@@ -635,20 +656,9 @@ fn register_crate<'tcx>(
+             private_dep,
+         )?;
+ 
+-        let raw_proc_macros = if crate_root.is_proc_macro_crate() {
+-            let temp_root;
+-            let (dlsym_source, dlsym_root) = match &host_lib {
+-                Some(host_lib) => (&host_lib.source, {
+-                    temp_root = host_lib.metadata.get_root();
+-                    &temp_root
+-                }),
+-                None => (&source, &crate_root),
+-            };
+-            let dlsym_dylib = dlsym_source.dylib.as_ref().expect("no dylib for a proc-macro crate");
+-            Some(self.dlsym_proc_macros(dlsym_dylib, dlsym_root.stable_crate_id())?)
+-        } else {
+-            None
+-        };
++        let raw_proc_macros = authorized_proc_macro_load
++            .map(|(dylib, stable_id)| self.dlsym_proc_macros(&dylib, stable_id))
++            .transpose()?;
+ 
+         let crate_metadata = CrateMetadata::new(
+             tcx,
+diff --git a/compiler/rustc_metadata/src/diagnostics.rs b/compiler/rustc_metadata/src/diagnostics.rs
+index 8fc2b27b..50b9d257 100644
+--- a/compiler/rustc_metadata/src/diagnostics.rs
++++ b/compiler/rustc_metadata/src/diagnostics.rs
+@@ -360,6 +360,14 @@ pub(crate) struct DlError {
+     pub err: String,
+ }
+ 
++#[derive(Diagnostic)]
++#[diag("loading proc-macro library is not permitted by the compiler driver: {$path}")]
++pub(crate) struct ProcMacroLoadDenied<'a> {
++    #[primary_span]
++    pub span: Span,
++    pub path: &'a Path,
++}
++
+ #[derive(Diagnostic)]
+ #[diag("found possibly newer version of crate `{$crate_name}`{$add_info}", code = E0460)]
+ #[note("perhaps that crate needs to be recompiled?")]
+diff --git a/compiler/rustc_metadata/src/locator.rs b/compiler/rustc_metadata/src/locator.rs
+index f26b2739..0ce21623 100644
+--- a/compiler/rustc_metadata/src/locator.rs
++++ b/compiler/rustc_metadata/src/locator.rs
+@@ -1037,6 +1037,7 @@ pub(crate) enum CrateError {
+     StableCrateIdCollision(Symbol, Symbol),
+     DlOpen(String, String),
+     DlSym(String, String),
++    ProcMacroLoadDenied(PathBuf),
+     LocatorCombined(Box<CombinedLocatorError>),
+     NotFound(Symbol),
+ }
+@@ -1113,6 +1114,9 @@ pub(crate) fn report(self, sess: &Session, span: Span, missing_core: bool) {
+             CrateError::DlOpen(path, err) | CrateError::DlSym(path, err) => {
+                 dcx.emit_err(diagnostics::DlError { span, path, err });
+             }
++            CrateError::ProcMacroLoadDenied(path) => {
++                dcx.emit_err(diagnostics::ProcMacroLoadDenied { span, path: &path });
++            }
+             CrateError::LocatorCombined(locator) => {
+                 let crate_name = locator.crate_name;
+                 let add_info = match &locator.dep_root {
+diff --git a/compiler/rustc_session/src/session.rs b/compiler/rustc_session/src/session.rs
+index abac8c79..3de2dac8 100644
+--- a/compiler/rustc_session/src/session.rs
++++ b/compiler/rustc_session/src/session.rs
+@@ -1,5 +1,5 @@
+ use std::any::Any;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::str::FromStr;
+ use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, AtomicUsize};
+@@ -110,6 +110,18 @@ fn report(&self, resource_use: ExternalResourceUse) {
+     }
+ }
+ 
++pub struct ProcMacroLoadGuard(IntoDynSyncSend<Box<dyn Fn(&Path) -> bool + Send + Sync>>);
++
++impl ProcMacroLoadGuard {
++    pub fn new(guard: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
++        ProcMacroLoadGuard(IntoDynSyncSend(Box::new(guard)))
++    }
++
++    fn is_allowed(&self, path: &Path) -> bool {
++        (self.0)(path)
++    }
++}
++
+ pub trait DynLintStore: Any + DynSync + DynSend {
+     /// Provides a way to access lint groups without depending on `rustc_lint`
+     fn lint_groups_iter(&self) -> Box<dyn Iterator<Item = LintGroup> + '_>;
+@@ -429,6 +441,10 @@ pub struct Session {
+     /// state is read and reports the attempted access to the compiler driver.
+     pub external_resource_guard: Option<ExternalResourceGuard>,
+ 
++    /// When present, authorizes selected proc-macro dynamic libraries before crate
++    /// registration mutates compiler state or loads them into the compiler process.
++    pub proc_macro_load_guard: Option<ProcMacroLoadGuard>,
++
+     target_filesearch: Arc<FileSearch>,
+     host_filesearch: Arc<FileSearch>,
+ 
+@@ -502,6 +518,10 @@ pub fn reject_external_resource(
+         ))
+     }
+ 
++    pub fn is_proc_macro_load_allowed(&self, path: &Path) -> bool {
++        self.proc_macro_load_guard.as_ref().is_none_or(|guard| guard.is_allowed(path))
++    }
++
+     pub fn miri_unleashed_feature(&self, span: Span, feature_gate: Option<Symbol>) {
+         self.miri_unleashed_features.lock().push((span, feature_gate));
+     }
+@@ -1397,6 +1417,7 @@ pub fn build_session(
+         env_depinfo: Default::default(),
+         file_depinfo: Default::default(),
+         external_resource_guard: None,
++        proc_macro_load_guard: None,
+         target_filesearch,
+         host_filesearch,
+         replaced_intrinsics: FxHashSet::default(), // filled by `run_compiler`
+diff --git a/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs b/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs
+index 03aec7a8..d2c7a6ea 100644
+--- a/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs
++++ b/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs
+@@ -34,6 +34,7 @@ fn main() {
+         output_file: None,               // Option<PathBuf>
+         file_loader: None,               // Option<Box<dyn FileLoader + Send + Sync>>
+         external_resource_guard: None,    // Option<ExternalResourceGuard>
++        proc_macro_load_guard: None,      // Option<ProcMacroLoadGuard>
+         lint_caps: FxHashMap::default(), // FxHashMap<lint::LintId, lint::Level>
+         // This is a callback from the driver that is called when [`ParseSess`] is created.
+         psess_created: None, //Option<Box<dyn FnOnce(&mut ParseSess) + Send>>
+diff --git a/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs b/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs
+index 93fe66ec..81937b44 100644
+--- a/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs
++++ b/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs
+@@ -67,6 +67,7 @@ fn main() {
+         output_file: None,
+         file_loader: None,
+         external_resource_guard: None,
++        proc_macro_load_guard: None,
+         lint_caps: rustc_hash::FxHashMap::default(),
+         psess_created: Some(Box::new(|parse_sess| {
+             parse_sess.dcx().set_emitter(Box::new(DebugEmitter {
+diff --git a/src/librustdoc/core.rs b/src/librustdoc/core.rs
+index 80f72873..a67007e1 100644
+--- a/src/librustdoc/core.rs
++++ b/src/librustdoc/core.rs
+@@ -310,6 +310,7 @@ pub(crate) fn create_config(
+         },
+         file_loader: None,
+         external_resource_guard: None,
++        proc_macro_load_guard: None,
+         lint_caps,
+         psess_created: None,
+         track_state: None,
+diff --git a/src/librustdoc/doctest.rs b/src/librustdoc/doctest.rs
+index d75b5a8b..bf7f6cca 100644
+--- a/src/librustdoc/doctest.rs
++++ b/src/librustdoc/doctest.rs
+@@ -190,6 +190,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
+         output_dir: None,
+         file_loader: None,
+         external_resource_guard: None,
++        proc_macro_load_guard: None,
+         lint_caps,
+         psess_created: None,
+         track_state: None,
+diff --git a/tests/ui-fulldeps/proc-macro-load-guard.rs b/tests/ui-fulldeps/proc-macro-load-guard.rs
+new file mode 100644
+index 00000000..f5d58162
+--- /dev/null
++++ b/tests/ui-fulldeps/proc-macro-load-guard.rs
+@@ -0,0 +1,249 @@
++//@ edition: 2024
++//@ run-pass
++//@ run-flags: {{sysroot-base}} {{target-linker}}
++//@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
++//@ ignore-cross-compile
++//@ ignore-remote
++
++#![feature(rustc_private)]
++
++extern crate rustc_driver;
++extern crate rustc_interface;
++
++use std::path::{Path, PathBuf};
++use std::process::{Command, ExitCode};
++use std::sync::{Arc, Mutex};
++
++use rustc_driver::{Callbacks, ProcMacroLoadGuard};
++
++fn main() -> ExitCode {
++    rustc_driver::catch_with_exit_code(|| {
++        let args: Vec<_> = std::env::args().collect();
++        if args.get(1).is_some_and(|arg| arg == "--deny-child") {
++            run_denied(&args[2..]);
++        } else {
++            run_test(&args[1..]);
++        }
++    })
++}
++
++fn run_test(args: &[String]) {
++    let (sysroot, linker) = compiler_paths(args);
++    let tmp = std::env::current_dir().unwrap().join("proc-macro-load-guard");
++    std::fs::create_dir_all(&tmp).unwrap();
++
++    let macros_source = tmp.join("guard_macros.rs");
++    std::fs::write(
++        &macros_source,
++        r#"
++            extern crate proc_macro;
++
++            use proc_macro::TokenStream;
++
++            #[proc_macro]
++            pub fn make_function(_: TokenStream) -> TokenStream {
++                "fn generated() -> usize { 1 }".parse().unwrap()
++            }
++
++            #[proc_macro_attribute]
++            pub fn passthrough(_: TokenStream, item: TokenStream) -> TokenStream {
++                item
++            }
++
++            #[proc_macro_derive(Marker)]
++            pub fn marker(_: TokenStream) -> TokenStream {
++                "impl Marker for Derived {}".parse().unwrap()
++            }
++        "#,
++    )
++    .unwrap();
++
++    let macro_out = tmp.join("macro-out");
++    std::fs::create_dir_all(&macro_out).unwrap();
++    compile(
++        rustc_args(
++            &sysroot,
++            linker,
++            &macros_source,
++            &macro_out,
++            "guard_macros",
++            &["--crate-type=proc-macro".to_string()],
++        ),
++        &mut DefaultCallbacks,
++    );
++    let macro_dylib = proc_macro_dylib(&macro_out, "guard_macros");
++    let macro_dylib = std::fs::canonicalize(macro_dylib).unwrap();
++
++    let client_source = tmp.join("client.rs");
++    std::fs::write(
++        &client_source,
++        r#"
++            trait Marker {}
++
++            #[derive(guard_macros::Marker)]
++            struct Derived;
++
++            #[guard_macros::passthrough]
++            fn attributed() -> usize { 2 }
++
++            guard_macros::make_function!();
++
++            fn main() {
++                let _: &dyn Marker = &Derived;
++                let _ = generated() + attributed();
++            }
++        "#,
++    )
++    .unwrap();
++
++    let deny = Command::new(std::env::current_exe().unwrap())
++        .arg("--deny-child")
++        .args(args)
++        .env("PROC_MACRO_GUARD_DYLIB", &macro_dylib)
++        .env("PROC_MACRO_GUARD_CLIENT", &client_source)
++        .env("PROC_MACRO_GUARD_TMP", &tmp)
++        .output()
++        .unwrap();
++    assert!(!deny.status.success());
++    let stderr = String::from_utf8(deny.stderr).unwrap();
++    assert!(
++        stderr.contains("loading proc-macro library is not permitted by the compiler driver"),
++        "unexpected denial diagnostic: {stderr}"
++    );
++    let denied_path = std::fs::read_to_string(tmp.join("denied-path")).unwrap();
++    assert_eq!(Path::new(&denied_path), macro_dylib);
++
++    let direct_extern = format!("--extern=guard_macros={}", macro_dylib.display());
++    compile_client(
++        &sysroot,
++        linker,
++        &client_source,
++        &tmp.join("no-guard-out"),
++        "no_guard",
++        &[direct_extern.clone()],
++        &mut DefaultCallbacks,
++    );
++
++    let observed = Arc::new(Mutex::new(Vec::new()));
++    compile_client(
++        &sysroot,
++        linker,
++        &client_source,
++        &tmp.join("allow-out"),
++        "allowed",
++        &[direct_extern],
++        &mut GuardCallbacks::allow(macro_dylib.clone(), observed.clone()),
++    );
++    assert_eq!(*observed.lock().unwrap(), [macro_dylib.clone()]);
++
++}
++
++fn run_denied(args: &[String]) {
++    let (sysroot, linker) = compiler_paths(args);
++    let macro_dylib = PathBuf::from(std::env::var_os("PROC_MACRO_GUARD_DYLIB").unwrap());
++    let client = PathBuf::from(std::env::var_os("PROC_MACRO_GUARD_CLIENT").unwrap());
++    let tmp = PathBuf::from(std::env::var_os("PROC_MACRO_GUARD_TMP").unwrap());
++    let observed = tmp.join("denied-path");
++    let expected = macro_dylib.clone();
++    let guard = ProcMacroLoadGuard::new(move |path| {
++        std::fs::write(&observed, path.to_string_lossy().as_bytes()).unwrap();
++        assert_eq!(path, expected);
++        false
++    });
++    compile_client(
++        &sysroot,
++        linker,
++        &client,
++        &tmp.join("deny-out"),
++        "denied",
++        &[format!("--extern=guard_macros={}", macro_dylib.display())],
++        &mut GuardCallbacks { guard: Some(guard) },
++    );
++}
++
++fn compiler_paths(args: &[String]) -> (PathBuf, Option<&Path>) {
++    let sysroot = args.first().expect("expected sysroot").as_str().into();
++    let linker = args.get(1).map(|arg| Path::new(arg));
++    (sysroot, linker)
++}
++
++fn compile_client(
++    sysroot: &Path,
++    linker: Option<&Path>,
++    input: &Path,
++    output: &Path,
++    crate_name: &str,
++    extra: &[String],
++    callbacks: &mut (dyn Callbacks + Send),
++) {
++    std::fs::create_dir_all(output).unwrap();
++    let mut extra = extra.to_vec();
++    extra.push("--emit=metadata".to_string());
++    compile(rustc_args(sysroot, linker, input, output, crate_name, &extra), callbacks);
++}
++
++fn rustc_args(
++    sysroot: &Path,
++    linker: Option<&Path>,
++    input: &Path,
++    output: &Path,
++    crate_name: &str,
++    extra: &[String],
++) -> Vec<String> {
++    let mut args = vec![
++        "rustc".to_string(),
++        format!("--sysroot={}", sysroot.display()),
++        "--edition=2024".to_string(),
++        format!("--crate-name={crate_name}"),
++        format!("--out-dir={}", output.display()),
++        input.display().to_string(),
++    ];
++    if let Some(linker) = linker {
++        args.push(format!("-Clinker={}", linker.display()));
++    }
++    args.extend_from_slice(extra);
++    args
++}
++
++fn compile(args: Vec<String>, callbacks: &mut (dyn Callbacks + Send)) {
++    rustc_driver::run_compiler(&args, callbacks);
++}
++
++fn proc_macro_dylib(output: &Path, crate_name: &str) -> PathBuf {
++    let prefix = if cfg!(target_os = "windows") { "" } else { "lib" };
++    let extension = if cfg!(target_os = "macos") {
++        "dylib"
++    } else if cfg!(target_os = "windows") {
++        "dll"
++    } else if cfg!(target_os = "aix") {
++        "a"
++    } else {
++        "so"
++    };
++    output.join(format!("{prefix}{crate_name}.{extension}"))
++}
++
++struct DefaultCallbacks;
++
++impl Callbacks for DefaultCallbacks {}
++
++struct GuardCallbacks {
++    guard: Option<ProcMacroLoadGuard>,
++}
++
++impl GuardCallbacks {
++    fn allow(expected: PathBuf, observed: Arc<Mutex<Vec<PathBuf>>>) -> Self {
++        Self {
++            guard: Some(ProcMacroLoadGuard::new(move |path| {
++                observed.lock().unwrap().push(path.to_owned());
++                path == expected
++            })),
++        }
++    }
++}
++
++impl Callbacks for GuardCallbacks {
++    fn config(&mut self, config: &mut rustc_interface::Config) {
++        config.proc_macro_load_guard = self.guard.take();
++    }
++}
+diff --git a/tests/ui-fulldeps/run-compiler-twice.rs b/tests/ui-fulldeps/run-compiler-twice.rs
+index ae0f41a2..7041cd07 100644
+--- a/tests/ui-fulldeps/run-compiler-twice.rs
++++ b/tests/ui-fulldeps/run-compiler-twice.rs
+@@ -64,6 +64,8 @@ fn compile(code: String, output: PathBuf, sysroot: Sysroot, linker: Option<&Path
+         output_dir: None,
+         ice_file: None,
+         file_loader: None,
++        external_resource_guard: None,
++        proc_macro_load_guard: None,
+         lint_caps: Default::default(),
+         psess_created: None,
+         track_state: None,
+diff --git a/tests/ui-fulldeps/typed-mono-successors.rs b/tests/ui-fulldeps/typed-mono-successors.rs
+index d1c4c9fd..9ef6dfd6 100644
+--- a/tests/ui-fulldeps/typed-mono-successors.rs
++++ b/tests/ui-fulldeps/typed-mono-successors.rs
+@@ -363,6 +363,7 @@ fn run_input<F>(
+         make_codegen_backend: None,
+         using_internal_features: &rustc_driver::USING_INTERNAL_FEATURES,
+         external_resource_guard: None,
++        proc_macro_load_guard: None,
+     };
+ 
+     interface::run_compiler(config, |compiler| {
+-- 
+2.55.0

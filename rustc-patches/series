@@ -19,3 +19,4 @@
 0018-rustc-expose-selected-declarative-macro-rules.patch
 0019-rustc-distinguish-imported-source-hydration.patch
 0020-rustc-preserve-associated-struct-path-arguments.patch
+0021-rustc-guard-proc-macro-dynamic-library-loading.patch

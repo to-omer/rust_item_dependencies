@@ -10,8 +10,8 @@ use crate::definitions::CollectedDefinitions;
 use crate::dependency_graph::{DependencyGraph, DependencyKind, GraphNode};
 use crate::graph::{DefinitionGraph, DefinitionId, DefinitionKind, DefinitionOrigin};
 use crate::source::{
-    CfgState, SourceInventory, SourceUnitId, WrittenUnitKind, validate_macro_rule_facts,
-    validate_ownerless_attribute_invocations,
+    CfgState, MacroRuleSourceFacts, SourceInventory, SourceUnitId, WrittenUnitKind,
+    validate_macro_rule_facts, validate_ownerless_attribute_invocations,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -31,6 +31,28 @@ pub(crate) struct ConditionalSourceRequirement {
 pub(crate) struct SourceDisjunction {
     pub trigger: SourceUnitId,
     pub choices: Vec<SourceUnitId>,
+}
+
+fn source_macro_rule_requirements(
+    source: &SourceInventory,
+) -> impl Iterator<Item = SourceRequirement> + '_ {
+    source
+        .macro_rules
+        .iter()
+        .filter_map(|facts| match facts {
+            MacroRuleSourceFacts::Whole { .. } => None,
+            MacroRuleSourceFacts::Refined {
+                definition,
+                required_rules,
+                ..
+            } => Some((*definition, required_rules.as_slice())),
+        })
+        .flat_map(|(trigger, required_rules)| {
+            required_rules
+                .iter()
+                .copied()
+                .map(move |required| SourceRequirement { trigger, required })
+        })
 }
 
 /// Owned source-domain constraints collected before leaving the compiler
@@ -77,20 +99,7 @@ impl SourceConstraints {
                 })
                 .collect(),
             shell_requirements: Vec::new(),
-            macro_rule_requirements: source
-                .macro_rules
-                .iter()
-                .flat_map(|facts| {
-                    facts
-                        .required_rules
-                        .iter()
-                        .copied()
-                        .map(|required| SourceRequirement {
-                            trigger: facts.definition,
-                            required,
-                        })
-                })
-                .collect(),
+            macro_rule_requirements: source_macro_rule_requirements(source).collect(),
             member_requirements: Vec::new(),
             conditional_member_requirements: Vec::new(),
             disjunctions: Vec::new(),
@@ -949,20 +958,7 @@ fn validate_constraints(
         &constraints.macro_rule_requirements,
         RequirementClass::Semantic,
     )?;
-    let expected_macro_rules = source
-        .macro_rules
-        .iter()
-        .flat_map(|facts| {
-            facts
-                .required_rules
-                .iter()
-                .copied()
-                .map(|required| SourceRequirement {
-                    trigger: facts.definition,
-                    required,
-                })
-        })
-        .collect::<BTreeSet<_>>();
+    let expected_macro_rules = source_macro_rule_requirements(source).collect::<BTreeSet<_>>();
     if macro_rules.iter().copied().collect::<BTreeSet<_>>() != expected_macro_rules {
         return Err(RetentionError::InvalidConstraint);
     }
@@ -2039,7 +2035,7 @@ mod tests {
             unit(4, WrittenUnitKind::MacroRule, (13, 22), Some(2), 4),
         ];
         let mut inventory = inventory(source, units.clone());
-        inventory.macro_rules = vec![MacroRuleSourceFacts {
+        inventory.macro_rules = vec![MacroRuleSourceFacts::Refined {
             definition: SourceUnitId(2),
             rules: vec![SourceUnitId(3), SourceUnitId(4)],
             required_rules: vec![SourceUnitId(3)],

@@ -16,6 +16,13 @@ use cli::{Parsed, parse_arguments, reducer_usage, render_path, validate_output};
 const RUST_REPOSITORY: &str = "https://github.com/rust-lang/rust.git";
 const USAGE_COMMAND: &str =
     "Usage: cargo rid [OPTIONS] INPUT.rs\n       cargo rid rustc [RUSTC_OPTIONS]...";
+const SNAPSHOT_PARENT_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_PARENT";
+const SNAPSHOT_OWNER_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_OWNER";
+const PROCESS_OWNER_PREFIX: &str = ".rust-item-dependencies-owner-";
+const PROCESS_ROOT_PREFIX: &str = "rust-item-dependencies-process-";
+const SNAPSHOT_OWNER_ATTEMPTS: u64 = 1_024;
+#[cfg(windows)]
+const SNAPSHOT_PARENT_LOCK_FILE: &str = ".rust-item-dependencies-parent-lock";
 const RUSTC_PRIVATE_CRATES: &[&str] = &[
     "rustc_ast",
     "rustc_data_structures",
@@ -330,6 +337,10 @@ fn run_reducer(
     rustc_driver: &Path,
     arguments: &[OsString],
 ) -> Result<(), String> {
+    let snapshot_parent = generated.join("snapshots");
+    fs::create_dir_all(&snapshot_parent)
+        .map_err(|error| format!("cannot create {}: {error}", render_path(&snapshot_parent)))?;
+    let snapshot_owner = unique_snapshot_owner(&snapshot_parent)?;
     let mut rustflags = vec![
         OsString::from("--extern"),
         prefixed_path("rustc_driver=", rustc_driver),
@@ -359,6 +370,8 @@ fn run_reducer(
         .env("RUSTC", rustc)
         .env("CARGO_ENCODED_RUSTFLAGS", encoded)
         .env("CARGO_TARGET_DIR", generated.join("cargo"))
+        .env(SNAPSHOT_PARENT_ENV, &snapshot_parent)
+        .env(SNAPSHOT_OWNER_ENV, &snapshot_owner)
         .env_remove("RUSTFLAGS")
         .args([
             "run",
@@ -373,7 +386,197 @@ fn run_reducer(
     if cfg!(windows) {
         prepend_path(&mut command, compiler_library)?;
     }
-    run_command(&mut command, "run rust-item-dependencies")
+    let result = command
+        .status()
+        .map_err(|error| format!("cannot run rust-item-dependencies: {error}"))
+        .and_then(|status| {
+            status.success().then_some(()).ok_or_else(|| {
+                format!("cannot run rust-item-dependencies: process exited with {status}")
+            })
+        });
+    let cleanup = remove_reducer_snapshot(&snapshot_parent, &snapshot_owner);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+    }
+}
+
+fn unique_snapshot_owner(parent: &Path) -> Result<String, String> {
+    let process = std::process::id();
+    let mut last_owner = String::new();
+    for nonce in 0..SNAPSHOT_OWNER_ATTEMPTS {
+        let owner = format!("{process}-{nonce}");
+        let owner_path = parent.join(format!("{PROCESS_OWNER_PREFIX}{owner}"));
+        let root = parent.join(format!("{PROCESS_ROOT_PREFIX}{owner}"));
+        let owner_exists = owner_path
+            .try_exists()
+            .map_err(|error| format!("cannot inspect {}: {error}", render_path(&owner_path)))?;
+        let root_exists = root
+            .try_exists()
+            .map_err(|error| format!("cannot inspect {}: {error}", render_path(&root)))?;
+        if !owner_exists && !root_exists {
+            return Ok(owner);
+        }
+        last_owner = owner;
+    }
+    Err(format!(
+        "cannot allocate a snapshot owner after {SNAPSHOT_OWNER_ATTEMPTS} attempts: {last_owner}"
+    ))
+}
+
+fn remove_reducer_snapshot(parent: &Path, owner: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let _parent_lock = lock_snapshot_parent(parent)?;
+    let root = parent.join(format!("{PROCESS_ROOT_PREFIX}{owner}"));
+    let owner = parent.join(format!("{PROCESS_OWNER_PREFIX}{owner}"));
+    #[cfg(windows)]
+    let owner_lock = {
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        match options.open(&owner) {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => Some(file),
+                Err(fs::TryLockError::WouldBlock) => return Ok(()),
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(format!("cannot lock {}: {error}", render_path(&owner)));
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!("cannot open {}: {error}", render_path(&owner)));
+            }
+        }
+    };
+    remove_snapshot_path(&root, true)?;
+    #[cfg(windows)]
+    drop(owner_lock);
+    remove_snapshot_path(&owner, false)
+}
+
+fn remove_snapshot_path(path: &Path, directory: bool) -> Result<(), String> {
+    let result = if directory {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot remove {}: {error}", render_path(path))),
+    }
+}
+
+#[cfg(windows)]
+fn lock_snapshot_parent(parent: &Path) -> Result<fs::File, String> {
+    let path = parent.join(SNAPSHOT_PARENT_LOCK_FILE);
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    let file = options
+        .open(&path)
+        .map_err(|error| format!("cannot open {}: {error}", render_path(&path)))?;
+    file.lock()
+        .map_err(|error| format!("cannot lock {}: {error}", render_path(&path)))?;
+    Ok(file)
+}
+
+#[cfg(all(test, windows))]
+mod snapshot_tests {
+    use std::io::{BufRead, BufReader, Write};
+
+    use super::*;
+
+    const HOLDER_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_TEST_HOLDER";
+    const TEST_NAME: &str = "snapshot_tests::cleanup_defers_to_a_live_reducer";
+
+    #[test]
+    fn cleanup_defers_to_a_live_reducer() {
+        if let Some(parent) = env::var_os(HOLDER_ENV) {
+            let parent = PathBuf::from(parent);
+            let owner = parent.join(format!("{PROCESS_OWNER_PREFIX}test"));
+            let root = parent.join(format!("{PROCESS_ROOT_PREFIX}test"));
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("artifact.dll"), b"loaded").unwrap();
+            let mut options = fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            let owner = options.open(owner).unwrap();
+            owner.lock().unwrap();
+            println!("LOCKED");
+            std::io::stdout().flush().unwrap();
+            std::io::stdin().read_line(&mut String::new()).unwrap();
+            return;
+        }
+
+        let directory = TestDirectory::new();
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(HOLDER_ENV, directory.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut stdout = BufReader::new(stdout);
+        let mut ready = String::new();
+        while !ready.contains("LOCKED") {
+            ready.clear();
+            assert_ne!(stdout.read_line(&mut ready).unwrap(), 0);
+        }
+
+        remove_reducer_snapshot(directory.path(), "test").unwrap();
+        assert!(
+            directory
+                .path()
+                .join(format!("{PROCESS_ROOT_PREFIX}test"))
+                .is_dir()
+        );
+        assert!(
+            directory
+                .path()
+                .join(format!("{PROCESS_OWNER_PREFIX}test"))
+                .is_file()
+        );
+
+        writeln!(child.stdin.take().unwrap(), "release").unwrap();
+        assert!(child.wait().unwrap().success());
+        remove_reducer_snapshot(directory.path(), "test").unwrap();
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "only the parent lock file may remain"
+        );
+    }
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("target/rid-tool-tests");
+            fs::create_dir_all(&parent).unwrap();
+            for nonce in 0..SNAPSHOT_OWNER_ATTEMPTS {
+                let path = parent.join(format!("{}-{nonce}", std::process::id()));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("cannot create test directory: {error}"),
+                }
+            }
+            panic!("cannot allocate test directory")
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 }
 
 fn prefixed_path(prefix: &str, path: &Path) -> OsString {

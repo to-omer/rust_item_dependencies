@@ -13,6 +13,7 @@ use crate::error::{
     AnalysisError, CompilerFailure, DecisionDifference, Diagnostic, DiagnosticBundle,
     DiagnosticLevel, ObservationGap, SnapshotDiff as PublicSnapshotDiff, SourceRewriteViolation,
 };
+use crate::external::ExternalArtifactKind;
 use crate::graph::DefinitionId;
 use crate::input::{
     CompilationContext, InputError, InspectedReduction, PreparedCompilationOptions,
@@ -76,7 +77,6 @@ impl Analyzer {
     }
 
     pub fn new_with_options(options: CompilationOptions) -> Result<Self, AnalysisError> {
-        options.validate()?;
         artifact_context(options)
     }
 
@@ -302,8 +302,8 @@ impl VerificationSummary {
 }
 
 fn artifact_context(options: CompilationOptions) -> Result<Analyzer, AnalysisError> {
-    let artifact = compiler_artifact().map_err(|_| AnalysisError::CompilerArtifactMismatch)?;
     let compilation = PreparedCompilationOptions::prepare(options)?;
+    let artifact = compiler_artifact().map_err(|_| AnalysisError::CompilerArtifactMismatch)?;
     Ok(Analyzer {
         sysroot: artifact.sysroot,
         artifact_digest: artifact.identity,
@@ -313,7 +313,7 @@ fn artifact_context(options: CompilationOptions) -> Result<Analyzer, AnalysisErr
 
 fn recipe_identity(artifact: [u8; 32], context: &CompilationContext<'_>) -> CompilerRecipeIdentity {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"rust-item-dependencies-recipe-v3\0");
+    bytes.extend_from_slice(b"rust-item-dependencies-recipe-v4\0");
     bytes.extend_from_slice(&artifact);
     append_recipe_bytes(&mut bytes, context.edition_argument().as_bytes());
     append_recipe_bytes(&mut bytes, context.target().as_bytes());
@@ -325,16 +325,31 @@ fn recipe_identity(artifact: [u8; 32], context: &CompilationContext<'_>) -> Comp
     let external_crates = context.external_crates();
     bytes.extend_from_slice(&(external_crates.direct().len() as u64).to_le_bytes());
     for external in external_crates.direct() {
+        append_external_artifact_kind(&mut bytes, external.kind());
         append_recipe_bytes(&mut bytes, external.extern_name().as_bytes());
         append_recipe_bytes(&mut bytes, external.file_name().as_bytes());
         bytes.extend_from_slice(&external.digest());
     }
     bytes.extend_from_slice(&(external_crates.dependencies().len() as u64).to_le_bytes());
     for dependency in external_crates.dependencies() {
+        append_external_artifact_kind(&mut bytes, dependency.kind());
         append_recipe_bytes(&mut bytes, dependency.file_name().as_bytes());
         bytes.extend_from_slice(&dependency.digest());
     }
+    let proc_macro_execution_artifacts = external_crates.proc_macro_execution_artifacts();
+    bytes.extend_from_slice(&(proc_macro_execution_artifacts.len() as u64).to_le_bytes());
+    for artifact in proc_macro_execution_artifacts {
+        append_recipe_bytes(&mut bytes, artifact.file_name().as_bytes());
+        bytes.extend_from_slice(&artifact.digest());
+    }
     CompilerRecipeIdentity(sha256(bytes))
+}
+
+fn append_external_artifact_kind(recipe: &mut Vec<u8>, kind: ExternalArtifactKind) {
+    recipe.push(match kind {
+        ExternalArtifactKind::Rlib => 0,
+        ExternalArtifactKind::HostDynamicLibrary => 1,
+    });
 }
 
 fn append_recipe_bytes(recipe: &mut Vec<u8>, value: &[u8]) {

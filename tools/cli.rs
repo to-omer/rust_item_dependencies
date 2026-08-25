@@ -12,9 +12,11 @@ Options:
   -O                     Same as --opt-level 3
       --opt-level LEVEL  Optimization level: 0, 1, 2, 3, s, or z [default: 0]
       --cfg NAME         Enable a name-only cfg; may be repeated
-      --extern NAME=PATH Add a direct .rlib dependency; may be repeated
+      --extern NAME=PATH Add a direct Rust dependency; may be repeated
       --dependency-artifact PATH
-                         Add a transitive .rlib dependency; may be repeated
+                         Add a transitive Rust dependency; may be repeated
+      --allow-proc-macro PATH
+                         Permit a declared procedural macro; may be repeated
   -h, --help             Print help"#
     )
 }
@@ -53,6 +55,7 @@ pub struct Cli {
     pub cfg_names: Vec<String>,
     pub external_crates: Vec<CliExternalCrate>,
     pub dependency_artifacts: Vec<PathBuf>,
+    pub allowed_proc_macro_artifacts: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -74,6 +77,7 @@ pub fn parse_arguments(
     let mut cfg_names = Vec::new();
     let mut external_crates = Vec::new();
     let mut dependency_artifacts = Vec::new();
+    let mut allowed_proc_macro_artifacts = Vec::new();
     let mut positional_only = false;
 
     while let Some(argument) = arguments.next() {
@@ -128,6 +132,14 @@ pub fn parse_arguments(
                     dependency_artifacts.push(artifact.into());
                     continue;
                 }
+                Some("--allow-proc-macro") => {
+                    let artifact = next_value(&mut arguments, "--allow-proc-macro")?;
+                    if artifact.is_empty() {
+                        return Err("--allow-proc-macro requires a nonempty path".to_owned());
+                    }
+                    allowed_proc_macro_artifacts.push(artifact.into());
+                    continue;
+                }
                 Some(value) if value.starts_with('-') => {
                     return Err(format!("unknown option: {value}\n\n{usage}"));
                 }
@@ -151,6 +163,7 @@ pub fn parse_arguments(
         cfg_names,
         external_crates,
         dependency_artifacts,
+        allowed_proc_macro_artifacts,
     }))
 }
 

@@ -5,12 +5,14 @@ use rustc_ast as ast;
 use rustc_ast::HasAttrs;
 use rustc_ast::tokenstream::WithTokens;
 use rustc_ast::visit::{self, AssocCtxt, Visitor};
+#[cfg(rust_item_dependencies_patched)]
+use rustc_data_structures::unord::UnordMap;
 use rustc_expand::config::{StripUnconfigured, features, pre_configure_attrs};
 use rustc_feature::Features;
 use rustc_interface::interface::Compiler;
 use rustc_lexer::{FrontmatterAllowed, TokenKind, strip_shebang, tokenize};
 #[cfg(rust_item_dependencies_patched)]
-use rustc_middle::ty::{MacroImplementationKind, TyCtxt};
+use rustc_middle::ty::{MacroImplementationKind, MacroInvocationOrigin, TyCtxt};
 #[cfg(rust_item_dependencies_patched)]
 use rustc_span::hygiene::{ExpnId, ExpnKind, MacroKind};
 use rustc_span::{SourceFile, Span, Symbol, sym};
@@ -191,13 +193,26 @@ pub(crate) fn resolve_attribute_source(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MacroRuleSourceFacts {
-    pub definition: SourceUnitId,
-    pub rules: Vec<SourceUnitId>,
-    /// Rules required whenever the definition is retained. This is the
-    /// observed selection union, except that a definition with no observed
-    /// selections keeps every rule so that it cannot become an empty macro.
-    pub required_rules: Vec<SourceUnitId>,
+pub(crate) enum MacroRuleSourceFacts {
+    Whole {
+        definition: SourceUnitId,
+    },
+    Refined {
+        definition: SourceUnitId,
+        rules: Vec<SourceUnitId>,
+        /// Rules required whenever the definition is retained. This is the
+        /// observed selection union, except that a definition with no observed
+        /// selections keeps every rule so that it cannot become an empty macro.
+        required_rules: Vec<SourceUnitId>,
+    },
+}
+
+impl MacroRuleSourceFacts {
+    pub(crate) fn definition(&self) -> SourceUnitId {
+        match self {
+            Self::Whole { definition } | Self::Refined { definition, .. } => *definition,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +228,19 @@ struct ObservedAttributeMacro {
     node_range: ByteRange,
     target_range: ByteRange,
     target_survives: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedProceduralMacro {
+    Invocation {
+        invocation_range: ByteRange,
+        node_range: ByteRange,
+    },
+    Target {
+        invocation_range: ByteRange,
+        node_range: ByteRange,
+        target_range: ByteRange,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,6 +264,7 @@ pub(crate) enum SourceError {
     InvalidInventory,
     IncompleteAttributeObservation,
     IncompleteMacroRuleObservation,
+    IncompleteProceduralMacroObservation,
 }
 
 impl OriginalOffsetMap {
@@ -696,7 +725,15 @@ fn refine_attribute_macros(
 
 pub(crate) fn refine_macro_rules(
     inventory: &mut SourceInventory,
+    observations: Vec<ObservedMacroRules>,
+) -> Result<(), SourceError> {
+    refine_macro_rules_outside_opaque_anchors(inventory, observations, &BTreeSet::new())
+}
+
+fn refine_macro_rules_outside_opaque_anchors(
+    inventory: &mut SourceInventory,
     mut observations: Vec<ObservedMacroRules>,
+    opaque_anchors: &BTreeSet<ByteRange>,
 ) -> Result<(), SourceError> {
     if !inventory.macro_rules.is_empty()
         || inventory
@@ -711,6 +748,11 @@ pub(crate) fn refine_macro_rules(
         &inventory.units,
         &inventory.ownerless_attribute_invocations,
     )?;
+    observations.retain(|observation| {
+        !opaque_anchors
+            .iter()
+            .any(|anchor| anchor.contains(observation.definition_range))
+    });
     observations.sort_by_key(|observation| observation.definition_range);
     if observations
         .windows(2)
@@ -722,7 +764,8 @@ pub(crate) fn refine_macro_rules(
     let (mut pending, _) = pending_units(&inventory.units);
     let mut next_temporary =
         u32::try_from(pending.len()).map_err(|_| SourceError::SourceTooLarge)?;
-    let mut raw_facts = Vec::new();
+    let mut refined_facts = Vec::new();
+    let mut whole_definitions = Vec::new();
     let mut classified_definitions = BTreeSet::new();
 
     for observation in observations {
@@ -791,7 +834,19 @@ pub(crate) fn refine_macro_rules(
         } else {
             selected.into_iter().map(|index| rules[index]).collect()
         };
-        raw_facts.push((definition.id.0, rules, required));
+        refined_facts.push((definition.id.0, rules, required));
+    }
+    for definition in inventory.units.iter().filter(|unit| {
+        unit.kind == WrittenUnitKind::MacroDefinition
+            && unit.cfg_state == CfgState::Active
+            && opaque_anchors
+                .iter()
+                .any(|anchor| anchor.contains(unit.full_range))
+    }) {
+        if !classified_definitions.insert(definition.id) {
+            return Err(SourceError::InvalidInventory);
+        }
+        whole_definitions.push(definition.id.0);
     }
     let expected_definitions = inventory
         .units
@@ -804,16 +859,24 @@ pub(crate) fn refine_macro_rules(
     if classified_definitions != expected_definitions {
         return Err(SourceError::IncompleteMacroRuleObservation);
     }
-
     let (units, id_map) = finish_pending_units(pending)?;
-    let macro_rules = raw_facts
-        .into_iter()
-        .map(|(definition, rules, required)| MacroRuleSourceFacts {
+    let mut macro_rules = Vec::with_capacity(whole_definitions.len() + refined_facts.len());
+    for definition in whole_definitions {
+        macro_rules.push(MacroRuleSourceFacts::Whole {
+            definition: id_map[&definition],
+        });
+    }
+    for (definition, rules, required_rules) in refined_facts {
+        macro_rules.push(MacroRuleSourceFacts::Refined {
             definition: id_map[&definition],
             rules: rules.into_iter().map(|rule| id_map[&rule]).collect(),
-            required_rules: required.into_iter().map(|rule| id_map[&rule]).collect(),
-        })
-        .collect::<Vec<_>>();
+            required_rules: required_rules
+                .into_iter()
+                .map(|rule| id_map[&rule])
+                .collect(),
+        });
+    }
+    macro_rules.sort_by_key(MacroRuleSourceFacts::definition);
     let mut ownerless_attribute_invocations = inventory
         .ownerless_attribute_invocations
         .iter()
@@ -838,6 +901,8 @@ pub(crate) fn refine_macro_rules_from_compiler(
     inventory: &mut SourceInventory,
     mut omit_one_selection: bool,
 ) -> Result<(), SourceError> {
+    let procedural = collect_procedural_macro_observations(compiler, tcx, inventory)?;
+    let opaque_anchors = resolve_procedural_macro_anchors(inventory, procedural)?;
     let resolutions = tcx.resolutions(());
     let definitions = &resolutions.macro_rules_definitions;
     let ordered_definitions = definitions
@@ -905,6 +970,13 @@ pub(crate) fn refine_macro_rules_from_compiler(
             continue;
         }
         let definition_span = tcx.def_span(definition);
+        let definition_range = original_span_range(compiler, &inventory.offsets, definition_span)?;
+        if opaque_anchors
+            .iter()
+            .any(|anchor| anchor.contains(definition_range))
+        {
+            continue;
+        }
         if definition_span.from_expansion() {
             return Err(SourceError::IncompleteMacroRuleObservation);
         }
@@ -923,8 +995,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
                 end: end.end,
             });
         }
-        let mut definition_range =
-            original_span_range(compiler, &inventory.offsets, definition_span)?;
+        let mut definition_range = definition_range;
         for rule in &rule_ranges {
             definition_range.start = definition_range.start.min(rule.start);
             definition_range.end = definition_range.end.max(rule.end);
@@ -938,7 +1009,236 @@ pub(crate) fn refine_macro_rules_from_compiler(
     if !selected.is_empty() {
         return Err(SourceError::IncompleteMacroRuleObservation);
     }
-    refine_macro_rules(inventory, observations)
+    refine_macro_rules_outside_opaque_anchors(inventory, observations, &opaque_anchors)?;
+    merge_procedural_macro_atomic_groups(inventory, &opaque_anchors)
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn collect_procedural_macro_observations(
+    compiler: &Compiler,
+    tcx: TyCtxt<'_>,
+    inventory: &SourceInventory,
+) -> Result<Vec<ObservedProceduralMacro>, SourceError> {
+    let resolutions = tcx.resolutions(());
+    let origin_map = &resolutions.macro_invocation_origins;
+    let origins = origin_map
+        .items()
+        .map(|(&expansion, origin)| {
+            (
+                expansion.expn_hash().local_hash().as_u64(),
+                expansion,
+                origin,
+            )
+        })
+        .into_sorted_stable_ord_by_key(|record| &record.0);
+    let mut observations = Vec::new();
+    for (_, expansion, origin) in origins {
+        if origin.implementation_kind != MacroImplementationKind::Procedural {
+            continue;
+        }
+
+        let data = expansion.expn_data();
+        let ExpnKind::Macro(kind, _) = data.kind else {
+            return Err(SourceError::IncompleteProceduralMacroObservation);
+        };
+        let observation = match kind {
+            MacroKind::Bang if origin.discovered_in_expansion == ExpnId::root() => {
+                ObservedProceduralMacro::Invocation {
+                    invocation_range: original_span_range(
+                        compiler,
+                        &inventory.offsets,
+                        data.call_site,
+                    )?,
+                    node_range: original_span_range(
+                        compiler,
+                        &inventory.offsets,
+                        origin.invocation_node_span,
+                    )?,
+                }
+            }
+            MacroKind::Attr | MacroKind::Derive => {
+                let container = if kind == MacroKind::Attr
+                    && origin.discovered_in_expansion == ExpnId::root()
+                {
+                    Some((expansion, origin))
+                } else {
+                    written_builtin_attribute_ancestor(origin_map, origin.discovered_in_expansion)?
+                };
+                let Some((container, container_origin)) = container else {
+                    continue;
+                };
+                let target_range = original_span_range(
+                    compiler,
+                    &inventory.offsets,
+                    container_origin
+                        .target_span
+                        .ok_or(SourceError::IncompleteProceduralMacroObservation)?,
+                )?;
+                ObservedProceduralMacro::Target {
+                    invocation_range: original_span_range(
+                        compiler,
+                        &inventory.offsets,
+                        container.expn_data().call_site,
+                    )?,
+                    node_range: original_span_range(
+                        compiler,
+                        &inventory.offsets,
+                        container_origin.invocation_node_span,
+                    )?,
+                    target_range,
+                }
+            }
+            MacroKind::Bang => continue,
+        };
+        observations.push(observation);
+    }
+    Ok(observations)
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn written_builtin_attribute_ancestor<'a>(
+    origins: &'a UnordMap<ExpnId, MacroInvocationOrigin>,
+    mut expansion: ExpnId,
+) -> Result<Option<(ExpnId, &'a MacroInvocationOrigin)>, SourceError> {
+    while expansion != ExpnId::root() {
+        let origin = origins
+            .get(&expansion)
+            .ok_or(SourceError::IncompleteProceduralMacroObservation)?;
+        if origin.implementation_kind != MacroImplementationKind::Builtin
+            || !matches!(
+                expansion.expn_data().kind,
+                ExpnKind::Macro(MacroKind::Attr, _)
+            )
+        {
+            return Ok(None);
+        }
+        if origin.discovered_in_expansion == ExpnId::root() {
+            return Ok(Some((expansion, origin)));
+        }
+        expansion = origin.discovered_in_expansion;
+    }
+    Err(SourceError::IncompleteProceduralMacroObservation)
+}
+
+fn resolve_procedural_macro_anchors(
+    inventory: &SourceInventory,
+    observations: Vec<ObservedProceduralMacro>,
+) -> Result<BTreeSet<ByteRange>, SourceError> {
+    validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
+    validate_ownerless_attribute_invocations(
+        &inventory.units,
+        &inventory.ownerless_attribute_invocations,
+    )?;
+
+    let mut anchors = BTreeSet::new();
+    for observation in observations {
+        let anchor = match observation {
+            ObservedProceduralMacro::Invocation {
+                invocation_range,
+                node_range,
+            } => resolve_bang_macro_source(inventory, invocation_range, node_range)?,
+            ObservedProceduralMacro::Target {
+                invocation_range,
+                node_range,
+                target_range,
+            } => {
+                let source =
+                    resolve_attribute_source(inventory, invocation_range, node_range, target_range)
+                        .map_err(|_| SourceError::IncompleteProceduralMacroObservation)?;
+                source
+                    .invocation
+                    .ok_or(SourceError::IncompleteProceduralMacroObservation)?;
+                source.target
+            }
+        };
+        anchors.insert(
+            inventory
+                .units
+                .get(anchor.0 as usize)
+                .ok_or(SourceError::IncompleteProceduralMacroObservation)?
+                .full_range,
+        );
+    }
+    Ok(anchors)
+}
+
+fn merge_procedural_macro_atomic_groups(
+    inventory: &mut SourceInventory,
+    anchors: &BTreeSet<ByteRange>,
+) -> Result<(), SourceError> {
+    validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
+    validate_macro_rule_facts(&inventory.units, &inventory.macro_rules)?;
+    validate_ownerless_attribute_invocations(
+        &inventory.units,
+        &inventory.ownerless_attribute_invocations,
+    )?;
+
+    let mut representatives = inventory
+        .units
+        .iter()
+        .map(|unit| (unit.atomic_group, unit.atomic_group))
+        .collect::<BTreeMap<_, _>>();
+    for &anchor_range in anchors {
+        inventory
+            .units
+            .iter()
+            .find(|unit| unit.full_range == anchor_range)
+            .ok_or(SourceError::IncompleteProceduralMacroObservation)?;
+        let components = inventory
+            .units
+            .iter()
+            .filter(|unit| anchor_range.contains(unit.full_range))
+            .map(|unit| representatives[&unit.atomic_group])
+            .collect::<BTreeSet<_>>();
+        let representative = components
+            .first()
+            .copied()
+            .ok_or(SourceError::IncompleteProceduralMacroObservation)?;
+        for current in representatives.values_mut() {
+            if components.contains(current) {
+                *current = representative;
+            }
+        }
+    }
+    for unit in &mut inventory.units {
+        unit.atomic_group = representatives[&unit.atomic_group];
+    }
+
+    validate_ownerless_attribute_invocations(
+        &inventory.units,
+        &inventory.ownerless_attribute_invocations,
+    )?;
+    Ok(())
+}
+
+fn resolve_bang_macro_source(
+    inventory: &SourceInventory,
+    invocation_range: ByteRange,
+    node_range: ByteRange,
+) -> Result<SourceUnitId, SourceError> {
+    if invocation_range.is_empty() || !node_range.contains(invocation_range) {
+        return Err(SourceError::IncompleteProceduralMacroObservation);
+    }
+    let mut candidates = inventory
+        .units
+        .iter()
+        .filter(|unit| {
+            unit.kind == WrittenUnitKind::MacroInvocation
+                && unit.cfg_state == CfgState::Active
+                && unit.full_range.contains(invocation_range)
+                && unit.full_range.contains(node_range)
+        })
+        .collect::<Vec<_>>();
+    let smallest = candidates
+        .iter()
+        .map(|unit| unit.full_range.len())
+        .min()
+        .ok_or(SourceError::IncompleteProceduralMacroObservation)?;
+    candidates.retain(|unit| unit.full_range.len() == smallest);
+    let [invocation] = candidates.as_slice() else {
+        return Err(SourceError::IncompleteProceduralMacroObservation);
+    };
+    Ok(invocation.id)
 }
 
 fn valid_source_range(source: &str, range: ByteRange) -> bool {
@@ -955,36 +1255,46 @@ pub(crate) fn validate_macro_rule_facts(
     let mut definitions = BTreeSet::new();
     let mut classified_rules = BTreeSet::new();
     for facts in macro_rules {
+        let definition_id = facts.definition();
         let definition = units
-            .get(facts.definition.0 as usize)
+            .get(definition_id.0 as usize)
             .ok_or(SourceError::InvalidInventory)?;
-        let rules = facts.rules.iter().copied().collect::<BTreeSet<_>>();
-        let required = facts
-            .required_rules
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
         if definition.kind != WrittenUnitKind::MacroDefinition
             || definition.cfg_state != CfgState::Active
             || !definitions.insert(definition.id)
-            || facts.rules.is_empty()
-            || rules.len() != facts.rules.len()
-            || facts.required_rules.is_empty()
-            || required.len() != facts.required_rules.len()
-            || !required.is_subset(&rules)
         {
             return Err(SourceError::InvalidInventory);
         }
-        for rule in rules {
-            let unit = units
-                .get(rule.0 as usize)
-                .ok_or(SourceError::InvalidInventory)?;
-            if unit.kind != WrittenUnitKind::MacroRule
-                || unit.cfg_state != CfgState::Active
-                || unit.parent != Some(definition.id)
-                || !classified_rules.insert(rule)
-            {
-                return Err(SourceError::InvalidInventory);
+
+        match facts {
+            MacroRuleSourceFacts::Whole { .. } => {}
+            MacroRuleSourceFacts::Refined {
+                rules,
+                required_rules,
+                ..
+            } => {
+                let unique_rules = rules.iter().copied().collect::<BTreeSet<_>>();
+                let unique_required = required_rules.iter().copied().collect::<BTreeSet<_>>();
+                if rules.is_empty()
+                    || required_rules.is_empty()
+                    || unique_rules.len() != rules.len()
+                    || unique_required.len() != required_rules.len()
+                    || !unique_required.is_subset(&unique_rules)
+                {
+                    return Err(SourceError::InvalidInventory);
+                }
+                for rule in unique_rules {
+                    let unit = units
+                        .get(rule.0 as usize)
+                        .ok_or(SourceError::InvalidInventory)?;
+                    if unit.kind != WrittenUnitKind::MacroRule
+                        || unit.cfg_state != CfgState::Active
+                        || unit.parent != Some(definition.id)
+                        || !classified_rules.insert(rule)
+                    {
+                        return Err(SourceError::InvalidInventory);
+                    }
+                }
             }
         }
     }
@@ -1865,9 +2175,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        AtomicGroupId, ByteRange, CfgState, ObservedMacroRules, OriginalOffsetMap, PieceKind,
-        SourceError, SourceInventory, SourceUnitId, WrittenUnit, WrittenUnitKind,
-        own_lexical_pieces, refine_macro_rules,
+        AtomicGroupId, ByteRange, CfgState, MacroRuleSourceFacts, ObservedMacroRules,
+        ObservedProceduralMacro, OriginalOffsetMap, PieceKind, SourceError, SourceInventory,
+        SourceUnitId, WrittenUnit, WrittenUnitKind, merge_procedural_macro_atomic_groups,
+        own_lexical_pieces, refine_macro_rules, refine_macro_rules_outside_opaque_anchors,
+        resolve_procedural_macro_anchors, validate_macro_rule_facts,
     };
     use crate::rewrite::rewrite_source;
 
@@ -2054,20 +2366,24 @@ mod tests {
         )
         .unwrap();
 
-        let facts = &inventory.macro_rules[0];
-        assert_eq!(facts.rules.len(), 2);
-        assert_eq!(facts.required_rules, vec![facts.rules[0]]);
-        assert_eq!(inventory.units[facts.rules[0].0 as usize].full_range, first);
-        assert_eq!(
-            inventory.units[facts.rules[1].0 as usize].full_range,
-            second
-        );
+        let MacroRuleSourceFacts::Refined {
+            definition: facts_definition,
+            rules,
+            required_rules,
+        } = &inventory.macro_rules[0]
+        else {
+            panic!("an observed definition must be refined")
+        };
+        assert_eq!(rules.len(), 2);
+        assert_eq!(required_rules.as_slice(), &[rules[0]]);
+        assert_eq!(inventory.units[rules[0].0 as usize].full_range, first);
+        assert_eq!(inventory.units[rules[1].0 as usize].full_range, second);
         assert_ne!(
-            inventory.units[facts.rules[0].0 as usize].atomic_group,
-            inventory.units[facts.rules[1].0 as usize].atomic_group
+            inventory.units[rules[0].0 as usize].atomic_group,
+            inventory.units[rules[1].0 as usize].atomic_group
         );
 
-        let retained = BTreeSet::from([SourceUnitId(0), facts.definition, facts.rules[0]]);
+        let retained = BTreeSet::from([SourceUnitId(0), *facts_definition, rules[0]]);
         let rewrite = rewrite_source(&inventory, &retained).unwrap();
         assert_eq!(
             rewrite.source,
@@ -2094,9 +2410,16 @@ mod tests {
             }],
         )
         .unwrap();
+        let MacroRuleSourceFacts::Refined {
+            rules,
+            required_rules,
+            ..
+        } = &unselected_inventory.macro_rules[0]
+        else {
+            panic!("an observed definition must be refined")
+        };
         assert_eq!(
-            unselected_inventory.macro_rules[0].required_rules,
-            unselected_inventory.macro_rules[0].rules,
+            required_rules, rules,
             "a retained definition with no observed selections must not become an empty macro"
         );
     }
@@ -2144,6 +2467,310 @@ mod tests {
             refine_macro_rules(&mut inventory, Vec::new()),
             Err(SourceError::IncompleteMacroRuleObservation)
         );
+    }
+
+    #[test]
+    fn procedural_bang_macro_merges_every_group_inside_its_invocation() {
+        let source = Arc::<str>::from("outer!(inner!());\nfn untouched() {}\n");
+        let outer = marker(&source, "outer!(inner!());");
+        let inner = marker(&source, "inner!()");
+        let untouched = marker(&source, "fn untouched() {}");
+        let units = vec![
+            unit(
+                0,
+                WrittenUnitKind::CrateRoot,
+                ByteRange {
+                    start: 0,
+                    end: source.len() as u32,
+                },
+                None,
+                0,
+            ),
+            unit(1, WrittenUnitKind::MacroInvocation, outer, Some(0), 1),
+            unit(2, WrittenUnitKind::MacroInvocation, inner, Some(1), 2),
+            unit(3, WrittenUnitKind::Item, untouched, Some(0), 3),
+        ];
+        let mut inventory = test_inventory(source, units, Vec::new());
+        let invocation_range = marker(&inventory.original, "outer!(inner!())");
+
+        let anchors = resolve_procedural_macro_anchors(
+            &inventory,
+            vec![ObservedProceduralMacro::Invocation {
+                invocation_range,
+                node_range: outer,
+            }],
+        )
+        .unwrap();
+        merge_procedural_macro_atomic_groups(&mut inventory, &anchors).unwrap();
+
+        assert_eq!(
+            inventory.units[1].atomic_group,
+            inventory.units[2].atomic_group
+        );
+        assert_ne!(
+            inventory.units[0].atomic_group,
+            inventory.units[1].atomic_group
+        );
+        assert_ne!(
+            inventory.units[1].atomic_group,
+            inventory.units[3].atomic_group
+        );
+    }
+
+    #[test]
+    fn procedural_attribute_keeps_nested_macro_rules_whole_and_merges_its_target() {
+        let source = Arc::<str>::from(
+            "#[cfg_attr(all(), wrap)]\nmod subject { macro_rules! local { (inside) => {} } }\nmacro_rules! outside { (outside) => {} }\n",
+        );
+        let target = marker(
+            &source,
+            "#[cfg_attr(all(), wrap)]\nmod subject { macro_rules! local { (inside) => {} } }",
+        );
+        let target_without_attribute = marker(
+            &source,
+            "mod subject { macro_rules! local { (inside) => {} } }",
+        );
+        let attribute = marker(&source, "#[cfg_attr(all(), wrap)]");
+        let definition = marker(&source, "macro_rules! local { (inside) => {} }");
+        let rule = marker(&source, "(inside) => {}");
+        let outside_definition = marker(&source, "macro_rules! outside { (outside) => {} }");
+        let outside_rule = marker(&source, "(outside) => {}");
+        let units = vec![
+            unit(
+                0,
+                WrittenUnitKind::CrateRoot,
+                ByteRange {
+                    start: 0,
+                    end: source.len() as u32,
+                },
+                None,
+                0,
+            ),
+            unit(1, WrittenUnitKind::InlineModule, target, Some(0), 1),
+            unit(2, WrittenUnitKind::MacroInvocation, attribute, Some(1), 1),
+            unit(3, WrittenUnitKind::MacroDefinition, definition, Some(1), 2),
+            unit(
+                4,
+                WrittenUnitKind::MacroDefinition,
+                outside_definition,
+                Some(0),
+                3,
+            ),
+        ];
+        let mut inventory = test_inventory(source, units, Vec::new());
+        let anchors = resolve_procedural_macro_anchors(
+            &inventory,
+            vec![ObservedProceduralMacro::Target {
+                invocation_range: attribute,
+                node_range: target,
+                target_range: target_without_attribute,
+            }],
+        )
+        .unwrap();
+        refine_macro_rules_outside_opaque_anchors(
+            &mut inventory,
+            vec![
+                ObservedMacroRules {
+                    definition_range: definition,
+                    rule_ranges: vec![rule],
+                    selected_rule_indices: vec![0],
+                },
+                ObservedMacroRules {
+                    definition_range: outside_definition,
+                    rule_ranges: vec![outside_rule],
+                    selected_rule_indices: vec![0],
+                },
+            ],
+            &anchors,
+        )
+        .unwrap();
+
+        assert_eq!(inventory.macro_rules.len(), 2);
+        let opaque_facts = inventory
+            .macro_rules
+            .iter()
+            .find(|facts| inventory.units[facts.definition().0 as usize].full_range == definition)
+            .unwrap();
+        assert!(matches!(opaque_facts, MacroRuleSourceFacts::Whole { .. }));
+        let outside_facts = inventory
+            .macro_rules
+            .iter()
+            .find(|facts| {
+                inventory.units[facts.definition().0 as usize].full_range == outside_definition
+            })
+            .unwrap();
+        let MacroRuleSourceFacts::Refined {
+            definition: outside_facts_definition,
+            rules: outside_rules,
+            ..
+        } = outside_facts
+        else {
+            panic!("a definition outside the opaque anchor must be refined")
+        };
+        assert_eq!(
+            inventory.units[outside_facts_definition.0 as usize].full_range,
+            outside_definition
+        );
+        assert_eq!(outside_rules.len(), 1);
+        assert_eq!(
+            inventory.units[outside_rules[0].0 as usize].full_range,
+            outside_rule
+        );
+        assert!(inventory.units.iter().all(|unit| {
+            unit.kind != WrittenUnitKind::MacroRule || !target.contains(unit.full_range)
+        }));
+        let opaque_definition = opaque_facts.definition();
+        let mut incomplete = inventory.clone();
+        incomplete
+            .macro_rules
+            .retain(|facts| facts.definition() != opaque_definition);
+        assert_eq!(
+            validate_macro_rule_facts(&incomplete.units, &incomplete.macro_rules),
+            Err(SourceError::InvalidInventory)
+        );
+
+        merge_procedural_macro_atomic_groups(&mut inventory, &anchors).unwrap();
+
+        let target_group = inventory
+            .units
+            .iter()
+            .find(|unit| unit.full_range == target)
+            .unwrap()
+            .atomic_group;
+        assert!(inventory.units.iter().all(|unit| {
+            !target.contains(unit.full_range) || unit.atomic_group == target_group
+        }));
+        assert_ne!(
+            target_group,
+            inventory
+                .units
+                .iter()
+                .find(|unit| unit.full_range == outside_definition)
+                .unwrap()
+                .atomic_group
+        );
+    }
+
+    #[test]
+    fn procedural_derive_merges_future_nested_units_with_its_target() {
+        let source = Arc::<str>::from(
+            "#[derive(Generated)]\nstruct Subject { field: u8 }\nstruct Sibling;\n",
+        );
+        let target = marker(
+            &source,
+            "#[derive(Generated)]\nstruct Subject { field: u8 }",
+        );
+        let target_without_attribute = marker(&source, "struct Subject { field: u8 }");
+        let derive = marker(&source, "#[derive(Generated)]");
+        let field = marker(&source, "field: u8");
+        let sibling = marker(&source, "struct Sibling;");
+        let units = vec![
+            unit(
+                0,
+                WrittenUnitKind::CrateRoot,
+                ByteRange {
+                    start: 0,
+                    end: source.len() as u32,
+                },
+                None,
+                0,
+            ),
+            unit(1, WrittenUnitKind::Item, target, Some(0), 1),
+            unit(2, WrittenUnitKind::MacroInvocation, derive, Some(1), 1),
+            unit(3, WrittenUnitKind::NestedItem, field, Some(1), 2),
+            unit(4, WrittenUnitKind::Item, sibling, Some(0), 3),
+        ];
+        let mut inventory = test_inventory(source, units, Vec::new());
+        let invocation_range = marker(&inventory.original, "Generated");
+
+        let anchors = resolve_procedural_macro_anchors(
+            &inventory,
+            vec![ObservedProceduralMacro::Target {
+                invocation_range,
+                node_range: target,
+                target_range: target_without_attribute,
+            }],
+        )
+        .unwrap();
+        merge_procedural_macro_atomic_groups(&mut inventory, &anchors).unwrap();
+
+        assert_eq!(
+            inventory.units[1].atomic_group,
+            inventory.units[3].atomic_group
+        );
+        assert_ne!(
+            inventory.units[1].atomic_group,
+            inventory.units[4].atomic_group
+        );
+    }
+
+    #[test]
+    fn procedural_macro_rejects_an_ambiguous_written_invocation() {
+        let source = Arc::<str>::from("proc!();\n");
+        let invocation = marker(&source, "proc!();");
+        let units = vec![
+            unit(
+                0,
+                WrittenUnitKind::CrateRoot,
+                ByteRange {
+                    start: 0,
+                    end: source.len() as u32,
+                },
+                None,
+                0,
+            ),
+            unit(1, WrittenUnitKind::MacroInvocation, invocation, Some(0), 1),
+            unit(2, WrittenUnitKind::MacroInvocation, invocation, Some(0), 2),
+        ];
+        let inventory = test_inventory(source, units, Vec::new());
+        let invocation_range = marker(&inventory.original, "proc!()");
+
+        assert_eq!(
+            resolve_procedural_macro_anchors(
+                &inventory,
+                vec![ObservedProceduralMacro::Invocation {
+                    invocation_range,
+                    node_range: invocation,
+                }],
+            ),
+            Err(SourceError::IncompleteProceduralMacroObservation)
+        );
+    }
+
+    fn unit(
+        id: u32,
+        kind: WrittenUnitKind,
+        full_range: ByteRange,
+        parent: Option<u32>,
+        atomic_group: u32,
+    ) -> WrittenUnit {
+        WrittenUnit {
+            id: SourceUnitId(id),
+            kind,
+            full_range,
+            parent: parent.map(SourceUnitId),
+            cfg_state: CfgState::Active,
+            atomic_group: AtomicGroupId(atomic_group),
+            same_role_ordinal: 0,
+        }
+    }
+
+    fn test_inventory(
+        source: Arc<str>,
+        units: Vec<WrittenUnit>,
+        macro_rules: Vec<MacroRuleSourceFacts>,
+    ) -> SourceInventory {
+        let (normalized, offsets) = OriginalOffsetMap::from_source(&source).unwrap();
+        let pieces = own_lexical_pieces(&source, &units).unwrap();
+        SourceInventory {
+            original: source,
+            normalized: Arc::from(normalized),
+            offsets,
+            units,
+            pieces,
+            macro_rules,
+            ownerless_attribute_invocations: Vec::new(),
+        }
     }
 
     fn marker(source: &str, text: &str) -> ByteRange {
