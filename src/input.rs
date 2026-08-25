@@ -2136,7 +2136,6 @@ fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<Unsupporte
         || attribute.has_name(sym::no_builtins)
         || attribute.has_name(sym::no_link)
         || attribute.has_name(sym::windows_subsystem)
-        || attribute.has_name(sym::link)
     {
         Some(UnsupportedReason::NativeLinkOrCustomRuntime)
     } else {
@@ -2147,7 +2146,7 @@ fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<Unsupporte
 fn unsupported_attribute_symbol(name: Symbol) -> Option<UnsupportedReason> {
     matches!(
         name,
-        sym::panic_handler | sym::alloc_error_handler | sym::no_link | sym::link
+        sym::panic_handler | sym::alloc_error_handler | sym::no_link
     )
     .then_some(UnsupportedReason::NativeLinkOrCustomRuntime)
 }
@@ -2941,10 +2940,6 @@ mod tests {
             (
                 "#![windows_subsystem = \"windows\"]\nfn main() {}\n",
                 "#![windows_subsystem = \"windows\"]",
-            ),
-            (
-                "#[link(name = \"native\")] unsafe extern \"C\" { fn foreign(); }\nfn main() {}\n",
-                "#[link(name = \"native\")]",
             ),
         ] {
             assert_unsupported(

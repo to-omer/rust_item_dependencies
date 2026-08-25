@@ -2138,6 +2138,61 @@ mod tests {
     }
 
     #[test]
+    fn native_link_definition_roots_are_compile_only() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
+            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
+            unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
+        ];
+        let inventory = inventory(source, units.clone());
+        let definitions = vec![
+            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+            written_definition(
+                2,
+                DefinitionKind::ForeignModule,
+                &units[2],
+                Some(0),
+                "linked",
+            ),
+        ];
+        let mut graph = graph(
+            definitions,
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+        graph.roots.push(RootRecord {
+            node: GraphNode::Definition(DefinitionId(2)),
+            reason: RootReason::NativeLink,
+        });
+
+        let retention = compute_retention(
+            &inventory,
+            &graph,
+            &complete_constraints(&inventory, &graph),
+        )
+        .unwrap();
+
+        assert_eq!(
+            retention.semantic_required,
+            BTreeSet::from([
+                GraphNode::Definition(DefinitionId(0)),
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Mono(MonoId(0)),
+            ])
+        );
+        assert!(
+            retention
+                .compile_required
+                .contains(&GraphNode::Definition(DefinitionId(2)))
+        );
+        assert!(retention.retained_units.contains(&SourceUnitId(2)));
+    }
+
+    #[test]
     fn disjunction_uses_shortest_member_then_source_order() {
         let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
         let units = vec![

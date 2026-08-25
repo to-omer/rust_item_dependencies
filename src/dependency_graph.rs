@@ -529,6 +529,7 @@ pub enum RootReason {
     StartInstance,
     UsedAttribute,
     ExternalSymbol,
+    NativeLink,
 }
 
 impl RootReason {
@@ -839,6 +840,26 @@ pub(crate) fn valid_roots(
                     } | MonoKey::Static { .. }
                 )
             ),
+            RootReason::NativeLink => match root.node {
+                GraphNode::Definition(definition) => definitions
+                    .definitions
+                    .get(definition.0 as usize)
+                    .is_some_and(|definition| match definition.kind {
+                        crate::graph::DefinitionKind::ForeignModule => true,
+                        crate::graph::DefinitionKind::Function
+                        | crate::graph::DefinitionKind::Static => {
+                            definition.parent.is_some_and(|parent| {
+                                definitions.definitions.get(parent.0 as usize).is_some_and(
+                                    |parent| {
+                                        parent.kind == crate::graph::DefinitionKind::ForeignModule
+                                    },
+                                )
+                            })
+                        }
+                        _ => false,
+                    }),
+                _ => false,
+            },
         }
     })
 }
@@ -2754,6 +2775,41 @@ mod tests {
             ),
             Err(DependencyGraphError::InvalidRoot)
         );
+    }
+
+    #[test]
+    fn native_link_roots_accept_only_linked_definition_kinds() {
+        let (mut definitions, mono_nodes, _) = allocation_graph_parts();
+        definitions.definitions[0].kind = DefinitionKind::ForeignModule;
+        let root = |definition| RootRecord {
+            node: GraphNode::Definition(DefinitionId(definition)),
+            reason: RootReason::NativeLink,
+        };
+        assert!(valid_roots(&[root(0)], &definitions, &mono_nodes));
+
+        for kind in [DefinitionKind::Function, DefinitionKind::Static] {
+            let mut with_child = definitions.clone();
+            let mut child = with_child.definitions[0].clone();
+            child.id = DefinitionId(1);
+            child.kind = kind;
+            child.parent = Some(DefinitionId(0));
+            with_child.definitions.push(child);
+            assert!(valid_roots(&[root(1)], &with_child, &mono_nodes));
+
+            with_child.definitions[1].parent = None;
+            assert!(!valid_roots(&[root(1)], &with_child, &mono_nodes));
+        }
+
+        definitions.definitions[0].kind = DefinitionKind::Struct;
+        assert!(!valid_roots(&[root(0)], &definitions, &mono_nodes));
+        assert!(!valid_roots(
+            &[RootRecord {
+                node: GraphNode::Mono(MonoId(0)),
+                reason: RootReason::NativeLink,
+            }],
+            &definitions,
+            &mono_nodes,
+        ));
     }
 
     #[test]

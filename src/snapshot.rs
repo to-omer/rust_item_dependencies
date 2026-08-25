@@ -1194,6 +1194,7 @@ fn put_root_reason(bytes: &mut Vec<u8>, reason: RootReason) {
         RootReason::StartInstance => 3,
         RootReason::UsedAttribute => 4,
         RootReason::ExternalSymbol => 5,
+        RootReason::NativeLink => 6,
     };
     put_u8(bytes, tag);
 }
