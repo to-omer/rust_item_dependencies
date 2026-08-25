@@ -47,6 +47,10 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --locked --all-targets
+      - name: Run cargo rid tests
+        env:
+          CARGO_TARGET_DIR: target/rid-tool-tests
+        run: cargo -Zscript test --manifest-path tools/rid.rs
       - name: Bootstrap patched compiler through cargo rid
         run: >-
           cargo rid tests/fixtures/compiler/driver_smoke.rs

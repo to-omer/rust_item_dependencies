@@ -15,6 +15,7 @@ mod patched {
     const WRAPPER_SOURCE: &str = include_str!("fixtures/procedural_macros/wrapper.rs");
     const INPUT_SOURCE: &str = include_str!("fixtures/procedural_macros/input.rs");
     const EXPECTED_SOURCE: &str = include_str!("fixtures/procedural_macros/expected.rs");
+    const SNAPSHOT_PARENT_LOCK_FILE: &str = ".rust-item-dependencies-parent-lock";
 
     struct TestDirectory(PathBuf);
 
@@ -153,6 +154,64 @@ mod patched {
             "reducing through the public CLI",
         );
         assert_eq!(fs::read_to_string(cli_output).unwrap(), EXPECTED_SOURCE);
+
+        let cargo_output = artifacts.directory().join("cargo-rid-output.rs");
+        let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/rid/snapshots");
+        let snapshots_before = directory_entries(&snapshots);
+        assert_success(
+            Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .arg("rid")
+                .args(["--edition", "2024", "--extern"])
+                .arg(format!("proc_fixture={}", artifacts.direct.display()))
+                .arg("--allow-proc-macro")
+                .arg(&artifacts.direct)
+                .arg(&cli_input)
+                .arg("-o")
+                .arg(&cargo_output)
+                .output()
+                .expect("cargo rid must finish"),
+            "reducing through cargo rid",
+        );
+        assert_eq!(fs::read_to_string(cargo_output).unwrap(), EXPECTED_SOURCE);
+        let mut new_snapshots = directory_entries(&snapshots);
+        new_snapshots.retain(|snapshot| !snapshots_before.contains(snapshot));
+        assert!(
+            new_snapshots.is_empty(),
+            "cargo rid left process snapshots behind: {new_snapshots:?}"
+        );
+
+        let failing_input = artifacts.directory().join("cargo-rid-failing-input.rs");
+        let failing_output = artifacts.directory().join("cargo-rid-failing-output.rs");
+        fs::write(
+            &failing_input,
+            "fn main() { let _ = proc_fixture::panic_bang!(); }\n",
+        )
+        .unwrap();
+        let failed = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .arg("rid")
+            .args(["--edition", "2024", "--extern"])
+            .arg(format!("proc_fixture={}", artifacts.direct.display()))
+            .arg("--allow-proc-macro")
+            .arg(&artifacts.direct)
+            .arg(&failing_input)
+            .arg("-o")
+            .arg(&failing_output)
+            .output()
+            .expect("failing cargo rid must finish");
+        assert!(!failed.status.success());
+        assert!(
+            String::from_utf8_lossy(&failed.stderr).contains("proc macro panicked at bytes"),
+            "cargo rid failed before executing the permitted macro:\n{}",
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        let mut new_snapshots = directory_entries(&snapshots);
+        new_snapshots.retain(|snapshot| !snapshots_before.contains(snapshot));
+        assert!(
+            new_snapshots.is_empty(),
+            "failed cargo rid left process snapshots behind: {new_snapshots:?}"
+        );
 
         let original_output = compile_and_run(&original.source, &artifacts, "original", false);
         let reduced_output = compile_and_run(&reduced.source, &artifacts, "reduced", false);
@@ -394,29 +453,28 @@ mod patched {
     }
 
     #[test]
-    fn loaded_proc_macro_snapshot_is_removed_after_last_analyzer_drops() {
-        const CHILD_PROCESS: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_CLEANUP_CHILD";
+    fn loaded_proc_macro_snapshots_follow_the_loader_process_lifetime() {
+        const PHASE_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_TEST_PHASE";
+        const SNAPSHOT_PARENT_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_PARENT";
         const TEST_NAME: &str =
-            "patched::loaded_proc_macro_snapshot_is_removed_after_last_analyzer_drops";
+            "patched::loaded_proc_macro_snapshots_follow_the_loader_process_lifetime";
 
-        if let Some(snapshot_parent) = std::env::var_os(CHILD_PROCESS) {
-            let snapshot_parent = fs::canonicalize(PathBuf::from(snapshot_parent)).unwrap();
-            assert_eq!(
-                fs::canonicalize(std::env::temp_dir()).unwrap(),
-                snapshot_parent
-            );
+        let phase = std::env::var(PHASE_ENV).ok();
+        if phase.as_deref() == Some("reap") {
+            drop(Analyzer::new().unwrap());
+            return;
+        }
+        if phase.as_deref() == Some("owner") {
+            let snapshot_parent = fs::canonicalize(
+                std::env::var_os(SNAPSHOT_PARENT_ENV).expect("snapshot parent must be configured"),
+            )
+            .unwrap();
             let artifacts = ProcMacroArtifacts::build();
-            let snapshots_before = directory_entries(&snapshot_parent);
             let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
-            let mut created_snapshots = directory_entries(&snapshot_parent);
-            created_snapshots.retain(|path| !snapshots_before.contains(path));
-            created_snapshots.retain(|path| {
-                path.join(artifacts.direct.file_name().unwrap())
-                    .try_exists()
-                    .unwrap()
-            });
-            assert_eq!(created_snapshots.len(), 1, "unexpected analyzer snapshots");
-            let snapshot = created_snapshots.pop().unwrap();
+            let snapshot = unique_directory_containing(
+                &snapshot_parent,
+                artifacts.direct.file_name().unwrap(),
+            );
 
             analyzer
                 .analyze(&input("fn main() { let _ = proc_fixture::one!(); }\n"))
@@ -433,27 +491,24 @@ mod patched {
                 "a live analyzer lost its procedural macro snapshot"
             );
 
-            drop(last_owner);
+            let reap = run_snapshot_phase(TEST_NAME, PHASE_ENV, "reap", &snapshot_parent);
+            assert_success(reap, "checking an active procedural macro snapshot");
             assert!(
-                !snapshot.try_exists().unwrap(),
-                "the loaded procedural macro snapshot remains at {}",
-                snapshot.display()
+                snapshot.try_exists().unwrap(),
+                "another process reaped an active procedural macro snapshot"
             );
+
+            drop(last_owner);
+            #[cfg(windows)]
+            assert!(snapshot.try_exists().unwrap());
+            #[cfg(not(windows))]
+            assert!(!snapshot.try_exists().unwrap());
+            println!("SNAPSHOT:{}", snapshot.display());
             return;
         }
 
         let snapshot_parent = TestDirectory::new();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg(TEST_NAME)
-            .arg("--nocapture")
-            .env(CHILD_PROCESS, snapshot_parent.path())
-            .env("TMPDIR", snapshot_parent.path())
-            .env("TMP", snapshot_parent.path())
-            .env("TEMP", snapshot_parent.path())
-            .env("SystemTemp", snapshot_parent.path())
-            .output()
-            .expect("the isolated cleanup test must finish");
+        let output = run_snapshot_phase(TEST_NAME, PHASE_ENV, "owner", snapshot_parent.path());
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -464,23 +519,69 @@ mod patched {
             stdout.contains("1 passed"),
             "the isolated cleanup test did not run:\n{stdout}\n{stderr}"
         );
+        let snapshot = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("SNAPSHOT:"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("the owner did not report its snapshot:\n{stdout}\n{stderr}")
+            });
+        #[cfg(windows)]
+        assert!(
+            snapshot.try_exists().unwrap(),
+            "the process-owned snapshot disappeared before it could be reaped"
+        );
+
+        let reap = run_snapshot_phase(TEST_NAME, PHASE_ENV, "reap", snapshot_parent.path());
+        assert_success(reap, "reaping a finished procedural macro snapshot");
+        assert!(
+            !snapshot.try_exists().unwrap(),
+            "the finished process snapshot remains at {}",
+            snapshot.display()
+        );
+    }
+
+    fn run_snapshot_phase(test_name: &str, phase_env: &str, phase: &str, parent: &Path) -> Output {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(phase_env, phase)
+            .env("RUST_ITEM_DEPENDENCIES_SNAPSHOT_PARENT", parent)
+            .output()
+            .expect("the isolated snapshot test must finish")
+    }
+
+    fn unique_directory_containing(parent: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+        let mut pending = vec![parent.to_owned()];
+        let mut matches = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(&directory).unwrap() {
+                let entry = entry.unwrap();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    if entry.path().join(file_name).is_file() {
+                        matches.push(entry.path());
+                    } else {
+                        pending.push(entry.path());
+                    }
+                }
+            }
+        }
+        assert_eq!(matches.len(), 1, "unexpected analyzer snapshots");
+        matches.pop().unwrap()
     }
 
     fn directory_entries(parent: &Path) -> Vec<PathBuf> {
-        let mut entries = Vec::new();
-        for entry in fs::read_dir(parent).unwrap() {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => panic!("cannot read the snapshot parent: {error}"),
-            };
-            match entry.file_type() {
-                Ok(file_type) if file_type.is_dir() => entries.push(entry.path()),
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => panic!("cannot inspect a snapshot candidate: {error}"),
-            }
-        }
+        let mut entries = match fs::read_dir(parent) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name() != SNAPSHOT_PARENT_LOCK_FILE)
+                .map(|entry| entry.path())
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("cannot read {}: {error}", parent.display()),
+        };
         entries.sort();
         entries
     }
