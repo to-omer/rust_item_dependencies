@@ -86,6 +86,7 @@ compile_driver_fixture() {
                 --sysroot "$stage2_sysroot" \
                 --edition=2024 \
                 --extern "rustc_driver=$rustc_driver" \
+                -C prefer-dynamic \
                 -L "dependency=$compiler_metadata" \
                 -L "native=$compiler_library" \
                 "$source" \
@@ -96,6 +97,7 @@ compile_driver_fixture() {
                 --sysroot "$stage2_sysroot" \
                 --edition=2024 \
                 --extern "rustc_driver=$rustc_driver" \
+                -C prefer-dynamic \
                 -L "dependency=$compiler_metadata" \
                 -L "native=$compiler_library" \
                 -C "link-arg=-Wl,-rpath,$compiler_library" \
