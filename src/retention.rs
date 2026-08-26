@@ -1,9 +1,11 @@
 //! Deterministic source-retention fixed point over the owned compiler graph.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_interface::interface::Compiler;
 use rustc_middle::ty::{self, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
 
 use crate::definitions::CollectedDefinitions;
@@ -17,6 +19,31 @@ use crate::graph::{
 use crate::source::{
     CfgState, MacroRuleSourceFacts, SourceInventory, SourceUnitId, WrittenUnit, WrittenUnitKind,
     validate_macro_rule_facts, validate_ownerless_attribute_invocations,
+};
+
+mod external;
+
+pub(crate) use external::{
+    ExternalCompilerExpectation, ExternalCompilerObservation, external_compiler_expectation,
+    external_compiler_observation, external_compiler_outcome_difference,
+};
+
+#[cfg(test)]
+use external::{
+    CompilerGeneratedCrateActivation, ExternalCompilerMetadataFact,
+    ExternalCompilerOutcomeDifference, ExternalCrateActivation, ExternalCrateBinding,
+    ExternalCrateBindingTarget, ExternalCrateDependency, ExternalCrateLoad, ExternalDependencyKind,
+    ExternalMetadataProvider, ExternalMetadataProviderKind, ExternalMetadataRequirement,
+    ExternalMetadataRequirementKind, LocalMetadataRequirement,
+};
+
+#[cfg(test)]
+pub(crate) fn with_one_omitted_external_compiler_metadata_fact<T>(f: impl FnOnce() -> T) -> T {
+    external::with_one_omitted_external_compiler_metadata_fact(f)
+}
+use external::{
+    CompilerSourceDisjunction, ExternalCrateFacts, collect_external_crate_facts,
+    validate_external_crate_facts,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -92,6 +119,7 @@ pub(crate) struct SourceConstraints {
     pub disjunctions: Vec<SourceDisjunction>,
     pub member_containers: Vec<SourceUnitId>,
     pub classified_members: Vec<SourceUnitId>,
+    external_crates: ExternalCrateFacts,
 }
 
 impl SourceConstraints {
@@ -126,6 +154,7 @@ impl SourceConstraints {
             disjunctions: Vec::new(),
             member_containers: Vec::new(),
             classified_members: Vec::new(),
+            external_crates: ExternalCrateFacts::default(),
         }
     }
 }
@@ -133,14 +162,26 @@ impl SourceConstraints {
 /// Converts rustc's trait/impl completeness rules into an owned source model.
 /// No compiler-lifetime value crosses this boundary.
 pub(crate) fn collect_source_constraints(
+    compiler: &Compiler,
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
     definitions: &CollectedDefinitions,
+    external_artifact_directory: Option<&Path>,
 ) -> Result<SourceConstraints, RetentionError> {
     validate_source(source)?;
     let local_definitions = reverse_local_definitions(tcx, definitions)?;
     let definition_units = definition_source_units_from_graph(source, &definitions.graph)?;
     let mut constraints = SourceConstraints::from_source(source);
+    constraints.external_crates = collect_external_crate_facts(
+        compiler,
+        tcx,
+        source,
+        definitions,
+        &local_definitions,
+        &definition_units,
+        external_artifact_directory,
+    )
+    .map_err(|_| RetentionError::IncompleteExternalCrateConstraints)?;
 
     let mut containers = BTreeMap::new();
     for definition in &definitions.graph.definitions {
@@ -610,6 +651,8 @@ pub(crate) enum RetentionError {
     InvalidGraph,
     InvalidConstraint,
     IncompleteMemberConstraints,
+    IncompleteExternalCrateConstraints,
+    UnsupportedExternalNativeLink,
 }
 
 pub(crate) fn compute_retention(
@@ -620,7 +663,7 @@ pub(crate) fn compute_retention(
     validate_source(source)?;
     validate_graph(graph)?;
     let definition_units = definition_source_units(source, graph)?;
-    let validated = validate_constraints(source, graph, constraints)?;
+    let validated = validate_constraints(source, graph, &definition_units, constraints)?;
 
     let semantic_roots = graph
         .roots
@@ -665,6 +708,26 @@ pub(crate) fn compute_retention(
                         (unit.full_range.len(), unit.full_range, unit.id)
                     })
                     .expect("validated disjunctions have a choice");
+                selected |= retained_units.insert(*choice);
+            }
+        }
+        for disjunction in &validated.compiler_disjunctions {
+            if disjunction
+                .trigger
+                .is_none_or(|trigger| compile_required.contains(&trigger))
+                && !disjunction
+                    .choices
+                    .iter()
+                    .any(|choice| retained_units.contains(choice))
+            {
+                let choice = disjunction
+                    .choices
+                    .iter()
+                    .min_by_key(|choice| {
+                        let unit = &source.units[choice.0 as usize];
+                        (unit.full_range.len(), unit.full_range, unit.id)
+                    })
+                    .expect("validated compiler disjunctions have a choice");
                 selected |= retained_units.insert(*choice);
             }
         }
@@ -863,6 +926,31 @@ pub(crate) fn source_site_is_retained(
     retained_units: &BTreeSet<SourceUnitId>,
     site: crate::source::ByteRange,
 ) -> Result<bool, RetentionError> {
+    let owner_states = source_site_owners(source, site)?
+        .into_iter()
+        .map(|unit| retained_units.contains(&unit.id))
+        .collect::<BTreeSet<_>>();
+    if owner_states.len() != 1 {
+        return Err(RetentionError::InvalidGraph);
+    }
+    Ok(*owner_states.first().expect("one owner state was checked"))
+}
+
+fn source_site_owner(
+    source: &SourceInventory,
+    site: crate::source::ByteRange,
+) -> Result<SourceUnitId, RetentionError> {
+    let owners = source_site_owners(source, site)?;
+    let [owner] = owners.as_slice() else {
+        return Err(RetentionError::IncompleteMemberConstraints);
+    };
+    Ok(owner.id)
+}
+
+fn source_site_owners(
+    source: &SourceInventory,
+    site: crate::source::ByteRange,
+) -> Result<Vec<&WrittenUnit>, RetentionError> {
     let candidates = source
         .units
         .iter()
@@ -883,16 +971,11 @@ pub(crate) fn source_site_is_retained(
         .map(|(_, depth)| *depth)
         .max()
         .ok_or(RetentionError::InvalidGraph)?;
-    let owner_states = candidates
+    Ok(candidates
         .into_iter()
         .filter(|(_, depth)| *depth == deepest)
         .map(|(unit, _)| unit)
-        .map(|unit| retained_units.contains(&unit.id))
-        .collect::<BTreeSet<_>>();
-    if owner_states.len() != 1 {
-        return Err(RetentionError::InvalidGraph);
-    }
-    Ok(*owner_states.first().expect("one owner state was checked"))
+        .collect())
 }
 
 fn source_unit_depth(
@@ -938,6 +1021,7 @@ struct ValidatedConstraints {
     member_requirements: Vec<SourceRequirement>,
     conditional_member_requirements: Vec<ConditionalSourceRequirement>,
     disjunctions: Vec<SourceDisjunction>,
+    compiler_disjunctions: Vec<CompilerSourceDisjunction>,
 }
 
 impl ValidatedConstraints {
@@ -954,6 +1038,7 @@ impl ValidatedConstraints {
 fn validate_constraints(
     source: &SourceInventory,
     graph: &DependencyGraph,
+    definition_units: &[SourceUnitId],
     constraints: &SourceConstraints,
 ) -> Result<ValidatedConstraints, RetentionError> {
     let unit_count = source.units.len();
@@ -1111,6 +1196,12 @@ fn validate_constraints(
         });
     }
     disjunctions.sort();
+    let compiler_disjunctions = validate_external_crate_facts(
+        source,
+        graph,
+        definition_units,
+        &constraints.external_crates,
+    )?;
 
     Ok(ValidatedConstraints {
         atomic_groups: actual_groups
@@ -1124,6 +1215,7 @@ fn validate_constraints(
         member_requirements: members,
         conditional_member_requirements: conditional_members,
         disjunctions,
+        compiler_disjunctions,
     })
 }
 
@@ -1631,7 +1723,8 @@ mod tests {
     };
     use crate::graph::{
         Definition, DefinitionGraph, DefinitionKey, DefinitionKeyPart,
-        DependencyKind as DefinitionDependencyKind, GeneratedRole, InjectedRole,
+        DependencyKind as DefinitionDependencyKind, ExternalDefinition, ExternalDefinitionId,
+        ExternalDefinitionKey, GeneratedRole, InjectedRole,
     };
     use crate::source::{
         AtomicGroupId, ByteRange, MacroRuleSourceFacts, OriginalOffsetMap, SourceInventory,
@@ -1900,6 +1993,28 @@ mod tests {
             })
             .map(|unit| unit.id)
             .collect();
+        constraints.external_crates.loaded_crates = graph
+            .definitions
+            .external_definitions
+            .iter()
+            .map(|definition| definition.key.crate_identity)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|crate_identity| ExternalCrateDependency {
+                crate_identity,
+                kind: ExternalDependencyKind::Unconditional,
+            })
+            .collect();
+        constraints.external_crates.bindings = graph
+            .definitions
+            .definitions
+            .iter()
+            .filter(|definition| definition.kind == DefinitionKind::ExternCrate)
+            .map(|definition| ExternalCrateBinding {
+                definition: definition.id,
+                target: ExternalCrateBindingTarget::SelfCrate,
+            })
+            .collect();
         collect_macro_rule_expansion_constraints(
             source,
             &graph.definitions,
@@ -1908,6 +2023,26 @@ mod tests {
         )
         .unwrap();
         constraints
+    }
+
+    fn external_dependency(
+        crate_identity: u64,
+        kind: ExternalDependencyKind,
+    ) -> ExternalCrateDependency {
+        ExternalCrateDependency {
+            crate_identity,
+            kind,
+        }
+    }
+
+    fn external_load(
+        direct: ExternalCrateDependency,
+        closure: impl IntoIterator<Item = ExternalCrateDependency>,
+    ) -> ExternalCrateLoad {
+        ExternalCrateLoad {
+            direct,
+            closure: closure.into_iter().collect(),
+        }
     }
 
     #[test]
@@ -2664,6 +2799,537 @@ mod tests {
         assert_eq!(
             compute_retention(&inventory, &graph, &missing),
             Err(RetentionError::InvalidConstraint)
+        );
+    }
+
+    #[test]
+    fn compiler_generated_load_keeps_the_source_of_its_external_condition() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
+            unit(1, WrittenUnitKind::Item, (48, 64), Some(0), 1),
+            unit(2, WrittenUnitKind::Item, (0, 32), Some(0), 2),
+        ];
+        let inventory = inventory(source, units.clone());
+        let graph = graph(
+            vec![
+                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+                written_definition(
+                    2,
+                    DefinitionKind::Function,
+                    &units[2],
+                    Some(0),
+                    "loads_need",
+                ),
+            ],
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+        let needs = external_dependency(10, ExternalDependencyKind::MacrosOnly);
+        let runtime = external_dependency(20, ExternalDependencyKind::Conditional);
+        let needs_load = external_load(needs, [needs]);
+        let runtime_load = external_load(runtime, [runtime]);
+        let mut constraints = complete_constraints(&inventory, &graph);
+        constraints.external_crates.loaded_crates = vec![needs, runtime];
+        constraints.external_crates.activations = vec![ExternalCrateActivation {
+            source: Some(SourceUnitId(2)),
+            load: needs_load.clone(),
+        }];
+        constraints.external_crates.compiler_generated_activations =
+            vec![CompilerGeneratedCrateActivation {
+                load: runtime_load,
+                condition: Some(needs.crate_identity),
+            }];
+        constraints.external_crates.providers = vec![ExternalMetadataProvider {
+            crate_identity: runtime.crate_identity,
+            kind: ExternalMetadataProviderKind::PanicRuntime,
+        }];
+
+        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
+        assert!(retention.retained_units.contains(&SourceUnitId(2)));
+
+        constraints
+            .external_crates
+            .activations
+            .push(ExternalCrateActivation {
+                source: None,
+                load: needs_load,
+            });
+        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
+        assert!(!retention.retained_units.contains(&SourceUnitId(2)));
+    }
+
+    #[test]
+    fn compiler_metadata_requirements_keep_their_external_source() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
+            unit(1, WrittenUnitKind::Item, (48, 64), Some(0), 1),
+            unit(2, WrittenUnitKind::Item, (0, 32), Some(0), 2),
+        ];
+        let inventory = inventory(source, units.clone());
+        let graph = graph(
+            vec![
+                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+                written_definition(
+                    2,
+                    DefinitionKind::Function,
+                    &units[2],
+                    Some(0),
+                    "loads_need",
+                ),
+            ],
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+        let dependency = external_dependency(10, ExternalDependencyKind::Unconditional);
+        let load = external_load(dependency, [dependency]);
+
+        for kind in [
+            ExternalMetadataRequirementKind::Allocator,
+            ExternalMetadataRequirementKind::PanicRuntime,
+        ] {
+            let mut constraints = complete_constraints(&inventory, &graph);
+            constraints.external_crates.loaded_crates = vec![dependency];
+            constraints.external_crates.activations = vec![ExternalCrateActivation {
+                source: Some(SourceUnitId(2)),
+                load: load.clone(),
+            }];
+            constraints.external_crates.requirements = vec![ExternalMetadataRequirement {
+                crate_identity: dependency.crate_identity,
+                kind,
+            }];
+
+            let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
+            assert!(retention.retained_units.contains(&SourceUnitId(2)));
+
+            constraints
+                .external_crates
+                .activations
+                .push(ExternalCrateActivation {
+                    source: None,
+                    load: load.clone(),
+                });
+            let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
+            assert!(!retention.retained_units.contains(&SourceUnitId(2)));
+        }
+    }
+
+    #[test]
+    fn compiler_metadata_requirement_uses_one_smallest_carrier() {
+        let source = "x".repeat(80);
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 80), None, 0),
+            unit(1, WrittenUnitKind::Item, (60, 80), Some(0), 1),
+            unit(2, WrittenUnitKind::Item, (0, 40), Some(0), 2),
+            unit(3, WrittenUnitKind::Item, (41, 55), Some(0), 3),
+        ];
+        let inventory = inventory(&source, units.clone());
+        let graph = graph(
+            vec![
+                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+                written_definition(2, DefinitionKind::Function, &units[2], Some(0), "large"),
+                written_definition(3, DefinitionKind::Function, &units[3], Some(0), "small"),
+            ],
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+        let large = external_dependency(10, ExternalDependencyKind::Unconditional);
+        let small = external_dependency(20, ExternalDependencyKind::MacrosOnly);
+        let mut constraints = complete_constraints(&inventory, &graph);
+        constraints.external_crates.loaded_crates = vec![large, small];
+        constraints.external_crates.activations = vec![
+            ExternalCrateActivation {
+                source: Some(SourceUnitId(2)),
+                load: external_load(large, [large]),
+            },
+            ExternalCrateActivation {
+                source: Some(SourceUnitId(3)),
+                load: external_load(small, [small]),
+            },
+        ];
+        constraints.external_crates.requirements = vec![
+            ExternalMetadataRequirement {
+                crate_identity: large.crate_identity,
+                kind: ExternalMetadataRequirementKind::Allocator,
+            },
+            ExternalMetadataRequirement {
+                crate_identity: small.crate_identity,
+                kind: ExternalMetadataRequirementKind::Allocator,
+            },
+        ];
+
+        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
+        assert!(!retention.retained_units.contains(&SourceUnitId(2)));
+        assert!(retention.retained_units.contains(&SourceUnitId(3)));
+
+        constraints.external_crates.local_requirements = vec![LocalMetadataRequirement {
+            source: None,
+            kind: ExternalMetadataRequirementKind::Allocator,
+        }];
+        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
+        assert!(!retention.retained_units.contains(&SourceUnitId(2)));
+        assert!(!retention.retained_units.contains(&SourceUnitId(3)));
+    }
+
+    #[test]
+    fn provider_choice_preserves_the_required_dependency_kind() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
+            unit(1, WrittenUnitKind::Item, (48, 64), Some(0), 1),
+            unit(2, WrittenUnitKind::Item, (0, 20), Some(0), 2),
+            unit(3, WrittenUnitKind::Item, (21, 40), Some(0), 3),
+        ];
+        let inventory = inventory(source, units.clone());
+        let graph = graph(
+            vec![
+                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+                written_definition(2, DefinitionKind::Function, &units[2], Some(0), "weak"),
+                written_definition(3, DefinitionKind::Function, &units[3], Some(0), "strong"),
+            ],
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+        let provider = external_dependency(10, ExternalDependencyKind::Unconditional);
+        let weak = external_dependency(20, ExternalDependencyKind::MacrosOnly);
+        let strong = external_dependency(30, ExternalDependencyKind::Unconditional);
+        let mut constraints = complete_constraints(&inventory, &graph);
+        constraints.external_crates.loaded_crates = vec![provider, weak, strong];
+        constraints.external_crates.activations = vec![
+            ExternalCrateActivation {
+                source: Some(SourceUnitId(2)),
+                load: external_load(
+                    weak,
+                    [
+                        weak,
+                        external_dependency(10, ExternalDependencyKind::MacrosOnly),
+                    ],
+                ),
+            },
+            ExternalCrateActivation {
+                source: Some(SourceUnitId(3)),
+                load: external_load(strong, [strong, provider]),
+            },
+        ];
+        constraints.external_crates.providers = vec![ExternalMetadataProvider {
+            crate_identity: provider.crate_identity,
+            kind: ExternalMetadataProviderKind::GlobalAllocator,
+        }];
+
+        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
+        assert!(!retention.retained_units.contains(&SourceUnitId(2)));
+        assert!(retention.retained_units.contains(&SourceUnitId(3)));
+    }
+
+    #[test]
+    fn external_compiler_root_selects_a_source_only_when_reached() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
+            unit(1, WrittenUnitKind::Item, (48, 64), Some(0), 1),
+            unit(2, WrittenUnitKind::Item, (0, 32), Some(0), 2),
+        ];
+        let inventory = inventory(source, units.clone());
+        let definitions = vec![
+            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+            written_definition(2, DefinitionKind::Function, &units[2], Some(0), "load"),
+        ];
+        let external = ExternalDefinition {
+            id: ExternalDefinitionId(0),
+            key: ExternalDefinitionKey {
+                crate_identity: 10,
+                crate_name: "external".to_owned(),
+                def_path_hash: [1; 16],
+            },
+            path: "external::entry".to_owned(),
+        };
+        let mut live_graph = graph(
+            definitions.clone(),
+            vec![
+                edge(
+                    GraphNode::Definition(DefinitionId(1)),
+                    GraphNode::Definition(DefinitionId(0)),
+                ),
+                edge(
+                    GraphNode::Definition(DefinitionId(1)),
+                    GraphNode::ExternalDefinition(ExternalDefinitionId(0)),
+                ),
+            ],
+        );
+        live_graph.definitions.external_definitions = vec![external.clone()];
+        let load = external_dependency(10, ExternalDependencyKind::Unconditional);
+        let mut constraints = complete_constraints(&inventory, &live_graph);
+        constraints.external_crates.activations = vec![ExternalCrateActivation {
+            source: Some(SourceUnitId(2)),
+            load: external_load(load, [load]),
+        }];
+
+        let retention = compute_retention(&inventory, &live_graph, &constraints).unwrap();
+        assert!(retention.retained_units.contains(&SourceUnitId(2)));
+
+        let mut dead_graph = graph(
+            definitions,
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+        dead_graph.definitions.external_definitions = vec![external];
+        let dead_retention = compute_retention(&inventory, &dead_graph, &constraints).unwrap();
+        assert!(!dead_retention.retained_units.contains(&SourceUnitId(2)));
+    }
+
+    #[test]
+    fn missing_external_activation_is_an_observation_gap() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
+            unit(1, WrittenUnitKind::Item, (16, 32), Some(0), 1),
+        ];
+        let inventory = inventory(source, units.clone());
+        let graph = graph(
+            vec![
+                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+            ],
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+        let mut constraints = complete_constraints(&inventory, &graph);
+        constraints.external_crates.loaded_crates = vec![external_dependency(
+            10,
+            ExternalDependencyKind::Unconditional,
+        )];
+        constraints.external_crates.providers = vec![ExternalMetadataProvider {
+            crate_identity: 10,
+            kind: ExternalMetadataProviderKind::CompilerBuiltins,
+        }];
+        assert_eq!(
+            compute_retention(&inventory, &graph, &constraints),
+            Err(RetentionError::IncompleteExternalCrateConstraints)
+        );
+    }
+
+    #[test]
+    fn removable_user_external_native_link_metadata_is_rejected() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 48), None, 0),
+            unit(1, WrittenUnitKind::Item, (32, 48), Some(0), 1),
+            unit(2, WrittenUnitKind::Item, (0, 24), Some(0), 2),
+        ];
+        let inventory = inventory(source, units.clone());
+        let graph = graph(
+            vec![
+                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+                written_definition(2, DefinitionKind::Function, &units[2], Some(0), "load"),
+            ],
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+        let dependency = external_dependency(10, ExternalDependencyKind::Unconditional);
+        let load = external_load(dependency, [dependency]);
+        let mut constraints = complete_constraints(&inventory, &graph);
+        constraints.external_crates.loaded_crates = vec![dependency];
+        constraints.external_crates.activations = vec![ExternalCrateActivation {
+            source: Some(SourceUnitId(2)),
+            load: load.clone(),
+        }];
+        constraints.external_crates.providers = vec![ExternalMetadataProvider {
+            crate_identity: dependency.crate_identity,
+            kind: ExternalMetadataProviderKind::ExternalNativeLink,
+        }];
+
+        assert!(compute_retention(&inventory, &graph, &constraints).is_ok());
+
+        constraints.external_crates.user_artifact_crates = vec![dependency.crate_identity];
+        assert_eq!(
+            compute_retention(&inventory, &graph, &constraints),
+            Err(RetentionError::UnsupportedExternalNativeLink)
+        );
+
+        constraints.external_crates.activations[0].source = Some(SourceUnitId(0));
+        assert!(compute_retention(&inventory, &graph, &constraints).is_ok());
+
+        constraints.external_crates.activations[0].source = None;
+        assert!(compute_retention(&inventory, &graph, &constraints).is_ok());
+    }
+
+    #[test]
+    fn order_sensitive_providers_require_one_crate_identity() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
+            unit(1, WrittenUnitKind::Item, (16, 32), Some(0), 1),
+        ];
+        let inventory = inventory(source, units.clone());
+        let graph = graph(
+            vec![
+                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+            ],
+            vec![edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(0)),
+            )],
+        );
+
+        for provider_kind in [
+            ExternalMetadataProviderKind::CompilerBuiltins,
+            ExternalMetadataProviderKind::ProfilerRuntime,
+            ExternalMetadataProviderKind::DefaultLibAllocator,
+        ] {
+            let first = external_dependency(10, ExternalDependencyKind::Conditional);
+            let second = external_dependency(20, ExternalDependencyKind::Conditional);
+            let mut constraints = complete_constraints(&inventory, &graph);
+            constraints.external_crates.loaded_crates = vec![first, second];
+            constraints.external_crates.activations = vec![
+                ExternalCrateActivation {
+                    source: None,
+                    load: external_load(first, [first]),
+                },
+                ExternalCrateActivation {
+                    source: None,
+                    load: external_load(second, [second]),
+                },
+            ];
+            constraints.external_crates.providers = vec![
+                ExternalMetadataProvider {
+                    crate_identity: first.crate_identity,
+                    kind: provider_kind,
+                },
+                ExternalMetadataProvider {
+                    crate_identity: second.crate_identity,
+                    kind: provider_kind,
+                },
+            ];
+
+            assert_eq!(
+                compute_retention(&inventory, &graph, &constraints),
+                Err(RetentionError::IncompleteExternalCrateConstraints)
+            );
+            assert_eq!(
+                external_compiler_observation(&constraints),
+                Err(RetentionError::IncompleteExternalCrateConstraints)
+            );
+        }
+    }
+
+    #[test]
+    fn external_compiler_outcome_detects_provider_and_kind_changes() {
+        let provider = ExternalCompilerMetadataFact::Provider {
+            crate_identity: 10,
+            provider: ExternalMetadataProviderKind::GlobalAllocator,
+            dependency_kind: ExternalDependencyKind::Unconditional,
+        };
+        let requirement = ExternalCompilerMetadataFact::Requirement(
+            ExternalMetadataRequirementKind::PanicRuntime,
+        );
+        let original = ExternalCompilerExpectation {
+            metadata: BTreeSet::from([provider, requirement]),
+            external_crates: BTreeSet::from([external_dependency(
+                20,
+                ExternalDependencyKind::Conditional,
+            )]),
+        };
+        let matching = ExternalCompilerObservation {
+            metadata: BTreeSet::from([provider, requirement]),
+            loaded_crates: BTreeSet::from([external_dependency(
+                20,
+                ExternalDependencyKind::Conditional,
+            )]),
+        };
+        assert_eq!(
+            external_compiler_outcome_difference(&original, &matching),
+            None
+        );
+
+        let mut missing_provider = matching.clone();
+        missing_provider.metadata.remove(&provider);
+        assert!(matches!(
+            external_compiler_outcome_difference(&original, &missing_provider),
+            Some(ExternalCompilerOutcomeDifference::Metadata { .. })
+        ));
+
+        let mut weaker_provider = matching.clone();
+        weaker_provider.metadata.remove(&provider);
+        weaker_provider
+            .metadata
+            .insert(ExternalCompilerMetadataFact::Provider {
+                crate_identity: 10,
+                provider: ExternalMetadataProviderKind::GlobalAllocator,
+                dependency_kind: ExternalDependencyKind::Conditional,
+            });
+        assert!(matches!(
+            external_compiler_outcome_difference(&original, &weaker_provider),
+            Some(ExternalCompilerOutcomeDifference::Metadata { .. })
+        ));
+
+        let mut additional_provider = matching.clone();
+        additional_provider
+            .metadata
+            .insert(ExternalCompilerMetadataFact::Provider {
+                crate_identity: 30,
+                provider: ExternalMetadataProviderKind::PanicRuntime,
+                dependency_kind: ExternalDependencyKind::Conditional,
+            });
+        assert!(matches!(
+            external_compiler_outcome_difference(&original, &additional_provider),
+            Some(ExternalCompilerOutcomeDifference::Metadata { .. })
+        ));
+
+        let mut missing_requirement = matching.clone();
+        missing_requirement.metadata.remove(&requirement);
+        assert!(matches!(
+            external_compiler_outcome_difference(&original, &missing_requirement),
+            Some(ExternalCompilerOutcomeDifference::Metadata { .. })
+        ));
+
+        let mut weaker_external = matching;
+        weaker_external.loaded_crates =
+            BTreeSet::from([external_dependency(20, ExternalDependencyKind::MacrosOnly)]);
+        assert_eq!(
+            external_compiler_outcome_difference(&original, &weaker_external),
+            Some(ExternalCompilerOutcomeDifference::ExternalCrate {
+                crate_identity: 20,
+                original: ExternalDependencyKind::Conditional,
+                reduced: Some(ExternalDependencyKind::MacrosOnly),
+            })
+        );
+
+        let stronger_external = ExternalCompilerObservation {
+            metadata: BTreeSet::from([provider, requirement]),
+            loaded_crates: BTreeSet::from([external_dependency(
+                20,
+                ExternalDependencyKind::Unconditional,
+            )]),
+        };
+        assert_eq!(
+            external_compiler_outcome_difference(&original, &stronger_external),
+            Some(ExternalCompilerOutcomeDifference::ExternalCrate {
+                crate_identity: 20,
+                original: ExternalDependencyKind::Conditional,
+                reduced: Some(ExternalDependencyKind::Unconditional),
+            })
         );
     }
 

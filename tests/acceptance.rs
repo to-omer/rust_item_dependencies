@@ -200,6 +200,123 @@ fn crate_codegen_and_subsystem_attributes_survive_binary_reduction() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn compiler_roots_keep_only_the_required_external_crate_loading_source() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let cases = [
+        (
+            "written declaration",
+            "extern_crate_written",
+            r#"#![cfg_attr(all(), no_std)]
+
+extern crate std;
+extern crate std as redundant;
+extern crate self as local;
+
+fn unused() {}
+
+fn main() {}
+"#,
+            r#"#![cfg_attr(all(), no_std)]
+
+extern crate std;
+
+
+
+
+
+fn main() {}
+"#,
+        ),
+        (
+            "macro-generated declaration",
+            "extern_crate_generated",
+            r#"#![cfg_attr(all(), no_std)]
+
+macro_rules! load_std {
+    () => {
+        extern crate std;
+    };
+}
+
+load_std!();
+
+fn unused() {}
+
+fn main() {}
+"#,
+            r#"#![cfg_attr(all(), no_std)]
+
+macro_rules! load_std {
+    () => {
+        extern crate std;
+    };
+}
+
+load_std!();
+
+
+
+fn main() {}
+"#,
+        ),
+        (
+            "injected declaration",
+            "extern_crate_injected",
+            "extern crate std as redundant;\nextern crate self as local;\nfn unused() {}\nfn main() {}\n",
+            "\n\n\nfn main() {}\n",
+        ),
+        (
+            "self binding",
+            "extern_crate_self",
+            "extern crate self as current;\nfn value() -> u8 { 7 }\nfn unused() {}\nfn main() { assert_eq!(current::value(), 7); }\n",
+            "extern crate self as current;\nfn value() -> u8 { 7 }\n\nfn main() { assert_eq!(current::value(), 7); }\n",
+        ),
+    ];
+
+    for (case, artifact, source, expected) in cases {
+        let original_input = input(source, &target);
+        let verified = analyzer
+            .reduce_and_verify(&original_input)
+            .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_verified(case, source, expected, &verified);
+
+        let reduced_input = input(expected, &target);
+        let fixed = analyzer
+            .reduce_and_verify(&reduced_input)
+            .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
+        assert_eq!(fixed.reduced_source(), expected, "{case}");
+
+        let original_output = compile_and_run(
+            &original_input,
+            &CompilationOptions::default(),
+            &format!("{artifact}_original"),
+        );
+        let reduced_output = compile_and_run(
+            &reduced_input,
+            &CompilationOptions::default(),
+            &format!("{artifact}_reduced"),
+        );
+        assert!(
+            original_output.status.success(),
+            "{case}: {original_output:?}"
+        );
+        assert!(
+            original_output.stdout.is_empty(),
+            "{case}: {original_output:?}"
+        );
+        assert!(
+            original_output.stderr.is_empty(),
+            "{case}: {original_output:?}"
+        );
+        assert_eq!(reduced_output.status, original_output.status, "{case}");
+        assert_eq!(reduced_output.stdout, original_output.stdout, "{case}");
+        assert_eq!(reduced_output.stderr, original_output.stderr, "{case}");
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn external_symbol_roots_preserve_linked_entry_points() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();

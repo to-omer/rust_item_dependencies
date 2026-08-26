@@ -47,8 +47,9 @@ use crate::monomorphization::{
     CollectedMonomorphization, MonomorphizationError, collect_monomorphization,
 };
 use crate::retention::{
-    Retention, RetentionError, SourceConstraints, collect_macro_rule_expansion_constraints,
-    collect_source_constraints, compute_retention,
+    ExternalCompilerExpectation, ExternalCompilerObservation, Retention, RetentionError,
+    SourceConstraints, collect_macro_rule_expansion_constraints, collect_source_constraints,
+    compute_retention, external_compiler_expectation, external_compiler_observation,
 };
 use crate::rewrite::{SourceRewrite, SourceRewriteError, rewrite_source};
 use crate::source::{
@@ -524,6 +525,7 @@ pub(crate) struct InspectedDependencies {
     pub source: SourceInventory,
     pub graph: DependencyGraph,
     pub constraints: SourceConstraints,
+    pub external_compiler: ExternalCompilerObservation,
     pub tags: DefinitionTags,
 }
 
@@ -534,6 +536,7 @@ pub(crate) struct InspectedReduction {
     pub constraints: SourceConstraints,
     pub retention: Retention,
     pub rewrite: SourceRewrite,
+    pub external_compiler: ExternalCompilerExpectation,
     pub tags: DefinitionTags,
 }
 
@@ -704,10 +707,12 @@ fn inspect_source_with_dependencies_inner(
     let dependencies = inspection
         .dependencies
         .ok_or(InputError::CompilerProtocolFailure)?;
+    let external_compiler = external_compiler_observation(&dependencies.constraints)?;
     Ok(InspectedDependencies {
         source: inspection.source,
         graph: dependencies.graph,
         constraints: dependencies.constraints,
+        external_compiler,
         tags: dependencies.tags,
     })
 }
@@ -728,6 +733,8 @@ pub(crate) fn inspect_source_with_reduction_in_context(
 ) -> Result<InspectedReduction, InputError> {
     let inspected = inspect_source_with_dependencies_inner(source, context, None)?;
     let retention = compute_retention(&inspected.source, &inspected.graph, &inspected.constraints)?;
+    let external_compiler =
+        external_compiler_expectation(&inspected.graph, &inspected.constraints, &retention)?;
     let rewrite = rewrite_source(&inspected.source, &retention.retained_units)?;
     Ok(InspectedReduction {
         source: inspected.source,
@@ -735,6 +742,7 @@ pub(crate) fn inspect_source_with_reduction_in_context(
         constraints: inspected.constraints,
         retention,
         rewrite,
+        external_compiler,
         tags: inspected.tags,
     })
 }
@@ -801,6 +809,10 @@ fn run_inspection(
             .iter()
             .map(|external| external.extern_name().to_owned())
             .collect(),
+        external_artifact_directory: context
+            .external_crates()
+            .search_directory()
+            .map(PathBuf::from),
         crate_type: context.crate_type(),
         crate_name: context.crate_name().to_owned(),
         entry_points: context.entry_points().cloned().collect(),
@@ -1074,6 +1086,7 @@ struct InputCallbacks {
     collection_mode: CollectionMode,
     coordinates: Option<SourceRewrite>,
     direct_external_crates: BTreeSet<String>,
+    external_artifact_directory: Option<PathBuf>,
     crate_type: CrateType,
     crate_name: String,
     entry_points: Vec<EntryPoint>,
@@ -1439,6 +1452,7 @@ impl Callbacks for InputCallbacks {
                     tcx,
                     inventory,
                     self.coordinates.as_ref(),
+                    self.external_artifact_directory.as_deref(),
                     self.crate_type,
                     &entry_points,
                 ) {
@@ -1464,6 +1478,7 @@ fn collect_dependency_graph(
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
     coordinates: Option<&SourceRewrite>,
+    external_artifact_directory: Option<&Path>,
     crate_type: CrateType,
     entry_points: &[ResolvedEntryPoint],
 ) -> Result<CollectedDependencies, DependencyError> {
@@ -1474,7 +1489,15 @@ fn collect_dependency_graph(
     // coordinates. Preserve the established query order for original-source
     // analysis, where no coordinate switch is needed.
     let constraints = coordinates
-        .map(|_| collect_source_constraints(tcx, source, &definitions))
+        .map(|_| {
+            collect_source_constraints(
+                compiler,
+                tcx,
+                source,
+                &definitions,
+                external_artifact_directory,
+            )
+        })
         .transpose()?;
     if let Some(coordinates) = coordinates {
         definitions.normalize_identity_keys(coordinates)?;
@@ -1512,8 +1535,18 @@ fn collect_dependency_graph(
         roots.sort();
         roots.dedup();
     }
-    let mut constraints =
-        constraints.map_or_else(|| collect_source_constraints(tcx, source, &definitions), Ok)?;
+    let mut constraints = constraints.map_or_else(
+        || {
+            collect_source_constraints(
+                compiler,
+                tcx,
+                source,
+                &definitions,
+                external_artifact_directory,
+            )
+        },
+        Ok,
+    )?;
     collect_macro_rule_expansion_constraints(
         source,
         &definitions.graph,
@@ -2120,8 +2153,8 @@ impl<'ast> Visitor<'ast> for ExpandedValidator<'_> {
 }
 
 fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<UnsupportedReason> {
-    if attribute.has_name(sym::no_std) || attribute.has_name(sym::no_main) {
-        Some(UnsupportedReason::NoStdOrNoMain)
+    if attribute.has_name(sym::no_main) {
+        Some(UnsupportedReason::NoMain)
     } else if attribute.has_name(sym::path) {
         Some(UnsupportedReason::AdditionalSourceFile)
     } else if attribute.has_name(sym::proc_macro)
@@ -2129,8 +2162,7 @@ fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<Unsupporte
         || attribute.has_name(sym::proc_macro_derive)
     {
         Some(UnsupportedReason::ProcMacro)
-    } else if attribute.has_name(sym::panic_handler)
-        || attribute.has_name(sym::alloc_error_handler)
+    } else if attribute.has_name(sym::alloc_error_handler)
         || attribute.has_name(sym::crate_name)
         || attribute.has_name(sym::crate_type)
         || attribute.has_name(sym::no_link)
@@ -2142,11 +2174,8 @@ fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<Unsupporte
 }
 
 fn unsupported_attribute_symbol(name: Symbol) -> Option<UnsupportedReason> {
-    matches!(
-        name,
-        sym::panic_handler | sym::alloc_error_handler | sym::no_link
-    )
-    .then_some(UnsupportedReason::NativeLinkOrCustomRuntime)
+    matches!(name, sym::alloc_error_handler | sym::no_link)
+        .then_some(UnsupportedReason::NativeLinkOrCustomRuntime)
 }
 
 fn external_crate_reason(name: Symbol) -> UnsupportedReason {
@@ -2944,13 +2973,8 @@ mod tests {
         );
         assert_unsupported(
             "#![no_main]\nfn main() {}\n",
-            UnsupportedReason::NoStdOrNoMain,
+            UnsupportedReason::NoMain,
             "#![no_main]",
-        );
-        assert_unsupported(
-            "#![no_std]\nfn main() {}\n",
-            UnsupportedReason::NoStdOrNoMain,
-            "#![no_std]",
         );
         assert_unsupported(
             "fn main() { unsafe { core::arch::asm!(\"\"); } }\n",
@@ -3040,6 +3064,13 @@ mod tests {
         );
         assert_eq!(
             super::unsupported_resolved_attribute(MacroImplementationKind::Builtin, sym::test),
+            None
+        );
+        assert_eq!(
+            super::unsupported_resolved_attribute(
+                MacroImplementationKind::Builtin,
+                sym::panic_handler,
+            ),
             None
         );
         assert_eq!(
@@ -3220,22 +3251,21 @@ mod tests {
 
     #[test]
     fn compiler_errors_and_missing_entry_are_not_reported_as_unsupported_syntax() {
-        assert!(matches!(
-            inspect("fn main() { let _: u8 = \"not a number\"; }\n"),
-            Err(InputError::OriginalCompilationFailed(_))
-        ));
-        assert!(matches!(
-            inspect("#[unsafe(no_mangle)] extern \"C\" fn generic<T>() {}\nfn main() {}\n"),
-            Err(InputError::OriginalCompilationFailed(_))
-        ));
         for source in [
+            "fn main() { let _: u8 = \"not a number\"; }\n",
+            "#[unsafe(no_mangle)] extern \"C\" fn generic<T>() {}\nfn main() {}\n",
             "#![no_builtins(unexpected)]\nfn main() {}\n",
             "#![windows_subsystem = \"unexpected\"]\nfn main() {}\n",
+            "#![no_std]\nfn main() {}\n",
+            "#![no_std(unexpected)]\nextern crate std;\nfn main() {}\n",
         ] {
-            assert!(matches!(
-                inspect(source),
-                Err(InputError::OriginalCompilationFailed(_))
-            ));
+            assert!(
+                matches!(
+                    inspect(source),
+                    Err(InputError::OriginalCompilationFailed(_))
+                ),
+                "{source}"
+            );
         }
         assert_eq!(
             inspect("fn helper() {}\n"),

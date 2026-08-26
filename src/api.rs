@@ -16,10 +16,12 @@ use crate::error::{
 use crate::external::ExternalArtifactKind;
 use crate::graph::DefinitionId;
 use crate::input::{
-    CompilationContext, InputError, InspectedReduction, PreparedCompilationOptions,
-    inspect_source_in_context, inspect_source_with_dependencies_at_original_coordinates_in_context,
+    CompilationContext, InputError, InspectedDependencies, InspectedReduction,
+    PreparedCompilationOptions,
+    inspect_source_with_dependencies_at_original_coordinates_in_context,
     inspect_source_with_reduction_in_context,
 };
+use crate::retention::external_compiler_outcome_difference;
 use crate::rewrite::{SourcePiece, SourceRewriteError};
 use crate::snapshot::{CompilerDecisionSnapshot, SnapshotDiff, SnapshotError};
 use crate::source::{SourceUnitId, WrittenUnit};
@@ -93,8 +95,7 @@ impl Analyzer {
         let context = self.compilation_context(input);
         let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
-        inspect_source_in_context(&inspected.rewrite.source, &context)
-            .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
+        self.inspect_reduced(&context, &inspected)?;
         Ok(self.reduction(input, &context, &inspected))
     }
 
@@ -114,12 +115,7 @@ impl Analyzer {
         )
         .map_err(snapshot_error)?;
 
-        let reduced = inspect_source_with_dependencies_at_original_coordinates_in_context(
-            &inspected.rewrite.source,
-            &context,
-            &inspected.rewrite,
-        )
-        .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
+        let reduced = self.inspect_reduced(&context, &inspected)?;
         let reduced_snapshot =
             CompilerDecisionSnapshot::reduced(&reduced.graph).map_err(snapshot_error)?;
         if let Some(difference) = original_snapshot.first_difference(&reduced_snapshot) {
@@ -138,6 +134,33 @@ impl Analyzer {
                 reduced_snapshot_hash,
             },
         })
+    }
+
+    fn inspect_reduced(
+        &self,
+        context: &CompilationContext<'_>,
+        original: &InspectedReduction,
+    ) -> Result<InspectedDependencies, AnalysisError> {
+        let reduced = inspect_source_with_dependencies_at_original_coordinates_in_context(
+            &original.rewrite.source,
+            context,
+            &original.rewrite,
+        )
+        .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
+        if let Some(difference) = external_compiler_outcome_difference(
+            &original.external_compiler,
+            &reduced.external_compiler,
+        ) {
+            return Err(AnalysisError::DecisionMismatch(PublicSnapshotDiff::new(
+                vec![DecisionDifference {
+                    kind: difference.kind().to_owned(),
+                    original: difference.original(),
+                    reduced: difference.reduced(),
+                    range: None,
+                }],
+            )));
+        }
+        Ok(reduced)
     }
 
     fn compilation_context<'a>(&'a self, input: &'a SourceInput) -> CompilationContext<'a> {
@@ -372,6 +395,12 @@ fn analysis_error(error: InputError, phase: CompilationPhase) -> AnalysisError {
         InputError::UnsupportedInput { reason, range } => {
             AnalysisError::UnsupportedInput { reason, range }
         }
+        InputError::Dependency(crate::input::DependencyError::Retention(
+            crate::retention::RetentionError::UnsupportedExternalNativeLink,
+        )) => AnalysisError::UnsupportedInput {
+            reason: crate::error::UnsupportedReason::ExternalNativeLink,
+            range: None,
+        },
         InputError::OriginalCompilationFailed(diagnostics) => {
             let diagnostics = DiagnosticBundle::new(
                 diagnostics
@@ -690,6 +719,31 @@ mod tests {
         let reduction = analyzer.reduce(&input).unwrap();
         assert_eq!(reduction.reduced_source(), "\nfn main() {}\n");
         assert_eq!(crate::input::inspection_count(), 2);
+    }
+
+    #[test]
+    fn public_reduction_rejects_an_external_compiler_outcome_change() {
+        let analyzer = Analyzer::new().unwrap();
+        let input = SourceInput::library(
+            "#![no_std]\nextern crate alloc;\npub fn entry() {}\n".to_owned(),
+            Edition::Rust2024,
+            host_target(),
+            "external_outcome".to_owned(),
+        )
+        .with_entry_point(EntryPoint::new("external_outcome::entry"));
+
+        let error = crate::retention::with_one_omitted_external_compiler_metadata_fact(|| {
+            analyzer.reduce(&input)
+        })
+        .expect_err("the public reduction path must compare external compiler outcomes");
+        let AnalysisError::DecisionMismatch(difference) = error else {
+            panic!("unexpected error: {error:?}")
+        };
+        assert_eq!(difference.differences().len(), 1);
+        assert_eq!(
+            difference.differences()[0].kind,
+            "external_compiler_metadata"
+        );
     }
 
     #[test]

@@ -62,6 +62,7 @@ echo "==> patched compiler observer fixtures"
         tests/ui-fulldeps/selection-proof-trace.rs \
         tests/ui-fulldeps/macro-rule-observer.rs \
         tests/ui-fulldeps/proc-macro-load-guard.rs \
+        tests/ui-fulldeps/external-crate-load-requirements.rs \
         tests/ui-fulldeps/associated-item-proof.rs \
         tests/ui-fulldeps/typed-mono-successors.rs \
         tests/ui-fulldeps/typeck-impl-dependencies.rs \

@@ -9,8 +9,8 @@ mod patched {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rust_item_dependencies::{
-        AnalysisError, Analyzer, CompilationOptions, Edition, SourceInput, UnsupportedReason,
-        VerifiedReduction, error::DiagnosticLevel, source::ByteRange,
+        AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, SourceInput,
+        UnsupportedReason, VerifiedReduction, error::DiagnosticLevel, source::ByteRange,
     };
 
     const LEAF_SOURCE: &str = include_str!("fixtures/external_crates/leaf.rs");
@@ -187,6 +187,245 @@ mod patched {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn direct_and_transitive_external_native_link_metadata_are_rejected() {
+        let directory = TestDirectory::new();
+        let native_source = directory.path().join("native_dependency.rs");
+        let native = directory.path().join("libnative_dependency.rlib");
+        let wrapper_source = directory.path().join("native_wrapper.rs");
+        let wrapper = directory.path().join("libnative_wrapper.rlib");
+        fs::write(
+            &native_source,
+            concat!(
+                "#![no_std]\n",
+                "#[link(name = \"rid_external_native_fixture\")]\n",
+                "unsafe extern \"C\" {}\n",
+                "pub fn marker() {}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &wrapper_source,
+            "#![no_std]\npub fn marker() { native_dependency::marker(); }\n",
+        )
+        .unwrap();
+        compile_library("native_dependency", &native_source, &native, &[]);
+        compile_library(
+            "native_wrapper",
+            &wrapper_source,
+            &wrapper,
+            &[
+                "--extern".into(),
+                format!("native_dependency={}", native.display()),
+                "-L".into(),
+                format!("dependency={}", directory.path().display()),
+            ],
+        );
+
+        for (name, direct_name, direct, transitive) in [
+            ("direct", "native_dependency", &native, None),
+            ("transitive", "native_wrapper", &wrapper, Some(&native)),
+        ] {
+            let mut options = CompilationOptions::new().with_external_crate(direct_name, direct);
+            if let Some(transitive) = transitive {
+                options = options.with_dependency_artifact(transitive);
+            }
+            let analyzer = Analyzer::new_with_options(options).unwrap();
+            let source = format!("fn dead() {{ {direct_name}::marker(); }}\npub fn entry() {{}}\n");
+            let input = SourceInput::library(
+                source,
+                Edition::Rust2024,
+                host_target(),
+                format!("native_{name}"),
+            )
+            .with_entry_point(EntryPoint::new(format!("native_{name}::entry")));
+
+            assert_eq!(
+                analyzer.reduce(&input),
+                Err(AnalysisError::UnsupportedInput {
+                    reason: UnsupportedReason::ExternalNativeLink,
+                    range: None,
+                }),
+                "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn panic_handler_provider_keeps_only_the_smallest_source_activation() {
+        let directory = TestDirectory::new();
+        let provider_source = directory.path().join("panic_provider.rs");
+        let provider = directory.path().join("libpanic_provider.rlib");
+        let wrapper_source = directory.path().join("panic_wrapper.rs");
+        let wrapper = directory.path().join("libpanic_wrapper.rlib");
+        fs::write(
+            &provider_source,
+            concat!(
+                "#![no_std]\n",
+                "#[panic_handler]\n",
+                "fn panic(_: &core::panic::PanicInfo<'_>) -> ! { loop {} }\n",
+                "pub fn marker() {}\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &wrapper_source,
+            "#![no_std]\npub fn marker() { panic_provider::marker(); }\n",
+        )
+        .unwrap();
+        compile_library("panic_provider", &provider_source, &provider, &[]);
+        compile_library(
+            "panic_wrapper",
+            &wrapper_source,
+            &wrapper,
+            &[
+                "--extern".into(),
+                format!("panic_provider={}", provider.display()),
+                "-L".into(),
+                format!("dependency={}", directory.path().display()),
+            ],
+        );
+
+        let cases = [
+            RuntimeProviderCase {
+                name: "direct provider",
+                direct_name: "panic_provider",
+                direct_artifact: &provider,
+                dependency_artifact: None,
+                source: concat!(
+                    "#![no_std]\n",
+                    "fn long_activation() {\n",
+                    "    panic_provider::marker();\n",
+                    "    let _ = 0;\n",
+                    "}\n",
+                    "fn a() { panic_provider::marker(); }\n",
+                    "pub fn entry() -> u8 { 7 }\n",
+                ),
+                kept: "fn a() { panic_provider::marker(); }",
+            },
+            RuntimeProviderCase {
+                name: "transitive provider",
+                direct_name: "panic_wrapper",
+                direct_artifact: &wrapper,
+                dependency_artifact: Some(&provider),
+                source: concat!(
+                    "#![no_std]\n",
+                    "fn long_activation() {\n",
+                    "    panic_wrapper::marker();\n",
+                    "    let _ = 0;\n",
+                    "}\n",
+                    "fn a() { panic_wrapper::marker(); }\n",
+                    "pub fn entry() -> u8 { 7 }\n",
+                ),
+                kept: "fn a() { panic_wrapper::marker(); }",
+            },
+        ];
+        let target = host_target();
+        let missing_provider_source = directory.path().join("missing-provider.rs");
+        let missing_provider = directory.path().join("libmissing-provider.rlib");
+        fs::write(
+            &missing_provider_source,
+            "#![no_std]\npub fn entry() -> u8 { 7 }\n",
+        )
+        .unwrap();
+        compile_library_with_edition(
+            "runtime_input",
+            &missing_provider_source,
+            &missing_provider,
+            "2024",
+            &[],
+        );
+        let missing_provider_downstream = compile_no_std_downstream(
+            directory.path(),
+            "missing-provider",
+            "control",
+            &missing_provider,
+            &target,
+        );
+        assert!(
+            !missing_provider_downstream.status.success(),
+            "the control input must fail without a panic provider"
+        );
+
+        for case in cases {
+            let mut options = CompilationOptions::new()
+                .with_external_crate(case.direct_name, case.direct_artifact);
+            if let Some(dependency) = case.dependency_artifact {
+                options = options.with_dependency_artifact(dependency);
+            }
+            let analyzer = Analyzer::new_with_options(options).unwrap();
+            let input = SourceInput::library(
+                case.source,
+                Edition::Rust2024,
+                target.clone(),
+                "runtime_input",
+            )
+            .with_entry_point(EntryPoint::new("runtime_input::entry"));
+            let verified = analyzer
+                .reduce_and_verify(&input)
+                .unwrap_or_else(|error| panic!("{}: {error:?}", case.name));
+            assert!(
+                verified.reduced_source().contains(case.kept),
+                "{}: {}",
+                case.name,
+                verified.reduced_source()
+            );
+            assert!(!verified.reduced_source().contains("long_activation"));
+
+            let mut fixed_input = input.clone();
+            fixed_input.source = verified.reduced_source().to_owned();
+            let fixed = analyzer.reduce_and_verify(&fixed_input).unwrap();
+            assert_eq!(fixed.reduced_source(), verified.reduced_source());
+
+            for (variant, source) in [
+                ("original", case.source),
+                ("reduced", verified.reduced_source()),
+            ] {
+                let source_path = directory
+                    .path()
+                    .join(format!("{}-{variant}.rs", case.direct_name));
+                let artifact = directory
+                    .path()
+                    .join(format!("lib{}-{variant}.rlib", case.direct_name));
+                fs::write(&source_path, source).unwrap();
+                compile_library_with_edition(
+                    "runtime_input",
+                    &source_path,
+                    &artifact,
+                    "2024",
+                    &[
+                        "--extern".into(),
+                        format!("{}={}", case.direct_name, case.direct_artifact.display()),
+                        "-L".into(),
+                        format!("dependency={}", directory.path().display()),
+                    ],
+                );
+                let downstream = compile_no_std_downstream(
+                    directory.path(),
+                    case.direct_name,
+                    variant,
+                    &artifact,
+                    &target,
+                );
+                assert!(
+                    downstream.status.success(),
+                    "{} {variant}:\n{}",
+                    case.name,
+                    String::from_utf8_lossy(&downstream.stderr)
+                );
+            }
+        }
+    }
+
+    struct RuntimeProviderCase<'a> {
+        name: &'static str,
+        direct_name: &'static str,
+        direct_artifact: &'a Path,
+        dependency_artifact: Option<&'a Path>,
+        source: &'static str,
+        kept: &'static str,
     }
 
     #[test]
@@ -514,10 +753,20 @@ mod patched {
     }
 
     fn compile_library(crate_name: &str, source: &Path, artifact: &Path, extra_args: &[String]) {
+        compile_library_with_edition(crate_name, source, artifact, "2021", extra_args);
+    }
+
+    fn compile_library_with_edition(
+        crate_name: &str,
+        source: &Path,
+        artifact: &Path,
+        edition: &str,
+        extra_args: &[String],
+    ) {
         let compiled = Command::new(compiler())
             .arg(source)
             .args(["--crate-name", crate_name, "--crate-type=rlib"])
-            .arg("--edition=2021")
+            .arg(format!("--edition={edition}"))
             .args(["--target", &host_target()])
             .args(extra_args)
             .args(["-Awarnings", "-o"])
@@ -529,6 +778,51 @@ mod patched {
             "building {crate_name} failed:\n{}",
             String::from_utf8_lossy(&compiled.stderr)
         );
+    }
+
+    fn compile_no_std_downstream(
+        directory: &Path,
+        case_name: &str,
+        variant: &str,
+        input_artifact: &Path,
+        target: &str,
+    ) -> Output {
+        let source = directory.join(format!("{case_name}-{variant}-downstream.rs"));
+        let metadata = directory.join(format!("{case_name}-{variant}-downstream.rmeta"));
+        fs::write(
+            &source,
+            concat!(
+                "#![no_std]\n",
+                "#![no_main]\n",
+                "extern crate runtime_input;\n",
+                "#[unsafe(no_mangle)]\n",
+                "pub extern \"C\" fn _start() -> ! {\n",
+                "    let _ = runtime_input::entry();\n",
+                "    loop {}\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        Command::new(compiler())
+            .arg(source)
+            .args([
+                "--crate-name",
+                "runtime_downstream",
+                "--crate-type=bin",
+                "--edition=2024",
+                "--target",
+                target,
+                "-Cpanic=abort",
+                "--emit=metadata",
+                "--extern",
+            ])
+            .arg(format!("runtime_input={}", input_artifact.display()))
+            .arg("-L")
+            .arg(format!("dependency={}", directory.display()))
+            .args(["-Awarnings", "-o"])
+            .arg(metadata)
+            .output()
+            .expect("the no_std downstream compiler must finish")
     }
 
     fn cargo_rid(arguments: impl IntoIterator<Item = OsString>) -> Output {
