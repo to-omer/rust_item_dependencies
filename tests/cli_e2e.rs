@@ -212,7 +212,7 @@ fn cli_failures_report_reasons_ranges_and_all_compiler_diagnostics() {
 
     let unsupported_input = work.join("unsupported.rs");
     let unsupported_output = work.join("unsupported-output.rs");
-    std::fs::write(&unsupported_input, "#![no_std]\nfn main() {}\n").unwrap();
+    std::fs::write(&unsupported_input, "#![no_main]\nfn main() {}\n").unwrap();
     let unsupported = run_cli(&unsupported_input, &unsupported_output);
     assert!(!unsupported.status.success());
     assert!(unsupported.stdout.is_empty());
@@ -220,7 +220,7 @@ fn cli_failures_report_reasons_ranges_and_all_compiler_diagnostics() {
     let unsupported_error = String::from_utf8(unsupported.stderr).unwrap();
     assert!(
         unsupported_error.starts_with(
-            "error: the input is outside the supported source boundary: NoStdOrNoMain at bytes "
+            "error: the input is outside the supported source boundary: NoMain at bytes "
         ),
         "{unsupported_error}"
     );

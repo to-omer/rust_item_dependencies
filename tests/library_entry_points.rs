@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(rust_item_dependencies_patched)]
+use rust_item_dependencies::dependency_graph::RootReason;
+#[cfg(rust_item_dependencies_patched)]
 use rust_item_dependencies::{
     AnalysisError, Analyzer, Edition, EntryPoint, EntryPointError, SourceInput,
 };
@@ -113,6 +115,210 @@ fn multiple_function_and_static_entries_remove_unrelated_items() {
         ])
     );
     assert_fixed_point(&analyzer, &input, verified.reduced_source());
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn a_no_std_library_preserves_core_semantics_for_a_std_downstream() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = r#"#![no_std]
+
+fn helper() -> u8 { 2 }
+
+pub fn entry(value: u8) -> u8 { value.saturating_add(helper()) }
+
+fn unused() -> u8 { 0 }
+"#;
+    let expected = r#"#![no_std]
+
+fn helper() -> u8 { 2 }
+
+pub fn entry(value: u8) -> u8 { value.saturating_add(helper()) }
+
+
+"#;
+    let input = SourceInput::library(source, Edition::Rust2024, target.clone(), "no_std_library")
+        .with_entry_point(EntryPoint::new("no_std_library::entry"));
+
+    let verified = analyzer
+        .reduce_and_verify(&input)
+        .expect("the no_std library must preserve its explicit entry and core dependencies");
+    assert_eq!(verified.reduced_source(), expected);
+    assert_fixed_point(&analyzer, &input, expected);
+
+    let downstream = concat!(
+        "use no_std_library::entry;\n",
+        "fn main() { println!(\"{}\", entry(5)); }\n",
+    );
+    let directory = TestDirectory::new("no-std-library");
+    let original = compile_library_and_run_downstream(
+        directory.path(),
+        "original",
+        "no_std_library",
+        source,
+        downstream,
+        &target,
+    );
+    let reduced = compile_library_and_run_downstream(
+        directory.path(),
+        "reduced",
+        "no_std_library",
+        expected,
+        downstream,
+        &target,
+    );
+    assert!(original.status.success(), "original run: {original:?}");
+    assert_eq!(original.stdout, b"7\n");
+    assert!(original.stderr.is_empty(), "original run: {original:?}");
+    assert_eq!(reduced.status, original.status);
+    assert_eq!(reduced.stdout, original.stdout);
+    assert_eq!(reduced.stderr, original.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn an_unused_alloc_import_preserves_the_downstream_allocator_requirement() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = "#![no_std]\nextern crate alloc;\npub fn entry() {}\n";
+    let input = SourceInput::library(
+        source,
+        Edition::Rust2024,
+        target.clone(),
+        "allocator_requirement",
+    )
+    .with_entry_point(EntryPoint::new("allocator_requirement::entry"));
+
+    let reduction = analyzer
+        .reduce(&input)
+        .expect("the public reduction path must preserve external compiler requirements");
+    assert!(reduction.reduced_source().contains("extern crate alloc;"));
+    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+
+    let directory = TestDirectory::new("allocator-requirement");
+    let original = compile_library(
+        directory.path(),
+        "original",
+        "allocator_requirement",
+        source,
+        &target,
+    );
+    let reduced = compile_library(
+        directory.path(),
+        "reduced",
+        "allocator_requirement",
+        reduction.reduced_source(),
+        &target,
+    );
+    let control = compile_library(
+        directory.path(),
+        "control",
+        "allocator_requirement",
+        "#![no_std]\npub fn entry() {}\n",
+        &target,
+    );
+
+    let original_downstream =
+        compile_no_std_allocator_downstream(directory.path(), "original", &original, &target);
+    let reduced_downstream =
+        compile_no_std_allocator_downstream(directory.path(), "reduced", &reduced, &target);
+    let control_downstream =
+        compile_no_std_allocator_downstream(directory.path(), "control", &control, &target);
+    assert!(!original_downstream.status.success());
+    assert_eq!(reduced_downstream.status, original_downstream.status);
+    assert!(
+        String::from_utf8_lossy(&original_downstream.stderr)
+            .contains("no global memory allocator found")
+    );
+    assert!(
+        String::from_utf8_lossy(&reduced_downstream.stderr)
+            .contains("no global memory allocator found")
+    );
+    assert!(
+        control_downstream.status.success(),
+        "control downstream failed:\n{}",
+        String::from_utf8_lossy(&control_downstream.stderr)
+    );
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn a_macro_generated_panic_handler_remains_an_external_symbol_root() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = r#"#![no_std]
+
+macro_rules! define_panic_handler {
+    () => {
+        #[panic_handler]
+        fn panic(_: &core::panic::PanicInfo<'_>) -> ! { runtime() }
+    };
+}
+
+define_panic_handler!();
+
+fn runtime() -> ! { loop {} }
+
+pub fn entry() -> u8 { 7 }
+
+fn unused() {}
+"#;
+    let expected = r#"#![no_std]
+
+macro_rules! define_panic_handler {
+    () => {
+        #[panic_handler]
+        fn panic(_: &core::panic::PanicInfo<'_>) -> ! { runtime() }
+    };
+}
+
+define_panic_handler!();
+
+fn runtime() -> ! { loop {} }
+
+pub fn entry() -> u8 { 7 }
+
+
+"#;
+    let input = SourceInput::library(
+        source,
+        Edition::Rust2024,
+        target.clone(),
+        "panic_handler_library",
+    )
+    .with_entry_point(EntryPoint::new("panic_handler_library::entry"));
+
+    let verified = analyzer
+        .reduce_and_verify(&input)
+        .expect("the generated panic handler must be retained as a compiler root");
+    assert_eq!(verified.reduced_source(), expected);
+    assert_eq!(
+        verified
+            .original_analysis()
+            .roots()
+            .iter()
+            .filter(|root| root.reason == RootReason::ExternalSymbol)
+            .count(),
+        1
+    );
+    assert_fixed_point(&analyzer, &input, expected);
+
+    let directory = TestDirectory::new("panic-handler-library");
+    let _ = compile_library(
+        directory.path(),
+        "original",
+        "panic_handler_library",
+        source,
+        &target,
+    );
+    let _ = compile_library(
+        directory.path(),
+        "reduced",
+        "panic_handler_library",
+        expected,
+        &target,
+    );
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -681,33 +887,8 @@ fn compile_library_and_run_downstream(
     downstream_source: &str,
     target: &str,
 ) -> Output {
+    let library_artifact = compile_library(root, variant, crate_name, library_source, target);
     let directory = root.join(variant);
-    std::fs::create_dir(&directory).expect("the variant directory must be writable");
-    let library_path = directory.join("library.rs");
-    let library_artifact = directory.join(format!("lib{crate_name}.rlib"));
-    std::fs::write(&library_path, library_source).expect("the library source must be writable");
-
-    let compilation = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
-        .arg(&library_path)
-        .args([
-            "--crate-name",
-            crate_name,
-            "--crate-type=rlib",
-            "--edition=2024",
-            "--target",
-            target,
-            "-Awarnings",
-            "-o",
-        ])
-        .arg(&library_artifact)
-        .output()
-        .expect("the library compiler must start");
-    assert!(
-        compilation.status.success(),
-        "{variant} library compilation failed:\n{}",
-        String::from_utf8_lossy(&compilation.stderr)
-    );
-
     let downstream_path = directory.join("downstream.rs");
     let executable = directory.join(format!("downstream{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(&downstream_path, downstream_source)
@@ -738,6 +919,89 @@ fn compile_library_and_run_downstream(
     Command::new(executable)
         .output()
         .expect("the downstream executable must start")
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn compile_library(
+    root: &Path,
+    variant: &str,
+    crate_name: &str,
+    source: &str,
+    target: &str,
+) -> PathBuf {
+    let directory = root.join(variant);
+    std::fs::create_dir(&directory).expect("the variant directory must be writable");
+    let source_path = directory.join("library.rs");
+    let artifact = directory.join(format!("lib{crate_name}.rlib"));
+    std::fs::write(&source_path, source).expect("the library source must be writable");
+
+    let compilation = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+        .arg(&source_path)
+        .args([
+            "--crate-name",
+            crate_name,
+            "--crate-type=rlib",
+            "--edition=2024",
+            "--target",
+            target,
+            "-Awarnings",
+            "-o",
+        ])
+        .arg(&artifact)
+        .output()
+        .expect("the library compiler must start");
+    assert!(
+        compilation.status.success(),
+        "{variant} library compilation failed:\n{}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    artifact
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn compile_no_std_allocator_downstream(
+    root: &Path,
+    variant: &str,
+    library: &Path,
+    target: &str,
+) -> Output {
+    let directory = root.join(variant);
+    let source = directory.join("allocator-downstream.rs");
+    let metadata = directory.join("allocator-downstream.rmeta");
+    std::fs::write(
+        &source,
+        concat!(
+            "#![no_std]\n",
+            "#![no_main]\n",
+            "extern crate allocator_requirement;\n",
+            "#[panic_handler]\n",
+            "fn panic(_: &core::panic::PanicInfo<'_>) -> ! { loop {} }\n",
+            "#[unsafe(no_mangle)]\n",
+            "pub extern \"C\" fn _start() -> ! {\n",
+            "    allocator_requirement::entry();\n",
+            "    loop {}\n",
+            "}\n",
+        ),
+    )
+    .expect("the allocator downstream source must be writable");
+    Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+        .arg(&source)
+        .args([
+            "--crate-name",
+            "allocator_downstream",
+            "--crate-type=bin",
+            "--edition=2024",
+            "--target",
+            target,
+            "-Cpanic=abort",
+            "--emit=metadata",
+            "--extern",
+        ])
+        .arg(format!("allocator_requirement={}", library.display()))
+        .args(["-Awarnings", "-o"])
+        .arg(metadata)
+        .output()
+        .expect("the allocator downstream compiler must finish")
 }
 
 #[cfg(rust_item_dependencies_patched)]

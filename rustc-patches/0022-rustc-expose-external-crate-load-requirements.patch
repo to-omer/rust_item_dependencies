@@ -1,0 +1,1545 @@
+From eb3bf018ba5120eb7652b381651baf53fa3364b0 Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Wed, 26 Aug 2026 23:41:51 +0900
+Subject: [PATCH] rustc: expose external crate load requirements
+
+---
+ compiler/rustc_driver_impl/src/lib.rs         |   2 +-
+ compiler/rustc_metadata/src/creader.rs        | 142 +++-
+ compiler/rustc_metadata/src/rmeta/decoder.rs  |   9 +
+ .../src/rmeta/decoder/cstore_impl.rs          |  89 ++-
+ compiler/rustc_middle/src/queries.rs          |  29 +-
+ compiler/rustc_middle/src/query/keys.rs       |   6 +
+ compiler/rustc_middle/src/ty/context.rs       |   2 +
+ compiler/rustc_middle/src/ty/mod.rs           |  70 ++
+ .../rustc_resolve/src/build_reduced_graph.rs  |   7 +-
+ compiler/rustc_resolve/src/ident.rs           |  12 +-
+ compiler/rustc_resolve/src/lib.rs             | 109 ++-
+ .../external-crate-load-requirements.rs       | 725 ++++++++++++++++++
+ 12 files changed, 1143 insertions(+), 59 deletions(-)
+ create mode 100644 tests/ui-fulldeps/external-crate-load-requirements.rs
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 9a741579..1a7d8add 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 14;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 15;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_metadata/src/creader.rs b/compiler/rustc_metadata/src/creader.rs
+index 90d6f6ab..d540f1b1 100644
+--- a/compiler/rustc_metadata/src/creader.rs
++++ b/compiler/rustc_metadata/src/creader.rs
+@@ -19,7 +19,10 @@
+ use rustc_index::IndexVec;
+ use rustc_middle::bug;
+ use rustc_middle::ty::data_structures::IndexSet;
+-use rustc_middle::ty::{TyCtxt, TyCtxtFeed};
++use rustc_middle::ty::{
++    CompilerGeneratedCrateActivation, ExternalCrateDependency, ExternalCrateLoad, TyCtxt,
++    TyCtxtFeed,
++};
+ use rustc_proc_macro::bridge::client::Client as ProcMacroClient;
+ use rustc_session::config::mitigation_coverage::DeniedPartialMitigationLevel;
+ use rustc_session::config::{
+@@ -78,6 +81,15 @@ pub struct CStore {
+     /// Unused externs of the crate
+     unused_externs: Vec<Symbol>,
+ 
++    /// Crates whose direct load was required by compiler configuration rather
++    /// than by a deletable source construct.
++    source_free_crate_activations: Vec<ExternalCrateLoad>,
++
++    /// Crates loaded by the compiler after external-crate resolution. The
++    /// optional condition records the already-loaded crate whose metadata made
++    /// the generated load necessary.
++    compiler_generated_crate_activations: Vec<CompilerGeneratedCrateActivation>,
++
+     used_extern_options: FxHashSet<Symbol>,
+     /// Whether there was a failure in resolving crate,
+     /// it's used to suppress some diagnostics that would otherwise too noisey.
+@@ -295,6 +307,90 @@ pub(crate) fn crate_dependencies_in_postorder(&self, cnum: CrateNum) -> IndexSet
+         deps
+     }
+ 
++    pub(crate) fn crate_dependency_closure(
++        &self,
++        root: ExternalCrateLoad,
++    ) -> Vec<ExternalCrateDependency> {
++        let mut effective = BTreeMap::new();
++        let mut work = vec![(root.crate_num, root.kind)];
++        while let Some((crate_num, kind)) = work.pop() {
++            if effective.get(&crate_num).is_some_and(|existing| *existing >= kind) {
++                continue;
++            }
++            effective.insert(crate_num, kind);
++            let data = self.get_crate_data(crate_num);
++            // Proc-macro dependencies belong to the host dylib and are not mapped into the target
++            // crate's CStore. The proc-macro crate itself is the complete target-side load.
++            if data.is_proc_macro_crate() {
++                continue;
++            }
++            for (dependency, edge_kind) in data.dependencies_with_kinds() {
++                let dependency_kind = if kind == CrateDepKind::MacrosOnly {
++                    CrateDepKind::MacrosOnly
++                } else {
++                    edge_kind
++                };
++                work.push((dependency, dependency_kind));
++            }
++        }
++        effective
++            .into_iter()
++            .map(|(crate_num, kind)| ExternalCrateDependency { crate_num, kind })
++            .collect()
++    }
++
++    pub(crate) fn source_free_crate_activations(
++        &self,
++    ) -> impl Iterator<Item = ExternalCrateLoad> + '_ {
++        self.source_free_crate_activations.iter().copied()
++    }
++
++    pub(crate) fn compiler_generated_crate_activations(
++        &self,
++    ) -> impl Iterator<Item = CompilerGeneratedCrateActivation> + '_ {
++        self.compiler_generated_crate_activations.iter().copied()
++    }
++
++    pub fn direct_activation_kind(
++        &self,
++        crate_num: CrateNum,
++        requested: CrateDepKind,
++    ) -> CrateDepKind {
++        if self.get_crate_data(crate_num).is_proc_macro_crate() {
++            CrateDepKind::MacrosOnly
++        } else {
++            requested
++        }
++    }
++
++    fn record_source_free_activation(&mut self, crate_num: CrateNum, requested: CrateDepKind) {
++        let load = ExternalCrateLoad {
++            crate_num,
++            kind: self.direct_activation_kind(crate_num, requested),
++        };
++        if !self.source_free_crate_activations.contains(&load) {
++            self.source_free_crate_activations.push(load);
++        }
++    }
++
++    fn record_compiler_generated_activation(
++        &mut self,
++        crate_num: CrateNum,
++        requested: CrateDepKind,
++        condition: Option<CrateNum>,
++    ) {
++        let activation = CompilerGeneratedCrateActivation {
++            load: ExternalCrateLoad {
++                crate_num,
++                kind: self.direct_activation_kind(crate_num, requested),
++            },
++            condition,
++        };
++        if !self.compiler_generated_crate_activations.contains(&activation) {
++            self.compiler_generated_crate_activations.push(activation);
++        }
++    }
++
+     pub(crate) fn injected_panic_runtime(&self) -> Option<CrateNum> {
+         self.injected_panic_runtime
+     }
+@@ -553,6 +649,8 @@ pub fn new(metadata_loader: Box<MetadataLoaderDyn>) -> CStore {
+             hash_to_cnum: UnordMap::default(),
+             resolved_externs: UnordMap::default(),
+             unused_externs: Vec::new(),
++            source_free_crate_activations: Vec::new(),
++            compiler_generated_crate_activations: Vec::new(),
+             used_extern_options: Default::default(),
+             has_crate_resolve_with_fail: false,
+         }
+@@ -968,14 +1066,19 @@ fn inject_panic_runtime(&mut self, tcx: TyCtxt<'_>, krate: &ast::Crate) {
+         // If we need a panic runtime, we try to find an existing one here. At
+         // the same time we perform some general validation of the DAG we've got
+         // going such as ensuring everything has a compatible panic strategy.
+-        let mut needs_panic_runtime = attr::contains_name(&krate.attrs, sym::needs_panic_runtime);
+-        for (_cnum, data) in self.iter_crate_data() {
+-            needs_panic_runtime |= data.needs_panic_runtime();
+-        }
++        let local_needs_panic_runtime = attr::contains_name(&krate.attrs, sym::needs_panic_runtime);
++        // `inject_panic_runtime` considers every loaded crate, regardless of
++        // its dependency kind. Preserve those exact positive causes so a
++        // later source rewrite cannot treat this generated load as
++        // unconditionally source-free.
++        let external_conditions = self
++            .iter_crate_data()
++            .filter_map(|(cnum, data)| data.needs_panic_runtime().then_some(cnum))
++            .collect::<Vec<_>>();
+ 
+         // If we just don't need a panic runtime at all, then we're done here
+         // and there's nothing else to do.
+-        if !needs_panic_runtime {
++        if !local_needs_panic_runtime && external_conditions.is_empty() {
+             return;
+         }
+ 
+@@ -1010,6 +1113,17 @@ fn inject_panic_runtime(&mut self, tcx: TyCtxt<'_>, krate: &ast::Crate) {
+         ) else {
+             return;
+         };
++        if local_needs_panic_runtime {
++            self.record_compiler_generated_activation(cnum, CrateDepKind::Conditional, None);
++        } else {
++            for condition in external_conditions {
++                self.record_compiler_generated_activation(
++                    cnum,
++                    CrateDepKind::Conditional,
++                    Some(condition),
++                );
++            }
++        }
+         let cdata = self.get_crate_data(cnum);
+ 
+         // Sanity check the loaded crate to ensure it is indeed a panic runtime
+@@ -1053,6 +1167,7 @@ fn inject_profiler_runtime(&mut self, tcx: TyCtxt<'_>) {
+         ) else {
+             return;
+         };
++        self.record_source_free_activation(cnum, CrateDepKind::Conditional);
+         let cdata = self.get_crate_data(cnum);
+ 
+         // Sanity check the loaded crate to ensure it is indeed a profiler runtime
+@@ -1169,14 +1284,17 @@ fn inject_forced_externs(&mut self, tcx: TyCtxt<'_>) {
+         for (name, entry) in tcx.sess.opts.externs.iter() {
+             if entry.force {
+                 let name_interned = Symbol::intern(name);
+-                if !self.used_extern_options.contains(&name_interned) {
++                let cnum = self.resolved_extern_crate(name_interned).or_else(|| {
+                     self.resolve_crate(
+                         tcx,
+                         name_interned,
+                         DUMMY_SP,
+                         CrateDepKind::Unconditional,
+                         CrateOrigin::Extern,
+-                    );
++                    )
++                });
++                if let Some(cnum) = cnum {
++                    self.record_source_free_activation(cnum, CrateDepKind::Unconditional);
+                 }
+             }
+         }
+@@ -1212,6 +1330,7 @@ fn inject_compiler_builtins(&mut self, tcx: TyCtxt<'_>, krate: &ast::Crate) {
+             info!("`compiler_builtins` not resolved");
+             return;
+         };
++        self.record_source_free_activation(cnum, CrateDepKind::Unconditional);
+ 
+         // Sanity check that the loaded crate is `#![compiler_builtins]`
+         let cdata = self.get_crate_data(cnum);
+@@ -1309,7 +1428,7 @@ pub fn process_extern_crate(
+         item: &ast::Item,
+         def_id: LocalDefId,
+         definitions: &Definitions,
+-    ) -> Option<CrateNum> {
++    ) -> Option<ExternalCrateLoad> {
+         match item.kind {
+             ast::ItemKind::ExternCrate(orig_name, ident) => {
+                 debug!("resolving extern crate stmt. ident: {} orig_name: {:?}", ident, orig_name);
+@@ -1340,7 +1459,10 @@ pub fn process_extern_crate(
+                         dependency_of: LOCAL_CRATE,
+                     },
+                 );
+-                Some(cnum)
++                Some(ExternalCrateLoad {
++                    crate_num: cnum,
++                    kind: self.direct_activation_kind(cnum, dep_kind),
++                })
+             }
+             _ => bug!(),
+         }
+diff --git a/compiler/rustc_metadata/src/rmeta/decoder.rs b/compiler/rustc_metadata/src/rmeta/decoder.rs
+index 3a7cffb5..c3baab71 100644
+--- a/compiler/rustc_metadata/src/rmeta/decoder.rs
++++ b/compiler/rustc_metadata/src/rmeta/decoder.rs
+@@ -2002,6 +2002,15 @@ pub(crate) fn dependencies(&self) -> impl Iterator<Item = CrateNum> {
+         self.cnum_map.iter().copied()
+     }
+ 
++    pub(crate) fn dependencies_with_kinds(&self) -> Vec<(CrateNum, CrateDepKind)> {
++        let dependencies = self.root.decode_crate_deps(&self.blob);
++        assert_eq!(dependencies.len() + 1, self.cnum_map.len());
++        dependencies
++            .zip(self.cnum_map.iter().copied().skip(1))
++            .map(|(dependency, crate_num)| (crate_num, dependency.kind))
++            .collect()
++    }
++
+     pub(crate) fn target_modifiers(&self) -> TargetModifiers {
+         self.root.decode_target_modifiers(&self.blob).collect()
+     }
+diff --git a/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs b/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
+index a9d52471..fe1f4cd5 100644
+--- a/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
++++ b/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
+@@ -3,7 +3,7 @@
+ use std::sync::Arc;
+ 
+ use rustc_data_structures::unord::ExtendUnord;
+-use rustc_hir::attrs::Deprecation;
++use rustc_hir::attrs::{Deprecation, NativeLibKind};
+ use rustc_hir::def::{CtorKind, DefKind};
+ use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LOCAL_CRATE};
+ use rustc_hir::definitions::{DefKey, DefPath, DefPathHash};
+@@ -15,7 +15,9 @@
+ use rustc_middle::queries::ExternProviders;
+ use rustc_middle::query::LocalCrate;
+ use rustc_middle::ty::fast_reject::SimplifiedType;
+-use rustc_middle::ty::{self, TyCtxt, TypeVisitable};
++use rustc_middle::ty::{
++    self, CompilerMetadataProvider, CompilerMetadataRequirement, TyCtxt, TypeVisitable,
++};
+ use rustc_middle::util::Providers;
+ use rustc_serialize::Decoder;
+ use rustc_session::StableCrateId;
+@@ -342,6 +344,7 @@ fn into_args(self) -> (DefId, SimplifiedType) {
+     has_global_allocator => { cdata.root.has_global_allocator }
+     // FIXME: to be replaced with externally_implementable_items below
+     has_alloc_error_handler => { cdata.root.has_alloc_error_handler }
++    has_default_lib_allocator => { cdata.root.has_default_lib_allocator }
+     // FIXME: to be replaced with externally_implementable_items below
+     has_panic_handler => { cdata.root.has_panic_handler }
+ 
+@@ -431,6 +434,77 @@ fn into_args(self) -> (DefId, SimplifiedType) {
+     args_known_to_outlive_alias_params => { table }
+ }
+ 
++fn compiler_metadata_providers<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    cnum: CrateNum,
++) -> &'tcx [CompilerMetadataProvider] {
++    let mut providers = Vec::new();
++    if tcx.is_compiler_builtins(cnum) {
++        providers.push(CompilerMetadataProvider::CompilerBuiltins);
++    }
++    if tcx.is_panic_runtime(cnum) {
++        providers.push(CompilerMetadataProvider::PanicRuntime);
++    }
++    if tcx.is_profiler_runtime(cnum) {
++        providers.push(CompilerMetadataProvider::ProfilerRuntime);
++    }
++    if tcx.native_libraries(cnum).iter().any(|library| {
++        matches!(library.kind, NativeLibKind::RawDylib { .. })
++            || (!tcx.crate_dep_kind(cnum).macros_only()
++                && native_libs::relevant_lib(tcx.sess, library)
++                && library.kind != NativeLibKind::WasmImportModule)
++    }) {
++        providers.push(CompilerMetadataProvider::ExternalNativeLink);
++    }
++    if tcx.has_global_allocator(cnum) {
++        providers.push(CompilerMetadataProvider::GlobalAllocator);
++    }
++    if tcx.has_alloc_error_handler(cnum) {
++        providers.push(CompilerMetadataProvider::AllocErrorHandler);
++    }
++    if tcx.has_default_lib_allocator(cnum) {
++        providers.push(CompilerMetadataProvider::DefaultLibAllocator);
++    }
++    // Weak lang items are selected from used crates, unlike the allocator,
++    // runtime, builtins, and EII scans which inspect every registered crate.
++    if tcx.used_crates(()).contains(&cnum) {
++        providers.extend(tcx.defined_lang_items(cnum).iter().filter_map(|&(_, item)| {
++            item.is_weak().then_some(CompilerMetadataProvider::WeakLangItem(item))
++        }));
++    }
++    if tcx
++        .externally_implementable_items(cnum)
++        .values()
++        .any(|(_, implementations)| !implementations.is_empty())
++    {
++        providers.push(CompilerMetadataProvider::ExternallyImplementableItemImplementation);
++    }
++    tcx.arena.alloc_from_iter(providers)
++}
++
++fn compiler_metadata_requirements<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    cnum: CrateNum,
++) -> &'tcx [CompilerMetadataRequirement] {
++    let cstore = CStore::from_tcx(tcx);
++    let cdata = cstore.get_crate_data(cnum);
++    let mut requirements = Vec::new();
++    if cdata.needs_allocator() {
++        requirements.push(CompilerMetadataRequirement::Allocator);
++    }
++    if cdata.needs_panic_runtime() {
++        requirements.push(CompilerMetadataRequirement::PanicRuntime);
++    }
++    requirements.extend(
++        tcx.missing_lang_items(cnum)
++            .iter()
++            .copied()
++            .filter(|item| item.is_weak())
++            .map(CompilerMetadataRequirement::MissingLangItem),
++    );
++    tcx.arena.alloc_from_iter(requirements)
++}
++
+ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
+     provide_cstore_hooks(providers);
+     providers.queries = rustc_middle::query::Providers {
+@@ -583,11 +657,22 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
+         dependency_formats: |tcx, ()| Arc::new(crate::dependency_format::calculate(tcx)),
+         has_global_allocator: |tcx, LocalCrate| CStore::from_tcx(tcx).has_global_allocator(),
+         has_alloc_error_handler: |tcx, LocalCrate| CStore::from_tcx(tcx).has_alloc_error_handler(),
++        compiler_metadata_providers,
++        compiler_metadata_requirements,
+         postorder_cnums: |tcx, ()| {
+             tcx.arena.alloc_from_iter(
+                 CStore::from_tcx(tcx).crate_dependencies_in_postorder(LOCAL_CRATE).into_iter(),
+             )
+         },
++        crate_dependency_closure: |tcx, cnum| {
++            tcx.arena.alloc_from_iter(CStore::from_tcx(tcx).crate_dependency_closure(cnum))
++        },
++        source_free_crate_activations: |tcx, ()| {
++            tcx.arena.alloc_from_iter(CStore::from_tcx(tcx).source_free_crate_activations())
++        },
++        compiler_generated_crate_activations: |tcx, ()| {
++            tcx.arena.alloc_from_iter(CStore::from_tcx(tcx).compiler_generated_crate_activations())
++        },
+         crates: |tcx, ()| {
+             // The loaded-crate list is now frozen in the query cache; stop
+             // mutating the cstore and stable crate id map from here on.
+diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
+index 8548a583..d4125c4a 100644
+--- a/compiler/rustc_middle/src/queries.rs
++++ b/compiler/rustc_middle/src/queries.rs
+@@ -122,8 +122,9 @@
+ use crate::ty::print::PrintTraitRefExt;
+ use crate::ty::util::AlwaysRequiresDrop;
+ use crate::ty::{
+-    self, CrateInherentImpls, GenericArg, GenericArgsRef, LitToConstInput, PseudoCanonicalInput,
+-    SizedTraitKind, Ty, TyCtxt, TyCtxtFeed,
++    self, CompilerGeneratedCrateActivation, CompilerMetadataProvider, CompilerMetadataRequirement,
++    CrateInherentImpls, ExternalCrateDependency, ExternalCrateLoad, GenericArg, GenericArgsRef,
++    LitToConstInput, PseudoCanonicalInput, SizedTraitKind, Ty, TyCtxt, TyCtxtFeed,
+ };
+ use crate::{mir, thir};
+ 
+@@ -1897,6 +1898,18 @@
+         desc { "checking if the crate has_alloc_error_handler" }
+         separate_provide_extern
+     }
++    query has_default_lib_allocator(_: CrateNum) -> bool {
++        desc { "checking if the crate has_default_lib_allocator" }
++        separate_provide_extern
++    }
++    query compiler_metadata_providers(_: CrateNum) -> &'tcx [CompilerMetadataProvider] {
++        eval_always
++        desc { "collecting compiler metadata provided by an external crate" }
++    }
++    query compiler_metadata_requirements(_: CrateNum) -> &'tcx [CompilerMetadataRequirement] {
++        eval_always
++        desc { "collecting compiler metadata required by an external crate" }
++    }
+     query has_panic_handler(_: CrateNum) -> bool {
+         desc { "checking if the crate has_panic_handler" }
+         separate_provide_extern
+@@ -2423,6 +2436,18 @@
+         eval_always
+         desc { "generating a postorder list of CrateNums" }
+     }
++    query crate_dependency_closure(_: ExternalCrateLoad) -> &'tcx [ExternalCrateDependency] {
++        eval_always
++        desc { "generating the dependency closure of a loaded crate" }
++    }
++    query source_free_crate_activations(_: ()) -> &'tcx [ExternalCrateLoad] {
++        eval_always
++        desc { "fetching crates activated by compiler configuration" }
++    }
++    query compiler_generated_crate_activations(_: ()) -> &'tcx [CompilerGeneratedCrateActivation] {
++        eval_always
++        desc { "fetching compiler-generated external crate activations" }
++    }
+     /// Returns whether or not the crate with CrateNum 'cnum'
+     /// is marked as a private dependency
+     query is_private_dep(c: CrateNum) -> bool {
+diff --git a/compiler/rustc_middle/src/query/keys.rs b/compiler/rustc_middle/src/query/keys.rs
+index d907da1b..8a4f5fe9 100644
+--- a/compiler/rustc_middle/src/query/keys.rs
++++ b/compiler/rustc_middle/src/query/keys.rs
+@@ -115,6 +115,12 @@ fn as_local_key(&self) -> Option<Self::LocalQueryKey> {
+     }
+ }
+ 
++impl QueryKey for ty::ExternalCrateLoad {
++    fn default_span(&self, _: TyCtxt<'_>) -> Span {
++        DUMMY_SP
++    }
++}
++
+ impl QueryKey for OwnerId {
+     type Cache<V> = VecCache<Self, V, DepNodeIndex>;
+ 
+diff --git a/compiler/rustc_middle/src/ty/context.rs b/compiler/rustc_middle/src/ty/context.rs
+index 136a9e6c..a7d30af1 100644
+--- a/compiler/rustc_middle/src/ty/context.rs
++++ b/compiler/rustc_middle/src/ty/context.rs
+@@ -2822,6 +2822,8 @@ pub fn is_entrypoint(self, def_id: DefId) -> bool {
+ pub fn provide(providers: &mut Providers) {
+     providers.is_panic_runtime = |tcx, LocalCrate| find_attr!(tcx, crate, PanicRuntime);
+     providers.is_compiler_builtins = |tcx, LocalCrate| find_attr!(tcx, crate, CompilerBuiltins);
++    providers.has_default_lib_allocator =
++        |tcx, LocalCrate| find_attr!(tcx, crate, DefaultLibAllocator);
+     providers.has_panic_handler = |tcx, LocalCrate| {
+         // We want to check if the panic handler was defined in this crate
+         tcx.lang_items().panic_impl().is_some_and(|did| did.is_local())
+diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
+index ee972d02..b85f5777 100644
+--- a/compiler/rustc_middle/src/ty/mod.rs
++++ b/compiler/rustc_middle/src/ty/mod.rs
+@@ -51,6 +51,7 @@
+ };
+ use rustc_serialize::{Decodable, Encodable};
+ use rustc_session::config::OptLevel;
++use rustc_session::cstore::CrateDepKind;
+ pub use rustc_session::lint::RegisteredTools;
+ use rustc_span::def_id::{LocalModId, ModId};
+ use rustc_span::hygiene::MacroKind;
+@@ -183,6 +184,10 @@ pub struct ResolverGlobalCtxt {
+     // correct reachability logic is implemented for macros.
+     pub macro_reachable_adts: FxIndexMap<LocalDefId, FxIndexSet<LocalDefId>>,
+     pub extern_crate_map: UnordMap<LocalDefId, CrateNum>,
++    /// Effective root load kind for each explicit external-crate declaration.
++    pub extern_crate_loads: UnordMap<LocalDefId, ExternalCrateLoad>,
++    /// Finalized source paths that resolved a crate through the extern prelude.
++    pub extern_prelude_path_activations: Vec<ExternPreludePathActivation>,
+     pub maybe_unused_trait_imports: FxIndexSet<LocalDefId>,
+     /// Import/re-export chains selected by finalized non-macro path resolution.
+     ///
+@@ -215,6 +220,71 @@ pub struct ResolverGlobalCtxt {
+     pub delegation_infos: FxIndexMap<LocalDefId, DelegationInfo>,
+ }
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash)]
++pub struct ExternPreludePathActivation {
++    pub path_span: Span,
++    pub load: ExternalCrateLoad,
++}
++
++#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, StableHash)]
++pub struct ExternalCrateLoad {
++    pub crate_num: CrateNum,
++    pub kind: CrateDepKind,
++}
++
++impl Hash for ExternalCrateLoad {
++    fn hash<H: Hasher>(&self, state: &mut H) {
++        self.crate_num.hash(state);
++        match self.kind {
++            CrateDepKind::MacrosOnly => 0_u8,
++            CrateDepKind::Conditional => 1,
++            CrateDepKind::Unconditional => 2,
++        }
++        .hash(state);
++    }
++}
++
++#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, StableHash)]
++pub struct ExternalCrateDependency {
++    pub crate_num: CrateNum,
++    pub kind: CrateDepKind,
++}
++
++/// A crate load selected by the compiler after resolving external crates.
++///
++/// `condition` is the already-loaded external crate whose metadata caused this
++/// load. A missing condition means that the local crate or compiler settings
++/// caused the load without depending on a source-controlled external load.
++#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, StableHash)]
++pub struct CompilerGeneratedCrateActivation {
++    pub load: ExternalCrateLoad,
++    pub condition: Option<CrateNum>,
++}
++
++/// Crate-level compiler information whose presence depends on loading an
++/// external crate, even when no item from that crate is referenced directly.
++#[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash)]
++pub enum CompilerMetadataProvider {
++    CompilerBuiltins,
++    PanicRuntime,
++    ProfilerRuntime,
++    ExternalNativeLink,
++    GlobalAllocator,
++    AllocErrorHandler,
++    DefaultLibAllocator,
++    WeakLangItem(LangItem),
++    ExternallyImplementableItemImplementation,
++}
++
++/// Crate-level compiler demand whose presence depends on loading an external
++/// crate, even when no item from that crate is referenced directly.
++#[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash)]
++pub enum CompilerMetadataRequirement {
++    Allocator,
++    PanicRuntime,
++    MissingLangItem(LangItem),
++}
++
+ #[derive(Debug, StableHash)]
+ pub struct ResolvedImportUse {
+     pub owner: LocalDefId,
+diff --git a/compiler/rustc_resolve/src/build_reduced_graph.rs b/compiler/rustc_resolve/src/build_reduced_graph.rs
+index ad00003a..81c9d7ff 100644
+--- a/compiler/rustc_resolve/src/build_reduced_graph.rs
++++ b/compiler/rustc_resolve/src/build_reduced_graph.rs
+@@ -1021,9 +1021,10 @@ fn build_reduced_graph_for_extern_crate(
+                 local_def_id,
+                 &tcx.definitions_untracked(),
+             );
+-            crate_id.map(|crate_id| {
+-                self.r.extern_crate_map.insert(local_def_id, crate_id);
+-                self.r.expect_module(crate_id.as_def_id())
++            crate_id.map(|load| {
++                self.r.extern_crate_map.insert(local_def_id, load.crate_num);
++                self.r.extern_crate_loads.insert(local_def_id, load);
++                self.r.expect_module(load.crate_num.as_def_id())
+             })
+         }
+         .map(|module| {
+diff --git a/compiler/rustc_resolve/src/ident.rs b/compiler/rustc_resolve/src/ident.rs
+index b607803b..ce2ccbeb 100644
+--- a/compiler/rustc_resolve/src/ident.rs
++++ b/compiler/rustc_resolve/src/ident.rs
+@@ -735,7 +735,11 @@ fn resolve_ident_in_scope<'r>(
+                 }
+             }
+             Scope::ExternPreludeFlags => {
+-                match self.extern_prelude_get_flag(ident, orig_ident_span, finalize.is_some()) {
++                match self.reborrow().extern_prelude_get_flag(
++                    ident,
++                    orig_ident_span,
++                    finalize.map(|finalize| finalize.path_span),
++                ) {
+                     Some(decl) => Ok(decl),
+                     None => Err(Determinacy::Determined),
+                 }
+@@ -1032,7 +1036,11 @@ pub(crate) fn resolve_ident_in_module<'r>(
+             ModuleOrUniformRoot::OpenModule(sym) => {
+                 let open_ns_name = format!("{}::{}", sym.as_str(), ident.name);
+                 let ns_ident = IdentKey::with_root_ctxt(Symbol::intern(&open_ns_name));
+-                match self.extern_prelude_get_flag(ns_ident, ident.span, finalize.is_some()) {
++                match self.extern_prelude_get_flag(
++                    ns_ident,
++                    ident.span,
++                    finalize.map(|finalize| finalize.path_span),
++                ) {
+                     Some(decl) => Ok(decl),
+                     None => Err(Determinacy::Determined),
+                 }
+diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
+index bddb6a0f..5a1fd814 100644
+--- a/compiler/rustc_resolve/src/lib.rs
++++ b/compiler/rustc_resolve/src/lib.rs
+@@ -65,12 +65,14 @@
+ use rustc_middle::middle::privacy::EffectiveVisibilities;
+ use rustc_middle::query::Providers;
+ use rustc_middle::ty::{
+-    self, DelegationInfo, MacroImportKind, MacroImportStep, MacroInvocationOrigin,
+-    MacroResolvedImportUse, MainDefinition, PerOwnerResolverData, RegisteredTools,
+-    ResolvedImportUse, ResolverAstLowering, ResolverGlobalCtxt, TyCtxt, TyCtxtFeed, Visibility,
++    self, DelegationInfo, ExternPreludePathActivation, ExternalCrateLoad, MacroImportKind,
++    MacroImportStep, MacroInvocationOrigin, MacroResolvedImportUse, MainDefinition,
++    PerOwnerResolverData, RegisteredTools, ResolvedImportUse, ResolverAstLowering,
++    ResolverGlobalCtxt, TyCtxt, TyCtxtFeed, Visibility,
+ };
+ use rustc_middle::{bug, span_bug};
+ use rustc_session::config::CrateType;
++use rustc_session::cstore::CrateDepKind;
+ use rustc_session::lint::builtin::PRIVATE_MACRO_USE;
+ use rustc_span::def_id::{LocalModId, ModId};
+ use rustc_span::hygiene::{ExpnId, LocalExpnId, MacroKind, SyntaxContext, Transparency};
+@@ -1372,6 +1374,9 @@ pub struct Resolver<'ra, 'tcx> {
+     /// Finalized import/re-export provenance for semantic, non-macro paths.
+     resolved_import_uses: Vec<ResolvedImportUse> = Vec::new(),
+ 
++    /// Finalized source paths that resolved a crate through the extern prelude.
++    extern_prelude_path_activations: Vec<ExternPreludePathActivation> = Vec::new(),
++
+     /// Exact source origins for successfully resolved macro invocations.
+     macro_invocation_origins: UnordMap<ExpnId, MacroInvocationOrigin> = Default::default(),
+ 
+@@ -1383,6 +1388,8 @@ pub struct Resolver<'ra, 'tcx> {
+ 
+     /// `CrateNum` resolutions of `extern crate` items.
+     extern_crate_map: UnordMap<LocalDefId, CrateNum> = Default::default(),
++    /// Effective root load kind for each explicit external-crate declaration.
++    extern_crate_loads: UnordMap<LocalDefId, ExternalCrateLoad> = Default::default(),
+     module_children: LocalDefIdMap<Vec<ModChild>> = Default::default(),
+     ambig_module_children: LocalDefIdMap<Vec<AmbigModChild>> = Default::default(),
+ 
+@@ -1972,6 +1979,8 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+         let proc_macros = self.proc_macros;
+         let expn_that_defined = self.expn_that_defined;
+         let extern_crate_map = self.extern_crate_map;
++        let extern_crate_loads = self.extern_crate_loads;
++        let extern_prelude_path_activations = self.extern_prelude_path_activations;
+         let maybe_unused_trait_imports = self.maybe_unused_trait_imports;
+         let resolved_import_uses = self.resolved_import_uses;
+         let macro_invocation_origins = self.macro_invocation_origins;
+@@ -2001,6 +2010,8 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+             effective_visibilities,
+             macro_reachable_adts: self.macro_reachable_adts,
+             extern_crate_map,
++            extern_crate_loads,
++            extern_prelude_path_activations,
+             module_children: self.module_children,
+             ambig_module_children: self.ambig_module_children,
+             glob_map,
+@@ -2561,52 +2572,72 @@ fn extern_prelude_get_item<'r>(
+         })
+     }
+ 
+-    fn extern_prelude_get_flag(
+-        &self,
++    fn extern_prelude_get_flag<'r>(
++        mut self: CmResolver<'r, 'ra, 'tcx>,
+         ident: IdentKey,
+         orig_ident_span: Span,
+-        finalize: bool,
++        finalized_path_span: Option<Span>,
+     ) -> Option<Decl<'ra>> {
+-        let entry = self.extern_prelude.get(&ident);
+-        entry.and_then(|entry| entry.flag_decl.as_ref()).and_then(|flag_decl| {
+-            let (pending_decl, finalized, is_open) = flag_decl.get();
+-            let decl = match pending_decl {
+-                PendingDecl::Ready(decl) => {
+-                    if finalize && !finalized && !is_open {
+-                        self.cstore_mut().process_path_extern(
+-                            self.tcx,
+-                            ident.name,
+-                            orig_ident_span,
+-                        );
+-                    }
+-                    decl
+-                }
+-                PendingDecl::Pending => {
+-                    debug_assert!(!finalized);
+-                    if is_open {
+-                        let res = Res::OpenMod(ident.name);
+-                        Some(self.arenas.new_pub_def_decl(res, DUMMY_SP, LocalExpnId::ROOT))
+-                    } else {
+-                        let crate_id = if finalize {
++        let finalize = finalized_path_span.is_some();
++        let outcome = self
++            .extern_prelude
++            .get(&ident)
++            .and_then(|entry| entry.flag_decl.as_ref())
++            .map(|flag_decl| {
++                let (pending_decl, finalized, is_open) = flag_decl.get();
++                let decl = match pending_decl {
++                    PendingDecl::Ready(decl) => {
++                        if finalize && !finalized && !is_open {
+                             self.cstore_mut().process_path_extern(
+                                 self.tcx,
+                                 ident.name,
+                                 orig_ident_span,
+-                            )
++                            );
++                        }
++                        decl
++                    }
++                    PendingDecl::Pending => {
++                        debug_assert!(!finalized);
++                        if is_open {
++                            let res = Res::OpenMod(ident.name);
++                            Some(self.arenas.new_pub_def_decl(res, DUMMY_SP, LocalExpnId::ROOT))
+                         } else {
+-                            self.cstore_mut().maybe_process_path_extern(self.tcx, ident.name)
+-                        };
+-                        crate_id.map(|crate_id| {
+-                            let def_id = crate_id.as_def_id();
+-                            let res = Res::Def(DefKind::Mod, def_id);
+-                            self.arenas.new_pub_def_decl(res, DUMMY_SP, LocalExpnId::ROOT)
+-                        })
++                            let crate_id = if finalize {
++                                self.cstore_mut().process_path_extern(
++                                    self.tcx,
++                                    ident.name,
++                                    orig_ident_span,
++                                )
++                            } else {
++                                self.cstore_mut().maybe_process_path_extern(self.tcx, ident.name)
++                            };
++                            crate_id.map(|crate_id| {
++                                let def_id = crate_id.as_def_id();
++                                let res = Res::Def(DefKind::Mod, def_id);
++                                self.arenas.new_pub_def_decl(res, DUMMY_SP, LocalExpnId::ROOT)
++                            })
++                        }
+                     }
+-                }
++                };
++                flag_decl.set((PendingDecl::Ready(decl), finalize || finalized, is_open));
++                (decl, decl.or_else(|| finalize.then_some(self.dummy_decl)))
++            });
++        let (decl, result) = outcome?;
++        if let Some(path_span) = finalized_path_span
++            && let Some(crate_num) = decl
++                .and_then(|decl| decl.res().opt_def_id())
++                .filter(|def_id| !def_id.is_local())
++                .map(|def_id| def_id.krate)
++        {
++            let load = ExternalCrateLoad {
++                crate_num,
++                kind: self.cstore().direct_activation_kind(crate_num, CrateDepKind::Unconditional),
+             };
+-            flag_decl.set((PendingDecl::Ready(decl), finalize || finalized, is_open));
+-            decl.or_else(|| finalize.then_some(self.dummy_decl))
+-        })
++            self.get_mut()
++                .extern_prelude_path_activations
++                .push(ExternPreludePathActivation { path_span, load });
++        }
++        result
+     }
+ 
+     /// Rustdoc uses this to resolve doc link paths in a recoverable way. `PathResult<'a>`
+diff --git a/tests/ui-fulldeps/external-crate-load-requirements.rs b/tests/ui-fulldeps/external-crate-load-requirements.rs
+new file mode 100644
+index 00000000..7db79815
+--- /dev/null
++++ b/tests/ui-fulldeps/external-crate-load-requirements.rs
+@@ -0,0 +1,725 @@
++//@ edition: 2024
++//@ run-pass
++//@ run-flags: {{sysroot-base}} {{target-linker}}
++//@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
++//@ ignore-cross-compile
++//@ ignore-remote
++
++#![feature(rustc_private)]
++
++extern crate rustc_driver;
++extern crate rustc_hir;
++extern crate rustc_interface;
++extern crate rustc_middle;
++extern crate rustc_session;
++
++use std::collections::BTreeSet;
++use std::path::{Path, PathBuf};
++use std::process::ExitCode;
++
++use rustc_driver::{Callbacks, Compilation};
++use rustc_hir::attrs::LangItem;
++use rustc_hir::def_id::CrateNum;
++use rustc_interface::interface::Compiler;
++use rustc_middle::ty::{
++    CompilerMetadataProvider, CompilerMetadataRequirement, ExternalCrateDependency, TyCtxt,
++};
++use rustc_session::cstore::CrateDepKind;
++
++fn main() -> ExitCode {
++    rustc_driver::catch_with_exit_code(|| {
++        let args: Vec<_> = std::env::args().collect();
++        let sysroot = PathBuf::from(args.get(1).expect("expected sysroot"));
++        let linker = args.get(2).map(Path::new);
++        run_test(&sysroot, linker);
++    })
++}
++
++fn run_test(sysroot: &Path, linker: Option<&Path>) {
++    let tmp = std::env::current_dir().unwrap().join("external-crate-load-requirements");
++    std::fs::create_dir_all(&tmp).unwrap();
++
++    let leaf = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "leaf",
++        "#![no_std]\npub fn first() -> usize { 1 }\npub fn second() -> usize { 2 }\n",
++        &[],
++    );
++    let middle = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "middle",
++        "#![no_std]\nextern crate leaf;\npub fn first() -> usize { leaf::first() }\npub fn second() -> usize { leaf::second() }\n",
++        &[extern_arg("leaf", &leaf)],
++    );
++    let forced = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "forced",
++        "#![no_std]\npub fn marker() {}\n",
++        &[],
++    );
++    let unrelated = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "unrelated",
++        "#![no_std]\npub fn marker() {}\n",
++        &[],
++    );
++    let native_link = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "native_link",
++        r#"
++#![no_std]
++
++#[link(name = "rid_external_native_fixture")]
++unsafe extern "C" {}
++
++pub fn marker() {}
++"#,
++        &[],
++    );
++    let raw_dylib_native_link = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "raw_dylib_native_link",
++        r#"
++#![feature(link_cfg, no_core)]
++#![no_core]
++
++#[link(name = "rid_raw_dylib_fixture", kind = "raw-dylib", cfg(any()))]
++unsafe extern "C" {}
++"#,
++        &["--target=x86_64-pc-windows-msvc".to_string()],
++    );
++    let compiler_builtins = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "compiler_builtins",
++        "#![no_std]\n#![feature(compiler_builtins)]\n#![compiler_builtins]\n",
++        &[],
++    );
++    let panic_runtime = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "panic_runtime_provider",
++        "#![no_std]\n#![feature(panic_runtime)]\n#![panic_runtime]\n",
++        &["-Cpanic=abort".to_string()],
++    );
++    let profiler_runtime = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "profiler_runtime_provider",
++        "#![no_std]\n#![feature(profiler_runtime)]\n#![profiler_runtime]\n",
++        &[],
++    );
++    let global_allocator = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "global_allocator_provider",
++        r#"
++#![no_std]
++
++use core::alloc::{GlobalAlloc, Layout};
++use core::ptr::null_mut;
++
++struct Allocator;
++
++unsafe impl GlobalAlloc for Allocator {
++    unsafe fn alloc(&self, _: Layout) -> *mut u8 { null_mut() }
++    unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}
++}
++
++#[global_allocator]
++static ALLOCATOR: Allocator = Allocator;
++"#,
++        &[],
++    );
++    let alloc_error_handler = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "alloc_error_handler_provider",
++        r#"
++#![no_std]
++#![feature(alloc_error_handler)]
++
++use core::alloc::Layout;
++
++#[alloc_error_handler]
++fn alloc_error_handler(_: Layout) -> ! { loop {} }
++"#,
++        &[],
++    );
++    let provider = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "provider",
++        r#"
++#![no_std]
++#![feature(allocator_internals, extern_item_impls, lang_items)]
++#![default_lib_allocator]
++
++#[lang = "eh_personality"]
++pub extern "C" fn eh_personality() {}
++
++#[eii(observed_eii)]
++pub fn eii_declaration();
++
++#[observed_eii]
++fn eii_implementation() {}
++"#,
++        &[],
++    );
++    let needs_only = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "needs_only",
++        r#"
++#![no_std]
++#![feature(allocator_internals, extern_item_impls, needs_panic_runtime)]
++#![needs_allocator]
++#![needs_panic_runtime]
++
++#[eii(unimplemented_eii)]
++pub fn eii_declaration_without_implementation();
++"#,
++        &[],
++    );
++    let needs_panic_only = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "needs_panic_only",
++        "#![no_std]\n#![feature(needs_panic_runtime)]\n#![needs_panic_runtime]\npub fn marker() {}\n",
++        &[],
++    );
++    let weak = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "weak",
++        "#![no_std]\n#[no_link]\nextern crate provider;\npub fn marker() {}\n",
++        &[extern_arg("provider", &provider)],
++    );
++    let strong = compile_rlib(
++        sysroot,
++        linker,
++        &tmp,
++        "strong",
++        "#![no_std]\nextern crate provider;\npub fn marker() {}\n",
++        &[extern_arg("provider", &provider)],
++    );
++    let macro_crate = compile_proc_macro(
++        sysroot,
++        linker,
++        &tmp,
++        "macro_crate",
++        r#"
++extern crate proc_macro;
++
++use proc_macro::TokenStream;
++
++#[proc_macro_attribute]
++pub fn passthrough(_: TokenStream, item: TokenStream) -> TokenStream {
++    item
++}
++"#,
++    );
++
++    let client = tmp.join("client.rs");
++    std::fs::write(
++        &client,
++        r#"
++#![no_std]
++
++extern crate forced;
++extern crate panic_runtime_provider;
++extern crate profiler_runtime_provider;
++extern crate global_allocator_provider;
++extern crate alloc_error_handler_provider;
++extern crate needs_only;
++extern crate native_link;
++extern crate unrelated;
++
++#[macro_crate::passthrough]
++pub fn decorated() {}
++
++pub fn first() -> usize { middle::first() }
++pub fn second() -> usize { middle::second() }
++pub fn through_weak() { weak::marker() }
++pub fn through_strong() { strong::marker() }
++"#,
++    )
++    .unwrap();
++
++    let mut extra = vec![
++        format!("-Ldependency={}", tmp.display()),
++        extern_arg("middle", &middle),
++        extern_arg("unrelated", &unrelated),
++        extern_arg("provider", &provider),
++        extern_arg("needs_only", &needs_only),
++        extern_arg("native_link", &native_link),
++        extern_arg("weak", &weak),
++        extern_arg("strong", &strong),
++        extern_arg("macro_crate", &macro_crate),
++        extern_arg("compiler_builtins", &compiler_builtins),
++        extern_arg("panic_runtime_provider", &panic_runtime),
++        extern_arg("profiler_runtime_provider", &profiler_runtime),
++        extern_arg("global_allocator_provider", &global_allocator),
++        extern_arg("alloc_error_handler_provider", &alloc_error_handler),
++        format!("--extern=force:forced={}", forced.display()),
++        "-Zunstable-options".to_string(),
++        "-Zprofiler-runtime=profiler_runtime_provider".to_string(),
++        "-Cinstrument-coverage".to_string(),
++        "--crate-type=rlib".to_string(),
++        "--emit=metadata".to_string(),
++    ];
++    compile(
++        rustc_args(
++            sysroot,
++            linker,
++            &client,
++            &tmp.join("client.rmeta"),
++            "client",
++            &mut extra,
++        ),
++        &mut ObserverCallbacks,
++    );
++
++    let raw_dylib_client = tmp.join("raw-dylib-client.rs");
++    std::fs::write(
++        &raw_dylib_client,
++        "#![feature(no_core)]\n#![no_core]\nextern crate raw_dylib_native_link;\n",
++    )
++    .unwrap();
++    let mut raw_dylib_extra = vec![
++        extern_arg("raw_dylib_native_link", &raw_dylib_native_link),
++        "--target=x86_64-pc-windows-msvc".to_string(),
++        "--crate-type=rlib".to_string(),
++        "--emit=metadata".to_string(),
++    ];
++    compile(
++        rustc_args(
++            sysroot,
++            linker,
++            &raw_dylib_client,
++            &tmp.join("raw-dylib-client.rmeta"),
++            "raw_dylib_client",
++            &mut raw_dylib_extra,
++        ),
++        &mut RawDylibCallbacks,
++    );
++
++    let conditional_client = tmp.join("conditional-client.rs");
++    std::fs::write(
++        &conditional_client,
++        r#"
++#![no_std]
++
++#[no_link]
++extern crate needs_panic_only;
++
++pub fn use_requirement() { needs_panic_only::marker() }
++
++#[panic_handler]
++fn panic(_: &core::panic::PanicInfo<'_>) -> ! { loop {} }
++"#,
++    )
++    .unwrap();
++    let mut conditional_extra = vec![
++        extern_arg("needs_panic_only", &needs_panic_only),
++        "-Cpanic=abort".to_string(),
++        "--crate-type=dylib".to_string(),
++        "--emit=metadata".to_string(),
++    ];
++    compile(
++        rustc_args(
++            sysroot,
++            linker,
++            &conditional_client,
++            &tmp.join("conditional-client.rmeta"),
++            "conditional_client",
++            &mut conditional_extra,
++        ),
++        &mut ConditionalActivationCallbacks,
++    );
++
++    let local_client = tmp.join("local-client.rs");
++    std::fs::write(
++        &local_client,
++        r#"
++#![no_std]
++#![feature(needs_panic_runtime)]
++#![needs_panic_runtime]
++
++#[panic_handler]
++fn panic(_: &core::panic::PanicInfo<'_>) -> ! { loop {} }
++"#,
++    )
++    .unwrap();
++    let mut local_extra = vec![
++        "-Cpanic=abort".to_string(),
++        "--crate-type=dylib".to_string(),
++        "--emit=metadata".to_string(),
++    ];
++    compile(
++        rustc_args(
++            sysroot,
++            linker,
++            &local_client,
++            &tmp.join("local-client.rmeta"),
++            "local_client",
++            &mut local_extra,
++        ),
++        &mut LocalActivationCallbacks,
++    );
++}
++
++struct ObserverCallbacks;
++
++impl Callbacks for ObserverCallbacks {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++
++        let middle = crate_num(tcx, "middle");
++        let activations = &tcx.resolutions(()).extern_prelude_path_activations;
++        let middle_paths: BTreeSet<_> = activations
++            .iter()
++            .filter(|activation| activation.load.crate_num == middle)
++            .map(|activation| {
++                tcx.sess
++                    .source_map()
++                    .span_to_snippet(activation.path_span)
++                    .unwrap()
++            })
++            .collect();
++        assert_eq!(
++            middle_paths,
++            BTreeSet::from(["middle::first".to_string(), "middle::second".to_string()])
++        );
++
++        let middle_load = activations
++            .iter()
++            .find(|activation| activation.load.crate_num == middle)
++            .unwrap()
++            .load;
++        assert_eq!(middle_load.kind, CrateDepKind::Unconditional);
++        let cold_closure = tcx.crate_dependency_closure(middle_load);
++        let warm_closure = tcx.crate_dependency_closure(middle_load);
++        assert!(std::ptr::eq(cold_closure, warm_closure));
++        let closure_names = crate_names(
++            tcx,
++            cold_closure.iter().map(|dependency| dependency.crate_num),
++        );
++        assert!(closure_names.contains("leaf"));
++        assert!(closure_names.contains("middle"));
++        assert!(!closure_names.contains("unrelated"));
++
++        let provider = crate_num(tcx, "provider");
++        assert_eq!(tcx.crate_dep_kind(provider), CrateDepKind::Unconditional);
++        let weak_load = only_path_load(tcx, activations, "weak");
++        let strong_load = only_path_load(tcx, activations, "strong");
++        assert_eq!(
++            dependency_kind(tcx, tcx.crate_dependency_closure(weak_load), "provider"),
++            CrateDepKind::MacrosOnly
++        );
++        assert_eq!(
++            dependency_kind(tcx, tcx.crate_dependency_closure(strong_load), "provider"),
++            CrateDepKind::Unconditional
++        );
++
++        let source_free = tcx.source_free_crate_activations(());
++        assert!(std::ptr::eq(source_free, tcx.source_free_crate_activations(())));
++        let source_free_names = crate_names(tcx, source_free.iter().map(|load| load.crate_num));
++        assert!(source_free_names.contains("forced"));
++        assert!(source_free_names.contains("profiler_runtime_provider"));
++
++        let forced = crate_num(tcx, "forced");
++        assert!(tcx
++            .resolutions(())
++            .extern_crate_map
++            .items()
++            .any(|(_, &crate_num)| crate_num == forced));
++
++        let macro_crate = crate_num(tcx, "macro_crate");
++        assert_eq!(tcx.crate_dep_kind(macro_crate), CrateDepKind::MacrosOnly);
++        let macro_load = only_path_load(tcx, activations, "macro_crate");
++        assert_eq!(
++            tcx.crate_dependency_closure(macro_load),
++            [ExternalCrateDependency {
++                crate_num: macro_crate,
++                kind: CrateDepKind::MacrosOnly,
++            }]
++        );
++
++        assert_eq!(
++            tcx.compiler_metadata_providers(provider),
++            [
++                CompilerMetadataProvider::DefaultLibAllocator,
++                CompilerMetadataProvider::WeakLangItem(LangItem::EhPersonality),
++                CompilerMetadataProvider::ExternallyImplementableItemImplementation,
++            ]
++        );
++        assert!(tcx
++            .compiler_metadata_providers(crate_num(tcx, "needs_only"))
++            .is_empty());
++        assert_eq!(
++            tcx.compiler_metadata_providers(crate_num(tcx, "native_link")),
++            [CompilerMetadataProvider::ExternalNativeLink]
++        );
++        assert_eq!(
++            tcx.compiler_metadata_requirements(crate_num(tcx, "needs_only")),
++            [
++                CompilerMetadataRequirement::Allocator,
++                CompilerMetadataRequirement::PanicRuntime,
++                CompilerMetadataRequirement::MissingLangItem(LangItem::EhPersonality),
++            ]
++        );
++        assert_eq!(
++            tcx.compiler_metadata_providers(crate_num(tcx, "compiler_builtins")),
++            [CompilerMetadataProvider::CompilerBuiltins]
++        );
++        assert_eq!(
++            tcx.compiler_metadata_providers(crate_num(tcx, "panic_runtime_provider")),
++            [CompilerMetadataProvider::PanicRuntime]
++        );
++        let profiler_runtime = crate_num(tcx, "profiler_runtime_provider");
++        assert_eq!(
++            tcx.compiler_metadata_providers(profiler_runtime),
++            [CompilerMetadataProvider::ProfilerRuntime]
++        );
++        assert!(
++            tcx.resolutions(()).extern_crate_loads.items().any(|(_, load)| {
++                load.crate_num == profiler_runtime && load.kind == CrateDepKind::Unconditional
++            })
++        );
++        assert!(source_free.iter().any(|load| {
++            load.crate_num == profiler_runtime && load.kind == CrateDepKind::Conditional
++        }));
++        assert_eq!(
++            tcx.compiler_metadata_providers(crate_num(tcx, "global_allocator_provider")),
++            [CompilerMetadataProvider::GlobalAllocator]
++        );
++        assert_eq!(
++            tcx.compiler_metadata_providers(crate_num(tcx, "alloc_error_handler_provider")),
++            [CompilerMetadataProvider::AllocErrorHandler]
++        );
++
++        Compilation::Stop
++    }
++}
++
++struct ConditionalActivationCallbacks;
++
++struct RawDylibCallbacks;
++
++impl Callbacks for RawDylibCallbacks {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++        assert_eq!(
++            tcx.compiler_metadata_providers(crate_num(tcx, "raw_dylib_native_link")),
++            [CompilerMetadataProvider::ExternalNativeLink]
++        );
++        Compilation::Stop
++    }
++}
++
++impl Callbacks for ConditionalActivationCallbacks {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++        let generated = tcx.compiler_generated_crate_activations(());
++        assert!(std::ptr::eq(
++            generated,
++            tcx.compiler_generated_crate_activations(())
++        ));
++        let panic_runtime = generated
++            .iter()
++            .find(|activation| {
++                tcx.compiler_metadata_providers(activation.load.crate_num)
++                    .contains(&CompilerMetadataProvider::PanicRuntime)
++            })
++            .expect("panic runtime activation must be recorded");
++        let condition = panic_runtime
++            .condition
++            .expect("panic runtime activation must retain its condition");
++        assert_eq!(tcx.crate_name(condition).as_str(), "needs_panic_only");
++        assert_eq!(tcx.crate_dep_kind(condition), CrateDepKind::MacrosOnly);
++        assert_eq!(
++            tcx.compiler_metadata_requirements(condition),
++            [
++                CompilerMetadataRequirement::PanicRuntime,
++                CompilerMetadataRequirement::MissingLangItem(LangItem::EhPersonality),
++            ]
++        );
++        assert_eq!(panic_runtime.load.kind, CrateDepKind::Conditional);
++        assert!(!tcx
++            .source_free_crate_activations(())
++            .contains(&panic_runtime.load));
++        Compilation::Stop
++    }
++}
++
++struct LocalActivationCallbacks;
++
++impl Callbacks for LocalActivationCallbacks {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++        let panic_runtime = tcx
++            .compiler_generated_crate_activations(())
++            .iter()
++            .find(|activation| {
++                tcx.compiler_metadata_providers(activation.load.crate_num)
++                    .contains(&CompilerMetadataProvider::PanicRuntime)
++            })
++            .expect("panic runtime activation must be recorded");
++        assert_eq!(panic_runtime.condition, None);
++        Compilation::Stop
++    }
++}
++
++fn only_path_load(
++    tcx: TyCtxt<'_>,
++    activations: &[rustc_middle::ty::ExternPreludePathActivation],
++    crate_name: &str,
++) -> rustc_middle::ty::ExternalCrateLoad {
++    let crate_num = crate_num(tcx, crate_name);
++    let loads = activations
++        .iter()
++        .filter(|activation| activation.load.crate_num == crate_num)
++        .map(|activation| activation.load)
++        .collect::<BTreeSet<_>>();
++    let mut loads = loads.into_iter();
++    let load = loads
++        .next()
++        .unwrap_or_else(|| panic!("expected a load for `{crate_name}`"));
++    assert!(loads.next().is_none(), "expected one load for `{crate_name}`");
++    load
++}
++
++fn dependency_kind(
++    tcx: TyCtxt<'_>,
++    dependencies: &[rustc_middle::ty::ExternalCrateDependency],
++    crate_name: &str,
++) -> CrateDepKind {
++    dependencies
++        .iter()
++        .find(|dependency| tcx.crate_name(dependency.crate_num).as_str() == crate_name)
++        .unwrap_or_else(|| panic!("dependency `{crate_name}` was not observed"))
++        .kind
++}
++
++fn crate_num(tcx: TyCtxt<'_>, name: &str) -> CrateNum {
++    tcx.crates(())
++        .iter()
++        .copied()
++        .find(|&crate_num| tcx.crate_name(crate_num).as_str() == name)
++        .unwrap_or_else(|| panic!("crate `{name}` was not loaded"))
++}
++
++fn crate_names(tcx: TyCtxt<'_>, crates: impl Iterator<Item = CrateNum>) -> BTreeSet<String> {
++    crates
++        .map(|crate_num| tcx.crate_name(crate_num).to_string())
++        .collect()
++}
++
++fn compile_rlib(
++    sysroot: &Path,
++    linker: Option<&Path>,
++    tmp: &Path,
++    crate_name: &str,
++    source: &str,
++    extra: &[String],
++) -> PathBuf {
++    let input = tmp.join(format!("{crate_name}.rs"));
++    let output = tmp.join(format!("lib{crate_name}.rlib"));
++    std::fs::write(&input, source).unwrap();
++    let mut extra = extra.to_vec();
++    extra.extend(["--crate-type=rlib".to_string(), "--emit=link".to_string()]);
++    compile(
++        rustc_args(sysroot, linker, &input, &output, crate_name, &mut extra),
++        &mut DefaultCallbacks,
++    );
++    output
++}
++
++fn compile_proc_macro(
++    sysroot: &Path,
++    linker: Option<&Path>,
++    tmp: &Path,
++    crate_name: &str,
++    source: &str,
++) -> PathBuf {
++    let input = tmp.join(format!("{crate_name}.rs"));
++    let output = tmp.join(format!(
++        "{prefix}{crate_name}.{extension}",
++        prefix = if cfg!(target_os = "windows") { "" } else { "lib" },
++        extension = if cfg!(target_os = "macos") {
++            "dylib"
++        } else if cfg!(target_os = "windows") {
++            "dll"
++        } else if cfg!(target_os = "aix") {
++            "a"
++        } else {
++            "so"
++        }
++    ));
++    std::fs::write(&input, source).unwrap();
++    let mut extra = vec!["--crate-type=proc-macro".to_string(), "--emit=link".to_string()];
++    compile(
++        rustc_args(sysroot, linker, &input, &output, crate_name, &mut extra),
++        &mut DefaultCallbacks,
++    );
++    output
++}
++
++fn extern_arg(crate_name: &str, path: &Path) -> String {
++    format!("--extern={crate_name}={}", path.display())
++}
++
++fn rustc_args(
++    sysroot: &Path,
++    linker: Option<&Path>,
++    input: &Path,
++    output: &Path,
++    crate_name: &str,
++    extra: &mut Vec<String>,
++) -> Vec<String> {
++    let mut args = vec![
++        "rustc".to_string(),
++        format!("--sysroot={}", sysroot.display()),
++        "--edition=2024".to_string(),
++        format!("--crate-name={crate_name}"),
++        "-Zunstable-options".to_string(),
++        input.display().to_string(),
++        "-o".to_string(),
++        output.display().to_string(),
++    ];
++    if let Some(linker) = linker {
++        args.push(format!("-Clinker={}", linker.display()));
++    }
++    args.append(extra);
++    args
++}
++
++fn compile(args: Vec<String>, callbacks: &mut (dyn Callbacks + Send)) {
++    rustc_driver::run_compiler(&args, callbacks);
++}
++
++struct DefaultCallbacks;
++
++impl Callbacks for DefaultCallbacks {}
