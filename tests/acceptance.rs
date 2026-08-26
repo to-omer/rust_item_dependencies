@@ -1,10 +1,14 @@
 #![feature(rustc_private)]
 
 #[cfg(rust_item_dependencies_patched)]
+use rust_item_dependencies::dependency_graph::{GraphNode, RootReason};
+#[cfg(rust_item_dependencies_patched)]
 use rust_item_dependencies::{
-    AnalysisError, Analyzer, CompilationOptions, Edition, OptimizationLevel, SourceInput,
-    VerifiedReduction,
+    AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel,
+    SourceInput, VerifiedReduction,
 };
+#[cfg(rust_item_dependencies_patched)]
+use std::collections::BTreeSet;
 
 #[cfg(rust_item_dependencies_patched)]
 const CASES: &[(&str, &str, &str)] = &[
@@ -274,6 +278,290 @@ fn foreign_items_are_reduced_independently_and_preserve_linked_behavior() {
         compile_and_run(&input(expected, &target), &options, "foreign_block_reduced");
     assert!(original_output.status.success());
     assert_eq!(original_output.stdout, b"7\n");
+    assert!(original_output.stderr.is_empty());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn native_link_directives_are_roots_without_pinning_unused_declarations() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "#[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n",
+        "#[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n",
+        "unsafe extern \"C\" {\n",
+        "    fn unused_foreign();\n",
+        "}\n",
+        "\n",
+        "#[cfg(any())]\n",
+        "#[link(name = \"unavailable\")]\n",
+        "unsafe extern \"C\" {\n",
+        "    fn inactive_foreign();\n",
+        "}\n",
+        "\n",
+        "fn unused_local() {}\n",
+        "\n",
+        "fn main() {\n",
+        "    println!(\"linked\");\n",
+        "}\n",
+    );
+    let expected = concat!(
+        "#[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n",
+        "#[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n",
+        "unsafe extern \"C\" {\n",
+        "    \n",
+        "}\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "fn main() {\n",
+        "    println!(\"linked\");\n",
+        "}\n",
+    );
+
+    let verified = analyzer
+        .reduce_and_verify(&input(source, &target))
+        .expect("an active native link directive must be reducible");
+    assert_verified("native link directive", source, expected, &verified);
+    let roots = verified
+        .original_analysis()
+        .roots()
+        .iter()
+        .filter(|root| root.reason == RootReason::NativeLink)
+        .collect::<Vec<_>>();
+    assert_eq!(roots.len(), 1);
+    assert!(matches!(roots[0].node, GraphNode::Definition(_)));
+
+    let fixed = analyzer
+        .reduce_and_verify(&input(expected, &target))
+        .expect("a reduced native link directive must remain reducible");
+    assert_eq!(fixed.reduced_source(), expected);
+
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(
+        &input(source, &target),
+        &options,
+        "native_link_directive_original",
+    );
+    let reduced_output = compile_and_run(
+        &input(expected, &target),
+        &options,
+        "native_link_directive_reduced",
+    );
+    assert!(original_output.status.success());
+    assert_eq!(original_output.stdout, b"linked\n");
+    assert!(original_output.stderr.is_empty());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn native_link_and_explicit_library_roots_share_the_same_graph() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "#[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n",
+        "#[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n",
+        "unsafe extern \"C\" {\n",
+        "    fn unused_foreign();\n",
+        "}\n",
+        "pub fn entry() {}\n",
+        "fn unused_local() {}\n",
+    );
+    let expected = concat!(
+        "#[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n",
+        "#[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n",
+        "unsafe extern \"C\" {\n",
+        "    \n",
+        "}\n",
+        "pub fn entry() {}\n",
+        "\n",
+    );
+    let input = SourceInput::library(source, Edition::Rust2024, target, "linked_library")
+        .with_entry_point(EntryPoint::new("linked_library::entry"));
+
+    let verified = analyzer
+        .reduce_and_verify(&input)
+        .expect("native links and explicit library entries must be reducible together");
+    assert_verified("native link library", source, expected, &verified);
+    assert_eq!(
+        verified
+            .original_analysis()
+            .roots()
+            .iter()
+            .map(|root| root.reason)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([RootReason::ExplicitEntry, RootReason::NativeLink])
+    );
+
+    let mut fixed_input = input;
+    fixed_input.source = expected.to_owned();
+    let fixed = analyzer
+        .reduce_and_verify(&fixed_input)
+        .expect("the reduced library must remain byte-identical");
+    assert_eq!(fixed.reduced_source(), expected);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn a_macro_generated_native_link_directive_is_a_compiler_root() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "macro_rules! native_link {\n",
+        "    () => {\n",
+        "        #[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n",
+        "        #[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n",
+        "        unsafe extern \"C\" {\n",
+        "            fn generated_unused();\n",
+        "        }\n",
+        "    };\n",
+        "}\n",
+        "native_link!();\n",
+        "fn unused_local() {}\n",
+        "fn main() {}\n",
+    );
+    let expected = concat!(
+        "macro_rules! native_link {\n",
+        "    () => {\n",
+        "        #[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n",
+        "        #[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n",
+        "        unsafe extern \"C\" {\n",
+        "            fn generated_unused();\n",
+        "        }\n",
+        "    };\n",
+        "}\n",
+        "native_link!();\n",
+        "\n",
+        "fn main() {}\n",
+    );
+
+    let verified = analyzer
+        .reduce_and_verify(&input(source, &target))
+        .expect("a generated native link directive must be reducible");
+    assert_verified(
+        "generated native link directive",
+        source,
+        expected,
+        &verified,
+    );
+    assert_eq!(
+        verified
+            .original_analysis()
+            .roots()
+            .iter()
+            .filter(|root| root.reason == RootReason::NativeLink)
+            .count(),
+        1
+    );
+
+    let fixed = analyzer
+        .reduce_and_verify(&input(expected, &target))
+        .expect("a reduced generated native link directive must remain reducible");
+    assert_eq!(fixed.reduced_source(), expected);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn an_unused_wasm_import_module_does_not_become_a_linker_root() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "#[link(wasm_import_module = \"unused\")]\n",
+        "unsafe extern \"C\" {\n",
+        "    fn unused();\n",
+        "}\n",
+        "fn main() {}\n",
+    );
+    let expected = "\nfn main() {}\n";
+
+    let verified = analyzer
+        .reduce_and_verify(&input(source, &target))
+        .expect("an unused wasm import module must be reducible");
+    assert_verified("unused wasm import module", source, expected, &verified);
+    assert!(
+        verified
+            .original_analysis()
+            .roots()
+            .iter()
+            .all(|root| root.reason != RootReason::NativeLink)
+    );
+
+    let fixed = analyzer
+        .reduce_and_verify(&input(expected, &target))
+        .expect("a reduced wasm import module input must remain reducible");
+    assert_eq!(fixed.reduced_source(), expected);
+}
+
+#[cfg(all(rust_item_dependencies_patched, windows))]
+#[test]
+fn raw_dylib_import_declarations_are_compiler_roots() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "#[link(name = \"kernel32\", kind = \"raw-dylib\")]\n",
+        "unsafe extern \"system\" {\n",
+        "    #[link_name = \"GetCurrentProcess\"]\n",
+        "    fn retained_by_name();\n",
+        "    #[link_ordinal(1)]\n",
+        "    fn retained_by_ordinal();\n",
+        "    static mut retained_static: u32;\n",
+        "}\n",
+        "fn unused_local() {}\n",
+        "fn main() {}\n",
+    );
+    let expected = concat!(
+        "#[link(name = \"kernel32\", kind = \"raw-dylib\")]\n",
+        "unsafe extern \"system\" {\n",
+        "    #[link_name = \"GetCurrentProcess\"]\n",
+        "    fn retained_by_name();\n",
+        "    #[link_ordinal(1)]\n",
+        "    fn retained_by_ordinal();\n",
+        "    static mut retained_static: u32;\n",
+        "}\n",
+        "\n",
+        "fn main() {}\n",
+    );
+
+    let verified = analyzer
+        .reduce_and_verify(&input(source, &target))
+        .expect("raw-dylib imports must be reducible without changing the import list");
+    assert_verified("raw-dylib imports", source, expected, &verified);
+    assert_eq!(
+        verified
+            .original_analysis()
+            .roots()
+            .iter()
+            .filter(|root| root.reason == RootReason::NativeLink)
+            .count(),
+        4
+    );
+
+    let fixed = analyzer
+        .reduce_and_verify(&input(expected, &target))
+        .expect("reduced raw-dylib imports must remain reducible");
+    assert_eq!(fixed.reduced_source(), expected);
+
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(
+        &input(source, &target),
+        &options,
+        "raw_dylib_imports_original",
+    );
+    let reduced_output = compile_and_run(
+        &input(expected, &target),
+        &options,
+        "raw_dylib_imports_reduced",
+    );
+    assert!(original_output.status.success());
+    assert!(original_output.stdout.is_empty());
     assert!(original_output.stderr.is_empty());
     assert_eq!(reduced_output.status, original_output.status);
     assert_eq!(reduced_output.stdout, original_output.stdout);

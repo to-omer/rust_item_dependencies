@@ -12,6 +12,8 @@ use crate::source::SourceInventory;
 use std::collections::{HashSet, VecDeque};
 
 #[cfg(rust_item_dependencies_patched)]
+use rustc_hir::attrs::NativeLibKind;
+#[cfg(rust_item_dependencies_patched)]
 use rustc_hir::def::DefKind;
 #[cfg(rust_item_dependencies_patched)]
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
@@ -31,7 +33,7 @@ use rustc_middle::ty::{self, Instance};
 #[cfg(rust_item_dependencies_patched)]
 use rustc_session::config::EntryFnType;
 #[cfg(rust_item_dependencies_patched)]
-use rustc_span::Span;
+use rustc_span::{Span, def_id::LOCAL_CRATE};
 
 #[cfg(rust_item_dependencies_patched)]
 use crate::compiler_terms::{CompilerTermError, CompilerTermKind, TermHasher};
@@ -42,7 +44,7 @@ use crate::dependency_graph::{
     MonoInstanceKey, MonoInstanceRole, MonoKey, ObservationSite, RootReason,
 };
 #[cfg(rust_item_dependencies_patched)]
-use crate::graph::DefinitionTarget;
+use crate::graph::{DefinitionKind, DefinitionTarget};
 #[cfg(rust_item_dependencies_patched)]
 use crate::selection::{SelectionCollectionError, SelectionCollector};
 #[cfg(rust_item_dependencies_patched)]
@@ -261,6 +263,7 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
                 _ => return Err(MonomorphizationError::InvalidRoot),
             }
         }
+        collect_native_link_definition_roots(tcx, definitions, &mut definition_roots)?;
 
         for definition in tcx.iter_local_def_id() {
             let kind = tcx.def_kind(definition);
@@ -1198,6 +1201,62 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
             },
         })
     }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn collect_native_link_definition_roots(
+    tcx: TyCtxt<'_>,
+    definitions: &CollectedDefinitions,
+    roots: &mut Vec<(rustc_hir::def_id::LocalDefId, RootReason)>,
+) -> Result<(), MonomorphizationError> {
+    for library in tcx.native_libraries(LOCAL_CRATE) {
+        if library.kind == NativeLibKind::WasmImportModule {
+            continue;
+        }
+        let Some(foreign_module) = library.foreign_module else {
+            continue;
+        };
+        let module = foreign_module
+            .as_local()
+            .ok_or(MonomorphizationError::InvalidRoot)?;
+        let module_id = definitions
+            .definition_id(module)
+            .ok_or(MonomorphizationError::InvalidRoot)?;
+        if definitions
+            .graph
+            .definitions
+            .get(module_id.0 as usize)
+            .is_none_or(|definition| definition.kind != DefinitionKind::ForeignModule)
+        {
+            return Err(MonomorphizationError::InvalidRoot);
+        }
+        roots.push((module, RootReason::NativeLink));
+
+        if matches!(library.kind, NativeLibKind::RawDylib { .. }) {
+            let foreign_module = tcx
+                .foreign_modules(LOCAL_CRATE)
+                .get(&foreign_module)
+                .ok_or(MonomorphizationError::InvalidRoot)?;
+            for child in &foreign_module.foreign_items {
+                let child = child.as_local().ok_or(MonomorphizationError::InvalidRoot)?;
+                let definition = definitions
+                    .definition_id(child)
+                    .and_then(|id| definitions.graph.definitions.get(id.0 as usize))
+                    .ok_or(MonomorphizationError::InvalidRoot)?;
+                if definition.parent != Some(module_id) {
+                    return Err(MonomorphizationError::InvalidRoot);
+                }
+                match definition.kind {
+                    DefinitionKind::Function | DefinitionKind::Static => {
+                        roots.push((child, RootReason::NativeLink));
+                    }
+                    DefinitionKind::ForeignType => {}
+                    _ => return Err(MonomorphizationError::InvalidRoot),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(rust_item_dependencies_patched)]
