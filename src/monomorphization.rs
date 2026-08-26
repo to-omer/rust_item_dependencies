@@ -5,7 +5,7 @@ use rustc_middle::ty::TyCtxt;
 
 use crate::definitions::{CollectedDefinitions, DefinitionError};
 use crate::dependency_graph::{DependencyEdge, MonoNode, ProofNode, RootRecord};
-use crate::input::{CrateType, ResolvedEntryPoint};
+use crate::input::ResolvedEntryPoint;
 use crate::source::SourceInventory;
 
 #[cfg(rust_item_dependencies_patched)]
@@ -100,7 +100,6 @@ pub(crate) fn collect_monomorphization(
     _tcx: TyCtxt<'_>,
     _source: &SourceInventory,
     _definitions: &mut CollectedDefinitions,
-    _crate_type: CrateType,
     _entry_points: &[ResolvedEntryPoint],
 ) -> Result<CollectedMonomorphization, MonomorphizationError> {
     Err(MonomorphizationError::IncompleteObservation)
@@ -112,10 +111,9 @@ pub(crate) fn collect_monomorphization<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
     source: &SourceInventory,
     definitions: &'a mut CollectedDefinitions,
-    crate_type: CrateType,
     entry_points: &[ResolvedEntryPoint],
 ) -> Result<CollectedMonomorphization, MonomorphizationError> {
-    MonoCollector::new(compiler, tcx, source, definitions, crate_type, entry_points)?.collect()
+    MonoCollector::new(compiler, tcx, source, definitions, entry_points)?.collect()
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -194,13 +192,10 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         source: &'a SourceInventory,
         definitions: &'a mut CollectedDefinitions,
-        crate_type: CrateType,
         entry_points: &[ResolvedEntryPoint],
     ) -> Result<Self, MonomorphizationError> {
         let mut seeds = Vec::new();
-        if crate_type == CrateType::Binary {
-            let (main, EntryFnType::Main { .. }) =
-                tcx.entry_fn(()).ok_or(MonomorphizationError::InvalidRoot)?;
+        if let Some((main, EntryFnType::Main { .. })) = tcx.entry_fn(()) {
             let main = Instance::mono(tcx, main);
             let start_definition = tcx
                 .lang_items()

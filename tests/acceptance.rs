@@ -200,6 +200,95 @@ fn crate_codegen_and_subsystem_attributes_survive_binary_reduction() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn no_main_uses_existing_external_symbol_roots_without_standard_entry_roots() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "#![no_std]\n",
+        "#![cfg_attr(all(), no_main)]\n",
+        "\n",
+        "extern crate std;\n",
+        "\n",
+        "fn kept() -> core::ffi::c_int {\n",
+        "    std::hint::black_box(0)\n",
+        "}\n",
+        "\n",
+        "fn dead() -> core::ffi::c_int { 1 }\n",
+        "\n",
+        "fn main() {}\n",
+        "\n",
+        "#[unsafe(export_name = \"main\")]\n",
+        "pub extern \"C\" fn entry(\n",
+        "    _argc: core::ffi::c_int,\n",
+        "    _argv: *const *const core::ffi::c_char,\n",
+        ") -> core::ffi::c_int {\n",
+        "    kept()\n",
+        "}\n",
+    );
+    let expected = concat!(
+        "#![no_std]\n",
+        "#![cfg_attr(all(), no_main)]\n",
+        "\n",
+        "extern crate std;\n",
+        "\n",
+        "fn kept() -> core::ffi::c_int {\n",
+        "    std::hint::black_box(0)\n",
+        "}\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "#[unsafe(export_name = \"main\")]\n",
+        "pub extern \"C\" fn entry(\n",
+        "    _argc: core::ffi::c_int,\n",
+        "    _argv: *const *const core::ffi::c_char,\n",
+        ") -> core::ffi::c_int {\n",
+        "    kept()\n",
+        "}\n",
+    );
+    let original_input = input(source, &target);
+
+    let verified = analyzer
+        .reduce_and_verify(&original_input)
+        .expect("the no_main program must preserve compiler decisions");
+    assert_verified("no_main external entry", source, expected, &verified);
+    assert!(
+        verified
+            .original_analysis()
+            .roots()
+            .iter()
+            .all(|root| !matches!(root.reason, RootReason::Main | RootReason::StartInstance))
+    );
+    assert_eq!(
+        verified
+            .original_analysis()
+            .roots()
+            .iter()
+            .filter(|root| root.reason == RootReason::ExternalSymbol)
+            .count(),
+        1
+    );
+
+    let reduced_input = input(expected, &target);
+    let fixed = analyzer
+        .reduce_and_verify(&reduced_input)
+        .expect("the no_main reduction must be byte-idempotent");
+    assert_eq!(fixed.reduced_source(), expected);
+
+    let options = CompilationOptions::new();
+    let original_output = compile_and_run(&original_input, &options, "no_main_original");
+    let reduced_output = compile_and_run(&reduced_input, &options, "no_main_reduced");
+    assert!(original_output.status.success());
+    assert!(original_output.stdout.is_empty());
+    assert!(original_output.stderr.is_empty());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn compiler_roots_keep_only_the_required_external_crate_loading_source() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();

@@ -19,11 +19,12 @@ use rustc_feature::{Features, UnstableFeatures};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_ID, LocalDefId};
+use rustc_hir::find_attr;
 use rustc_interface::interface::{Compiler, Config};
 use rustc_middle::metadata::Reexport;
 #[cfg(rust_item_dependencies_patched)]
 use rustc_middle::ty::MacroImplementationKind;
-use rustc_middle::ty::{self, GenericArgKind, TyCtxt};
+use rustc_middle::ty::{self, GenericArgKind, Instance, TyCtxt};
 use rustc_session::config::Input;
 use rustc_span::source_map::{FileLoader, SourceMap};
 use rustc_span::{FileName, RealFileName, Span, Symbol, sym};
@@ -1414,22 +1415,18 @@ impl Callbacks for InputCallbacks {
             }
         }
         tcx.ensure_ok().early_lint_checks(());
-        if self.crate_type == CrateType::Binary && tcx.entry_fn(()).is_none() {
-            return self.finish(Err(InputError::UnsupportedInput {
-                reason: UnsupportedReason::MissingMain,
-                range: None,
-            }));
+        if let Err(error) = validate_standard_entry(tcx, self.crate_type) {
+            return self.finish(Err(error));
         }
         Compilation::Continue
     }
 
     fn after_analysis<'tcx>(&mut self, compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
         tcx.sess.dcx().abort_if_errors();
-        if self.crate_type == CrateType::Binary && tcx.entry_fn(()).is_none() {
-            return self.finish(Err(InputError::UnsupportedInput {
-                reason: UnsupportedReason::MissingMain,
-                range: None,
-            }));
+        let entry_validation = validate_no_main_target_entry(tcx, self.crate_type);
+        tcx.sess.dcx().abort_if_errors();
+        if let Err(error) = entry_validation {
+            return self.finish(Err(error));
         }
         let entry_points = match resolve_entry_points(tcx, &self.crate_name, &self.entry_points) {
             Ok(entry_points) => entry_points,
@@ -1470,6 +1467,54 @@ impl Callbacks for InputCallbacks {
             definitions,
             dependencies,
         }))
+    }
+}
+
+fn validate_standard_entry(tcx: TyCtxt<'_>, crate_type: CrateType) -> Result<(), InputError> {
+    if crate_type != CrateType::Binary
+        || tcx.entry_fn(()).is_some()
+        || find_attr!(tcx, crate, NoMain)
+    {
+        return Ok(());
+    }
+    Err(InputError::UnsupportedInput {
+        reason: UnsupportedReason::MissingMain,
+        range: None,
+    })
+}
+
+fn validate_no_main_target_entry(tcx: TyCtxt<'_>, crate_type: CrateType) -> Result<(), InputError> {
+    if crate_type != CrateType::Binary
+        || tcx.entry_fn(()).is_some()
+        || !find_attr!(tcx, crate, NoMain)
+    {
+        return Ok(());
+    }
+
+    let entry_name = tcx.sess.target.entry_name.as_ref();
+    let mut has_target_entry = false;
+    for definition in tcx.iter_local_def_id() {
+        if !matches!(tcx.def_kind(definition), DefKind::Fn | DefKind::AssocFn) {
+            continue;
+        }
+        let attributes = tcx.codegen_fn_attrs(definition);
+        if !tcx.generics_of(definition).requires_monomorphization(tcx)
+            && attributes.contains_extern_indicator()
+            && tcx
+                .symbol_name(Instance::mono(tcx, definition.to_def_id()))
+                .name
+                == entry_name
+        {
+            has_target_entry = true;
+        }
+    }
+    if has_target_entry {
+        Ok(())
+    } else {
+        Err(InputError::UnsupportedInput {
+            reason: UnsupportedReason::MissingTargetEntry,
+            range: None,
+        })
     }
 }
 
@@ -1522,14 +1567,7 @@ fn collect_dependency_graph(
         mut mono_nodes,
         edges: mono_edges,
         mut roots,
-    } = collect_monomorphization(
-        compiler,
-        tcx,
-        source,
-        &mut definitions,
-        crate_type,
-        entry_points,
-    )?;
+    } = collect_monomorphization(compiler, tcx, source, &mut definitions, entry_points)?;
     if needs_downstream_selection {
         roots.extend(downstream_selection_roots(&definitions.graph));
         roots.sort();
@@ -2153,9 +2191,7 @@ impl<'ast> Visitor<'ast> for ExpandedValidator<'_> {
 }
 
 fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<UnsupportedReason> {
-    if attribute.has_name(sym::no_main) {
-        Some(UnsupportedReason::NoMain)
-    } else if attribute.has_name(sym::path) {
+    if attribute.has_name(sym::path) {
         Some(UnsupportedReason::AdditionalSourceFile)
     } else if attribute.has_name(sym::proc_macro)
         || attribute.has_name(sym::proc_macro_attribute)
@@ -2972,12 +3008,16 @@ mod tests {
             "#[path = \"external.rs\"]",
         );
         assert_unsupported(
-            "#![no_main]\nfn main() {}\n",
-            UnsupportedReason::NoMain,
-            "#![no_main]",
+            "fn main() { unsafe { core::arch::asm!(\"\"); } }\n",
+            UnsupportedReason::Assembly,
+            "core::arch::asm!(\"\")",
         );
         assert_unsupported(
-            "fn main() { unsafe { core::arch::asm!(\"\"); } }\n",
+            concat!(
+                "#![no_main]\n",
+                "#[unsafe(export_name = \"main\")]\n",
+                "pub extern \"C\" fn entry() -> i32 { unsafe { core::arch::asm!(\"\"); } 0 }\n",
+            ),
             UnsupportedReason::Assembly,
             "core::arch::asm!(\"\")",
         );
@@ -3258,6 +3298,19 @@ mod tests {
             "#![windows_subsystem = \"unexpected\"]\nfn main() {}\n",
             "#![no_std]\nfn main() {}\n",
             "#![no_std(unexpected)]\nextern crate std;\nfn main() {}\n",
+            concat!(
+                "#![no_main]\n",
+                "#[unsafe(export_name = \"main\")]\n",
+                "pub extern \"C\" fn entry<T>() -> core::ffi::c_int { 0 }\n",
+            ),
+            concat!(
+                "#![no_main]\n",
+                "#[unsafe(export_name = \"main\")]\n",
+                "pub extern \"C\" fn entry() -> core::ffi::c_int { 0 }\n",
+                "#[unsafe(export_name = \"callback\")]\n",
+                "pub extern \"C\" fn invalid<T>() {}\n",
+            ),
+            "#![no_main]\nfn broken() { let _: u8 = \"not a number\"; }\n",
         ] {
             assert!(
                 matches!(
@@ -3274,6 +3327,44 @@ mod tests {
                 range: None,
             })
         );
+        assert_eq!(
+            inspect("#![no_main]\nfn main() {}\n"),
+            Err(InputError::UnsupportedInput {
+                reason: UnsupportedReason::MissingTargetEntry,
+                range: None,
+            })
+        );
+        assert_eq!(
+            inspect(concat!(
+                "#![no_main]\n",
+                "#[unsafe(export_name = \"callback\")]\n",
+                "pub extern \"C\" fn callback() {}\n",
+                "#[used]\n",
+                "static DATA: [u8; 1] = [0];\n",
+            )),
+            Err(InputError::UnsupportedInput {
+                reason: UnsupportedReason::MissingTargetEntry,
+                range: None,
+            })
+        );
+    }
+
+    #[test]
+    fn no_main_uses_the_configured_target_entry_symbol() {
+        for source in [
+            concat!(
+                "#![no_main]\n",
+                "#[unsafe(no_mangle)]\n",
+                "pub extern \"C\" fn main() -> core::ffi::c_int { 0 }\n",
+            ),
+            concat!(
+                "#![cfg_attr(all(), no_main)]\n",
+                "#[unsafe(export_name = \"main\")]\n",
+                "pub extern \"C\" fn entry() -> core::ffi::c_int { 0 }\n",
+            ),
+        ] {
+            assert!(inspect(source).is_ok(), "{source}");
+        }
     }
 
     #[test]

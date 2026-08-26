@@ -14,12 +14,12 @@ pub enum UnsupportedReason {
     ExternalCompileTimeResource,
     ExternalDependency,
     ProcMacro,
-    NoMain,
     Assembly,
     NativeLinkOrCustomRuntime,
     ExternalNativeLink,
     UnsupportedTarget,
     MissingMain,
+    MissingTargetEntry,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
