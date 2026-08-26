@@ -155,6 +155,51 @@ fn compilation_context_is_shared_by_reduction_fixed_point_and_linking() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn crate_codegen_and_subsystem_attributes_survive_binary_reduction() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "#![no_builtins]\n",
+        "#![windows_subsystem = \"windows\"]\n",
+        "\n",
+        "fn unused() {}\n",
+        "\n",
+        "fn main() {}\n",
+    );
+    let expected = concat!(
+        "#![no_builtins]\n",
+        "#![windows_subsystem = \"windows\"]\n",
+        "\n",
+        "\n",
+        "\n",
+        "fn main() {}\n",
+    );
+    let original_input = input(source, &target);
+
+    let verified = analyzer
+        .reduce_and_verify(&original_input)
+        .expect("crate codegen and subsystem attributes must be reducible");
+    assert_verified("crate attributes", source, expected, &verified);
+
+    let reduced_input = input(expected, &target);
+    let fixed = analyzer
+        .reduce_and_verify(&reduced_input)
+        .expect("the reduced crate attributes must remain reducible");
+    assert_eq!(fixed.reduced_source(), expected);
+
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(&original_input, &options, "crate_attributes_original");
+    let reduced_output = compile_and_run(&reduced_input, &options, "crate_attributes_reduced");
+    assert!(original_output.status.success());
+    assert!(original_output.stdout.is_empty());
+    assert!(original_output.stderr.is_empty());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn external_symbol_roots_preserve_linked_entry_points() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();
