@@ -94,6 +94,38 @@ fn analysis_and_verified_reduction_are_owned_read_only_results() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn no_effect_cfg_attrs_are_typed_removed_source_units() {
+    use rust_item_dependencies::source::WrittenUnitKind;
+
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let attribute = "#[cfg_attr(any(),allow(dead_code))]";
+    let source = format!("{attribute}fn main(){{}}");
+    let input = SourceInput::binary(source.clone(), Edition::Rust2024, host_target());
+
+    let analysis = analyzer.analyze(&input).expect("the source must compile");
+    let units = analysis
+        .source_units()
+        .iter()
+        .filter(|unit| unit.kind == WrittenUnitKind::NoEffectCfgAttr)
+        .collect::<Vec<_>>();
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].full_range.start, 0);
+    assert_eq!(units[0].full_range.end as usize, attribute.len());
+    assert!(analysis.removed_source_units().contains(&units[0].id));
+    assert!(
+        units[0]
+            .parent
+            .is_some_and(|parent| analysis.retained_source_units().contains(&parent))
+    );
+
+    let verified = analyzer
+        .reduce_and_verify(&input)
+        .expect("removing the attribute must preserve compiler decisions");
+    assert_eq!(verified.reduced_source(), "fn main(){}");
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn compiler_recipe_identifies_normalized_compilation_options_but_not_source_text() {
     let target = host_target();
     let input = SourceInput::binary(

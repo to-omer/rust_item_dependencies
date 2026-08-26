@@ -268,6 +268,87 @@ mod patched {
     }
 
     #[test]
+    fn no_effect_cfg_attrs_follow_proc_macro_input_configuration() {
+        let artifacts = ProcMacroArtifacts::build();
+        let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
+        let cases = [
+            (
+                "function-like",
+                concat!(
+                    "#[cfg_attr(any(),allow(dead_code))]",
+                    "proc_fixture::configured_bang!();",
+                    "fn main(){assert_eq!(generated(),1)}",
+                ),
+                concat!(
+                    "proc_fixture::configured_bang!();",
+                    "fn main(){assert_eq!(generated(),1)}",
+                ),
+            ),
+            (
+                "attribute",
+                concat!(
+                    "#[cfg_attr(any(),allow(dead_code))]",
+                    "#[proc_fixture::require_nested_cfg_attr]",
+                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                    "fn main(){assert_eq!(Subject{value:1}.value,1)}",
+                ),
+                concat!(
+                    "#[proc_fixture::require_nested_cfg_attr]",
+                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                    "fn main(){assert_eq!(Subject{value:1}.value,1)}",
+                ),
+            ),
+            (
+                "derive",
+                concat!(
+                    "#[cfg_attr(any(),allow(dead_code))]",
+                    "#[derive(proc_fixture::ConfiguredInput)]",
+                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                    "fn main(){assert_eq!(Subject{value:1}.value,1)}",
+                ),
+                concat!(
+                    "#[derive(proc_fixture::ConfiguredInput)]",
+                    "struct Subject{value:u8}",
+                    "fn main(){assert_eq!(Subject{value:1}.value,1)}",
+                ),
+            ),
+            (
+                "attribute and derive",
+                concat!(
+                    "#[cfg_attr(any(),allow(dead_code))]",
+                    "#[proc_fixture::require_nested_cfg_attr]",
+                    "#[derive(proc_fixture::ConfiguredInput)]",
+                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                    "fn main(){assert_eq!(Subject{value:1}.value,1)}",
+                ),
+                concat!(
+                    "#[proc_fixture::require_nested_cfg_attr]",
+                    "#[derive(proc_fixture::ConfiguredInput)]",
+                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                    "fn main(){assert_eq!(Subject{value:1}.value,1)}",
+                ),
+            ),
+        ];
+
+        for (case, source, expected) in cases {
+            let verified = analyzer
+                .reduce_and_verify(&input(source))
+                .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+            assert_eq!(verified.reduced_source(), expected, "{case}");
+            assert_eq!(
+                verified.verification().original_snapshot_hash(),
+                verified.verification().reduced_snapshot_hash(),
+                "{case}",
+            );
+
+            let fixed = analyzer
+                .reduce_and_verify(&input(expected))
+                .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
+            assert_eq!(fixed.reduced_source(), expected, "{case}");
+        }
+    }
+
+    #[test]
     fn a_transitively_reexported_proc_macro_uses_the_same_permission_boundary() {
         let artifacts = ProcMacroArtifacts::build();
         let analyzer = Analyzer::new_with_options(artifacts.transitive_options()).unwrap();

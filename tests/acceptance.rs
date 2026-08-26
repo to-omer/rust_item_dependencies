@@ -308,26 +308,28 @@ fn native_link_directives_are_roots_without_pinning_unused_declarations() {
         "    println!(\"linked\");\n",
         "}\n",
     );
-    let expected = concat!(
-        "#[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n",
-        "#[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n",
-        "unsafe extern \"C\" {\n",
-        "    \n",
-        "}\n",
-        "\n",
-        "\n",
-        "\n",
-        "\n",
-        "\n",
-        "fn main() {\n",
-        "    println!(\"linked\");\n",
-        "}\n",
+    let expected = format!(
+        "{}{}",
+        active_host_link_attribute(),
+        concat!(
+            "unsafe extern \"C\" {\n",
+            "    \n",
+            "}\n",
+            "\n",
+            "\n",
+            "\n",
+            "\n",
+            "\n",
+            "fn main() {\n",
+            "    println!(\"linked\");\n",
+            "}\n",
+        )
     );
 
     let verified = analyzer
         .reduce_and_verify(&input(source, &target))
         .expect("an active native link directive must be reducible");
-    assert_verified("native link directive", source, expected, &verified);
+    assert_verified("native link directive", source, &expected, &verified);
     let roots = verified
         .original_analysis()
         .roots()
@@ -338,7 +340,7 @@ fn native_link_directives_are_roots_without_pinning_unused_declarations() {
     assert!(matches!(roots[0].node, GraphNode::Definition(_)));
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce_and_verify(&input(&expected, &target))
         .expect("a reduced native link directive must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -349,7 +351,7 @@ fn native_link_directives_are_roots_without_pinning_unused_declarations() {
         "native_link_directive_original",
     );
     let reduced_output = compile_and_run(
-        &input(expected, &target),
+        &input(&expected, &target),
         &options,
         "native_link_directive_reduced",
     );
@@ -375,14 +377,16 @@ fn native_link_and_explicit_library_roots_share_the_same_graph() {
         "pub fn entry() {}\n",
         "fn unused_local() {}\n",
     );
-    let expected = concat!(
-        "#[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n",
-        "#[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n",
-        "unsafe extern \"C\" {\n",
-        "    \n",
-        "}\n",
-        "pub fn entry() {}\n",
-        "\n",
+    let expected = format!(
+        "{}{}",
+        active_host_link_attribute(),
+        concat!(
+            "unsafe extern \"C\" {\n",
+            "    \n",
+            "}\n",
+            "pub fn entry() {}\n",
+            "\n",
+        )
     );
     let input = SourceInput::library(source, Edition::Rust2024, target, "linked_library")
         .with_entry_point(EntryPoint::new("linked_library::entry"));
@@ -390,7 +394,7 @@ fn native_link_and_explicit_library_roots_share_the_same_graph() {
     let verified = analyzer
         .reduce_and_verify(&input)
         .expect("native links and explicit library entries must be reducible together");
-    assert_verified("native link library", source, expected, &verified);
+    assert_verified("native link library", source, &expected, &verified);
     assert_eq!(
         verified
             .original_analysis()
@@ -781,16 +785,7 @@ fn main() {
     println!("initialized");
 }
 "#;
-    let expected = r#"static INITIALIZED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-extern "C" fn initialize() {
-    INITIALIZED.store(true, core::sync::atomic::Ordering::Relaxed);
-}
-
-
-
-#[cfg_attr(
+    const INIT_ARRAY: &str = r#"#[cfg_attr(
     any(
         target_os = "android",
         target_os = "dragonfly",
@@ -806,25 +801,41 @@ extern "C" fn initialize() {
         target_os = "managarm",
     ),
     unsafe(link_section = ".init_array")
-)]
-#[cfg_attr(target_vendor = "apple", unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs"))]
-#[cfg_attr(target_os = "windows", unsafe(link_section = ".CRT$XCU"))]
-#[used]
-static INITIALIZER: extern "C" fn() = initialize;
-
-fn main() {
-    assert!(INITIALIZED.load(core::sync::atomic::Ordering::Relaxed));
-    println!("initialized");
-}
-"#;
+)]"#;
+    const APPLE_INIT: &str = r#"#[cfg_attr(target_vendor = "apple", unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs"))]"#;
+    const WINDOWS_INIT: &str =
+        r#"#[cfg_attr(target_os = "windows", unsafe(link_section = ".CRT$XCU"))]"#;
+    let mut expected = source.replace("fn unused() {}", "");
+    if !cfg!(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "illumos",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "nto",
+        target_os = "qnx",
+        target_os = "openbsd",
+        target_os = "fuchsia",
+        target_os = "managarm",
+    )) {
+        expected = expected.replace(INIT_ARRAY, "");
+    }
+    if !cfg!(target_vendor = "apple") {
+        expected = expected.replace(APPLE_INIT, "");
+    }
+    if !cfg!(target_os = "windows") {
+        expected = expected.replace(WINDOWS_INIT, "");
+    }
 
     let verified = analyzer
         .reduce_and_verify(&input(source, &target))
         .expect("a used constructor static must be reducible");
-    assert_verified("used constructor static", source, expected, &verified);
+    assert_verified("used constructor static", source, &expected, &verified);
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce_and_verify(&input(&expected, &target))
         .expect("a reduced constructor static must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -931,6 +942,84 @@ fn builtin_test_attributes_are_accepted_and_their_unreachable_items_are_removed(
             .reduce_and_verify(&input(verified.reduced_source(), &target))
             .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
         assert_eq!(fixed.reduced_source(), verified.reduced_source(), "{case}");
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn cfg_attr_wrapped_macro_invocations_resolve_their_written_source() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let cases = [
+        (
+            "inactive cfg_attr on a retained item",
+            "#[cfg_attr(any(),allow(dead_code))]fn main(){}",
+            "fn main(){}",
+        ),
+        (
+            "inactive cfg_attr on a retained invocation",
+            "macro_rules! item{()=>{fn main(){}}}#[cfg_attr(any(),allow(dead_code))]item!();",
+            "macro_rules! item{()=>{fn main(){}}}item!();",
+        ),
+        (
+            "active cfg_attr on a retained invocation",
+            "macro_rules! item{()=>{fn main(){}}}#[cfg_attr(all(),allow(dead_code))]item!();",
+            "macro_rules! item{()=>{fn main(){}}}#[cfg_attr(all(),allow(dead_code))]item!();",
+        ),
+        (
+            "cfg_attr between nested invocations",
+            concat!(
+                "macro_rules! inner{()=>{fn generated(){}}}",
+                "macro_rules! outer{()=>{#[cfg_attr(any(),allow(dead_code))]inner!();}}",
+                "outer!();fn main(){generated();}",
+            ),
+            concat!(
+                "macro_rules! inner{()=>{fn generated(){}}}",
+                "macro_rules! outer{()=>{#[cfg_attr(any(),allow(dead_code))]inner!();}}",
+                "outer!();fn main(){generated();}",
+            ),
+        ),
+        (
+            "inactive cfg_attr containing derive",
+            "#[cfg_attr(any(),derive(Clone))]struct Live;fn main(){let _=Live;}",
+            "struct Live;fn main(){let _=Live;}",
+        ),
+        (
+            "inactive cfg_attr on a field",
+            concat!(
+                "struct Live{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                "fn main(){assert_eq!(Live{value:1}.value,1)}",
+            ),
+            "struct Live{value:u8}fn main(){assert_eq!(Live{value:1}.value,1)}",
+        ),
+        (
+            "inactive cfg_attr beside a retained attribute",
+            concat!(
+                "#[cfg_attr(any(),allow(unused_variables))]",
+                "#[allow(dead_code)]fn main(){}",
+            ),
+            "#[allow(dead_code)]fn main(){}",
+        ),
+        (
+            "unused cfg_attr wrapped invocation",
+            concat!(
+                "macro_rules! item{()=>{fn generated(){}}}",
+                "#[cfg_attr(any(),allow(dead_code))]item!();fn main(){}",
+            ),
+            "fn main(){}",
+        ),
+    ];
+
+    for (case, source, expected) in cases {
+        let verified = analyzer
+            .reduce_and_verify(&input(source, &target))
+            .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_verified(case, source, expected, &verified);
+
+        let fixed = analyzer
+            .reduce_and_verify(&input(verified.reduced_source(), &target))
+            .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
+        assert_eq!(fixed.reduced_source(), expected, "{case}");
     }
 }
 
@@ -1060,6 +1149,15 @@ fn input(source: &str, target: &str) -> SourceInput {
 #[cfg(rust_item_dependencies_patched)]
 fn input_with_edition(source: &str, target: &str, edition: Edition) -> SourceInput {
     SourceInput::binary(source.to_owned(), edition, target)
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn active_host_link_attribute() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "#[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n\n"
+    } else {
+        "\n#[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n"
+    }
 }
 
 #[cfg(rust_item_dependencies_patched)]

@@ -23,11 +23,11 @@ use crate::graph::{
     InjectedRole,
 };
 use crate::rewrite::{SourceRewrite, SourceRewriteError};
-#[cfg(rust_item_dependencies_patched)]
-use crate::source::resolve_attribute_source;
 use crate::source::{
     ByteRange, CfgState, SourceError, SourceInventory, WrittenUnitKind, original_span_range,
 };
+#[cfg(rust_item_dependencies_patched)]
+use crate::source::{resolve_attribute_source, resolve_written_bang_macro_source};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DefinitionError {
@@ -825,11 +825,17 @@ fn expanded_origin(
     let invocation = written_macro_invocation(compiler, source, current, origin)
         .map_err(|_| DefinitionError::IncompleteDefinition)?;
     Ok(DefinitionOrigin::Expanded {
-        invocation: invocation.id,
-        invocation_range: invocation.full_range,
+        invocation: invocation.unit.id,
+        invocation_range: invocation.call_range,
         generated_role,
         ordinal: 0,
     })
+}
+
+#[cfg(rust_item_dependencies_patched)]
+struct WrittenMacroInvocation<'a> {
+    unit: &'a crate::source::WrittenUnit,
+    call_range: ByteRange,
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -838,7 +844,7 @@ fn written_macro_invocation<'a>(
     source: &'a SourceInventory,
     expansion: ExpnId,
     origin: &rustc_middle::ty::MacroInvocationOrigin,
-) -> Result<&'a crate::source::WrittenUnit, DefinitionError> {
+) -> Result<WrittenMacroInvocation<'a>, DefinitionError> {
     let node_range = original_span_range(compiler, &source.offsets, origin.invocation_node_span)?;
     let call_range =
         original_span_range(compiler, &source.offsets, expansion.expn_data().call_site)?;
@@ -857,23 +863,19 @@ fn written_macro_invocation<'a>(
             .map_err(|_| DefinitionError::IncompleteDependency)?
             .invocation
             .ok_or(DefinitionError::IncompleteDependency)?;
-        return source
+        let unit = source
             .units
             .get(invocation.0 as usize)
-            .ok_or(DefinitionError::IncompleteDependency);
+            .ok_or(DefinitionError::IncompleteDependency)?;
+        return Ok(WrittenMacroInvocation { unit, call_range });
     }
-    let mut matches = source.units.iter().filter(|unit| {
-        unit.kind == WrittenUnitKind::MacroInvocation
-            && unit.cfg_state == CfgState::Active
-            && (unit.full_range == node_range || unit.full_range == call_range)
-    });
-    let invocation = matches
-        .next()
+    let invocation = resolve_written_bang_macro_source(source, call_range, node_range)
         .ok_or(DefinitionError::IncompleteDependency)?;
-    if matches.next().is_some() {
-        return Err(DefinitionError::IncompleteDependency);
-    }
-    Ok(invocation)
+    let unit = source
+        .units
+        .get(invocation.0 as usize)
+        .ok_or(DefinitionError::IncompleteDependency)?;
+    Ok(WrittenMacroInvocation { unit, call_range })
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -2275,7 +2277,7 @@ fn collect_import_edges(
             .ok_or(DefinitionError::IncompleteDependency)?;
         let invocation = written_macro_invocation(compiler, source, outer_expansion, outer)?;
         let from = if outer.target_span.is_some() {
-            source_owner(source, source_owners, invocation.id)?
+            source_owner(source, source_owners, invocation.unit.id)?
         } else {
             outer.parent_definition
         };
@@ -2960,7 +2962,7 @@ mod exact_tests {
         let graph = inspect(source);
         let actual = project_graph(&graph);
         let root = crate_root(source);
-        let invocation = marker_range(source, "define_borrow!();");
+        let invocation = marker_range(source, "define_borrow!()");
         let function = named(
             expanded(DefinitionKind::Function, invocation, None, 0, Some(&root)),
             Some("generated"),
@@ -3037,7 +3039,7 @@ mod exact_tests {
             Some("make_products"),
             0,
         );
-        let invocation = marker_range(source, "make_products!();");
+        let invocation = marker_range(source, "make_products!()");
         let function = named(
             expanded(DefinitionKind::Function, invocation, None, 0, Some(&root)),
             Some("generated"),
@@ -5107,7 +5109,7 @@ mod exact_tests {
             1,
             Some(&main),
         );
-        let invocation = marker_range(source, "make_async!();");
+        let invocation = marker_range(source, "make_async!()");
         let generated_function = named(
             expanded(DefinitionKind::Function, invocation, None, 0, Some(&root)),
             Some("generated"),
@@ -5182,7 +5184,7 @@ mod exact_tests {
         );
         let injected_std = find_local(definitions, DefinitionKind::ExternCrate, Some("std"));
         let injected_prelude = injected(DefinitionKind::Use, InjectedRole::PreludeImport, 0, &root);
-        let invocation = marker_range(source, "make_async!();");
+        let invocation = marker_range(source, "make_async!()");
 
         BTreeSet::from([
             edge(

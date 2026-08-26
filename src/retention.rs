@@ -1480,7 +1480,8 @@ fn resolve_definition_unit(
                 .get(invocation.0 as usize)
                 .ok_or(RetentionError::InvalidGraph)?;
             if written.id != *invocation
-                || written.full_range != *invocation_range
+                || invocation_range.is_empty()
+                || !written.full_range.contains(*invocation_range)
                 || written.kind != WrittenUnitKind::MacroInvocation
                 || written.cfg_state != CfgState::Active
             {
