@@ -342,6 +342,8 @@ fn run_reducer(
         .map_err(|error| format!("cannot create {}: {error}", render_path(&snapshot_parent)))?;
     let snapshot_owner = unique_snapshot_owner(&snapshot_parent)?;
     let mut rustflags = vec![
+        OsString::from("-C"),
+        OsString::from("prefer-dynamic"),
         OsString::from("--extern"),
         prefixed_path("rustc_driver=", rustc_driver),
     ];

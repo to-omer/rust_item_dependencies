@@ -98,6 +98,8 @@ fn validate_patched_compiler(rustc: &OsString, sysroot: &Path, host: &str) -> Pa
         .arg("--edition=2024")
         .arg("--extern")
         .arg(format!("rustc_driver={}", rustc_driver.display()))
+        .arg("-C")
+        .arg("prefer-dynamic")
         .arg("-L")
         .arg(format!("dependency={}", compiler_metadata.display()))
         .arg("-L")

@@ -191,6 +191,7 @@ cargo_target_directory=$(native_path "$repository_root/target/rid/tests")
 # the qualification crate, without changing the compiler or copying sysroot files.
 unit_separator=$(printf '\037')
 encoded_rustflags="--extern${unit_separator}rustc_driver=$rustc_driver"
+encoded_rustflags="${encoded_rustflags}${unit_separator}-C${unit_separator}prefer-dynamic"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_ast=$rustc_ast"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_data_structures=$rustc_data_structures"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_errors=$rustc_errors"
