@@ -26,7 +26,7 @@ use crate::retention::{Retention, source_site_is_retained};
 use crate::rewrite::SourceRewrite;
 use crate::source::{ByteRange, SourceInventory};
 
-const SNAPSHOT_SCHEMA: u8 = 4;
+const SNAPSHOT_SCHEMA: u8 = 5;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum SnapshotNodeKey {
@@ -1195,6 +1195,7 @@ fn put_root_reason(bytes: &mut Vec<u8>, reason: RootReason) {
         RootReason::UsedAttribute => 4,
         RootReason::ExternalSymbol => 5,
         RootReason::NativeLink => 6,
+        RootReason::GlobalAssembly => 7,
     };
     put_u8(bytes, tag);
 }
@@ -1623,6 +1624,10 @@ fn put_mono_key(bytes: &mut Vec<u8>, key: &MonoKey) {
                 put_allocation_path_site(bytes, part.site);
                 put_u32(bytes, part.same_role_ordinal);
             }
+        }
+        MonoKey::GlobalAsm { definition } => {
+            put_u8(bytes, 4);
+            put_definition_key(bytes, definition);
         }
     }
 }

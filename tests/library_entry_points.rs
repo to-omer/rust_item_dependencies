@@ -497,6 +497,76 @@ fn a_generic_definition_entry_preserves_downstream_trait_selection() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn downstream_codegen_assembly_preserves_the_active_library_source() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let cases = [
+        (
+            "generic_assembly",
+            concat!(
+                "pub fn entry<T>() { unsafe { core::arch::asm!(\"\"); } }\n",
+                "fn unused() {}\n",
+            ),
+            concat!(
+                "use generic_assembly::entry;\n",
+                "fn main() { entry::<u8>(); println!(\"ok\"); }\n",
+            ),
+        ),
+        (
+            "default_method_assembly",
+            concat!(
+                "pub trait AssemblyDefault {\n",
+                "    fn run() { unsafe { core::arch::asm!(\"\"); } }\n",
+                "}\n",
+                "pub fn entry<T: AssemblyDefault>() {}\n",
+                "fn unused() {}\n",
+            ),
+            concat!(
+                "use default_method_assembly::{entry, AssemblyDefault};\n",
+                "struct Downstream;\n",
+                "impl AssemblyDefault for Downstream {}\n",
+                "fn main() { entry::<Downstream>(); Downstream::run(); println!(\"ok\"); }\n",
+            ),
+        ),
+    ];
+
+    for (crate_name, source, downstream) in cases {
+        let input = library_input(source, crate_name)
+            .with_entry_point(EntryPoint::new(format!("{crate_name}::entry")));
+        let verified = analyzer
+            .reduce_and_verify(&input)
+            .unwrap_or_else(|error| panic!("{crate_name}: {error:?}"));
+        assert_eq!(verified.reduced_source(), source, "{crate_name}");
+        assert_fixed_point(&analyzer, &input, source);
+
+        let directory = TestDirectory::new(crate_name);
+        let original = compile_library_and_run_downstream(
+            directory.path(),
+            "original",
+            crate_name,
+            source,
+            downstream,
+            &target,
+        );
+        let reduced = compile_library_and_run_downstream(
+            directory.path(),
+            "reduced",
+            crate_name,
+            verified.reduced_source(),
+            downstream,
+            &target,
+        );
+        assert!(original.status.success(), "{crate_name}: {original:?}");
+        assert_eq!(original.stdout, b"ok\n", "{crate_name}");
+        assert!(original.stderr.is_empty(), "{crate_name}: {original:?}");
+        assert_eq!(reduced.status, original.status, "{crate_name}");
+        assert_eq!(reduced.stdout, original.stdout, "{crate_name}");
+        assert_eq!(reduced.stderr, original.stderr, "{crate_name}");
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn a_local_type_in_an_entry_signature_preserves_its_downstream_value_semantics() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();

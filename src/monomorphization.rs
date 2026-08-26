@@ -12,9 +12,7 @@ use crate::source::SourceInventory;
 use std::collections::{HashSet, VecDeque};
 
 #[cfg(rust_item_dependencies_patched)]
-use rustc_hir::attrs::NativeLibKind;
-#[cfg(rust_item_dependencies_patched)]
-use rustc_hir::def::DefKind;
+use rustc_hir::{attrs::NativeLibKind, def::DefKind};
 #[cfg(rust_item_dependencies_patched)]
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 #[cfg(rust_item_dependencies_patched)]
@@ -260,6 +258,20 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
         }
         collect_native_link_definition_roots(tcx, definitions, &mut definition_roots)?;
 
+        for item_id in tcx.hir_free_items() {
+            if tcx.def_kind(item_id.owner_id) == DefKind::GlobalAsm {
+                let item = tcx.hir_item(item_id);
+                insert_seed(
+                    &mut seeds,
+                    MonoTraceRoot::GlobalAsm {
+                        item_id,
+                        trigger_span: item.span,
+                    },
+                    RootReason::GlobalAssembly,
+                );
+            }
+        }
+
         for definition in tcx.iter_local_def_id() {
             let kind = tcx.def_kind(definition);
             if !matches!(
@@ -333,19 +345,24 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
                     proof,
                 }));
             let owner = trace_root(root);
-            let (instance, body) = match root {
-                MonoTraceRoot::Fn(instance) => (instance, self.tcx.instance_mir(instance.def)),
+            let instance_and_body = match root {
+                MonoTraceRoot::Fn(instance) => {
+                    Some((instance, self.tcx.instance_mir(instance.def)))
+                }
                 MonoTraceRoot::Static { def_id, .. } => {
                     let instance = Instance::mono(self.tcx, def_id);
-                    (instance, self.tcx.instance_mir(instance.def))
+                    Some((instance, self.tcx.instance_mir(instance.def)))
                 }
+                MonoTraceRoot::GlobalAsm { .. } => None,
             };
-            let required = self.required_const_edges(
-                RawIdentity::Trace(owner),
-                instance,
-                body,
-                trace_collection(mode),
-            )?;
+            let required = instance_and_body.map_or(Ok(Vec::new()), |(instance, body)| {
+                self.required_const_edges(
+                    RawIdentity::Trace(owner),
+                    instance,
+                    body,
+                    trace_collection(mode),
+                )
+            })?;
             self.validate_associated_const_uses(owner, &required, successors.associated_consts)?;
             for edge in required.iter().copied() {
                 self.insert_required_const(edge)?;
@@ -1029,6 +1046,9 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
         Ok(match self.nonallocation_node(node)?.key {
             MonoKey::Instance { instance, role } => AllocationRootKey::Instance { instance, role },
             MonoKey::Static { definition } => AllocationRootKey::Static(definition),
+            MonoKey::GlobalAsm { .. } => {
+                return Err(MonomorphizationError::IncompleteObservation);
+            }
             MonoKey::VTable {
                 concrete_type,
                 trait_reference,
@@ -1091,8 +1111,20 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
                     Some(DefinitionTarget::Local(local)),
                 )
             }
-            MonoTraceNode::Item(MonoItem::GlobalAsm(_)) => {
-                return Err(MonomorphizationError::IncompleteObservation);
+            MonoTraceNode::Item(MonoItem::GlobalAsm(item_id)) => {
+                let definition = self
+                    .definitions
+                    .definition_id(item_id.owner_id.def_id)
+                    .ok_or(MonomorphizationError::InvalidNode)?;
+                let key = self
+                    .definitions
+                    .identity_key(definition)
+                    .ok_or(MonomorphizationError::InvalidNode)?
+                    .clone();
+                (
+                    MonoKey::GlobalAsm { definition: key },
+                    Some(DefinitionTarget::Local(definition)),
+                )
             }
             MonoTraceNode::VTable {
                 concrete_ty,
@@ -1273,6 +1305,9 @@ fn trace_root(root: MonoTraceRoot<'_>) -> MonoTraceNode<'_> {
     match root {
         MonoTraceRoot::Fn(instance) => MonoTraceNode::Item(MonoItem::Fn(instance)),
         MonoTraceRoot::Static { def_id, .. } => MonoTraceNode::Item(MonoItem::Static(def_id)),
+        MonoTraceRoot::GlobalAsm { item_id, .. } => {
+            MonoTraceNode::Item(MonoItem::GlobalAsm(item_id))
+        }
     }
 }
 
@@ -1314,7 +1349,10 @@ fn trace_item<'tcx>(
             def_id,
             trigger_span: span,
         }),
-        MonoItem::GlobalAsm(_) => Err(MonomorphizationError::IncompleteObservation),
+        MonoItem::GlobalAsm(item_id) => Ok(MonoTraceRoot::GlobalAsm {
+            item_id,
+            trigger_span: span,
+        }),
     }
 }
 

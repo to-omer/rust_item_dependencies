@@ -215,6 +215,7 @@ pub enum DependencyKind {
     AdjustmentType,
     ClosureCaptureType,
     FieldTarget,
+    OpaqueSource,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

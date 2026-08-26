@@ -1,0 +1,290 @@
+From fb6d6ec83054f6fa3dd719b8f9e1a3f4b356cea1 Mon Sep 17 00:00:00 2001
+From: to-omer <48119218+to-omer@users.noreply.github.com>
+Date: Thu, 27 Aug 2026 03:56:01 +0900
+Subject: [PATCH] Expose global assembly monomorphization roots
+
+---
+ compiler/rustc_driver_impl/src/lib.rs        |   2 +-
+ compiler/rustc_middle/src/mono.rs            |   1 +
+ compiler/rustc_middle/src/query/keys.rs      |   1 +
+ compiler/rustc_monomorphize/src/collector.rs | 138 +++++++++++--------
+ tests/ui-fulldeps/typed-mono-successors.rs   |  54 +++++++-
+ 5 files changed, 140 insertions(+), 56 deletions(-)
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 1a7d8add..92cb39ef 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 15;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 16;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_middle/src/mono.rs b/compiler/rustc_middle/src/mono.rs
+index 96dcb732..c62e1336 100644
+--- a/compiler/rustc_middle/src/mono.rs
++++ b/compiler/rustc_middle/src/mono.rs
+@@ -67,6 +67,7 @@ pub enum MonoItem<'tcx> {
+ pub enum MonoTraceRoot<'tcx> {
+     Fn(Instance<'tcx>),
+     Static { def_id: DefId, trigger_span: Span },
++    GlobalAsm { item_id: ItemId, trigger_span: Span },
+ }
+ 
+ /// A node retained by the typed monomorphization observer.
+diff --git a/compiler/rustc_middle/src/query/keys.rs b/compiler/rustc_middle/src/query/keys.rs
+index 8a4f5fe9..df67499d 100644
+--- a/compiler/rustc_middle/src/query/keys.rs
++++ b/compiler/rustc_middle/src/query/keys.rs
+@@ -435,6 +435,7 @@ fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+         match self.0 {
+             MonoTraceRoot::Fn(instance) => instance.default_span(tcx),
+             MonoTraceRoot::Static { trigger_span, .. } => trigger_span,
++            MonoTraceRoot::GlobalAsm { trigger_span, .. } => trigger_span,
+         }
+     }
+ }
+diff --git a/compiler/rustc_monomorphize/src/collector.rs b/compiler/rustc_monomorphize/src/collector.rs
+index e8e042d3..aa45b438 100644
+--- a/compiler/rustc_monomorphize/src/collector.rs
++++ b/compiler/rustc_monomorphize/src/collector.rs
+@@ -739,61 +739,11 @@ fn collect_items_rec<'tcx>(
+             });
+         }
+         MonoItem::GlobalAsm(item_id) => {
+-            assert!(
+-                mode == CollectionMode::UsedItems,
+-                "should never encounter global_asm when collecting mentioned items"
+-            );
+             recursion_depth_reset = None;
+-
+-            let item = tcx.hir_item(item_id);
+-            if let hir::ItemKind::GlobalAsm { asm, .. } = item.kind {
+-                for (op, op_sp) in asm.operands {
+-                    match *op {
+-                        hir::InlineAsmOperand::Const { anon_const } => {
+-                            match tcx.const_eval_poly(anon_const.def_id.to_def_id()) {
+-                                Ok(val) => {
+-                                    collect_const_value(tcx, val, *op_sp, &mut used_items);
+-                                }
+-                                Err(ErrorHandled::TooGeneric(..)) => {
+-                                    span_bug!(*op_sp, "asm const cannot be resolved; too generic")
+-                                }
+-                                Err(ErrorHandled::Reported(..)) => {
+-                                    continue;
+-                                }
+-                            }
+-                        }
+-                        hir::InlineAsmOperand::SymFn { expr } => {
+-                            let fn_ty = tcx.typeck(item_id.owner_id).expr_ty(expr);
+-                            visit_fn_use(
+-                                tcx,
+-                                fn_ty,
+-                                false,
+-                                *op_sp,
+-                                MonoUseCause::InlineAsmSymbol,
+-                                &mut used_items,
+-                            );
+-                        }
+-                        hir::InlineAsmOperand::SymStatic { path: _, def_id } => {
+-                            let instance = Instance::mono(tcx, def_id);
+-                            if tcx.should_codegen_locally(instance) {
+-                                trace!("collecting static {:?}", def_id);
+-                                used_items.push(dummy_spanned(MonoItem::Static(def_id)));
+-                            }
+-                        }
+-                        hir::InlineAsmOperand::In { .. }
+-                        | hir::InlineAsmOperand::Out { .. }
+-                        | hir::InlineAsmOperand::InOut { .. }
+-                        | hir::InlineAsmOperand::SplitInOut { .. }
+-                        | hir::InlineAsmOperand::Label { .. } => {
+-                            span_bug!(*op_sp, "invalid operand type for global_asm!")
+-                        }
+-                    }
+-                }
+-            } else {
+-                span_bug!(item.span, "Mismatch between hir::Item type and MonoItem type")
+-            }
+-
+-            // mention_items stays empty as nothing gets optimized here.
++            let (global_used, global_mentioned) =
++                collect_items_of_global_asm(tcx, item_id, mode, false);
++            used_items.extend(global_used);
++            mentioned_items.extend(global_mentioned);
+         }
+     };
+ 
+@@ -1913,6 +1863,82 @@ fn collect_items_of_static<'tcx>(
+     (used_items, mentioned_items)
+ }
+ 
++fn collect_items_of_global_asm<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    item_id: hir::ItemId,
++    mode: CollectionMode,
++    trace_observations: bool,
++) -> (MonoItems<'tcx>, MonoItems<'tcx>) {
++    assert!(
++        mode == CollectionMode::UsedItems,
++        "should never encounter global_asm when collecting mentioned items"
++    );
++    let root = MonoTraceNode::Item(MonoItem::GlobalAsm(item_id));
++    let mut used_items = if trace_observations {
++        MonoItems::with_trace(root, MonoTraceCollection::Used)
++    } else {
++        MonoItems::new()
++    };
++    let mentioned_items = if trace_observations {
++        MonoItems::with_trace(root, MonoTraceCollection::Mentioned)
++    } else {
++        MonoItems::new()
++    };
++
++    let item = tcx.hir_item(item_id);
++    let hir::ItemKind::GlobalAsm { asm, .. } = item.kind else {
++        span_bug!(item.span, "Mismatch between hir::Item type and MonoItem type")
++    };
++    for (operand, span) in asm.operands {
++        match *operand {
++            hir::InlineAsmOperand::Const { anon_const } => {
++                match tcx.const_eval_poly(anon_const.def_id.to_def_id()) {
++                    Ok(value) => collect_const_value(tcx, value, *span, &mut used_items),
++                    Err(ErrorHandled::TooGeneric(..)) => {
++                        span_bug!(*span, "asm const cannot be resolved; too generic")
++                    }
++                    Err(ErrorHandled::Reported(..)) => continue,
++                }
++            }
++            hir::InlineAsmOperand::SymFn { expr } => {
++                let fn_ty = tcx.typeck(item_id.owner_id).expr_ty(expr);
++                visit_fn_use(
++                    tcx,
++                    fn_ty,
++                    false,
++                    *span,
++                    MonoUseCause::InlineAsmSymbol,
++                    &mut used_items,
++                );
++            }
++            hir::InlineAsmOperand::SymStatic { path: _, def_id } => {
++                let instance = Instance::mono(tcx, def_id);
++                if tcx.should_codegen_locally(instance) {
++                    trace!("collecting static {:?}", def_id);
++                    if trace_observations {
++                        used_items.push_traced(
++                            dummy_spanned(MonoItem::Static(def_id)),
++                            MonoUseCause::InlineAsmSymbol,
++                            source_trace_site(*span),
++                        );
++                    } else {
++                        used_items.push(dummy_spanned(MonoItem::Static(def_id)));
++                    }
++                }
++            }
++            hir::InlineAsmOperand::In { .. }
++            | hir::InlineAsmOperand::Out { .. }
++            | hir::InlineAsmOperand::InOut { .. }
++            | hir::InlineAsmOperand::SplitInOut { .. }
++            | hir::InlineAsmOperand::Label { .. } => {
++                span_bug!(*span, "invalid operand type for global_asm!")
++            }
++        }
++    }
++
++    (used_items, mentioned_items)
++}
++
+ #[instrument(skip(tcx), level = "debug")]
+ fn collect_items_of_instance<'tcx>(
+     tcx: TyCtxt<'tcx>,
+@@ -2068,6 +2094,10 @@ fn mono_successors<'tcx>(
+             )?;
+             (items.0, items.1, associated_consts)
+         }
++        MonoTraceRoot::GlobalAsm { item_id, .. } => {
++            let items = collect_items_of_global_asm(tcx, item_id, mode, true);
++            (items.0, items.1, Vec::new())
++        }
+     };
+ 
+     let (used, mut facts, mut proof_uses) = used_items.into_observation_parts()?;
+diff --git a/tests/ui-fulldeps/typed-mono-successors.rs b/tests/ui-fulldeps/typed-mono-successors.rs
+index 9ef6dfd6..8888f6c0 100644
+--- a/tests/ui-fulldeps/typed-mono-successors.rs
++++ b/tests/ui-fulldeps/typed-mono-successors.rs
+@@ -51,6 +51,13 @@ fn static_dead() {}
+ static KEEP: [fn(); 2] = [static_a, static_b];
+ static DEAD_STATIC: [fn(); 1] = [static_dead];
+ 
++std::arch::global_asm!(
++    "/* {function_symbol} {static_symbol} {constant} */",
++    function_symbol = sym static_a,
++    static_symbol = sym CONST_D,
++    constant = const 7,
++);
++
+ trait Tr {
+     fn a(&self);
+     fn b(&self);
+@@ -520,8 +527,53 @@ fn check_observer<'tcx>(tcx: TyCtxt<'tcx>) {
+             && matches!(fact.to, MonoTraceNode::Item(MonoItem::Fn(instance)) if named_instance(tcx, instance, "static_a"))
+             && matches!(fact.site, MonoTraceSite::Source(_))
+     }));
+-
+     let const_d = local_static(tcx, "CONST_D");
++
++    let global_asm = tcx
++        .hir_free_items()
++        .filter(|item| tcx.def_kind(item.owner_id) == DefKind::GlobalAsm)
++        .collect::<Vec<_>>();
++    let [global_asm] = global_asm.as_slice() else {
++        panic!("expected exactly one global asm item")
++    };
++    let global_asm = *global_asm;
++    let global_asm_item = tcx.hir_item(global_asm);
++    let global_root = MonoTraceRoot::GlobalAsm {
++        item_id: global_asm,
++        trigger_span: global_asm_item.span,
++    };
++    let global_successors = tcx
++        .mono_successors((global_root, CollectionMode::UsedItems))
++        .unwrap();
++    let global_again = tcx
++        .mono_successors((global_root, CollectionMode::UsedItems))
++        .unwrap();
++    assert!(std::ptr::eq(global_successors, global_again));
++    assert!(global_successors.mentioned.is_empty());
++    assert!(global_successors.associated_consts.is_empty());
++    assert_no_dummy_source(global_successors);
++    let global_static = global_successors
++        .used
++        .iter()
++        .find(|item| item.node == MonoItem::Static(const_d))
++        .expect("global asm must retain its structured static operand");
++    assert!(global_static.span.is_dummy());
++    let global_owner = MonoTraceNode::Item(MonoItem::GlobalAsm(global_asm));
++    assert!(global_successors.facts.iter().any(|fact| {
++        fact.collection == MonoTraceCollection::Used
++            && fact.cause == MonoUseCause::InlineAsmSymbol
++            && fact.from == global_owner
++            && matches!(fact.to, MonoTraceNode::Item(MonoItem::Fn(instance)) if named_instance(tcx, instance, "static_a"))
++            && matches!(fact.site, MonoTraceSite::Source(_))
++    }));
++    assert!(global_successors.facts.iter().any(|fact| {
++        fact.collection == MonoTraceCollection::Used
++            && fact.cause == MonoUseCause::InlineAsmSymbol
++            && fact.from == global_owner
++            && fact.to == MonoTraceNode::Item(MonoItem::Static(const_d))
++            && matches!(fact.site, MonoTraceSite::Source(_))
++    }));
++
+     assert!(inline_asm_successors.facts.iter().any(|fact| {
+         fact.collection == MonoTraceCollection::Used
+             && fact.cause == MonoUseCause::InlineAsmSymbol
+-- 
+2.55.0
+

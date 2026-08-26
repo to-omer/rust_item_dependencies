@@ -23,6 +23,13 @@ pub fn make_unused(_input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+pub fn make_assembly(_input: TokenStream) -> TokenStream {
+    "fn generated_assembly() { unsafe { core::arch::asm!(\"\"); } }"
+        .parse()
+        .expect("the generated assembly function must parse")
+}
+
+#[proc_macro]
 pub fn configured_bang(input: TokenStream) -> TokenStream {
     assert!(!contains_identifier(input, "cfg_attr"));
     "fn generated() -> i32 { 1 }"

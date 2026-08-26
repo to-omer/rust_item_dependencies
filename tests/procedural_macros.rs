@@ -223,6 +223,30 @@ mod patched {
     }
 
     #[test]
+    fn proc_macro_generated_assembly_uses_the_same_opaque_source_constraint() {
+        let artifacts = ProcMacroArtifacts::build();
+        let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
+        let source = concat!(
+            "proc_fixture::make_assembly!();\n",
+            "fn unused() {}\n",
+            "fn main() { generated_assembly(); println!(\"ok\"); }\n",
+        );
+
+        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
+        assert_eq!(verified.reduced_source(), source);
+
+        let fixed = analyzer
+            .reduce_and_verify(&input(verified.reduced_source()))
+            .unwrap();
+        assert_eq!(fixed.reduced_source(), source);
+
+        let output = compile_and_run(source, &artifacts, "proc_macro_assembly", false);
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"ok\n");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
     fn generated_and_stacked_proc_macros_keep_their_written_outer_input() {
         let artifacts = ProcMacroArtifacts::build();
         let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();

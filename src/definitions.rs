@@ -1602,6 +1602,24 @@ impl<'tcx> Visitor<'tcx> for HirEdgeCollector<'_, 'tcx> {
         }
     }
 
+    fn visit_inline_asm(&mut self, asm: &'tcx hir::InlineAsm<'tcx>, id: hir::HirId) {
+        let expected_owner = if self.tcx.def_kind(id.owner.def_id) == DefKind::GlobalAsm {
+            id.owner.def_id
+        } else {
+            self.tcx.hir_enclosing_body_owner(id)
+        };
+        if self.current != Some(expected_owner) {
+            self.error = Some(DefinitionError::IncompleteDependency);
+            return;
+        }
+        self.record(
+            CRATE_DEF_ID.to_def_id(),
+            DependencyKind::OpaqueSource,
+            self.tcx.hir_span(id),
+        );
+        intravisit::walk_inline_asm(self, asm, id);
+    }
+
     fn visit_qpath(&mut self, path: &'tcx hir::QPath<'tcx>, id: hir::HirId, span: Span) {
         if let hir::QPath::TypeRelative(qualifier, segment) = path
             && segment.res == Res::Err
@@ -3174,6 +3192,125 @@ mod exact_tests {
                     TargetRef::Local(value),
                     DependencyKind::MacroPath,
                     [nth_marker_range(source, "value!()", 1)],
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn reports_opaque_source_edges_from_the_exact_hir_owner() {
+        let source = concat!(
+            "core::arch::global_asm!(\"\");\n",
+            "fn generic<T>() {\n",
+            "    unsafe { core::arch::asm!(\"\"); }\n",
+            "}\n",
+            "trait Service {\n",
+            "    fn default_method() {\n",
+            "        unsafe { core::arch::asm!(\"\"); }\n",
+            "    }\n",
+            "}\n",
+            "fn closure_owner() {\n",
+            "    let _ = || unsafe { core::arch::asm!(\"\"); };\n",
+            "}\n",
+            "macro_rules! make_global_assembly {\n",
+            "    () => { core::arch::global_asm!(\"\"); };\n",
+            "}\n",
+            "make_global_assembly!();\n",
+            "macro_rules! make_inline_assembly {\n",
+            "    () => {\n",
+            "        fn macro_generated<T>() {\n",
+            "            unsafe { core::arch::asm!(\"\"); }\n",
+            "        }\n",
+            "    };\n",
+            "}\n",
+            "make_inline_assembly!();\n",
+            "fn main() {}\n",
+        );
+        let actual = project_graph(&inspect(source));
+        let root = crate_root(source);
+        let direct_global_invocation = nth_marker_range(source, "core::arch::global_asm!(\"\")", 0);
+        let global_assembly = find_expanded_local(
+            &actual.definitions,
+            DefinitionKind::GlobalAsm,
+            None,
+            direct_global_invocation,
+        );
+        let generic = find_local(
+            &actual.definitions,
+            DefinitionKind::Function,
+            Some("generic"),
+        );
+        let service = find_local(&actual.definitions, DefinitionKind::Trait, Some("Service"));
+        let default_method = child_of(
+            &actual.definitions,
+            DefinitionKind::AssociatedFunction,
+            &service,
+            Some("default_method"),
+        );
+        let closure_owner = find_local(
+            &actual.definitions,
+            DefinitionKind::Function,
+            Some("closure_owner"),
+        );
+        let closure = child_of(
+            &actual.definitions,
+            DefinitionKind::Closure,
+            &closure_owner,
+            None,
+        );
+        let generated_global_invocation = marker_range(source, "make_global_assembly!()");
+        let generated_global_assembly = find_expanded_local(
+            &actual.definitions,
+            DefinitionKind::GlobalAsm,
+            None,
+            generated_global_invocation,
+        );
+        let generated_inline_invocation = marker_range(source, "make_inline_assembly!()");
+        let macro_generated = find_expanded_local(
+            &actual.definitions,
+            DefinitionKind::Function,
+            Some("macro_generated"),
+            generated_inline_invocation,
+        );
+
+        assert_eq!(
+            edges_of_kinds(&actual.edges, &[DependencyKind::OpaqueSource]),
+            BTreeSet::from([
+                edge(
+                    &global_assembly,
+                    TargetRef::Local(root.clone()),
+                    DependencyKind::OpaqueSource,
+                    [direct_global_invocation],
+                ),
+                edge(
+                    &generic,
+                    TargetRef::Local(root.clone()),
+                    DependencyKind::OpaqueSource,
+                    [nth_marker_range(source, "core::arch::asm!(\"\")", 0)],
+                ),
+                edge(
+                    &default_method,
+                    TargetRef::Local(root.clone()),
+                    DependencyKind::OpaqueSource,
+                    [nth_marker_range(source, "core::arch::asm!(\"\")", 1)],
+                ),
+                edge(
+                    &closure,
+                    TargetRef::Local(root.clone()),
+                    DependencyKind::OpaqueSource,
+                    [nth_marker_range(source, "core::arch::asm!(\"\")", 2)],
+                ),
+                edge(
+                    &generated_global_assembly,
+                    TargetRef::Local(root.clone()),
+                    DependencyKind::OpaqueSource,
+                    [generated_global_invocation],
+                ),
+                edge(
+                    &macro_generated,
+                    TargetRef::Local(root),
+                    DependencyKind::OpaqueSource,
+                    [generated_inline_invocation],
                 ),
             ])
         );
@@ -7570,6 +7707,36 @@ mod exact_tests {
         assert!(
             matches.next().is_none(),
             "ambiguous {kind:?} definition at {anchor:?}"
+        );
+        definition
+    }
+
+    fn find_expanded_local(
+        definitions: &BTreeSet<LocalRef>,
+        kind: DefinitionKind,
+        name: Option<&str>,
+        invocation_range: ByteRange,
+    ) -> LocalRef {
+        let mut matches = definitions
+            .iter()
+            .filter(|definition| {
+                definition.kind == kind
+                    && definition.name.as_deref() == name
+                    && matches!(
+                        definition.origin,
+                        OriginRef::Expanded {
+                            invocation_range: actual,
+                            ..
+                        } if actual == invocation_range
+                    )
+            })
+            .cloned();
+        let definition = matches.next().unwrap_or_else(|| {
+            panic!("missing expanded {kind:?} definition named {name:?} at {invocation_range:?}")
+        });
+        assert!(
+            matches.next().is_none(),
+            "ambiguous expanded {kind:?} definition named {name:?} at {invocation_range:?}"
         );
         definition
     }
