@@ -2133,9 +2133,7 @@ fn unsupported_attribute_reason(attribute: &ast::Attribute) -> Option<Unsupporte
         || attribute.has_name(sym::alloc_error_handler)
         || attribute.has_name(sym::crate_name)
         || attribute.has_name(sym::crate_type)
-        || attribute.has_name(sym::no_builtins)
         || attribute.has_name(sym::no_link)
-        || attribute.has_name(sym::windows_subsystem)
     {
         Some(UnsupportedReason::NativeLinkOrCustomRuntime)
     } else {
@@ -2983,14 +2981,9 @@ mod tests {
                 "#![crate_type = \"lib\"]\nfn main() {}\n",
                 "#![crate_type = \"lib\"]",
             ),
-            ("#![no_builtins]\nfn main() {}\n", "#![no_builtins]"),
             (
                 "#[no_link]\nextern crate std;\nfn main() {}\n",
                 "#[no_link]",
-            ),
-            (
-                "#![windows_subsystem = \"windows\"]\nfn main() {}\n",
-                "#![windows_subsystem = \"windows\"]",
             ),
         ] {
             assert_unsupported(
@@ -3235,6 +3228,15 @@ mod tests {
             inspect("#[unsafe(no_mangle)] extern \"C\" fn generic<T>() {}\nfn main() {}\n"),
             Err(InputError::OriginalCompilationFailed(_))
         ));
+        for source in [
+            "#![no_builtins(unexpected)]\nfn main() {}\n",
+            "#![windows_subsystem = \"unexpected\"]\nfn main() {}\n",
+        ] {
+            assert!(matches!(
+                inspect(source),
+                Err(InputError::OriginalCompilationFailed(_))
+            ));
+        }
         assert_eq!(
             inspect("fn helper() {}\n"),
             Err(InputError::UnsupportedInput {
