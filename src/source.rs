@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use rustc_ast as ast;
 use rustc_ast::HasAttrs;
-use rustc_ast::tokenstream::WithTokens;
+use rustc_ast::tokenstream::LazyAttrTokenStream;
 use rustc_ast::visit::{self, AssocCtxt, Visitor};
 #[cfg(rust_item_dependencies_patched)]
 use rustc_data_structures::unord::UnordMap;
@@ -909,6 +909,33 @@ struct PendingTupleLayout {
     elements: Vec<PendingTupleElement>,
 }
 
+#[derive(Clone)]
+struct ConfigurableAttributes {
+    attrs: ast::AttrVec,
+}
+
+impl HasAttrs for ConfigurableAttributes {
+    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = false;
+
+    fn attrs(&self) -> &[ast::Attribute] {
+        &self.attrs
+    }
+
+    fn visit_attrs(&mut self, f: impl FnOnce(&mut ast::AttrVec)) {
+        f(&mut self.attrs);
+    }
+}
+
+impl ast::HasTokens for ConfigurableAttributes {
+    fn tokens(&self) -> Option<&LazyAttrTokenStream> {
+        None
+    }
+
+    fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
+        None
+    }
+}
+
 fn pending_units(units: &[WrittenUnit]) -> (Vec<PendingUnit>, BTreeMap<AtomicGroupId, u32>) {
     let representatives = units.iter().fold(
         BTreeMap::<AtomicGroupId, u32>::new(),
@@ -964,7 +991,9 @@ pub(crate) fn collect_source(
         config_tokens: false,
         lint_node_id: ast::CRATE_NODE_ID,
     }
-    .configure(WithTokens::new(krate.clone()))
+    .configure(ConfigurableAttributes {
+        attrs: krate.attrs.clone(),
+    })
     .is_some();
     let mut collector = UnitCollector::new(
         compiler,
@@ -2036,7 +2065,7 @@ impl<'a> UnitCollector<'a> {
         }
     }
 
-    fn configured<T: ast::HasTokens + Clone>(&self, node: &T) -> Option<T> {
+    fn configured(&self, node: &impl HasAttrs) -> Option<ConfigurableAttributes> {
         if !self.current_active() {
             return None;
         }
@@ -2046,10 +2075,12 @@ impl<'a> UnitCollector<'a> {
             config_tokens: false,
             lint_node_id: ast::CRATE_NODE_ID,
         }
-        .configure(node.clone())
+        .configure(ConfigurableAttributes {
+            attrs: node.attrs().iter().cloned().collect(),
+        })
     }
 
-    fn span_with_attributes<T: ast::HasTokens>(
+    fn span_with_attributes<T: HasAttrs>(
         &self,
         node: &T,
         span: Span,
@@ -2226,7 +2257,7 @@ impl<'a> UnitCollector<'a> {
         layout: InactiveComponentLayout,
         walk: F,
     ) where
-        T: ast::HasTokens + Clone,
+        T: HasAttrs,
         F: FnOnce(&mut Self, &'ast T, CfgComponentObservation),
     {
         let parent_active = self.current_active();
