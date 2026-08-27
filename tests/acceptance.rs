@@ -1287,6 +1287,79 @@ fn main() {
     assert_eq!(reduced_output.stderr, original_output.stderr);
 }
 
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn builtin_derives_are_reduced_by_element_without_changing_compiler_behavior() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = include_str!("fixtures/retention/builtin_derive_reduction.input.rs");
+    let expected = include_str!("fixtures/retention/builtin_derive_reduction.expected.rs");
+    let original_input = input(source, &target);
+
+    let verified = analyzer
+        .reduce_and_verify(&original_input)
+        .expect("stable builtin derives must be reducible by element");
+    assert_verified("builtin derive elements", source, expected, &verified);
+
+    let reduced_input = input(expected, &target);
+    let fixed = analyzer
+        .reduce_and_verify(&reduced_input)
+        .expect("the builtin derive reduction must remain reducible");
+    assert_eq!(fixed.reduced_source(), expected);
+
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(&original_input, &options, "builtin_derives_original");
+    let reduced_output = compile_and_run(&reduced_input, &options, "builtin_derives_reduced");
+    assert!(original_output.status.success());
+    assert_eq!(
+        original_output.stdout,
+        b"Basic(0)\ntrue\n0\nSome(Less)\nSome(Less)\nmatch\n"
+    );
+    assert!(original_output.stderr.is_empty());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn opaque_builtin_derive_boundaries_keep_their_written_source_units() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = include_str!("fixtures/retention/builtin_derive_boundaries.input.rs");
+    let expected = include_str!("fixtures/retention/builtin_derive_boundaries.expected.rs");
+    let original_input = input(source, &target);
+
+    let verified = analyzer
+        .reduce_and_verify(&original_input)
+        .expect("opaque builtin derive inputs must remain reducible");
+    assert_verified("builtin derive boundaries", source, expected, &verified);
+
+    let reduced_input = input(expected, &target);
+    let fixed = analyzer
+        .reduce_and_verify(&reduced_input)
+        .expect("opaque builtin derive inputs must reach a fixed point");
+    assert_eq!(fixed.reduced_source(), expected);
+
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(
+        &original_input,
+        &options,
+        "builtin_derive_boundaries_original",
+    );
+    let reduced_output = compile_and_run(
+        &reduced_input,
+        &options,
+        "builtin_derive_boundaries_reduced",
+    );
+    assert!(original_output.status.success());
+    assert_eq!(original_output.stdout, b"ok\n");
+    assert!(original_output.stderr.is_empty());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
 #[cfg(all(rust_item_dependencies_patched, target_arch = "x86_64"))]
 #[test]
 fn x86_sysroot_sources_are_not_treated_as_user_inputs() {

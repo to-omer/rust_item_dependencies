@@ -57,7 +57,10 @@ use crate::source::{
     ByteRange, OriginalOffsetMap, SourceError, SourceInventory, collect_source, original_span_range,
 };
 #[cfg(rust_item_dependencies_patched)]
-use crate::source::{refine_attribute_macros_from_compiler, refine_macro_rules_from_compiler};
+use crate::source::{
+    refine_attribute_macros_from_compiler, refine_derive_targets_from_compiler,
+    refine_macro_rules_from_compiler,
+};
 use crate::tags::{DefinitionTags, TagError, collect_definition_tags};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1378,6 +1381,16 @@ impl Callbacks for InputCallbacks {
             ) {
                 return self.finish(Err(error.into()));
             }
+            #[cfg(rust_item_dependencies_patched)]
+            if let Err(error) = refine_derive_targets_from_compiler(
+                compiler,
+                tcx,
+                self.inventory
+                    .as_mut()
+                    .expect("source inventory must survive through expansion"),
+            ) {
+                return self.finish(Err(error.into()));
+            }
         }
         #[cfg(rust_item_dependencies_patched)]
         {
@@ -2422,6 +2435,8 @@ mod tests {
     };
     #[cfg(not(rust_item_dependencies_patched))]
     use crate::definitions::DefinitionError;
+    #[cfg(rust_item_dependencies_patched)]
+    use crate::source::DeriveTargetSourceFacts;
     use crate::source::{ByteRange, CfgState, PieceKind, WrittenUnitKind};
 
     const INVENTORY_SOURCE: &str = concat!(
@@ -2566,6 +2581,18 @@ mod tests {
                     Some(range(404, 441)),
                     Active
                 ),
+                (
+                    MacroInvocation,
+                    range(413, 418),
+                    Some(range(404, 426)),
+                    Active
+                ),
+                (
+                    MacroInvocation,
+                    range(420, 424),
+                    Some(range(404, 426)),
+                    Active
+                ),
                 (Item, range(443, 455), Some(range(0, 468)), Active),
             ]
         );
@@ -2580,7 +2607,25 @@ mod tests {
             .iter()
             .find(|unit| unit.full_range == range(404, 426))
             .unwrap();
+        #[cfg(rust_item_dependencies_patched)]
+        assert_ne!(stamp.atomic_group, derive.atomic_group);
+        #[cfg(not(rust_item_dependencies_patched))]
         assert_eq!(stamp.atomic_group, derive.atomic_group);
+        let mut element_groups = Vec::new();
+        for element in [range(413, 418), range(420, 424)] {
+            let element = inventory
+                .units
+                .iter()
+                .find(|unit| unit.full_range == element)
+                .unwrap();
+            #[cfg(rust_item_dependencies_patched)]
+            assert_ne!(derive.atomic_group, element.atomic_group);
+            #[cfg(not(rust_item_dependencies_patched))]
+            assert_eq!(derive.atomic_group, element.atomic_group);
+            element_groups.push(element.atomic_group);
+        }
+        #[cfg(rust_item_dependencies_patched)]
+        assert_ne!(element_groups[0], element_groups[1]);
 
         let pair_groups = inventory
             .units
@@ -2619,6 +2664,8 @@ mod tests {
             (range(87, 98), range(50, 150)),
             (range(124, 133), range(50, 150)),
             (range(404, 405), range(404, 426)),
+            (range(413, 418), range(413, 418)),
+            (range(420, 424), range(420, 424)),
             (range(426, 428), range(404, 441)),
             (range(428, 434), range(404, 441)),
             (range(457, 466), range(0, 468)),
@@ -2635,6 +2682,64 @@ mod tests {
         }
 
         assert_eq!(inventory, inspect(INVENTORY_SOURCE).unwrap());
+    }
+
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn stacked_written_derives_are_refined_independently_on_nested_items() {
+        let source = concat!(
+            "fn main() {\n",
+            "    #[derive()]\n",
+            "    #[derive(Clone, Debug)]\n",
+            "    struct Local;\n",
+            "    let _ = Local.clone();\n",
+            "}\n",
+        );
+        let inventory = inspect(source).unwrap();
+        let target_range = {
+            let start = source.find("#[derive()]").unwrap() as u32;
+            let declaration = "struct Local;";
+            let end = source.find(declaration).unwrap() + declaration.len();
+            ByteRange {
+                start,
+                end: end as u32,
+            }
+        };
+        let target = inventory
+            .units
+            .iter()
+            .find(|unit| unit.full_range == target_range)
+            .expect("the local struct must have one source unit");
+        assert_eq!(target.kind, WrittenUnitKind::NestedItem);
+        let facts = inventory
+            .derive_targets
+            .iter()
+            .find(|facts| facts.target() == target.id)
+            .expect("the local struct must have derive facts");
+        let DeriveTargetSourceFacts::Complete { attributes, .. } = facts else {
+            panic!("directly written stacked derives must be complete");
+        };
+        assert_eq!(
+            attributes
+                .iter()
+                .map(|attribute| attribute.elements.len())
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        let units = std::iter::once(target.id)
+            .chain(attributes.iter().flat_map(|attribute| {
+                std::iter::once(attribute.attribute).chain(attribute.elements.iter().copied())
+            }))
+            .collect::<Vec<_>>();
+        assert_eq!(units.len(), 5);
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| inventory.units[unit.0 as usize].atomic_group)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            units.len()
+        );
     }
 
     #[test]

@@ -633,6 +633,91 @@ fn a_local_type_in_an_entry_signature_preserves_its_downstream_value_semantics()
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn derived_impls_follow_the_same_downstream_selection_contract() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "#[derive(Clone, Debug)]\n",
+        "pub struct DerivedValue(pub u8);\n",
+        "pub fn entry() -> DerivedValue { DerivedValue(7) }\n",
+        "pub fn unrelated() {}\n",
+    );
+    let input = SourceInput::library(source, Edition::Rust2024, target.clone(), "derived_value")
+        .with_entry_point(EntryPoint::new("derived_value::entry"));
+
+    let verified = analyzer
+        .reduce_and_verify(&input)
+        .expect("derive-generated impls on an exposed type must remain available downstream");
+    assert!(
+        verified
+            .reduced_source()
+            .contains("#[derive(Clone, Debug)]")
+    );
+    assert!(
+        verified
+            .reduced_source()
+            .contains("pub struct DerivedValue(pub u8);")
+    );
+    assert!(!verified.reduced_source().contains("unrelated"));
+    assert_fixed_point(&analyzer, &input, verified.reduced_source());
+
+    let private_source = concat!(
+        "#[derive(Clone)]\n",
+        "struct Private;\n",
+        "pub fn entry() { let _ = Private; }\n",
+    );
+    let private_input = SourceInput::library(
+        private_source,
+        Edition::Rust2024,
+        target.clone(),
+        "private_derive",
+    )
+    .with_entry_point(EntryPoint::new("private_derive::entry"));
+    let private_verified = analyzer
+        .reduce_and_verify(&private_input)
+        .expect("an unused derive on a private entry dependency must be removable");
+    assert!(!private_verified.reduced_source().contains("derive"));
+    assert!(
+        private_verified
+            .reduced_source()
+            .contains("struct Private;")
+    );
+    assert_fixed_point(&analyzer, &private_input, private_verified.reduced_source());
+
+    let downstream = concat!(
+        "use derived_value::entry;\n",
+        "fn main() {\n",
+        "    let value = entry();\n",
+        "    println!(\"{:?}:{}\", value.clone(), value.0);\n",
+        "}\n",
+    );
+    let directory = TestDirectory::new("derived-value-downstream");
+    let original = compile_library_and_run_downstream(
+        directory.path(),
+        "original",
+        "derived_value",
+        source,
+        downstream,
+        &target,
+    );
+    let reduced = compile_library_and_run_downstream(
+        directory.path(),
+        "reduced",
+        "derived_value",
+        verified.reduced_source(),
+        downstream,
+        &target,
+    );
+    assert!(original.status.success(), "original run: {original:?}");
+    assert_eq!(original.stdout, b"DerivedValue(7):7\n");
+    assert!(original.stderr.is_empty(), "original run: {original:?}");
+    assert_eq!(reduced.status, original.status);
+    assert_eq!(reduced.stdout, original.stdout);
+    assert_eq!(reduced.stderr, original.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn entry_type_surfaces_and_bounds_preserve_downstream_trait_semantics() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();

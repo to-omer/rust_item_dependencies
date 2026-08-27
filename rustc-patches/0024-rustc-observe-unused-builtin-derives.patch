@@ -1,0 +1,1720 @@
+From 13be3f01f31fc92d20f475aa2a4fe2dbe296441a Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Thu, 27 Aug 2026 21:44:12 +0900
+Subject: [PATCH] rustc: observe unused built-in derive dependencies
+
+---
+ compiler/rustc_builtin_macros/src/derive.rs   |  23 +-
+ .../src/deriving/clone.rs                     |   9 +-
+ .../src/deriving/cmp/partial_ord.rs           |   5 +-
+ compiler/rustc_driver_impl/src/lib.rs         |   2 +-
+ compiler/rustc_expand/src/base.rs             |  14 +-
+ compiler/rustc_expand/src/expand.rs           |  63 ++--
+ compiler/rustc_middle/src/queries.rs          |  13 +-
+ compiler/rustc_middle/src/thir.rs             |   4 +
+ compiler/rustc_middle/src/traits/mod.rs       |   7 +
+ compiler/rustc_middle/src/ty/mod.rs           |  32 ++
+ compiler/rustc_mir_build/src/builder/mod.rs   |   2 +-
+ compiler/rustc_mir_build/src/thir/cx/mod.rs   |  12 +
+ .../src/thir/pattern/const_to_pat.rs          |  40 ++-
+ compiler/rustc_resolve/src/lib.rs             |  81 ++++-
+ compiler/rustc_resolve/src/macros.rs          | 221 ++++++++++--
+ .../rustc_ty_utils/src/structural_match.rs    |  48 ++-
+ .../auxiliary/derive-observer-input.rs        |  57 +++
+ ...l-dependencies-structural-pattern-input.rs |  17 +
+ tests/ui-fulldeps/derive-observer.rs          | 339 ++++++++++++++++++
+ ...ck-impl-dependencies-structural-pattern.rs | 167 +++++++++
+ 20 files changed, 1052 insertions(+), 104 deletions(-)
+ create mode 100644 tests/ui-fulldeps/auxiliary/derive-observer-input.rs
+ create mode 100644 tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-structural-pattern-input.rs
+ create mode 100644 tests/ui-fulldeps/derive-observer.rs
+ create mode 100644 tests/ui-fulldeps/typeck-impl-dependencies-structural-pattern.rs
+
+diff --git a/compiler/rustc_builtin_macros/src/derive.rs b/compiler/rustc_builtin_macros/src/derive.rs
+index da85a8a76..c34004332 100644
+--- a/compiler/rustc_builtin_macros/src/derive.rs
++++ b/compiler/rustc_builtin_macros/src/derive.rs
+@@ -5,6 +5,7 @@
+     Annotatable, DeriveResolution, ExpandResult, ExtCtxt, Indeterminate, MultiItemModifier,
+ };
+ use rustc_session::Session;
++use rustc_span::hygiene::LocalExpnId;
+ use rustc_span::{ErrorGuaranteed, Ident, Span, sym};
+ 
+ use crate::cfg_eval::cfg_eval;
+@@ -49,25 +50,27 @@ fn expand(
+                 let mut resolutions = match &meta_item.kind {
+                     MetaItemKind::List(list) => {
+                         list.iter()
+-                            .filter_map(|meta_item_inner| match meta_item_inner {
+-                                MetaItemInner::MetaItem(meta) => Some(meta),
++                            .enumerate()
++                            .filter_map(|(source_index, meta_item_inner)| match meta_item_inner {
++                                MetaItemInner::MetaItem(meta) => Some((source_index, meta)),
+                                 MetaItemInner::Lit(lit) => {
+                                     // Reject `#[derive("Debug")]`.
+                                     report_unexpected_meta_item_lit(sess, lit);
+                                     None
+                                 }
+                             })
+-                            .map(|meta| {
++                            .map(|(source_index, meta)| {
+                                 // Reject `#[derive(Debug = "value", Debug(abc))]`, but recover the
+                                 // paths.
+                                 report_path_args(sess, meta);
+-                                meta.path.clone()
+-                            })
+-                            .map(|path| DeriveResolution {
+-                                path,
+-                                item: dummy_annotatable(),
+-                                exts: None,
+-                                is_const: self.is_const,
++                                DeriveResolution {
++                                    path: meta.path.clone(),
++                                    item: dummy_annotatable(),
++                                    exts: None,
++                                    is_const: self.is_const,
++                                    child_expansion: LocalExpnId::fresh_empty(),
++                                    source_index,
++                                }
+                             })
+                             .collect()
+                     }
+diff --git a/compiler/rustc_builtin_macros/src/deriving/clone.rs b/compiler/rustc_builtin_macros/src/deriving/clone.rs
+index af3db65bd..881bbd3cb 100644
+--- a/compiler/rustc_builtin_macros/src/deriving/clone.rs
++++ b/compiler/rustc_builtin_macros/src/deriving/clone.rs
+@@ -37,11 +37,10 @@ pub(crate) fn expand_deriving_clone(
+             ItemKind::Struct(_, Generics { params, .. }, _)
+             | ItemKind::Enum(_, Generics { params, .. }, _) => {
+                 let container_id = cx.current_expansion.id.expn_data().parent.expect_local();
+-                let has_derive_copy = cx.resolver.has_derive_copy(container_id);
+-                if has_derive_copy
+-                    && !params
+-                        .iter()
+-                        .any(|param| matches!(param.kind, ast::GenericParamKind::Type { .. }))
++                if !params
++                    .iter()
++                    .any(|param| matches!(param.kind, ast::GenericParamKind::Type { .. }))
++                    && cx.resolver.derive_copy_affects_output(container_id, cx.current_expansion.id)
+                 {
+                     bounds = vec![];
+                     is_simple = true;
+diff --git a/compiler/rustc_builtin_macros/src/deriving/cmp/partial_ord.rs b/compiler/rustc_builtin_macros/src/deriving/cmp/partial_ord.rs
+index d66d14bb8..f96da83d2 100644
+--- a/compiler/rustc_builtin_macros/src/deriving/cmp/partial_ord.rs
++++ b/compiler/rustc_builtin_macros/src/deriving/cmp/partial_ord.rs
+@@ -43,10 +43,9 @@ pub(crate) fn expand_deriving_partial_ord(
+     };
+ 
+     let container_id = cx.current_expansion.id.expn_data().parent.expect_local();
+-    let has_derive_ord = cx.resolver.has_derive_ord(container_id);
+     let is_simple_candidate = |params: &ThinVec<ast::GenericParam>| -> bool {
+-        has_derive_ord
+-            && !params.iter().any(|param| matches!(param.kind, ast::GenericParamKind::Type { .. }))
++        !params.iter().any(|param| matches!(param.kind, ast::GenericParamKind::Type { .. }))
++            && cx.resolver.derive_ord_affects_output(container_id, cx.current_expansion.id)
+     };
+ 
+     let default_substructure = combine_substructure(Box::new(|cx, span, substr| {
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 92cb39ef3..e572445eb 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 16;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 17;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_expand/src/base.rs b/compiler/rustc_expand/src/base.rs
+index dfad80959..2df63adeb 100644
+--- a/compiler/rustc_expand/src/base.rs
++++ b/compiler/rustc_expand/src/base.rs
+@@ -1029,6 +1029,10 @@ pub struct DeriveResolution {
+     // is completed.
+     pub exts: Option<Arc<SyntaxExtension>>,
+     pub is_const: bool,
++    /// Stable child expansion allocated for this source element before resolution retries.
++    pub child_expansion: LocalExpnId,
++    /// Position of this element in the containing `derive` list.
++    pub source_index: usize,
+ }
+ 
+ pub trait ResolverExpand {
+@@ -1070,10 +1074,12 @@ fn record_macro_rule_usage(
+     fn check_unused_macros(&mut self);
+ 
+     // Resolver interfaces for specific built-in macros.
+-    /// Does `#[derive(...)]` attribute with the given `ExpnId` have built-in `Copy` inside it?
+-    fn has_derive_copy(&self, expn_id: LocalExpnId) -> bool;
+-    /// Does `#[derive(...)]` attribute with the given `ExpnId` have built-in `Ord` inside it?
+-    fn has_derive_ord(&self, expn_id: LocalExpnId) -> bool;
++    /// Record that the built-in derive at `dependent` chose output that depends on `Copy` being
++    /// present in the given derive container.
++    fn derive_copy_affects_output(&self, container: LocalExpnId, dependent: LocalExpnId) -> bool;
++    /// Record that the built-in derive at `dependent` chose output that depends on `Ord` being
++    /// present in the given derive container.
++    fn derive_ord_affects_output(&self, container: LocalExpnId, dependent: LocalExpnId) -> bool;
+     /// Resolve paths inside the `#[derive(...)]` attribute with the given `ExpnId`.
+     fn resolve_derives(
+         &mut self,
+diff --git a/compiler/rustc_expand/src/expand.rs b/compiler/rustc_expand/src/expand.rs
+index 29b6bbfa1..ca8a27fe3 100644
+--- a/compiler/rustc_expand/src/expand.rs
++++ b/compiler/rustc_expand/src/expand.rs
+@@ -395,6 +395,7 @@ pub enum InvocationKind {
+         path: ast::Path,
+         is_const: bool,
+         item: Annotatable,
++        source_index: usize,
+     },
+     GlobDelegation {
+         item: Box<ast::AssocItem>,
+@@ -570,25 +571,42 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
+                             derive_invocations.reserve(derives.len());
+                             derives
+                                 .into_iter()
+-                                .map(|DeriveResolution { path, item, exts: _, is_const }| {
+-                                    // FIXME: Consider using the derive resolutions (`_exts`)
+-                                    // instead of enqueuing the derives to be resolved again later.
+-                                    // Note that this can result in duplicate diagnostics.
+-                                    let expn_id = LocalExpnId::fresh_empty();
+-                                    derive_invocations.push((
+-                                        Invocation {
+-                                            kind: InvocationKind::Derive { path, item, is_const },
+-                                            fragment_kind,
+-                                            expansion_data: ExpansionData {
+-                                                id: expn_id,
+-                                                ..self.cx.current_expansion.clone()
++                                .map(
++                                    |DeriveResolution {
++                                         path,
++                                         item,
++                                         exts: _,
++                                         is_const,
++                                         child_expansion,
++                                         source_index,
++                                     }| {
++                                        // FIXME: Consider using the derive resolutions (`_exts`)
++                                        // instead of enqueuing the derives to be resolved again later.
++                                        // Note that this can result in duplicate diagnostics.
++                                        let expn_id = child_expansion;
++                                        derive_invocations.push((
++                                            Invocation {
++                                                kind: InvocationKind::Derive {
++                                                    path,
++                                                    item,
++                                                    is_const,
++                                                    source_index,
++                                                },
++                                                fragment_kind,
++                                                expansion_data: ExpansionData {
++                                                    id: expn_id,
++                                                    ..self.cx.current_expansion.clone()
++                                                },
++                                                discovered_in_expansion: self
++                                                    .cx
++                                                    .current_expansion
++                                                    .id,
+                                             },
+-                                            discovered_in_expansion: self.cx.current_expansion.id,
+-                                        },
+-                                        None,
+-                                    ));
+-                                    NodeId::placeholder_from_expn_id(expn_id)
+-                                })
++                                            None,
++                                        ));
++                                        NodeId::placeholder_from_expn_id(expn_id)
++                                    },
++                                )
+                                 .collect::<Vec<_>>()
+                         })
+                         .unwrap_or_default();
+@@ -935,7 +953,7 @@ fn expand_invoc(
+                     unreachable!();
+                 }
+             }
+-            InvocationKind::Derive { path, item, is_const } => match ext {
++            InvocationKind::Derive { path, item, is_const, source_index } => match ext {
+                 SyntaxExtensionKind::Derive(expander)
+                 | SyntaxExtensionKind::LegacyDerive(expander) => {
+                     // The `MetaItem` representing the trait to derive can't
+@@ -951,7 +969,12 @@ fn expand_invoc(
+                         ExpandResult::Retry(item) => {
+                             // Reassemble the original invocation for retrying.
+                             return ExpandResult::Retry(Invocation {
+-                                kind: InvocationKind::Derive { path: meta.path, item, is_const },
++                                kind: InvocationKind::Derive {
++                                    path: meta.path,
++                                    item,
++                                    is_const,
++                                    source_index,
++                                },
+                                 ..invoc
+                             });
+                         }
+diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
+index d4125c4a5..abaa42100 100644
+--- a/compiler/rustc_middle/src/queries.rs
++++ b/compiler/rustc_middle/src/queries.rs
+@@ -114,8 +114,8 @@
+     CodegenSelectionProof, CodegenSelectionProofError, CodegenVtableMethodWitness,
+     CodegenVtableMethodWitnessError, DynCompatibilityViolation, EvaluationImplDependencies,
+     EvaluationResult, ImplSource, ObligationCause, OverflowError, RpititImplDependencies,
+-    TypeckImplDependenciesError, TypeckImplDependency, WellFormedLoc, WfImplDependencies, solve,
+-    specialization_graph,
++    StructuralEqImplDependencies, TypeckImplDependenciesError, TypeckImplDependency, WellFormedLoc,
++    WfImplDependencies, solve, specialization_graph,
+ };
+ use crate::ty::fast_reject::SimplifiedType;
+ use crate::ty::layout::ValidityRequirement;
+@@ -1767,6 +1767,15 @@
+         }
+     }
+ 
++    query has_structural_eq_impl_with_impl_dependencies(
++        key: (PseudoCanonicalInput<'tcx, Ty<'tcx>>, LocalDefId, Span)
++    ) -> &'tcx StructuralEqImplDependencies<'tcx> {
++        desc {
++            "computing whether `{}` implements `StructuralPartialEq` at a source use",
++            key.0.value
++        }
++    }
++
+     /// A list of types where the ADT requires drop if and only if any of
+     /// those types require drop. If the ADT is known to always need drop
+     /// then `Err(AlwaysRequiresDrop)` is returned.
+diff --git a/compiler/rustc_middle/src/thir.rs b/compiler/rustc_middle/src/thir.rs
+index 8e7d3d0d9..9915e5fb3 100644
+--- a/compiler/rustc_middle/src/thir.rs
++++ b/compiler/rustc_middle/src/thir.rs
+@@ -32,6 +32,7 @@
+ use crate::mir::interpret::AllocId;
+ use crate::mir::{self, AssignOp, BinOp, BorrowKind, FakeReadCause, UnOp};
+ use crate::thir::visit::for_each_immediate_subpat;
++use crate::traits::{TypeckImplDependenciesError, TypeckImplDependency};
+ use crate::ty::adjustment::PointerCoercion;
+ use crate::ty::layout::IntegerExt;
+ use crate::ty::{
+@@ -63,6 +64,8 @@ pub struct $id {}
+         pub struct Thir<'tcx> {
+             pub body_type: BodyTy<'tcx>,
+             pub attributes: FxIndexMap<ExprId, ThinVec<AttributeKind>>,
++            pub typeck_impl_dependencies:
++                Result<Vec<TypeckImplDependency>, TypeckImplDependenciesError>,
+             $(
+                 pub $name: IndexVec<$id, $value>,
+             )*
+@@ -73,6 +76,7 @@ pub fn new(body_type: BodyTy<'tcx>) -> Thir<'tcx> {
+                 Thir {
+                     body_type,
+                     attributes: FxIndexMap::default(),
++                    typeck_impl_dependencies: Ok(Vec::new()),
+                     $(
+                         $name: IndexVec::new(),
+                     )*
+diff --git a/compiler/rustc_middle/src/traits/mod.rs b/compiler/rustc_middle/src/traits/mod.rs
+index 704d9d22c..479271537 100644
+--- a/compiler/rustc_middle/src/traits/mod.rs
++++ b/compiler/rustc_middle/src/traits/mod.rs
+@@ -1237,3 +1237,10 @@ pub struct EvaluationImplDependencies<'tcx> {
+     pub result: Result<EvaluationResult, OverflowError>,
+     pub dependencies: Result<&'tcx [TypeckImplDependency], TypeckImplDependenciesError>,
+ }
++
++/// Structural-equality eligibility and the local impls selected by the same proof.
++#[derive(Copy, Clone, Debug, StableHash)]
++pub struct StructuralEqImplDependencies<'tcx> {
++    pub result: bool,
++    pub dependencies: Result<&'tcx [TypeckImplDependency], TypeckImplDependenciesError>,
++}
+diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
+index b85f57775..55c202ce1 100644
+--- a/compiler/rustc_middle/src/ty/mod.rs
++++ b/compiler/rustc_middle/src/ty/mod.rs
+@@ -196,6 +196,14 @@ pub struct ResolverGlobalCtxt {
+     pub resolved_import_uses: Vec<ResolvedImportUse>,
+     /// Macro invocations after their path and expansion data have been finalized.
+     pub macro_invocation_origins: UnordMap<ExpnId, MacroInvocationOrigin>,
++    /// Built-in derive output choices that depended on another derive element being present.
++    pub derive_output_influences: UnordSet<DeriveOutputInfluence>,
++    /// Final derive-helper resolutions, keyed by the written use and selected provider.
++    pub derive_helper_uses: UnordSet<DeriveHelperUse>,
++    /// Completeness witnesses for every finalized outer `derive` expansion.
++    pub derive_observation_witnesses: UnordMap<ExpnId, DeriveObservationWitness>,
++    /// Whether every finalized derive observation could be attributed to an outer expansion.
++    pub derive_observations_complete: bool,
+     /// Ordered, complete source ranges of the rules in each local `macro_rules!` definition.
+     ///
+     /// The vector index is the rule index reported by `selected_macro_rule`.
+@@ -372,6 +380,8 @@ pub struct MacroInvocationOrigin {
+     pub target_span: Option<Span>,
+     pub fragment_kind: MacroInvocationFragmentKind,
+     pub implementation_kind: MacroImplementationKind,
++    /// Position in the containing `derive` list for a derive child expansion.
++    pub derive_source_index: Option<usize>,
+     /// Exact local declarative macro rule selected by this invocation.
+     ///
+     /// This is `None` for macros other than local `macro_rules!` definitions.
+@@ -380,6 +390,28 @@ pub struct MacroInvocationOrigin {
+     pub resolved_import_uses: Vec<MacroResolvedImportUse>,
+ }
+ 
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, StableHash)]
++pub struct DeriveOutputInfluence {
++    pub target_expansion: ExpnId,
++    pub dependent_expansion: ExpnId,
++    pub provider_expansion: ExpnId,
++}
++
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, StableHash)]
++pub struct DeriveHelperUse {
++    pub target_expansion: ExpnId,
++    pub use_span: Span,
++    pub provider_expansion: Option<ExpnId>,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash)]
++pub struct DeriveObservationWitness {
++    pub complete: bool,
++    pub child_count: usize,
++    pub output_influence_count: usize,
++    pub helper_use_count: usize,
++}
++
+ #[derive(Clone, Copy, Debug, Eq, PartialEq, StableHash)]
+ pub struct MacroRuleSelection {
+     pub definition: LocalDefId,
+diff --git a/compiler/rustc_mir_build/src/builder/mod.rs b/compiler/rustc_mir_build/src/builder/mod.rs
+index ec94e5284..c52f555c8 100644
+--- a/compiler/rustc_mir_build/src/builder/mod.rs
++++ b/compiler/rustc_mir_build/src/builder/mod.rs
+@@ -821,7 +821,7 @@ fn new(
+             var_debug_info: vec![],
+             lint_level_roots_cache: GrowableBitSet::new_empty(),
+             coverage_info: coverageinfo::CoverageInfoBuilder::new_if_enabled(tcx, def),
+-            typeck_impl_dependencies: Ok(Vec::new()),
++            typeck_impl_dependencies: thir.typeck_impl_dependencies.clone(),
+         };
+ 
+         assert_eq!(builder.cfg.start_new_block(), START_BLOCK);
+diff --git a/compiler/rustc_mir_build/src/thir/cx/mod.rs b/compiler/rustc_mir_build/src/thir/cx/mod.rs
+index aad87a99c..51f1b118c 100644
+--- a/compiler/rustc_mir_build/src/thir/cx/mod.rs
++++ b/compiler/rustc_mir_build/src/thir/cx/mod.rs
+@@ -10,6 +10,7 @@
+ use rustc_hir::{self as hir, HirId, find_attr};
+ use rustc_middle::bug;
+ use rustc_middle::thir::*;
++use rustc_middle::traits::{TypeckImplDependenciesError, TypeckImplDependency};
+ use rustc_middle::ty::{self, TyCtxt};
+ 
+ /// Query implementation for [`TyCtxt::thir_body`].
+@@ -67,6 +68,17 @@ pub(crate) struct ThirBuildCx<'tcx> {
+ }
+ 
+ impl<'tcx> ThirBuildCx<'tcx> {
++    pub(super) fn record_typeck_impl_dependencies(
++        &mut self,
++        dependencies: Result<Vec<TypeckImplDependency>, TypeckImplDependenciesError>,
++    ) {
++        match (&mut self.thir.typeck_impl_dependencies, dependencies) {
++            (Ok(all), Ok(observed)) => all.extend(observed),
++            (all, Err(error)) => *all = Err(error),
++            (Err(_), Ok(_)) => {}
++        }
++    }
++
+     fn new(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Self {
+         let typeck_results = tcx.typeck(def);
+         let hir_id = tcx.local_def_id_to_hir_id(def);
+diff --git a/compiler/rustc_mir_build/src/thir/pattern/const_to_pat.rs b/compiler/rustc_mir_build/src/thir/pattern/const_to_pat.rs
+index 0230840ef..49d97bf39 100644
+--- a/compiler/rustc_mir_build/src/thir/pattern/const_to_pat.rs
++++ b/compiler/rustc_mir_build/src/thir/pattern/const_to_pat.rs
+@@ -13,6 +13,7 @@
+ use rustc_middle::mir::interpret::ErrorHandled;
+ use rustc_middle::span_bug;
+ use rustc_middle::thir::{FieldPat, Pat, PatKind};
++use rustc_middle::traits::{TypeckImplDependenciesError, TypeckImplDependency};
+ use rustc_middle::ty::{
+     self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitableExt, TypeVisitor, Unnormalized,
+ };
+@@ -41,7 +42,7 @@ impl<'tcx, 'ptcx> PatCtxt<'tcx, 'ptcx> {
+     /// so we have to carry one ourselves.
+     #[instrument(level = "debug", skip(self), ret)]
+     pub(super) fn const_to_pat(
+-        &self,
++        &mut self,
+         c: ty::Const<'tcx>,
+         ty: Ty<'tcx>,
+         id: hir::HirId,
+@@ -49,11 +50,13 @@ pub(super) fn const_to_pat(
+     ) -> Box<Pat<'tcx>> {
+         let mut convert = ConstToPat::new(self, id, span, c);
+ 
+-        match c.kind() {
++        let pattern = match c.kind() {
+             ty::ConstKind::Alias(_, alias_const) => convert.alias_to_pat(alias_const, ty),
+             ty::ConstKind::Value(value) => convert.valtree_to_pat(value),
+             _ => span_bug!(span, "Invalid `ConstKind` for `const_to_pat`: {:?}", c),
+-        }
++        };
++        self.upper.record_typeck_impl_dependencies(convert.typeck_impl_dependencies);
++        pattern
+     }
+ }
+ 
+@@ -64,16 +67,37 @@ struct ConstToPat<'tcx> {
+     id: hir::HirId,
+ 
+     c: ty::Const<'tcx>,
++    typeck_impl_dependencies: Result<Vec<TypeckImplDependency>, TypeckImplDependenciesError>,
+ }
+ 
+ impl<'tcx> ConstToPat<'tcx> {
+     fn new(pat_ctxt: &PatCtxt<'tcx, '_>, id: hir::HirId, span: Span, c: ty::Const<'tcx>) -> Self {
+         trace!(?pat_ctxt.typeck_results.hir_owner);
+-        ConstToPat { tcx: pat_ctxt.tcx, typing_env: pat_ctxt.typing_env, span, id, c }
++        ConstToPat {
++            tcx: pat_ctxt.tcx,
++            typing_env: pat_ctxt.typing_env,
++            span,
++            id,
++            c,
++            typeck_impl_dependencies: Ok(Vec::new()),
++        }
+     }
+ 
+-    fn type_marked_structural(&self, ty: Ty<'tcx>) -> bool {
+-        ty.is_structural_eq_shallow(self.tcx)
++    fn type_marked_structural(&mut self, ty: Ty<'tcx>) -> bool {
++        let owner = self.tcx.hir_enclosing_body_owner(self.id);
++        let observed = self.tcx.has_structural_eq_impl_with_impl_dependencies((
++            ty::TypingEnv::fully_monomorphized().as_query_input(ty),
++            owner,
++            self.span,
++        ));
++        if observed.result {
++            match (&mut self.typeck_impl_dependencies, observed.dependencies) {
++                (Ok(all), Ok(dependencies)) => all.extend_from_slice(dependencies),
++                (all, Err(error)) => *all = Err(error),
++                (Err(_), Ok(_)) => {}
++            }
++        }
++        observed.result
+     }
+ 
+     /// We errored. Signal that in the pattern, so that follow up errors can be silenced.
+@@ -220,7 +244,7 @@ fn alias_to_pat(&mut self, alias_const: ty::AliasConst<'tcx>, ty: Ty<'tcx>) -> B
+     }
+ 
+     fn lower_field_values_to_fieldpats(
+-        &self,
++        &mut self,
+         values: impl Iterator<Item = ty::Value<'tcx>>,
+     ) -> Vec<FieldPat<'tcx>> {
+         values
+@@ -234,7 +258,7 @@ fn lower_field_values_to_fieldpats(
+ 
+     // Recursive helper for `to_pat`; invoke that (instead of calling this directly).
+     #[instrument(skip(self), level = "debug")]
+-    fn valtree_to_pat(&self, value: ty::Value<'tcx>) -> Box<Pat<'tcx>> {
++    fn valtree_to_pat(&mut self, value: ty::Value<'tcx>) -> Box<Pat<'tcx>> {
+         let span = self.span;
+         let tcx = self.tcx;
+         let ty::Value { ty, valtree } = value;
+diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
+index 5a1fd814b..6ebe7c0a8 100644
+--- a/compiler/rustc_resolve/src/lib.rs
++++ b/compiler/rustc_resolve/src/lib.rs
+@@ -43,7 +43,9 @@
+     self as ast, AngleBracketedArg, CRATE_NODE_ID, Crate, DUMMY_NODE_ID, Expr, ExprKind,
+     GenericArg, GenericArgs, Generics, NodeId, Path, attr,
+ };
+-use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet, default};
++use rustc_data_structures::fx::{
++    FxBuildHasher, FxHashMap, FxHashSet, FxIndexMap, FxIndexSet, default,
++};
+ use rustc_data_structures::intern::Interned;
+ use rustc_data_structures::steal::Steal;
+ use rustc_data_structures::sync::{FreezeReadGuard, FreezeWriteGuard, WorkerLocal};
+@@ -65,10 +67,11 @@
+ use rustc_middle::middle::privacy::EffectiveVisibilities;
+ use rustc_middle::query::Providers;
+ use rustc_middle::ty::{
+-    self, DelegationInfo, ExternPreludePathActivation, ExternalCrateLoad, MacroImportKind,
+-    MacroImportStep, MacroInvocationOrigin, MacroResolvedImportUse, MainDefinition,
+-    PerOwnerResolverData, RegisteredTools, ResolvedImportUse, ResolverAstLowering,
+-    ResolverGlobalCtxt, TyCtxt, TyCtxtFeed, Visibility,
++    self, DelegationInfo, DeriveHelperUse, DeriveObservationWitness, DeriveOutputInfluence,
++    ExternPreludePathActivation, ExternalCrateLoad, MacroImportKind, MacroImportStep,
++    MacroInvocationOrigin, MacroResolvedImportUse, MainDefinition, PerOwnerResolverData,
++    RegisteredTools, ResolvedImportUse, ResolverAstLowering, ResolverGlobalCtxt, TyCtxt,
++    TyCtxtFeed, Visibility,
+ };
+ use rustc_middle::{bug, span_bug};
+ use rustc_session::config::CrateType;
+@@ -1314,11 +1317,17 @@ fn span(&self) -> Span {
+ 
+ struct DeriveData {
+     resolutions: Vec<DeriveResolution>,
+-    helper_attrs: Vec<(usize, IdentKey, Span)>,
+-    // if this list keeps getting extended, we could use `bitflags`,
+-    // something like what [`rustc_type_ir::flags::TypeFlags`] is doing.
+-    has_derive_copy: bool,
+-    has_derive_ord: bool,
++    helper_attrs: Vec<(usize, IdentKey, Span, LocalExpnId)>,
++    copy_providers: Vec<LocalExpnId>,
++    ord_providers: Vec<LocalExpnId>,
++}
++
++#[derive(Default)]
++struct DeriveObservationState {
++    incomplete: bool,
++    child_count: usize,
++    output_influences: FxHashSet<(LocalExpnId, LocalExpnId)>,
++    helper_uses: FxHashSet<(Span, Option<LocalExpnId>)>,
+ }
+ 
+ pub struct ResolverOutputs<'tcx> {
+@@ -1380,6 +1389,30 @@ pub struct Resolver<'ra, 'tcx> {
+     /// Exact source origins for successfully resolved macro invocations.
+     macro_invocation_origins: UnordMap<ExpnId, MacroInvocationOrigin> = Default::default(),
+ 
++    /// Built-in derive output choices that used a provider from the containing derive attributes.
++    derive_output_influences: CmRefCell<Vec<DeriveOutputInfluence>> =
++        CmRefCell::new(Vec::new()),
++
++    /// Final derive-helper uses and the exact provider selected by resolver.
++    derive_helper_uses: UnordSet<DeriveHelperUse> = Default::default(),
++
++    /// Outer derive and provider child expansion for each derive-helper declaration.
++    derive_helper_providers: FxHashMap<Decl<'ra>, (LocalExpnId, LocalExpnId)> =
++        default::fx_hash_map(),
++
++    /// Outer derives selected by each source derive path, including legacy helper resolution.
++    derive_targets_by_path_span: FxHashMap<Span, FxIndexSet<LocalExpnId>> = default::fx_hash_map(),
++
++    /// Ambiguous legacy-helper provider spans whose candidate targets were already marked.
++    incomplete_derive_path_spans: FxHashSet<Span> = default::fx_hash_set(),
++
++    /// Counts finalized derive observations independently from the public fact collections.
++    derive_observation_states: CmRefCell<FxIndexMap<LocalExpnId, DeriveObservationState>> =
++        CmRefCell::new(FxIndexMap::with_hasher(FxBuildHasher)),
++
++    /// Whether every finalized helper use could be attributed to at least one outer derive.
++    derive_observations_complete: bool = true,
++
+     /// Ordered rule spans for every successfully compiled local `macro_rules!` definition.
+     macro_rules_definitions: UnordMap<LocalDefId, Vec<ty::MacroRuleDefinition>> = Default::default(),
+ 
+@@ -1468,6 +1501,7 @@ pub struct Resolver<'ra, 'tcx> {
+             Option<Decl<'ra>>,
+             Option<Span>,
+             Option<LocalExpnId>,
++            Option<Span>,
+         )>,
+     >,
+     multi_segment_macro_resolutions: CmRefCell<
+@@ -1485,8 +1519,8 @@ pub struct Resolver<'ra, 'tcx> {
+     /// `derive(Copy)` marks items they are applied to so they are treated specially later.
+     /// Derive macros cannot modify the item themselves and have to store the markers in the global
+     /// context, so they attach the markers to derive container IDs using this resolver table.
+-    containers_deriving_copy: FxHashSet<LocalExpnId> = default::fx_hash_set(),
+-    containers_deriving_ord: FxHashSet<LocalExpnId> = default::fx_hash_set(),
++    containers_deriving_copy: FxHashMap<LocalExpnId, Vec<LocalExpnId>> = default::fx_hash_map(),
++    containers_deriving_ord: FxHashMap<LocalExpnId, Vec<LocalExpnId>> = default::fx_hash_map(),
+     /// Parent scopes in which the macros were invoked.
+     /// FIXME: `derives` are missing in these parent scopes and need to be taken from elsewhere.
+     invocation_parent_scopes: FxHashMap<LocalExpnId, ParentScope<'ra>> = default::fx_hash_map(),
+@@ -1976,6 +2010,22 @@ fn feed_visibility(&mut self, feed: TyCtxtFeed<'tcx, LocalDefId>, vis: Visibilit
+     }
+ 
+     pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
++        let mut derive_output_influences = UnordSet::default();
++        for influence in self.derive_output_influences.take(&self) {
++            derive_output_influences.insert(influence);
++        }
++        let mut derive_observation_witnesses = UnordMap::default();
++        for (target, state) in self.derive_observation_states.take(&self) {
++            derive_observation_witnesses.insert(
++                target.to_expn_id(),
++                DeriveObservationWitness {
++                    complete: !state.incomplete,
++                    child_count: state.child_count,
++                    output_influence_count: state.output_influences.len(),
++                    helper_use_count: state.helper_uses.len(),
++                },
++            );
++        }
+         let proc_macros = self.proc_macros;
+         let expn_that_defined = self.expn_that_defined;
+         let extern_crate_map = self.extern_crate_map;
+@@ -1984,6 +2034,7 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+         let maybe_unused_trait_imports = self.maybe_unused_trait_imports;
+         let resolved_import_uses = self.resolved_import_uses;
+         let macro_invocation_origins = self.macro_invocation_origins;
++        let derive_helper_uses = self.derive_helper_uses;
+         let macro_rules_definitions = self.macro_rules_definitions;
+         let glob_map = self.glob_map;
+         let main_def = self.main_def;
+@@ -2018,6 +2069,10 @@ pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+             maybe_unused_trait_imports,
+             resolved_import_uses,
+             macro_invocation_origins,
++            derive_output_influences,
++            derive_helper_uses,
++            derive_observation_witnesses,
++            derive_observations_complete: self.derive_observations_complete,
+             macro_rules_definitions,
+             main_def,
+             trait_impls: self.trait_impls,
+@@ -3144,7 +3199,7 @@ pub(crate) fn is_speculative(&self) -> bool {
+     pub(crate) struct CmRefCell<T>(RefCell<T>);
+ 
+     impl<T> CmRefCell<T> {
+-        pub(crate) fn new(value: T) -> CmRefCell<T> {
++        pub(crate) const fn new(value: T) -> CmRefCell<T> {
+             CmRefCell(RefCell::new(value))
+         }
+ 
+diff --git a/compiler/rustc_resolve/src/macros.rs b/compiler/rustc_resolve/src/macros.rs
+index e034e6577..35083674d 100644
+--- a/compiler/rustc_resolve/src/macros.rs
++++ b/compiler/rustc_resolve/src/macros.rs
+@@ -22,8 +22,8 @@
+ use rustc_hir::{Attribute, StabilityLevel};
+ use rustc_middle::middle::stability;
+ use rustc_middle::ty::{
+-    MacroImplementationKind, MacroInvocationFragmentKind, MacroInvocationOrigin,
+-    MacroRuleDefinition, MacroRuleSelection, RegisteredTools, TyCtxt,
++    DeriveHelperUse, DeriveOutputInfluence, MacroImplementationKind, MacroInvocationFragmentKind,
++    MacroInvocationOrigin, MacroRuleDefinition, MacroRuleSelection, RegisteredTools, TyCtxt,
+ };
+ use rustc_session::Session;
+ use rustc_session::diagnostics::feature_err;
+@@ -44,9 +44,9 @@
+ use crate::hygiene::Macros20NormalizedSyntaxContext;
+ use crate::imports::Import;
+ use crate::{
+-    BindingKey, CacheCell, CmResolver, Decl, DeclKind, DeriveData, Determinacy, Finalize, IdentKey,
+-    InvocationParent, ModuleKind, ModuleOrUniformRoot, ParentScope, PathResult, Res,
+-    ResolutionError, Resolver, ScopeSet, Segment, Used,
++    BindingKey, CacheCell, CmResolver, Decl, DeclKind, DeriveData, DeriveObservationState,
++    Determinacy, Finalize, IdentKey, InvocationParent, ModuleKind, ModuleOrUniformRoot,
++    ParentScope, PathResult, Res, ResolutionError, Resolver, ScopeSet, Segment, Used,
+ };
+ 
+ /// Name declaration produced by a `macro_rules` item definition.
+@@ -372,6 +372,10 @@ fn resolve_macro_invocation(
+             }
+             _ => None,
+         };
++        let attr_span = match &invoc.kind {
++            InvocationKind::Attr { attr, .. } => Some(attr.span),
++            _ => None,
++        };
+         let (ext, res) = self.smart_resolve_macro_path(
+             path,
+             kind,
+@@ -384,6 +388,7 @@ fn resolve_macro_invocation(
+             deleg_impl,
+             looks_like_invoc_in_mod_inert_attr,
+             sugg_span,
++            attr_span,
+         )?;
+ 
+         let span = invoc.span();
+@@ -410,6 +415,10 @@ fn resolve_macro_invocation(
+             target_span: invoc.target_span(),
+             fragment_kind: macro_invocation_fragment_kind(invoc.fragment_kind),
+             implementation_kind: macro_implementation_kind(&ext),
++            derive_source_index: match &invoc.kind {
++                InvocationKind::Derive { source_index, .. } => Some(*source_index),
++                _ => None,
++            },
+             selected_macro_rule: None,
+             resolved_import_uses: Vec::new(),
+         };
+@@ -487,12 +496,20 @@ fn check_unused_macros(&mut self) {
+         }
+     }
+ 
+-    fn has_derive_copy(&self, expn_id: LocalExpnId) -> bool {
+-        self.containers_deriving_copy.contains(&expn_id)
++    fn derive_copy_affects_output(&self, container: LocalExpnId, dependent: LocalExpnId) -> bool {
++        self.record_derive_output_influences(
++            container,
++            dependent,
++            self.containers_deriving_copy.get(&container).map(Vec::as_slice),
++        )
+     }
+ 
+-    fn has_derive_ord(&self, expn_id: LocalExpnId) -> bool {
+-        self.containers_deriving_ord.contains(&expn_id)
++    fn derive_ord_affects_output(&self, container: LocalExpnId, dependent: LocalExpnId) -> bool {
++        self.record_derive_output_influences(
++            container,
++            dependent,
++            self.containers_deriving_ord.get(&container).map(Vec::as_slice),
++        )
+     }
+ 
+     fn resolve_derives(
+@@ -513,11 +530,11 @@ fn resolve_derives(
+         let entry = derive_data.entry(expn_id).or_insert_with(|| DeriveData {
+             resolutions: derive_paths(),
+             helper_attrs: Vec::new(),
+-            has_derive_copy: false,
+-            has_derive_ord: false,
++            copy_providers: Vec::new(),
++            ord_providers: Vec::new(),
+         });
+         let parent_scope = self.invocation_parent_scopes[&expn_id];
+-        for (i, resolution) in entry.resolutions.iter_mut().enumerate() {
++        for resolution in &mut entry.resolutions {
+             if resolution.exts.is_none() {
+                 resolution.exts = Some(Arc::clone(
+                     match self.cm().resolve_derive_macro_path(
+@@ -530,14 +547,21 @@ fn resolve_derives(
+                             if !ext.helper_attrs.is_empty() {
+                                 let span = resolution.path.segments.last().unwrap().ident.span;
+                                 let ctxt = Macros20NormalizedSyntaxContext::new(span.ctxt());
+-                                entry.helper_attrs.extend(
+-                                    ext.helper_attrs
+-                                        .iter()
+-                                        .map(|&name| (i, IdentKey { name, ctxt }, span)),
+-                                );
++                                entry.helper_attrs.extend(ext.helper_attrs.iter().map(|&name| {
++                                    (
++                                        resolution.source_index,
++                                        IdentKey { name, ctxt },
++                                        span,
++                                        resolution.child_expansion,
++                                    )
++                                }));
++                            }
++                            if ext.builtin_name == Some(sym::Copy) {
++                                entry.copy_providers.push(resolution.child_expansion);
++                            }
++                            if ext.builtin_name == Some(sym::Ord) {
++                                entry.ord_providers.push(resolution.child_expansion);
+                             }
+-                            entry.has_derive_copy |= ext.builtin_name == Some(sym::Copy);
+-                            entry.has_derive_ord |= ext.builtin_name == Some(sym::Ord);
+                             ext
+                         }
+                         Ok(_) | Err(Determinacy::Determined) => self.dummy_ext(MacroKind::Derive),
+@@ -550,17 +574,33 @@ fn resolve_derives(
+                 ));
+             }
+         }
++        {
++            let child_count = entry.resolutions.len();
++            let mut observations = self.derive_observation_states.borrow_mut(self);
++            if let Some(previous) = observations.get(&expn_id).map(|state| state.child_count) {
++                if previous != child_count {
++                    self.dcx().bug("a derive child inventory changed after it was finalized");
++                }
++            } else {
++                observations
++                    .insert(expn_id, DeriveObservationState { child_count, ..Default::default() });
++            }
++        }
++        for resolution in &entry.resolutions {
++            let targets = self.derive_targets_by_path_span.entry(resolution.path.span).or_default();
++            targets.insert(expn_id);
++        }
+         // Sort helpers in a stable way independent from the derive resolution order.
+-        entry.helper_attrs.sort_by_key(|(i, ..)| *i);
+-        let helper_attrs = entry
+-            .helper_attrs
+-            .iter()
+-            .map(|&(_, ident, orig_ident_span)| {
+-                let res = Res::NonMacroAttr(NonMacroAttrKind::DeriveHelper);
+-                let decl = self.arenas.new_pub_def_decl(res, orig_ident_span, expn_id);
+-                (ident, orig_ident_span, decl)
+-            })
+-            .collect();
++        entry.helper_attrs.sort_by_key(|(source_index, ..)| *source_index);
++        let mut helper_attrs = Vec::with_capacity(entry.helper_attrs.len());
++        for &(_, ident, orig_ident_span, provider) in &entry.helper_attrs {
++            let res = Res::NonMacroAttr(NonMacroAttrKind::DeriveHelper);
++            let decl = self.arenas.new_pub_def_decl(res, orig_ident_span, expn_id);
++            if self.derive_helper_providers.insert(decl, (expn_id, provider)).is_some() {
++                self.dcx().bug("a derive-helper declaration must have exactly one provider");
++            }
++            helper_attrs.push((ident, orig_ident_span, decl));
++        }
+         self.helper_attrs.insert(expn_id, helper_attrs);
+         // Mark this derive as having `Copy` either if it has `Copy` itself or if its parent derive
+         // has `Copy`, to support `#[derive(Copy, Clone)]`, `#[derive(Clone, Copy)]`, or
+@@ -569,15 +609,33 @@ fn resolve_derives(
+         //
+         // FIXME(#124794): unfortunately this doesn't work with `#[derive(Clone)] #[derive(Copy)]`.
+         // When the `Clone` impl is generated the `#[derive(Copy)]` hasn't been processed and
+-        // `has_derive_copy` hasn't been set yet.
+-        if entry.has_derive_copy || self.has_derive_copy(parent_scope.expansion) {
+-            self.containers_deriving_copy.insert(expn_id);
++        // its provider expansion hasn't been recorded yet.
++        let mut copy_providers = entry.copy_providers.clone();
++        if let Some(inherited) = self.containers_deriving_copy.get(&parent_scope.expansion) {
++            copy_providers.extend(
++                inherited
++                    .iter()
++                    .copied()
++                    .filter(|provider| !entry.copy_providers.contains(provider)),
++            );
++        }
++        if !copy_providers.is_empty() {
++            self.containers_deriving_copy.insert(expn_id, copy_providers);
+         }
+         // Similar to the above `Copy` and `Clone` case, the code generated for
+         // `derive(PartialOrd)` changes if `derive(Ord)` is also present.
+         // FIXME(makai410): this also doesn't work with `#[derive(PartialOrd)] #[derive(Ord)]`.
+-        if entry.has_derive_ord || self.has_derive_ord(parent_scope.expansion) {
+-            self.containers_deriving_ord.insert(expn_id);
++        let mut ord_providers = entry.ord_providers.clone();
++        if let Some(inherited) = self.containers_deriving_ord.get(&parent_scope.expansion) {
++            ord_providers.extend(
++                inherited
++                    .iter()
++                    .copied()
++                    .filter(|provider| !entry.ord_providers.contains(provider)),
++            );
++        }
++        if !ord_providers.is_empty() {
++            self.containers_deriving_ord.insert(expn_id, ord_providers);
+         }
+         assert!(self.derive_data.is_empty());
+         self.derive_data = derive_data;
+@@ -684,6 +742,55 @@ fn insert_impl_trait_name(&mut self, id: NodeId, name: Symbol) {
+ }
+ 
+ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
++    fn record_derive_output_influences(
++        &self,
++        target: LocalExpnId,
++        dependent: LocalExpnId,
++        providers: Option<&[LocalExpnId]>,
++    ) -> bool {
++        let Some(providers) = providers else { return false };
++        let mut influences = self.derive_output_influences.borrow_mut(self);
++        let mut observations = self.derive_observation_states.borrow_mut(self);
++        let Some(observation) = observations.get_mut(&target) else {
++            self.dcx().bug("a finalized derive output must have an observation state");
++        };
++        for &provider in providers {
++            influences.push(DeriveOutputInfluence {
++                target_expansion: target.to_expn_id(),
++                dependent_expansion: dependent.to_expn_id(),
++                provider_expansion: provider.to_expn_id(),
++            });
++            observation.output_influences.insert((dependent, provider));
++        }
++        true
++    }
++
++    fn mark_derive_observation_incomplete(&mut self, target: LocalExpnId) {
++        let mut observations = self.derive_observation_states.borrow_mut(self);
++        let Some(observation) = observations.get_mut(&target) else {
++            self.dcx().bug("an ambiguous derive-helper use must have an observation state");
++        };
++        observation.incomplete = true;
++    }
++
++    fn record_derive_helper_use(
++        &mut self,
++        target: LocalExpnId,
++        use_span: Span,
++        provider: Option<LocalExpnId>,
++    ) {
++        self.derive_helper_uses.insert(DeriveHelperUse {
++            target_expansion: target.to_expn_id(),
++            use_span,
++            provider_expansion: provider.map(LocalExpnId::to_expn_id),
++        });
++        let mut observations = self.derive_observation_states.borrow_mut(self);
++        let Some(observation) = observations.get_mut(&target) else {
++            self.dcx().bug("a resolved derive-helper use must have an observation state");
++        };
++        observation.helper_uses.insert((use_span, provider));
++    }
++
+     pub(crate) fn record_macro_rules_definition(
+         &mut self,
+         node_id: NodeId,
+@@ -725,6 +832,7 @@ fn smart_resolve_macro_path(
+         deleg_impl: Option<(LocalDefId, Span)>,
+         invoc_in_mod_inert_attr: Option<LocalDefId>,
+         suggestion_span: Option<Span>,
++        attr_span: Option<Span>,
+     ) -> Result<(&'ra Arc<SyntaxExtension>, Res), Indeterminate> {
+         let (ext, res) = match self.cm_mut().resolve_macro_or_delegation_path(
+             path,
+@@ -736,6 +844,7 @@ fn smart_resolve_macro_path(
+             macro_invocation,
+             None,
+             suggestion_span,
++            attr_span,
+         ) {
+             Ok((Some(ext), res)) => (ext, res),
+             Ok((None, res)) => (self.dummy_ext(kind), res),
+@@ -876,6 +985,7 @@ pub(crate) fn resolve_derive_macro_path<'r>(
+             None,
+             ignore_import,
+             None,
++            None,
+         )
+     }
+ 
+@@ -890,6 +1000,7 @@ fn resolve_macro_or_delegation_path<'r>(
+         macro_invocation: Option<LocalExpnId>,
+         ignore_import: Option<Import<'ra>>,
+         suggestion_span: Option<Span>,
++        attr_span: Option<Span>,
+     ) -> Result<(Option<&'ra Arc<SyntaxExtension>>, Res), Determinacy> {
+         let path_span = ast_path.span;
+         let mut path = Segment::from_path(ast_path);
+@@ -958,6 +1069,7 @@ fn resolve_macro_or_delegation_path<'r>(
+                 binding.ok(),
+                 suggestion_span,
+                 macro_invocation,
++                attr_span,
+             ));
+ 
+             let res = binding.map(|binding| binding.res());
+@@ -1131,7 +1243,7 @@ pub(crate) fn finalize_macro_resolutions(&mut self, krate: &Crate) {
+         }
+ 
+         let macro_resolutions = self.single_segment_macro_resolutions.take(self);
+-        for (ident, kind, parent_scope, initial_binding, sugg_span, macro_invocation) in
++        for (ident, kind, parent_scope, initial_binding, sugg_span, macro_invocation, attr_span) in
+             macro_resolutions
+         {
+             match self.cm_mut().resolve_ident_in_scope_set(
+@@ -1151,6 +1263,45 @@ pub(crate) fn finalize_macro_resolutions(&mut self, krate: &Crate) {
+                         initial_binding.res()
+                     });
+                     let res = binding.res();
++                    if matches!(
++                        res,
++                        Res::NonMacroAttr(
++                            NonMacroAttrKind::DeriveHelper | NonMacroAttrKind::DeriveHelperCompat
++                        )
++                    ) {
++                        let Some(use_span) = attr_span else {
++                            self.dcx().bug("a resolved derive-helper use must be an attribute");
++                        };
++                        if let Some((target, provider)) =
++                            self.derive_helper_providers.get(&binding).copied()
++                        {
++                            self.record_derive_helper_use(target, use_span, Some(provider));
++                        } else {
++                            let candidate_count = self
++                                .derive_targets_by_path_span
++                                .get(&binding.span)
++                                .map_or(0, |targets| targets.len());
++                            match candidate_count {
++                                0 => self.derive_observations_complete = false,
++                                1 => {
++                                    let target = *self.derive_targets_by_path_span[&binding.span]
++                                        .first()
++                                        .unwrap();
++                                    self.record_derive_helper_use(target, use_span, None);
++                                }
++                                _ if self.incomplete_derive_path_spans.insert(binding.span) => {
++                                    let targets = self.derive_targets_by_path_span[&binding.span]
++                                        .iter()
++                                        .copied()
++                                        .collect::<Vec<_>>();
++                                    for target in targets {
++                                        self.mark_derive_observation_incomplete(target);
++                                    }
++                                }
++                                _ => {}
++                            }
++                        }
++                    }
+                     let seg = Segment::from_ident(ident);
+                     check_consistency(self, &[seg], ident.span, kind, initial_res, res);
+                     if res == Res::NonMacroAttr(NonMacroAttrKind::DeriveHelperCompat) {
+diff --git a/compiler/rustc_ty_utils/src/structural_match.rs b/compiler/rustc_ty_utils/src/structural_match.rs
+index 85d13cfda..07054ddaa 100644
+--- a/compiler/rustc_ty_utils/src/structural_match.rs
++++ b/compiler/rustc_ty_utils/src/structural_match.rs
+@@ -1,8 +1,15 @@
+ use rustc_hir::attrs::lang_items::LangItem;
+ use rustc_infer::infer::TyCtxtInferExt;
+ use rustc_middle::query::Providers;
+-use rustc_middle::ty::{self, Ty, TyCtxt, TypingMode};
+-use rustc_trait_selection::traits::{ObligationCause, ObligationCtxt};
++use rustc_middle::traits::{
++    StructuralEqImplDependencies, TypeckImplDependenciesError, TypeckImplDependency,
++};
++use rustc_middle::ty::{self, PseudoCanonicalInput, Ty, TyCtxt, TypingMode};
++use rustc_span::Span;
++use rustc_span::def_id::LocalDefId;
++use rustc_trait_selection::traits::{
++    ObligationCause, ObligationCtxt, TypeckImplDependencyRecorder,
++};
+ 
+ /// This method returns true if and only if `adt_ty` itself has been marked as
+ /// eligible for structural-match: namely, if it implements
+@@ -31,6 +38,43 @@ fn has_structural_eq_impl<'tcx>(tcx: TyCtxt<'tcx>, adt_ty: Ty<'tcx>) -> bool {
+     ocx.evaluate_obligations_error_on_ambiguity().no_errors()
+ }
+ 
++fn has_structural_eq_impl_with_impl_dependencies<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    (input, owner, span): (PseudoCanonicalInput<'tcx, Ty<'tcx>>, LocalDefId, Span),
++) -> &'tcx StructuralEqImplDependencies<'tcx> {
++    debug_assert_eq!(input.typing_env, ty::TypingEnv::fully_monomorphized());
++    let adt_ty = input.value;
++    let infcx = &tcx.infer_ctxt().build(TypingMode::non_body_analysis());
++    let cause = ObligationCause::misc(span, owner);
++    let recorder = TypeckImplDependencyRecorder::shared();
++    let ocx = ObligationCtxt::new_with_typeck_impl_dependencies(infcx, recorder.clone());
++    let structural_peq_def_id = tcx.require_lang_item(LangItem::StructuralPeq, span);
++    ocx.register_bound(cause, ty::ParamEnv::empty(), adt_ty, structural_peq_def_id);
++
++    let result = ocx.evaluate_obligations_error_on_ambiguity().no_errors();
++    let dependencies = if result {
++        recorder
++            .borrow()
++            .finish(infcx)
++            .map(|mut dependencies| {
++                dependencies.sort_by_key(|dependency| {
++                    (
++                        tcx.def_path_hash(dependency.impl_def_id.to_def_id()),
++                        dependency.associated_item.map(|item| tcx.def_path_hash(item)),
++                    )
++                });
++                dependencies.dedup();
++                tcx.arena.alloc_from_iter(dependencies) as &[TypeckImplDependency]
++            })
++            .map_err(|()| TypeckImplDependenciesError::IncompleteObservation)
++    } else {
++        Ok(&[] as &[TypeckImplDependency])
++    };
++    tcx.arena.alloc(StructuralEqImplDependencies { result, dependencies })
++}
++
+ pub(crate) fn provide(providers: &mut Providers) {
+     providers.has_structural_eq_impl = has_structural_eq_impl;
++    providers.has_structural_eq_impl_with_impl_dependencies =
++        has_structural_eq_impl_with_impl_dependencies;
+ }
+diff --git a/tests/ui-fulldeps/auxiliary/derive-observer-input.rs b/tests/ui-fulldeps/auxiliary/derive-observer-input.rs
+new file mode 100644
+index 000000000..67a5cb2c0
+--- /dev/null
++++ b/tests/ui-fulldeps/auxiliary/derive-observer-input.rs
+@@ -0,0 +1,57 @@
++#![allow(dead_code)]
++
++#[derive()]
++struct Empty;
++
++#[derive(Copy, Clone)]
++struct CopyClone(u8);
++
++#[derive(Clone, Copy)]
++struct CloneCopy(u8);
++
++#[derive(Copy)]
++#[derive(Clone)]
++struct CopyThenClone(u8);
++
++#[derive(Clone)]
++#[derive(Copy)]
++struct CloneThenCopy(u8);
++
++#[derive(Copy, Clone)]
++struct GenericCopy<T>(T);
++
++#[derive(Eq, PartialEq, Ord, PartialOrd)]
++struct OrdPartialOrd(u8);
++
++#[derive(Eq, PartialEq, PartialOrd, Ord)]
++struct PartialOrdOrd(u8);
++
++#[derive(Eq, PartialEq, Ord)]
++#[derive(PartialOrd)]
++struct OrdThenPartialOrd(u8);
++
++#[derive(Eq, PartialEq, PartialOrd)]
++#[derive(Ord)]
++struct PartialOrdThenOrd(u8);
++
++#[derive(Eq, PartialEq, Ord, PartialOrd)]
++struct Unit;
++
++#[derive(Eq, PartialEq, Ord, PartialOrd)]
++struct GenericOrd<T>(T);
++
++#[derive(Default)]
++enum FirstDefault {
++    #[default]
++    First,
++    Second,
++}
++
++#[derive(Default)]
++enum SecondDefault {
++    First,
++    #[default]
++    Second,
++}
++
++fn main() {}
+diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-structural-pattern-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-structural-pattern-input.rs
+new file mode 100644
+index 000000000..591612a29
+--- /dev/null
++++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-structural-pattern-input.rs
+@@ -0,0 +1,17 @@
++#![allow(dead_code)]
++
++#[derive(PartialEq, Eq)]
++struct Inner(u8);
++
++#[derive(PartialEq, Eq)]
++struct Wrapper<T>(T);
++
++struct NonStructural;
++
++const EXPECTED: Wrapper<Inner> = Wrapper(Inner(7));
++
++fn structural_pattern(value: Wrapper<Inner>) -> bool {
++    matches!(value, EXPECTED)
++}
++
++fn main() {}
+diff --git a/tests/ui-fulldeps/derive-observer.rs b/tests/ui-fulldeps/derive-observer.rs
+new file mode 100644
+index 000000000..d7d792a3e
+--- /dev/null
++++ b/tests/ui-fulldeps/derive-observer.rs
+@@ -0,0 +1,339 @@
++//@ edition: 2024
++//@ run-pass
++//@ run-flags: --sysroot {{sysroot-base}} --edition=2024 {{src-base}}/auxiliary/derive-observer-input.rs
++//@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
++//@ ignore-cross-compile
++//@ ignore-remote
++
++#![feature(rustc_private)]
++
++extern crate rustc_driver;
++extern crate rustc_hir;
++extern crate rustc_interface;
++extern crate rustc_middle;
++extern crate rustc_span;
++
++use std::cell::RefCell;
++use std::collections::{HashMap, HashSet};
++use std::process::ExitCode;
++
++use rustc_driver::Compilation;
++use rustc_hir::ItemKind;
++use rustc_interface::interface::Compiler;
++use rustc_middle::ty::{DeriveObservationWitness, MacroImplementationKind, TyCtxt};
++use rustc_span::hygiene::{ExpnId, ExpnKind, MacroKind};
++use rustc_span::Span;
++
++fn main() -> ExitCode {
++    rustc_driver::catch_with_exit_code(move || {
++        let args: Vec<_> = std::env::args().collect();
++        rustc_driver::run_compiler(&args, &mut Callbacks);
++    })
++}
++
++struct Callbacks;
++
++impl rustc_driver::Callbacks for Callbacks {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++        let resolutions = tcx.resolutions(());
++        assert!(resolutions.derive_observations_complete);
++
++        let derive_origins = RefCell::new(HashMap::new());
++        assert!(resolutions
++            .macro_invocation_origins
++            .items()
++            .filter(|(expansion, _)| {
++                matches!(
++                    expansion.expn_data().kind,
++                    ExpnKind::Macro(MacroKind::Derive, _)
++                )
++            })
++            .all(|(&expansion, origin)| {
++                derive_origins.borrow_mut().insert(expansion, origin);
++                true
++            }));
++        let derive_origins = derive_origins.into_inner();
++        assert_eq!(derive_origins.len(), 36);
++        assert!(derive_origins.values().all(|origin| {
++            origin.implementation_kind == MacroImplementationKind::Builtin
++                && origin.derive_source_index.is_some()
++        }));
++        assert!(resolutions
++            .macro_invocation_origins
++            .items()
++            .filter(|(expansion, _)| {
++                !matches!(
++                    expansion.expn_data().kind,
++                    ExpnKind::Macro(MacroKind::Derive, _)
++                )
++            })
++            .all(|(_, origin)| origin.derive_source_index.is_none()));
++
++        let mut children = HashMap::<ExpnId, Vec<(usize, ExpnId)>>::new();
++        for (&expansion, origin) in &derive_origins {
++            children.entry(origin.discovered_in_expansion).or_default().push((
++                origin.derive_source_index.unwrap(),
++                expansion,
++            ));
++        }
++        assert_eq!(children.len(), 17);
++        for children in children.values_mut() {
++            children.sort_by_key(|(source_index, _)| *source_index);
++            assert_eq!(
++                children.iter().map(|(source_index, _)| *source_index).collect::<Vec<_>>(),
++                (0..children.len()).collect::<Vec<_>>()
++            );
++            assert_eq!(
++                children.iter().map(|(_, expansion)| *expansion).collect::<HashSet<_>>().len(),
++                children.len()
++            );
++        }
++
++        let witnesses = RefCell::new(HashMap::new());
++        assert!(resolutions
++            .derive_observation_witnesses
++            .items()
++            .all(|(&target, &witness)| {
++                witnesses.borrow_mut().insert(target, witness);
++                true
++            }));
++        let witnesses = witnesses.into_inner();
++        assert_eq!(witnesses.len(), 18);
++        assert!(witnesses.values().all(|witness| witness.complete));
++        for target in witnesses.keys() {
++            let origin = &resolutions.macro_invocation_origins[target];
++            assert!(matches!(
++                target.expn_data().kind,
++                ExpnKind::Macro(MacroKind::Attr, name) if name.as_str() == "derive"
++            ));
++            assert_eq!(origin.derive_source_index, None);
++        }
++        let outer_targets = RefCell::new(Vec::new());
++        assert!(resolutions
++            .macro_invocation_origins
++            .items()
++            .filter(|(expansion, _)| {
++                matches!(
++                    expansion.expn_data().kind,
++                    ExpnKind::Macro(MacroKind::Attr, name) if name.as_str() == "derive"
++                )
++            })
++            .all(|(&target, _)| {
++                outer_targets.borrow_mut().push(target);
++                true
++        }));
++        let outer_targets = outer_targets.into_inner();
++        assert_eq!(outer_targets.len(), 18);
++        let empty_target = outer_targets
++            .iter()
++            .copied()
++            .find(|target| {
++                resolutions.macro_invocation_origins[target]
++                    .target_span
++                    .is_some_and(|span| snippet(tcx, span).contains("struct Empty"))
++            })
++            .expect("the empty derive target must have an observation witness");
++        let empty_witness = witnesses[&empty_target];
++        assert!(empty_witness.complete);
++        assert_eq!(empty_witness.child_count, 0);
++        assert_eq!(empty_witness.output_influence_count, 0);
++        assert_eq!(empty_witness.helper_use_count, 0);
++        let child_targets = derive_origins
++            .values()
++            .map(|origin| origin.discovered_in_expansion)
++            .collect::<Vec<_>>();
++        let influence_targets = RefCell::new(Vec::new());
++        assert!(resolutions.derive_output_influences.items().all(|influence| {
++            influence_targets.borrow_mut().push(influence.target_expansion);
++            true
++        }));
++        let influence_targets = influence_targets.into_inner();
++        let helper_targets = RefCell::new(Vec::new());
++        assert!(resolutions.derive_helper_uses.items().all(|helper| {
++            helper_targets.borrow_mut().push(helper.target_expansion);
++            true
++        }));
++        let helper_targets = helper_targets.into_inner();
++        assert!(observations_complete(
++            resolutions.derive_observations_complete,
++            &witnesses,
++            &outer_targets,
++            &child_targets,
++            &influence_targets,
++            &helper_targets
++        ));
++        let mut incomplete_witnesses = witnesses.clone();
++        let missing_witness = *incomplete_witnesses.keys().next().unwrap();
++        incomplete_witnesses.remove(&missing_witness);
++        assert!(!observations_complete(
++            resolutions.derive_observations_complete,
++            &incomplete_witnesses,
++            &outer_targets,
++            &child_targets,
++            &influence_targets,
++            &helper_targets
++        ));
++        let mut incomplete_witnesses = witnesses.clone();
++        incomplete_witnesses.values_mut().next().unwrap().complete = false;
++        assert!(!observations_complete(
++            resolutions.derive_observations_complete,
++            &incomplete_witnesses,
++            &outer_targets,
++            &child_targets,
++            &influence_targets,
++            &helper_targets
++        ));
++        for (missing_children, missing_influences, missing_helpers) in [
++            (&child_targets[1..], influence_targets.as_slice(), helper_targets.as_slice()),
++            (child_targets.as_slice(), &influence_targets[1..], helper_targets.as_slice()),
++            (child_targets.as_slice(), influence_targets.as_slice(), &helper_targets[1..]),
++        ] {
++            assert!(!observations_complete(
++                resolutions.derive_observations_complete,
++                &witnesses,
++                &outer_targets,
++                missing_children,
++                missing_influences,
++                missing_helpers
++            ));
++        }
++        assert!(!observations_complete(
++            false,
++            &witnesses,
++            &outer_targets,
++            &child_targets,
++            &influence_targets,
++            &helper_targets
++        ));
++
++        let expected_influences = HashSet::from([
++            ("CopyClone", "Clone", "Copy"),
++            ("CloneCopy", "Clone", "Copy"),
++            ("CopyThenClone", "Clone", "Copy"),
++            ("OrdPartialOrd", "PartialOrd", "Ord"),
++            ("PartialOrdOrd", "PartialOrd", "Ord"),
++            ("OrdThenPartialOrd", "PartialOrd", "Ord"),
++        ]);
++        assert_eq!(resolutions.derive_output_influences.len(), expected_influences.len());
++        assert!(resolutions.derive_output_influences.items().all(|influence| {
++                let dependent = derive_origins[&influence.dependent_expansion];
++                let provider = derive_origins[&influence.provider_expansion];
++                assert_eq!(influence.target_expansion, dependent.discovered_in_expansion);
++                assert_eq!(dependent.target_span, provider.target_span);
++                expected_influences.contains(&(
++                    target_name(tcx, dependent.target_span.unwrap()),
++                    macro_name(influence.dependent_expansion),
++                    macro_name(influence.provider_expansion),
++                ))
++            }));
++
++        assert_eq!(resolutions.derive_helper_uses.len(), 2);
++        let expected_uses = written_default_helper_spans(tcx);
++        assert_eq!(expected_uses.len(), 2);
++        assert!(resolutions.derive_helper_uses.items().all(|helper| {
++            assert!(expected_uses.contains(&helper.use_span));
++            assert_eq!(snippet(tcx, helper.use_span), "#[default]");
++            let provider = helper
++                .provider_expansion
++                .expect("a selected built-in derive helper has an exact provider");
++            let origin = derive_origins[&provider];
++            assert_eq!(helper.target_expansion, origin.discovered_in_expansion);
++            let target = origin.target_span.expect("derive helpers have a target item");
++            assert!(target.contains(helper.use_span));
++            assert_eq!(macro_name(provider), "Default");
++            true
++        }));
++
++        Compilation::Stop
++    }
++}
++
++fn observations_complete(
++    observations_complete: bool,
++    witnesses: &HashMap<ExpnId, DeriveObservationWitness>,
++    expected_targets: &[ExpnId],
++    children: &[ExpnId],
++    influences: &[ExpnId],
++    helpers: &[ExpnId],
++) -> bool {
++    fn counts(values: &[ExpnId]) -> HashMap<ExpnId, usize> {
++        let mut counts = HashMap::new();
++        for &value in values {
++            *counts.entry(value).or_default() += 1;
++        }
++        counts
++    }
++
++    if !observations_complete {
++        return false;
++    }
++    let child_counts = counts(children);
++    let influence_counts = counts(influences);
++    let helper_counts = counts(helpers);
++    expected_targets.iter().copied().collect::<HashSet<_>>()
++        == witnesses.keys().copied().collect()
++        && witnesses.iter().all(|(target, witness)| {
++            witness.complete
++                && child_counts.get(target).copied().unwrap_or(0) == witness.child_count
++                && influence_counts.get(target).copied().unwrap_or(0)
++                    == witness.output_influence_count
++                && helper_counts.get(target).copied().unwrap_or(0) == witness.helper_use_count
++        })
++}
++
++fn written_default_helper_spans(tcx: TyCtxt<'_>) -> HashSet<Span> {
++    let mut result = HashSet::new();
++    for owner in tcx.hir_crate_items(()).free_items() {
++        let item = tcx.hir_item(owner);
++        let ItemKind::Enum(_, _, definition) = item.kind else { continue };
++        for variant in definition.variants {
++            for attribute in tcx.hir_attrs(variant.hir_id) {
++                if snippet(tcx, attribute.span()) == "#[default]" {
++                    result.insert(attribute.span());
++                }
++            }
++        }
++    }
++    result
++}
++
++fn target_name(tcx: TyCtxt<'_>, span: Span) -> &'static str {
++    let text = snippet(tcx, span);
++    [
++        "CopyClone",
++        "CloneCopy",
++        "CopyThenClone",
++        "CloneThenCopy",
++        "GenericCopy",
++        "OrdPartialOrd",
++        "PartialOrdOrd",
++        "OrdThenPartialOrd",
++        "PartialOrdThenOrd",
++        "Unit",
++        "GenericOrd",
++        "FirstDefault",
++        "SecondDefault",
++    ]
++    .into_iter()
++    .find(|name| text.contains(name))
++    .unwrap_or_else(|| panic!("unknown derive target: {text}"))
++}
++
++fn macro_name(expansion: ExpnId) -> &'static str {
++    let ExpnKind::Macro(MacroKind::Derive, name) = expansion.expn_data().kind else {
++        panic!("expected a derive expansion")
++    };
++    match name.as_str() {
++        "Clone" => "Clone",
++        "Copy" => "Copy",
++        "Default" => "Default",
++        "Ord" => "Ord",
++        "PartialOrd" => "PartialOrd",
++        other => panic!("unexpected derive macro: {other}"),
++    }
++}
++
++fn snippet(tcx: TyCtxt<'_>, span: Span) -> String {
++    tcx.sess.source_map().span_to_snippet(span).unwrap()
++}
+diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-structural-pattern.rs b/tests/ui-fulldeps/typeck-impl-dependencies-structural-pattern.rs
+new file mode 100644
+index 000000000..7fb644bef
+--- /dev/null
++++ b/tests/ui-fulldeps/typeck-impl-dependencies-structural-pattern.rs
+@@ -0,0 +1,167 @@
++//@ edition: 2024
++//@ revisions: current next
++//@ run-pass
++//@[current] run-flags: --sysroot {{sysroot-base}} --edition=2024 {{src-base}}/auxiliary/typeck-impl-dependencies-structural-pattern-input.rs
++//@[next] run-flags: --sysroot {{sysroot-base}} --edition=2024 -Znext-solver {{src-base}}/auxiliary/typeck-impl-dependencies-structural-pattern-input.rs
++//@ ignore-compare-mode-next-solver (explicit revisions)
++//@ ignore-stage1 (requires matching sysroot built with in-tree compiler)
++//@ ignore-cross-compile
++//@ ignore-remote
++
++#![feature(rustc_private)]
++
++extern crate rustc_driver;
++extern crate rustc_hir;
++extern crate rustc_interface;
++extern crate rustc_middle;
++extern crate rustc_span;
++
++use std::collections::HashSet;
++use std::process::ExitCode;
++
++use rustc_driver::Compilation;
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::{DefId, LocalDefId};
++use rustc_interface::interface::Compiler;
++use rustc_middle::traits::TypeckImplDependenciesError;
++use rustc_middle::ty::{PseudoCanonicalInput, TyCtxt, TypingEnv};
++use rustc_span::Span;
++
++fn main() -> ExitCode {
++    rustc_driver::catch_with_exit_code(move || {
++        let args: Vec<_> = std::env::args().collect();
++        rustc_driver::run_compiler(&args, &mut Callbacks);
++    })
++}
++
++struct Callbacks;
++
++impl rustc_driver::Callbacks for Callbacks {
++    fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
++        tcx.sess.dcx().abort_if_errors();
++
++        let next_solver = tcx.next_trait_solver_globally();
++        let structural_trait = tcx.lang_items().structural_peq_trait().unwrap();
++        let partial_eq_trait = tcx.lang_items().eq_trait().unwrap();
++        let inner = named_def(tcx, "Inner", DefKind::Struct);
++        let wrapper = named_def(tcx, "Wrapper", DefKind::Struct);
++        let non_structural = named_def(tcx, "NonStructural", DefKind::Struct);
++        let pattern_owner = named_def(tcx, "structural_pattern", DefKind::Fn).expect_local();
++        let expected = named_def(tcx, "EXPECTED", DefKind::Const { is_type_const: false });
++        let expected_ty = tcx.type_of(expected).instantiate_identity().skip_norm_wip();
++        let non_structural_ty =
++            tcx.type_of(non_structural).instantiate_identity().skip_norm_wip();
++        let inner_impl = impl_for_adt(tcx, structural_trait, inner).expect_local();
++        let inner_partial_eq_impl = impl_for_adt(tcx, partial_eq_trait, inner).expect_local();
++        let wrapper_impl = impl_for_adt(tcx, structural_trait, wrapper).expect_local();
++        let expected_impls = HashSet::from([inner_impl, inner_partial_eq_impl, wrapper_impl]);
++
++        let source_span = if next_solver {
++            assert!(matches!(
++                tcx.typeck_impl_dependencies(()),
++                Err(TypeckImplDependenciesError::IncompleteObservation)
++            ));
++            tcx.def_span(pattern_owner)
++        } else {
++            let cold = tcx.typeck_impl_dependencies(()).unwrap();
++            assert!(std::ptr::eq(cold, tcx.typeck_impl_dependencies(()).unwrap()));
++            let observed = cold
++                .iter()
++                .filter(|dependency| {
++                    dependency.source_owner == pattern_owner
++                        && expected_impls.contains(&dependency.impl_def_id)
++                })
++                .collect::<Vec<_>>();
++            assert_eq!(observed.len(), 3);
++            assert_eq!(
++                observed.iter().map(|dependency| dependency.impl_def_id).collect::<HashSet<_>>(),
++                expected_impls
++            );
++            assert!(observed.iter().all(|dependency| {
++                dependency.associated_item.is_none()
++                    && snippet(tcx, dependency.source_span) == "EXPECTED"
++            }));
++            let source_span = observed[0].source_span;
++            assert!(observed.iter().all(|dependency| dependency.source_span == source_span));
++            source_span
++        };
++
++        let key = (
++            PseudoCanonicalInput {
++                typing_env: TypingEnv::fully_monomorphized(),
++                value: expected_ty,
++            },
++            pattern_owner,
++            source_span,
++        );
++        let direct = tcx.has_structural_eq_impl_with_impl_dependencies(key);
++        assert!(std::ptr::eq(
++            direct,
++            tcx.has_structural_eq_impl_with_impl_dependencies(key)
++        ));
++        assert_eq!(direct.result, expected_ty.is_structural_eq_shallow(tcx));
++        assert!(direct.result);
++        if next_solver {
++            assert!(matches!(
++                direct.dependencies,
++                Err(TypeckImplDependenciesError::IncompleteObservation)
++            ));
++        } else {
++            assert_eq!(
++                direct
++                    .dependencies
++                    .unwrap()
++                    .iter()
++                    .map(|dependency| dependency.impl_def_id)
++                    .collect::<HashSet<_>>(),
++                HashSet::from([inner_partial_eq_impl, wrapper_impl])
++            );
++        }
++
++        let non_structural_key = (
++            PseudoCanonicalInput {
++                typing_env: TypingEnv::fully_monomorphized(),
++                value: non_structural_ty,
++            },
++            pattern_owner,
++            source_span,
++        );
++        let non_structural_observed =
++            tcx.has_structural_eq_impl_with_impl_dependencies(non_structural_key);
++        assert_eq!(
++            non_structural_observed.result,
++            non_structural_ty.is_structural_eq_shallow(tcx)
++        );
++        assert!(!non_structural_observed.result);
++        assert!(non_structural_observed.dependencies.unwrap().is_empty());
++
++        Compilation::Stop
++    }
++}
++
++fn named_def(tcx: TyCtxt<'_>, name: &str, kind: DefKind) -> DefId {
++    tcx.iter_local_def_id()
++        .map(LocalDefId::to_def_id)
++        .find(|&def_id| tcx.def_kind(def_id) == kind && tcx.item_name(def_id).as_str() == name)
++        .unwrap()
++}
++
++fn impl_for_adt(tcx: TyCtxt<'_>, trait_id: DefId, adt_id: DefId) -> DefId {
++    tcx.iter_local_def_id()
++        .map(LocalDefId::to_def_id)
++        .filter(|&def_id| tcx.def_kind(def_id) == DefKind::Impl { of_trait: true })
++        .find(|&def_id| {
++            tcx.impl_trait_id(def_id) == trait_id
++                && tcx
++                    .impl_trait_ref(def_id)
++                    .skip_binder()
++                    .self_ty()
++                    .ty_adt_def()
++                    .is_some_and(|adt| adt.did() == adt_id)
++        })
++        .unwrap()
++}
++
++fn snippet(tcx: TyCtxt<'_>, span: Span) -> String {
++    tcx.sess.source_map().span_to_snippet(span).unwrap()
++}
+-- 
+2.55.0
+
