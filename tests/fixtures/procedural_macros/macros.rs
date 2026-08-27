@@ -1,12 +1,38 @@
 extern crate proc_macro;
 
-use proc_macro::{TokenStream, TokenTree};
+use proc_macro::{Spacing, TokenStream, TokenTree};
 
 fn contains_identifier(input: TokenStream, expected: &str) -> bool {
     input.into_iter().any(|token| match token {
         TokenTree::Group(group) => contains_identifier(group.stream(), expected),
         TokenTree::Ident(identifier) => identifier.to_string() == expected,
         TokenTree::Literal(_) | TokenTree::Punct(_) => false,
+    })
+}
+
+fn contains_group_starting_with_comma(input: TokenStream) -> bool {
+    input.into_iter().any(|token| match token {
+        TokenTree::Group(group) => {
+            matches!(group.stream().into_iter().next(), Some(TokenTree::Punct(punctuation)) if punctuation.as_char() == ',')
+                || contains_group_starting_with_comma(group.stream())
+        }
+        TokenTree::Ident(_) | TokenTree::Literal(_) | TokenTree::Punct(_) => false,
+    })
+}
+
+fn contains_joint_comma_before(input: TokenStream, expected: &str) -> bool {
+    let tokens = input.into_iter().collect::<Vec<_>>();
+    tokens.windows(2).any(|pair| {
+        matches!(
+            pair,
+            [TokenTree::Punct(punctuation), TokenTree::Ident(identifier)]
+                if punctuation.as_char() == ','
+                    && punctuation.spacing() == Spacing::Joint
+                    && identifier.to_string() == expected
+        )
+    }) || tokens.into_iter().any(|token| match token {
+        TokenTree::Group(group) => contains_joint_comma_before(group.stream(), expected),
+        TokenTree::Ident(_) | TokenTree::Literal(_) | TokenTree::Punct(_) => false,
     })
 }
 
@@ -72,6 +98,13 @@ pub fn answer(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(ConfiguredInput)]
 pub fn configured_input(input: TokenStream) -> TokenStream {
     assert!(!contains_identifier(input, "cfg_attr"));
+    TokenStream::new()
+}
+
+#[proc_macro_derive(ConfiguredPunctuation)]
+pub fn configured_punctuation(input: TokenStream) -> TokenStream {
+    assert!(contains_group_starting_with_comma(input.clone()));
+    assert!(contains_joint_comma_before(input, "tail"));
     TokenStream::new()
 }
 

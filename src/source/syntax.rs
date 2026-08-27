@@ -58,6 +58,18 @@ pub(crate) enum SourceSyntaxError {
     InvalidSyntax,
 }
 
+pub(crate) fn is_trivia(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Whitespace
+            | TokenKind::LineComment { doc_style: None }
+            | TokenKind::BlockComment {
+                doc_style: None,
+                ..
+            }
+    )
+}
+
 pub(crate) fn tokenize_balanced_range(
     source: &str,
     range: ByteRange,

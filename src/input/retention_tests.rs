@@ -423,6 +423,45 @@ fn macro_fixed_points_are_byte_idempotent() {
 
 #[test]
 #[cfg(rust_item_dependencies_patched)]
+fn inactive_cfg_component_ranges_preserve_crlf_unicode_and_neighboring_comments() {
+    let input = concat!(
+        "fn main() {\r\n",
+        "    let value: (i32,) = (\r\n",
+        "        1, /* 保持 */\r\n",
+        "        #[cfg(any())] Vec::<(i32, i32)>::new() /* 削除 */,\r\n",
+        "        #[cfg(any())] 3 // 削除\r\n",
+        "        ,\r\n",
+        "        #[cfg(any())] 4\r\n",
+        "    );\r\n",
+        "    assert_eq!(value.0, 1);\r\n",
+        "}\r\n",
+    );
+    let expected = concat!(
+        "fn main() {\r\n",
+        "    let value: (i32,) = (\r\n",
+        "        1, /* 保持 */\r\n",
+        "        \r\n",
+        "        \r\n",
+        "        \r\n",
+        "    );\r\n",
+        "    assert_eq!(value.0, 1);\r\n",
+        "}\r\n",
+    );
+
+    assert_eq!(input.len(), 238);
+    assert_eq!(expected.len(), 135);
+    let first = inspect_reduction(input);
+    assert_eq!(first.rewrite.source, expected);
+    assert_piece_map(&first.source, &first.rewrite);
+    assert_compiles(&first.rewrite.source);
+
+    let fixed = inspect_reduction(&first.rewrite.source);
+    assert_eq!(fixed.rewrite.source, first.rewrite.source);
+    assert_piece_map(&fixed.source, &fixed.rewrite);
+}
+
+#[test]
+#[cfg(rust_item_dependencies_patched)]
 fn generated_sibling_method_keeps_the_required_impl_shell() {
     let first = inspect_reduction(GENERATED_SIBLING_IMPL_INPUT);
 

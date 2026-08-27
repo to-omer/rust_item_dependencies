@@ -199,6 +199,14 @@ fn validate_inventory(inventory: &SourceInventory) -> Result<BTreeSet<u32>, Sour
         {
             return Err(SourceRewriteError::InvalidInventory);
         }
+        if unit.kind == WrittenUnitKind::InactiveCfgComponent
+            && (unit.cfg_state != crate::source::CfgState::Inactive
+                || unit.parent.is_none_or(|parent| {
+                    inventory.units[parent.0 as usize].cfg_state != crate::source::CfgState::Active
+                }))
+        {
+            return Err(SourceRewriteError::InvalidInventory);
+        }
 
         let mut cursor = unit.parent;
         let mut depth = 0_usize;

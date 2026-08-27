@@ -70,6 +70,42 @@ fn complex_reductions_match_handwritten_sources() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn inactive_cfg_components_are_removed_across_stable_syntax() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = include_str!("fixtures/retention/inactive_cfg_components.input.rs");
+    let expected = include_str!("fixtures/retention/inactive_cfg_components.expected.rs");
+    let original_input = input(source, &target);
+
+    let verified = analyzer
+        .reduce_and_verify(&original_input)
+        .expect("inactive cfg components must be reducible");
+    assert_verified("inactive cfg components", source, expected, &verified);
+
+    let reduced_input = input(expected, &target);
+    let fixed = analyzer
+        .reduce_and_verify(&reduced_input)
+        .expect("the inactive cfg reduction must be byte-idempotent");
+    assert_eq!(fixed.reduced_source(), expected);
+
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(
+        &original_input,
+        &options,
+        "inactive_cfg_components_original",
+    );
+    let reduced_output =
+        compile_and_run(&reduced_input, &options, "inactive_cfg_components_reduced");
+    assert!(original_output.status.success());
+    assert_eq!(original_output.stdout, b"456\n");
+    assert!(original_output.stderr.is_empty());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn associated_struct_paths_keep_the_selected_impl_and_reach_a_fixed_point() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();

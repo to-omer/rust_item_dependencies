@@ -313,12 +313,12 @@ mod patched {
                 concat!(
                     "#[cfg_attr(any(),allow(dead_code))]",
                     "#[proc_fixture::require_nested_cfg_attr]",
-                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                    "struct Subject{#[cfg(any())]removed:u8,#[cfg_attr(any(),allow(dead_code))]value:u8}",
                     "fn main(){assert_eq!(Subject{value:1}.value,1)}",
                 ),
                 concat!(
                     "#[proc_fixture::require_nested_cfg_attr]",
-                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                    "struct Subject{#[cfg(any())]removed:u8,#[cfg_attr(any(),allow(dead_code))]value:u8}",
                     "fn main(){assert_eq!(Subject{value:1}.value,1)}",
                 ),
             ),
@@ -331,8 +331,9 @@ mod patched {
                     "fn main(){assert_eq!(Subject{value:1}.value,1)}",
                 ),
                 concat!(
+                    "#[cfg_attr(any(),allow(dead_code))]",
                     "#[derive(proc_fixture::ConfiguredInput)]",
-                    "struct Subject{value:u8}",
+                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
                     "fn main(){assert_eq!(Subject{value:1}.value,1)}",
                 ),
             ),
@@ -342,13 +343,13 @@ mod patched {
                     "#[cfg_attr(any(),allow(dead_code))]",
                     "#[proc_fixture::require_nested_cfg_attr]",
                     "#[derive(proc_fixture::ConfiguredInput)]",
-                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                    "struct Subject{#[cfg(any())]removed:u8,#[cfg_attr(any(),allow(dead_code))]value:u8}",
                     "fn main(){assert_eq!(Subject{value:1}.value,1)}",
                 ),
                 concat!(
                     "#[proc_fixture::require_nested_cfg_attr]",
                     "#[derive(proc_fixture::ConfiguredInput)]",
-                    "struct Subject{#[cfg_attr(any(),allow(dead_code))]value:u8}",
+                    "struct Subject{#[cfg(any())]removed:u8,#[cfg_attr(any(),allow(dead_code))]value:u8}",
                     "fn main(){assert_eq!(Subject{value:1}.value,1)}",
                 ),
             ),
@@ -370,6 +371,26 @@ mod patched {
                 .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
             assert_eq!(fixed.reduced_source(), expected, "{case}");
         }
+    }
+
+    #[test]
+    fn procedural_derive_targets_preserve_cfg_token_punctuation_and_spacing() {
+        let artifacts = ProcMacroArtifacts::build();
+        let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
+        let source = concat!(
+            "#[derive(proc_fixture::ConfiguredPunctuation)]",
+            "struct Subject{live:u8,#[cfg_attr(any(),allow(dead_code))]",
+            "tail:[u8;{fn nested(#[cfg(any())] dead:u8,live:u8){}0}]}",
+            "fn main(){assert_eq!(Subject{live:1,tail:[]}.live,1)}",
+        );
+
+        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
+        assert_eq!(verified.reduced_source(), source);
+
+        let fixed = analyzer
+            .reduce_and_verify(&input(verified.reduced_source()))
+            .unwrap();
+        assert_eq!(fixed.reduced_source(), source);
     }
 
     #[test]

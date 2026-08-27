@@ -2782,6 +2782,59 @@ mod tests {
     }
 
     #[test]
+    fn inactive_cfg_components_are_maximal_independent_source_units() {
+        let source = concat!(
+            "struct Record{kept:u8,#[cfg(all())] active:u8,#[cfg(any())] dead:Vec<(u8,u8)>,tail:u8}\n",
+            "enum Kind{Kept,#[cfg(any())] Dead(Vec<(u8,u8)>),Tail}\n",
+            "fn choose<#[cfg(any())] T,U>(#[cfg(any())] dead:u8,kept:U)->U{\n",
+            "#[cfg(any())] let removed=();\n",
+            "let _tuple=(#[cfg(any())] 1,);\n",
+            "match 0{#[cfg(any())] 0=>{},_=>{}}\n",
+            "kept\n",
+            "}\n",
+            "fn main(){let _=choose::<u8>(1);}\n",
+        );
+        let inventory = inspect(source).unwrap();
+        let expected = [
+            "#[cfg(any())] dead:Vec<(u8,u8)>,",
+            "#[cfg(any())] Dead(Vec<(u8,u8)>),",
+            "#[cfg(any())] T,",
+            "#[cfg(any())] dead:u8,",
+            "#[cfg(any())] let removed=();",
+            "#[cfg(any())] 1,",
+            "#[cfg(any())] 0=>{},",
+        ]
+        .map(|snippet| {
+            let start = source.find(snippet).unwrap() as u32;
+            range(start, start + snippet.len() as u32)
+        });
+        let components = inventory
+            .units
+            .iter()
+            .filter(|unit| unit.kind == WrittenUnitKind::InactiveCfgComponent)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            components
+                .iter()
+                .map(|unit| unit.full_range)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(components.iter().all(|unit| {
+            let parent = &inventory.units[unit.parent.unwrap().0 as usize];
+            unit.cfg_state == CfgState::Inactive
+                && parent.cfg_state == CfgState::Active
+                && unit.atomic_group != parent.atomic_group
+        }));
+        assert!(inventory.units.iter().all(|unit| {
+            unit.kind != WrittenUnitKind::InactiveCfgComponent
+                || !components
+                    .iter()
+                    .any(|other| unit.id != other.id && unit.full_range.contains(other.full_range))
+        }));
+    }
+
+    #[test]
     fn trait_impl_and_body_units_keep_their_exact_parents() {
         let source = concat!(
             "trait Service {\n",
@@ -2839,6 +2892,54 @@ mod tests {
                 (Item, range(169, 181), Some(range(0, 182)), Active, 2),
             ]
         );
+    }
+
+    #[test]
+    fn tuple_expression_components_preserve_rustc_trailing_commas() {
+        let source = concat!(
+            "fn main(){\n",
+            "let _suffix=(1,#[cfg(any())] 2);\n",
+            "let _prefix=(#[cfg(any())] 3,4);\n",
+            "let _prefix_with_trailing=(#[cfg(any())] 5,6,);\n",
+            "let _both_sides=(#[cfg(any())] 7,8,#[cfg(any())] 9);\n",
+            "let _two_active=(10,#[cfg(any())] 11,12);\n",
+            "let _nested=(#[cfg(all())](#[cfg(any())] 13,14),(#[cfg(any())] 15,#[cfg(any())] 16,17));\n",
+            "}\n",
+        );
+        let inventory = inspect(source).unwrap();
+        let component_units = inventory
+            .units
+            .iter()
+            .filter(|unit| unit.kind == WrittenUnitKind::InactiveCfgComponent)
+            .collect::<Vec<_>>();
+        let components = component_units
+            .iter()
+            .map(|unit| &source[unit.full_range.start as usize..unit.full_range.end as usize])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            components,
+            vec![
+                "#[cfg(any())] 2",
+                "#[cfg(any())] 3,",
+                "#[cfg(any())] 5,",
+                "#[cfg(any())] 7,",
+                "#[cfg(any())] 9",
+                "#[cfg(any())] 11,",
+                "#[cfg(any())] 13,",
+                "#[cfg(any())] 15,",
+                "#[cfg(any())] 16,",
+            ]
+        );
+        for (unit, component) in component_units.iter().zip(components) {
+            let parent = &inventory.units[unit.parent.unwrap().0 as usize];
+            assert_eq!(
+                unit.atomic_group == parent.atomic_group,
+                matches!(
+                    component,
+                    "#[cfg(any())] 3," | "#[cfg(any())] 13," | "#[cfg(any())] 16,"
+                )
+            );
+        }
     }
 
     #[test]
@@ -3028,9 +3129,14 @@ mod tests {
             })
             .expect("the inactive macro must remain in the written inventory");
         assert_eq!(invocation.cfg_state, CfgState::Inactive);
-        let parent = &inventory.units[invocation.parent.unwrap().0 as usize];
-        assert_eq!(parent.kind, WrittenUnitKind::Item);
-        assert_eq!(invocation.atomic_group, parent.atomic_group);
+        let component = &inventory.units[invocation.parent.unwrap().0 as usize];
+        assert_eq!(component.kind, WrittenUnitKind::InactiveCfgComponent);
+        assert_eq!(component.cfg_state, CfgState::Inactive);
+        assert_eq!(invocation.atomic_group, component.atomic_group);
+        let item = &inventory.units[component.parent.unwrap().0 as usize];
+        assert_eq!(item.kind, WrittenUnitKind::Item);
+        assert_eq!(item.cfg_state, CfgState::Active);
+        assert_ne!(component.atomic_group, item.atomic_group);
     }
 
     #[test]
