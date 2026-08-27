@@ -1761,6 +1761,9 @@ fn validate_source(source: &SourceInventory) -> Result<(), RetentionError> {
             if parent.id == unit.id
                 || !parent.full_range.contains(unit.full_range)
                 || parent.cfg_state == CfgState::Inactive && unit.cfg_state == CfgState::Active
+                || unit.kind == WrittenUnitKind::InactiveCfgComponent
+                    && (unit.cfg_state != CfgState::Inactive
+                        || parent.cfg_state != CfgState::Active)
             {
                 return Err(RetentionError::InvalidSource);
             }

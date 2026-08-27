@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use rustc_ast as ast;
 use rustc_ast::HasAttrs;
-use rustc_ast::tokenstream::WithTokens;
+use rustc_ast::tokenstream::LazyAttrTokenStream;
 use rustc_ast::visit::{self, AssocCtxt, Visitor};
 #[cfg(rust_item_dependencies_patched)]
 use rustc_data_structures::unord::UnordMap;
@@ -79,6 +79,7 @@ pub enum WrittenUnitKind {
     NestedItem,
     MacroRule,
     NoEffectCfgAttr,
+    InactiveCfgComponent,
 }
 
 impl WrittenUnitKind {
@@ -96,6 +97,7 @@ impl WrittenUnitKind {
             Self::NestedItem => 9,
             Self::MacroRule => 10,
             Self::NoEffectCfgAttr => 11,
+            Self::InactiveCfgComponent => 12,
         }
     }
 }
@@ -882,6 +884,58 @@ struct PendingDeriveTargetSourceFacts {
     helper_candidates: Vec<ByteRange>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InactiveComponentLayout {
+    Standalone,
+    CommaSeparated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CfgComponentObservation {
+    source_range: ByteRange,
+    active: bool,
+    component: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingTupleElement {
+    source_range: ByteRange,
+    observation: Option<CfgComponentObservation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingTupleLayout {
+    parent_atomic_representative: u32,
+    elements: Vec<PendingTupleElement>,
+}
+
+#[derive(Clone)]
+struct ConfigurableAttributes {
+    attrs: ast::AttrVec,
+}
+
+impl HasAttrs for ConfigurableAttributes {
+    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = false;
+
+    fn attrs(&self) -> &[ast::Attribute] {
+        &self.attrs
+    }
+
+    fn visit_attrs(&mut self, f: impl FnOnce(&mut ast::AttrVec)) {
+        f(&mut self.attrs);
+    }
+}
+
+impl ast::HasTokens for ConfigurableAttributes {
+    fn tokens(&self) -> Option<&LazyAttrTokenStream> {
+        None
+    }
+
+    fn tokens_mut(&mut self) -> Option<&mut Option<LazyAttrTokenStream>> {
+        None
+    }
+}
+
 fn pending_units(units: &[WrittenUnit]) -> (Vec<PendingUnit>, BTreeMap<AtomicGroupId, u32>) {
     let representatives = units.iter().fold(
         BTreeMap::<AtomicGroupId, u32>::new(),
@@ -937,7 +991,9 @@ pub(crate) fn collect_source(
         config_tokens: false,
         lint_node_id: ast::CRATE_NODE_ID,
     }
-    .configure(WithTokens::new(krate.clone()))
+    .configure(ConfigurableAttributes {
+        attrs: krate.attrs.clone(),
+    })
     .is_some();
     let mut collector = UnitCollector::new(
         compiler,
@@ -945,7 +1001,7 @@ pub(crate) fn collect_source(
         &offsets,
         features,
         root_active,
-        original.len(),
+        &original,
     )?;
     collector.record_configured_attributes(&krate.attrs, &configured_attrs, root_active);
     collector.visit_crate(krate);
@@ -1688,15 +1744,15 @@ fn merge_procedural_macro_atomic_groups(
 }
 
 fn procedural_macro_observes_unit(anchor: ProceduralMacroAnchor, unit: &WrittenUnit) -> bool {
-    if unit.kind != WrittenUnitKind::NoEffectCfgAttr {
-        return true;
-    }
-    match anchor.kind {
-        ProceduralMacroAnchorKind::Invocation => false,
-        ProceduralMacroAnchorKind::AttributeTarget { target_range } => {
-            target_range.contains(unit.full_range)
-        }
-        ProceduralMacroAnchorKind::DeriveTarget => false,
+    match unit.kind {
+        WrittenUnitKind::NoEffectCfgAttr => match anchor.kind {
+            ProceduralMacroAnchorKind::Invocation => false,
+            ProceduralMacroAnchorKind::AttributeTarget { target_range } => {
+                target_range.contains(unit.full_range)
+            }
+            ProceduralMacroAnchorKind::DeriveTarget => true,
+        },
+        _ => true,
     }
 }
 
@@ -1886,6 +1942,8 @@ struct UnitCollector<'a> {
     source_file: Arc<SourceFile>,
     offsets: &'a OriginalOffsetMap,
     features: Features,
+    source_tokens: Vec<syntax::SourceToken>,
+    tuple_stack: Vec<PendingTupleLayout>,
     units: Vec<PendingUnit>,
     parent_stack: Vec<u32>,
     active_stack: Vec<bool>,
@@ -1904,14 +1962,32 @@ impl<'a> UnitCollector<'a> {
         offsets: &'a OriginalOffsetMap,
         features: Features,
         root_active: bool,
-        original_len: usize,
+        original: &str,
     ) -> Result<Self, SourceError> {
-        let original_len = u32::try_from(original_len).map_err(|_| SourceError::SourceTooLarge)?;
+        let original_len =
+            u32::try_from(original.len()).map_err(|_| SourceError::SourceTooLarge)?;
+        let mut source_tokens = Vec::new();
+        let mut offset = 0_u32;
+        for token in tokenize(original, FrontmatterAllowed::Yes) {
+            let end = offset
+                .checked_add(token.len)
+                .ok_or(SourceError::SourceTooLarge)?;
+            source_tokens.push(syntax::SourceToken {
+                kind: token.kind,
+                range: ByteRange { start: offset, end },
+            });
+            offset = end;
+        }
+        if offset != original_len {
+            return Err(SourceError::InvalidInventory);
+        }
         Ok(Self {
             compiler,
             source_file,
             offsets,
             features,
+            source_tokens,
+            tuple_stack: Vec::new(),
             units: vec![PendingUnit {
                 temporary_id: 0,
                 kind: WrittenUnitKind::CrateRoot,
@@ -1989,11 +2065,7 @@ impl<'a> UnitCollector<'a> {
         }
     }
 
-    fn node_is_active<T: ast::HasTokens + Clone>(&self, node: &T) -> bool {
-        self.configured(node).is_some()
-    }
-
-    fn configured<T: ast::HasTokens + Clone>(&self, node: &T) -> Option<T> {
+    fn configured(&self, node: &impl HasAttrs) -> Option<ConfigurableAttributes> {
         if !self.current_active() {
             return None;
         }
@@ -2003,7 +2075,250 @@ impl<'a> UnitCollector<'a> {
             config_tokens: false,
             lint_node_id: ast::CRATE_NODE_ID,
         }
-        .configure(node.clone())
+        .configure(ConfigurableAttributes {
+            attrs: node.attrs().iter().cloned().collect(),
+        })
+    }
+
+    fn span_with_attributes<T: HasAttrs>(
+        &self,
+        node: &T,
+        span: Span,
+    ) -> Result<ByteRange, SourceError> {
+        self.span_range(
+            node.attrs()
+                .iter()
+                .fold(span, |span, attribute| attribute.span.to(span)),
+        )
+    }
+
+    fn comma_separated_range(&self, core: ByteRange) -> Result<ByteRange, SourceError> {
+        if core.is_empty() {
+            return Err(SourceError::InvalidInventory);
+        }
+
+        let start = self
+            .source_tokens
+            .partition_point(|token| token.range.end <= core.start);
+        if self
+            .source_tokens
+            .get(start)
+            .is_some_and(|token| token.range.start < core.start)
+        {
+            return Err(SourceError::InvalidInventory);
+        }
+        let end = self
+            .source_tokens
+            .partition_point(|token| token.range.end <= core.end);
+        if self
+            .source_tokens
+            .get(end)
+            .is_some_and(|token| token.range.start < core.end)
+        {
+            return Err(SourceError::InvalidInventory);
+        }
+
+        let following = self.following_nontrivia(core);
+        if let Some(comma) = following.filter(|token| token.kind == TokenKind::Comma) {
+            return Ok(ByteRange {
+                start: core.start,
+                end: comma.range.end,
+            });
+        }
+        Ok(core)
+    }
+
+    fn following_nontrivia(&self, range: ByteRange) -> Option<syntax::SourceToken> {
+        let start = self
+            .source_tokens
+            .partition_point(|token| token.range.start < range.end);
+        self.source_tokens
+            .get(start..)?
+            .iter()
+            .find(|token| !syntax::is_trivia(token.kind))
+            .copied()
+    }
+
+    fn begin_tuple_layout(&mut self, expression: &ast::Expr) -> bool {
+        let ast::ExprKind::Tup(elements) = &expression.kind else {
+            return false;
+        };
+        if elements.len() < 2
+            || !elements.iter().any(|element| {
+                element.attrs.iter().any(|attribute| {
+                    attribute.has_name(sym::cfg) || attribute.has_name(sym::cfg_attr)
+                })
+            })
+        {
+            return false;
+        }
+
+        let mut pending = Vec::with_capacity(elements.len());
+        for element in elements {
+            let source_range = match self.span_with_attributes(element.as_ref(), element.span) {
+                Ok(range) => range,
+                Err(error) => {
+                    self.fail(error);
+                    return false;
+                }
+            };
+            pending.push(PendingTupleElement {
+                source_range,
+                observation: None,
+            });
+        }
+        self.tuple_stack.push(PendingTupleLayout {
+            parent_atomic_representative: self.units[self.current_parent() as usize]
+                .atomic_representative,
+            elements: pending,
+        });
+        true
+    }
+
+    fn record_tuple_element(&mut self, observation: CfgComponentObservation) {
+        let Some(tuple) = self.tuple_stack.last_mut() else {
+            return;
+        };
+        let matches = tuple
+            .elements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| {
+                (element.source_range == observation.source_range).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let [index] = matches.as_slice() else {
+            if !matches.is_empty() {
+                self.fail(SourceError::InvalidInventory);
+            }
+            return;
+        };
+        if tuple.elements[*index]
+            .observation
+            .replace(observation)
+            .is_some()
+        {
+            self.fail(SourceError::InvalidInventory);
+        }
+    }
+
+    fn finish_tuple_layout(&mut self) {
+        let Some(tuple) = self.tuple_stack.pop() else {
+            self.fail(SourceError::InvalidInventory);
+            return;
+        };
+        if tuple
+            .elements
+            .iter()
+            .any(|element| element.observation.is_none())
+        {
+            self.fail(SourceError::InvalidInventory);
+            return;
+        }
+        let active = tuple
+            .elements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| element.observation?.active.then_some(index))
+            .collect::<Vec<_>>();
+        let [active] = active.as_slice() else {
+            return;
+        };
+        if *active + 1 != tuple.elements.len()
+            || self
+                .following_nontrivia(tuple.elements[*active].source_range)
+                .is_some_and(|token| token.kind == TokenKind::Comma)
+        {
+            return;
+        }
+        let Some(preceding) = active.checked_sub(1) else {
+            return;
+        };
+        let Some(component) = tuple.elements[preceding]
+            .observation
+            .and_then(|observation| (!observation.active).then_some(observation.component))
+            .flatten()
+        else {
+            self.fail(SourceError::InvalidInventory);
+            return;
+        };
+        let component_representative = self.units[component as usize].atomic_representative;
+        for unit in &mut self.units {
+            if unit.atomic_representative == component_representative {
+                unit.atomic_representative = tuple.parent_atomic_representative;
+            }
+        }
+    }
+
+    fn walk_cfg_component<'ast, T, F>(
+        &mut self,
+        node: &'ast T,
+        span: Span,
+        layout: InactiveComponentLayout,
+        walk: F,
+    ) where
+        T: HasAttrs,
+        F: FnOnce(&mut Self, &'ast T, CfgComponentObservation),
+    {
+        let parent_active = self.current_active();
+        let source_range = match self.span_with_attributes(node, span) {
+            Ok(range) => range,
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        };
+        let configured = self.configured(node);
+        let active = configured.is_some();
+        let component = if parent_active && !active {
+            let range = match layout {
+                InactiveComponentLayout::Standalone => Ok(source_range),
+                InactiveComponentLayout::CommaSeparated => self.comma_separated_range(source_range),
+            }
+            .and_then(|range| {
+                self.units[self.current_parent() as usize]
+                    .full_range
+                    .contains(range)
+                    .then_some(range)
+                    .ok_or(SourceError::InvalidInventory)
+            });
+            match range {
+                Ok(range) => Some(self.add_unit(
+                    WrittenUnitKind::InactiveCfgComponent,
+                    range,
+                    false,
+                    self.current_parent(),
+                    None,
+                )),
+                Err(error) => {
+                    self.fail(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(component) = component {
+            self.parent_stack.push(component);
+        }
+        self.active_stack.push(active);
+        if let Some(configured) = &configured {
+            self.record_configured_attributes(node.attrs(), configured.attrs(), active);
+        }
+        walk(
+            self,
+            node,
+            CfgComponentObservation {
+                source_range,
+                active,
+                component,
+            },
+        );
+        self.active_stack.pop();
+        if component.is_some() {
+            self.parent_stack.pop();
+        }
     }
 
     fn record_configured_attributes(
@@ -2509,115 +2824,136 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
     }
 
     fn visit_stmt(&mut self, statement: &'ast ast::Stmt) {
+        if !matches!(&statement.kind, ast::StmtKind::Item(_)) {
+            self.walk_cfg_component(
+                statement,
+                statement.span,
+                InactiveComponentLayout::Standalone,
+                |collector, statement, observation| {
+                    if let ast::StmtKind::MacCall(call) = &statement.kind
+                        && let Err(error) = collector.record_macro(
+                            call.mac.span(),
+                            observation.active,
+                            Some(statement.span),
+                            None,
+                        )
+                    {
+                        collector.fail(error);
+                    }
+                    visit::walk_stmt(collector, statement);
+                },
+            );
+            return;
+        }
+
         let configured = self.configured(statement);
         let active = configured.is_some();
-        if let ast::StmtKind::MacCall(call) = &statement.kind
-            && let Err(error) =
-                self.record_macro(call.mac.span(), active, Some(statement.span), None)
-        {
-            self.fail(error);
-        }
         self.active_stack.push(active);
-        if let Some(configured) = &configured
-            && !matches!(&statement.kind, ast::StmtKind::Item(_))
-        {
-            self.record_configured_attributes(statement.attrs(), configured.attrs(), active);
-        }
         visit::walk_stmt(self, statement);
         self.active_stack.pop();
     }
 
     fn visit_expr(&mut self, expression: &'ast ast::Expr) {
-        let configured = self.configured(expression);
-        let active = configured.is_some();
-        if let ast::ExprKind::MacCall(call) = &expression.kind
-            && let Err(error) = self.record_macro(call.span(), active, Some(expression.span), None)
-        {
-            self.fail(error);
-        }
-        self.active_stack.push(active);
-        if let Some(configured) = &configured {
-            self.record_configured_attributes(expression.attrs(), configured.attrs(), active);
-        }
-        visit::walk_expr(self, expression);
-        self.active_stack.pop();
+        self.walk_cfg_component(
+            expression,
+            expression.span,
+            InactiveComponentLayout::CommaSeparated,
+            |collector, expression, observation| {
+                collector.record_tuple_element(observation);
+                if let ast::ExprKind::MacCall(call) = &expression.kind
+                    && let Err(error) = collector.record_macro(
+                        call.span(),
+                        collector.current_active(),
+                        Some(expression.span),
+                        None,
+                    )
+                {
+                    collector.fail(error);
+                }
+                let tuple = collector.current_active() && collector.begin_tuple_layout(expression);
+                visit::walk_expr(collector, expression);
+                if tuple {
+                    collector.finish_tuple_layout();
+                }
+            },
+        );
     }
 
     fn visit_arm(&mut self, arm: &'ast ast::Arm) {
-        let configured = self.configured(arm);
-        let active = configured.is_some();
-        self.active_stack.push(active);
-        if let Some(configured) = &configured {
-            self.record_configured_attributes(arm.attrs(), configured.attrs(), active);
-        }
-        visit::walk_arm(self, arm);
-        self.active_stack.pop();
+        self.walk_cfg_component(
+            arm,
+            arm.span,
+            InactiveComponentLayout::CommaSeparated,
+            |collector, arm, _| {
+                visit::walk_arm(collector, arm);
+            },
+        );
     }
 
     fn visit_expr_field(&mut self, field: &'ast ast::ExprField) {
-        let configured = self.configured(field);
-        let active = configured.is_some();
-        self.active_stack.push(active);
-        if let Some(configured) = &configured {
-            self.record_configured_attributes(field.attrs(), configured.attrs(), active);
-        }
-        visit::walk_expr_field(self, field);
-        self.active_stack.pop();
+        self.walk_cfg_component(
+            field,
+            field.span,
+            InactiveComponentLayout::CommaSeparated,
+            |collector, field, _| {
+                visit::walk_expr_field(collector, field);
+            },
+        );
     }
 
     fn visit_field_def(&mut self, field: &'ast ast::FieldDef) {
-        let configured = self.configured(field);
-        let active = configured.is_some();
-        self.active_stack.push(active);
-        if let Some(configured) = &configured {
-            self.record_configured_attributes(field.attrs(), configured.attrs(), active);
-        }
-        visit::walk_field_def(self, field);
-        self.active_stack.pop();
+        self.walk_cfg_component(
+            field,
+            field.span,
+            InactiveComponentLayout::CommaSeparated,
+            |collector, field, _| {
+                visit::walk_field_def(collector, field);
+            },
+        );
     }
 
     fn visit_generic_param(&mut self, parameter: &'ast ast::GenericParam) {
-        let configured = self.configured(parameter);
-        let active = configured.is_some();
-        self.active_stack.push(active);
-        if let Some(configured) = &configured {
-            self.record_configured_attributes(parameter.attrs(), configured.attrs(), active);
-        }
-        visit::walk_generic_param(self, parameter);
-        self.active_stack.pop();
+        self.walk_cfg_component(
+            parameter,
+            parameter.span(),
+            InactiveComponentLayout::CommaSeparated,
+            |collector, parameter, _| {
+                visit::walk_generic_param(collector, parameter);
+            },
+        );
     }
 
     fn visit_param(&mut self, parameter: &'ast ast::Param) {
-        let configured = self.configured(parameter);
-        let active = configured.is_some();
-        self.active_stack.push(active);
-        if let Some(configured) = &configured {
-            self.record_configured_attributes(parameter.attrs(), configured.attrs(), active);
-        }
-        visit::walk_param(self, parameter);
-        self.active_stack.pop();
+        self.walk_cfg_component(
+            parameter,
+            parameter.span,
+            InactiveComponentLayout::CommaSeparated,
+            |collector, parameter, _| {
+                visit::walk_param(collector, parameter);
+            },
+        );
     }
 
     fn visit_pat_field(&mut self, field: &'ast ast::PatField) {
-        let configured = self.configured(field);
-        let active = configured.is_some();
-        self.active_stack.push(active);
-        if let Some(configured) = &configured {
-            self.record_configured_attributes(field.attrs(), configured.attrs(), active);
-        }
-        visit::walk_pat_field(self, field);
-        self.active_stack.pop();
+        self.walk_cfg_component(
+            field,
+            field.span,
+            InactiveComponentLayout::CommaSeparated,
+            |collector, field, _| {
+                visit::walk_pat_field(collector, field);
+            },
+        );
     }
 
     fn visit_variant(&mut self, variant: &'ast ast::Variant) {
-        let configured = self.configured(variant);
-        let active = configured.is_some();
-        self.active_stack.push(active);
-        if let Some(configured) = &configured {
-            self.record_configured_attributes(variant.attrs(), configured.attrs(), active);
-        }
-        visit::walk_variant(self, variant);
-        self.active_stack.pop();
+        self.walk_cfg_component(
+            variant,
+            variant.span,
+            InactiveComponentLayout::CommaSeparated,
+            |collector, variant, _| {
+                visit::walk_variant(collector, variant);
+            },
+        );
     }
 
     fn visit_where_predicate(&mut self, predicate: &'ast ast::WherePredicate) {
@@ -2663,13 +2999,10 @@ fn own_lexical_pieces(source: &str, units: &[WrittenUnit]) -> Result<Vec<OwnedPi
         let end = offset
             .checked_add(token.len)
             .ok_or(SourceError::SourceTooLarge)?;
-        let kind = match token.kind {
-            TokenKind::Whitespace
-            | TokenKind::LineComment { doc_style: None }
-            | TokenKind::BlockComment {
-                doc_style: None, ..
-            } => PieceKind::Trivia,
-            _ => PieceKind::Token,
+        let kind = if syntax::is_trivia(token.kind) {
+            PieceKind::Trivia
+        } else {
+            PieceKind::Token
         };
         let token_range = ByteRange { start: offset, end };
         let token_bytes = &source.as_bytes()[offset as usize..end as usize];
@@ -2803,6 +3136,11 @@ fn validate_inventory(
                 return Err(SourceError::InvalidInventory);
             }
             if parent.cfg_state == CfgState::Inactive && unit.cfg_state != CfgState::Inactive {
+                return Err(SourceError::InvalidInventory);
+            }
+            if unit.kind == WrittenUnitKind::InactiveCfgComponent
+                && (unit.cfg_state != CfgState::Inactive || parent.cfg_state != CfgState::Active)
+            {
                 return Err(SourceError::InvalidInventory);
             }
         }
@@ -3321,17 +3659,20 @@ mod tests {
     #[test]
     fn procedural_derive_merges_future_nested_units_with_its_target() {
         let source = Arc::<str>::from(
-            "#[derive(Generated)]\nstruct Subject { field: u8 }\nstruct Sibling;\n",
+            "#[derive(Generated)]\nstruct Subject { #[cfg(any())] removed: u8, field: u8 }\nstruct Sibling;\n",
         );
         let target = marker(
             &source,
-            "#[derive(Generated)]\nstruct Subject { field: u8 }",
+            "#[derive(Generated)]\nstruct Subject { #[cfg(any())] removed: u8, field: u8 }",
         );
-        let target_without_attribute = marker(&source, "struct Subject { field: u8 }");
+        let target_without_attribute = marker(
+            &source,
+            "struct Subject { #[cfg(any())] removed: u8, field: u8 }",
+        );
         let derive = marker(&source, "#[derive(Generated)]");
-        let field = marker(&source, "field: u8");
+        let inactive = marker(&source, "#[cfg(any())] removed: u8,");
         let sibling = marker(&source, "struct Sibling;");
-        let units = vec![
+        let mut units = vec![
             unit(
                 0,
                 WrittenUnitKind::CrateRoot,
@@ -3344,9 +3685,16 @@ mod tests {
             ),
             unit(1, WrittenUnitKind::Item, target, Some(0), 1),
             unit(2, WrittenUnitKind::MacroInvocation, derive, Some(1), 1),
-            unit(3, WrittenUnitKind::NestedItem, field, Some(1), 2),
+            unit(
+                3,
+                WrittenUnitKind::InactiveCfgComponent,
+                inactive,
+                Some(1),
+                2,
+            ),
             unit(4, WrittenUnitKind::Item, sibling, Some(0), 3),
         ];
+        units[3].cfg_state = CfgState::Inactive;
         let mut inventory = test_inventory(source, units, Vec::new());
         let invocation_range = marker(&inventory.original, "Generated");
 
@@ -3373,7 +3721,7 @@ mod tests {
     }
 
     #[test]
-    fn procedural_targets_only_merge_cfg_attrs_visible_in_their_input() {
+    fn procedural_targets_preserve_source_units_that_can_affect_their_token_input() {
         fn inventory_for(
             kind: ProceduralTargetKind,
         ) -> (SourceInventory, BTreeSet<super::ProceduralMacroAnchor>) {
@@ -3447,8 +3795,8 @@ mod tests {
 
         let (mut derive, anchors) = inventory_for(ProceduralTargetKind::Derive);
         merge_procedural_macro_atomic_groups(&mut derive, &anchors).unwrap();
-        assert_ne!(derive.units[1].atomic_group, derive.units[3].atomic_group);
-        assert_ne!(derive.units[1].atomic_group, derive.units[4].atomic_group);
+        assert_eq!(derive.units[1].atomic_group, derive.units[3].atomic_group);
+        assert_eq!(derive.units[1].atomic_group, derive.units[4].atomic_group);
     }
 
     #[test]
