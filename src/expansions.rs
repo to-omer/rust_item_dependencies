@@ -28,7 +28,8 @@ use crate::graph::{DefinitionId, DefinitionOrigin, DefinitionTarget};
 use crate::source::SourceInventory;
 #[cfg(rust_item_dependencies_patched)]
 use crate::source::{
-    ByteRange, original_span_range, resolve_attribute_source, resolve_written_bang_macro_source,
+    ByteRange, EditableMacroSource, EditableMacroSourceRole, SourceError, original_span_range,
+    resolve_editable_macro_source,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,14 +115,13 @@ pub(crate) fn collect_expansions(
             .map(|span| source_range(compiler, source, span))
             .transpose()?
             .flatten();
-        let discovered_in = origin
+        let mut discovered_in = origin
             .map(|origin| origin.discovered_in_expansion)
             .filter(|parent| *parent != ExpnId::root());
-        let semantic_parent = (data.parent != ExpnId::root()).then_some(data.parent);
+        let mut semantic_parent = (data.parent != ExpnId::root()).then_some(data.parent);
         let source_call = data.call_site.ctxt().outer_expn();
-        let source_call_parent =
+        let mut source_call_parent =
             (source_call != ExpnId::root() && source_call != expansion).then_some(source_call);
-        let identity_parent = discovered_in.or(source_call_parent).or(semantic_parent);
         let fragment = origin.map(|origin| fragment_kind(origin.fragment_kind));
         let implementation = origin.map(|origin| implementation_kind(origin.implementation_kind));
         let selected_macro_rule = origin
@@ -132,23 +132,26 @@ pub(crate) fn collect_expansions(
             &data.kind,
             ExpnKind::Macro(MacroKind::Attr | MacroKind::Derive, _)
         );
-        let written_invocation = if let Some(origin) =
-            origin.filter(|origin| origin.discovered_in_expansion == ExpnId::root())
-        {
-            Some(
-                written_invocation(
-                    source,
-                    invocation_range,
-                    node_range,
-                    target_range,
-                    origin,
-                    attribute_like,
-                )
-                .ok_or(ExpansionError::IncompleteOrigin)?,
-            )
-        } else {
-            None
+        let editable_source = match origin {
+            Some(origin) => {
+                let editable = resolve_editable_macro_source(compiler, source, origins, expansion)
+                    .map_err(expansion_source_error)?;
+                if origin.discovered_in_expansion == ExpnId::root() && editable.is_none() {
+                    return Err(ExpansionError::IncompleteOrigin);
+                }
+                editable
+            }
+            None => None,
         };
+        if editable_source
+            .is_some_and(|editable| editable.role == EditableMacroSourceRole::TransparentAttribute)
+        {
+            discovered_in = None;
+            semantic_parent = None;
+            source_call_parent = None;
+        }
+        let identity_parent = discovered_in.or(source_call_parent).or(semantic_parent);
+        let written_invocation = editable_source.map(|editable| editable.unit);
         let source_owner = origin
             .map(|origin| {
                 expansion_source_owner(
@@ -156,7 +159,7 @@ pub(crate) fn collect_expansions(
                     source,
                     definitions,
                     origin,
-                    written_invocation,
+                    editable_source,
                     attribute_like,
                 )
             })
@@ -472,9 +475,15 @@ fn expansion_source_owner(
     source: &SourceInventory,
     definitions: &CollectedDefinitions,
     origin: &MacroInvocationOrigin,
-    written_invocation: Option<crate::source::SourceUnitId>,
+    editable_source: Option<EditableMacroSource>,
     attribute_like: bool,
 ) -> Result<Option<DefinitionId>, ExpansionError> {
+    if editable_source
+        .is_some_and(|editable| editable.role == EditableMacroSourceRole::TransparentAttribute)
+    {
+        return Ok(None);
+    }
+    let written_invocation = editable_source.map(|editable| editable.unit);
     if let Some(target_span) = origin.target_span {
         if let Some(target_range) = source_range(compiler, source, target_span)? {
             let mut candidates = definitions
@@ -530,23 +539,17 @@ fn expansion_source_owner(
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn written_invocation(
-    source: &SourceInventory,
-    invocation_range: Option<ByteRange>,
-    node_range: Option<ByteRange>,
-    target_range: Option<ByteRange>,
-    origin: &MacroInvocationOrigin,
-    attribute_like: bool,
-) -> Option<crate::source::SourceUnitId> {
-    if origin.discovered_in_expansion != ExpnId::root() {
-        return None;
+fn expansion_source_error(error: SourceError) -> ExpansionError {
+    match error {
+        SourceError::InvalidSpan => ExpansionError::InvalidSpan,
+        SourceError::SourceTooLarge
+        | SourceError::NormalizationMismatch
+        | SourceError::InvalidInventory
+        | SourceError::IncompleteAttributeObservation
+        | SourceError::IncompleteDeriveObservation
+        | SourceError::IncompleteMacroRuleObservation
+        | SourceError::IncompleteProceduralMacroObservation => ExpansionError::IncompleteOrigin,
     }
-    if attribute_like {
-        return resolve_attribute_source(source, invocation_range?, node_range?, target_range?)
-            .ok()?
-            .invocation;
-    }
-    resolve_written_bang_macro_source(source, invocation_range?, node_range?)
 }
 
 #[cfg(rust_item_dependencies_patched)]

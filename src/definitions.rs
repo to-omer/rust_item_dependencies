@@ -13,8 +13,6 @@ use rustc_middle::hir::nested_filter;
 use rustc_middle::metadata::Reexport;
 use rustc_middle::ty::{self, GenericArgKind, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::{ExpnId, Span};
-#[cfg(rust_item_dependencies_patched)]
-use rustc_span::{ExpnKind, MacroKind, sym};
 
 use crate::graph::{
     Definition, DefinitionEdge, DefinitionGraph, DefinitionId, DefinitionKey, DefinitionKeyPart,
@@ -27,7 +25,7 @@ use crate::source::{
     ByteRange, CfgState, SourceError, SourceInventory, WrittenUnitKind, original_span_range,
 };
 #[cfg(rust_item_dependencies_patched)]
-use crate::source::{resolve_attribute_source, resolve_written_bang_macro_source};
+use crate::source::{EditableMacroSource, EditableMacroSourceRole, resolve_editable_macro_source};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DefinitionError {
@@ -561,7 +559,7 @@ fn definition_origin(
     let expansion = tcx.expn_that_defined(definition.to_def_id());
     if expansion != ExpnId::root() {
         #[cfg(rust_item_dependencies_patched)]
-        if let Some(origin) = written_derive_target_origin(
+        if let Some(origin) = written_target_definition_origin(
             compiler,
             tcx,
             source,
@@ -635,7 +633,7 @@ fn definition_origin(
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn written_derive_target_origin(
+fn written_target_definition_origin(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
@@ -644,14 +642,17 @@ fn written_derive_target_origin(
     expansion: ExpnId,
     hir_definitions: &BTreeSet<u32>,
 ) -> Result<Option<DefinitionOrigin>, DefinitionError> {
-    let Some(origin) = tcx.resolutions(()).macro_invocation_origins.get(&expansion) else {
+    let Some(expansion) = recorded_macro_expansion(tcx, expansion) else {
         return Ok(None);
     };
-    if origin.discovered_in_expansion != ExpnId::root()
-        || !matches!(
-            expansion.expn_data().kind,
-            ExpnKind::Macro(MacroKind::Attr, name) if name == sym::derive
-        )
+    let origins = &tcx.resolutions(()).macro_invocation_origins;
+    let Some(origin) = origins.get(&expansion) else {
+        return Ok(None);
+    };
+    let editable = resolve_editable_macro_source(compiler, source, origins, expansion)
+        .map_err(|_| DefinitionError::IncompleteDefinition)?;
+    if editable
+        .is_none_or(|editable| editable.role != EditableMacroSourceRole::TransparentAttribute)
         || !hir_definitions.contains(&raw_local_id(definition))
     {
         return Ok(None);
@@ -806,26 +807,10 @@ fn expanded_origin(
     expansion: ExpnId,
     generated_role: Option<GeneratedRole>,
 ) -> Result<DefinitionOrigin, DefinitionError> {
-    let origins = &tcx.resolutions(()).macro_invocation_origins;
-    let mut current =
-        recorded_macro_expansion(tcx, expansion).ok_or(DefinitionError::IncompleteDefinition)?;
-    loop {
-        let origin = origins
-            .get(&current)
-            .ok_or(DefinitionError::IncompleteDefinition)?;
-        if origin.discovered_in_expansion == ExpnId::root() {
-            break;
-        }
-        current = recorded_macro_expansion(tcx, origin.discovered_in_expansion)
-            .ok_or(DefinitionError::IncompleteDefinition)?;
-    }
-    let origin = origins
-        .get(&current)
-        .ok_or(DefinitionError::IncompleteDefinition)?;
-    let invocation = written_macro_invocation(compiler, source, current, origin)
+    let (_, invocation) = nearest_editable_macro_source(compiler, tcx, source, expansion)
         .map_err(|_| DefinitionError::IncompleteDefinition)?;
     Ok(DefinitionOrigin::Expanded {
-        invocation: invocation.unit.id,
+        invocation: invocation.unit,
         invocation_range: invocation.call_range,
         generated_role,
         ordinal: 0,
@@ -833,49 +818,35 @@ fn expanded_origin(
 }
 
 #[cfg(rust_item_dependencies_patched)]
-struct WrittenMacroInvocation<'a> {
-    unit: &'a crate::source::WrittenUnit,
-    call_range: ByteRange,
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn written_macro_invocation<'a>(
+fn nearest_editable_macro_source(
     compiler: &Compiler,
-    source: &'a SourceInventory,
+    tcx: TyCtxt<'_>,
+    source: &SourceInventory,
     expansion: ExpnId,
-    origin: &rustc_middle::ty::MacroInvocationOrigin,
-) -> Result<WrittenMacroInvocation<'a>, DefinitionError> {
-    let node_range = original_span_range(compiler, &source.offsets, origin.invocation_node_span)?;
-    let call_range =
-        original_span_range(compiler, &source.offsets, expansion.expn_data().call_site)?;
-    if matches!(
-        &expansion.expn_data().kind,
-        ExpnKind::Macro(MacroKind::Attr, _)
-    ) {
-        let target_range = original_span_range(
-            compiler,
-            &source.offsets,
-            origin
-                .target_span
-                .ok_or(DefinitionError::IncompleteDependency)?,
-        )?;
-        let invocation = resolve_attribute_source(source, call_range, node_range, target_range)
+) -> Result<(ExpnId, EditableMacroSource), DefinitionError> {
+    let origins = &tcx.resolutions(()).macro_invocation_origins;
+    let mut current =
+        recorded_macro_expansion(tcx, expansion).ok_or(DefinitionError::IncompleteDependency)?;
+    let mut visited = Vec::new();
+    loop {
+        if current == ExpnId::root() || visited.contains(&current) {
+            return Err(DefinitionError::IncompleteDependency);
+        }
+        visited.push(current);
+        if let Some(editable) = resolve_editable_macro_source(compiler, source, origins, current)
             .map_err(|_| DefinitionError::IncompleteDependency)?
-            .invocation
+        {
+            return Ok((current, editable));
+        }
+        let origin = origins
+            .get(&current)
             .ok_or(DefinitionError::IncompleteDependency)?;
-        let unit = source
-            .units
-            .get(invocation.0 as usize)
+        if origin.discovered_in_expansion == ExpnId::root() {
+            return Err(DefinitionError::IncompleteDependency);
+        }
+        current = recorded_macro_expansion(tcx, origin.discovered_in_expansion)
             .ok_or(DefinitionError::IncompleteDependency)?;
-        return Ok(WrittenMacroInvocation { unit, call_range });
     }
-    let invocation = resolve_written_bang_macro_source(source, call_range, node_range)
-        .ok_or(DefinitionError::IncompleteDependency)?;
-    let unit = source
-        .units
-        .get(invocation.0 as usize)
-        .ok_or(DefinitionError::IncompleteDependency)?;
-    Ok(WrittenMacroInvocation { unit, call_range })
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -2287,34 +2258,37 @@ fn collect_import_edges(
         if macro_definition.is_none() && origin.resolved_import_uses.is_empty() {
             continue;
         }
-        let outer_expansion = outer_macro_expansion(tcx, expansion)?;
-        let outer = tcx
+        let (source_expansion, invocation) =
+            nearest_editable_macro_source(compiler, tcx, source, expansion)?;
+        let source_origin = tcx
             .resolutions(())
             .macro_invocation_origins
-            .get(&outer_expansion)
+            .get(&source_expansion)
             .ok_or(DefinitionError::IncompleteDependency)?;
-        let invocation = written_macro_invocation(compiler, source, outer_expansion, outer)?;
-        let from = if outer.target_span.is_some() {
-            source_owner(source, source_owners, invocation.unit.id)?
+        let source_unit = source
+            .units
+            .get(invocation.unit.0 as usize)
+            .filter(|unit| unit.id == invocation.unit)
+            .ok_or(DefinitionError::IncompleteDependency)?;
+        let from = if source_origin.target_span.is_some() {
+            source_owner(source, source_owners, source_unit.id)?
         } else {
-            outer.parent_definition
+            source_origin.parent_definition
         };
         if let Some(target) = macro_definition {
-            let site = original_span_range(
-                compiler,
-                &source.offsets,
-                outer_expansion.expn_data().call_site,
-            )?;
             edges.push(RawEdge {
                 from,
                 to: target,
                 kind: DependencyKind::MacroPath,
-                site: Some(site),
+                site: Some(invocation.call_range),
             });
         }
         for record in &origin.resolved_import_uses {
             let site =
                 import_source_range(compiler, source, record.path_span, record.segment_span)?;
+            if !source_unit.full_range.contains(site) {
+                return Err(DefinitionError::IncompleteDependency);
+            }
             let target = record
                 .target
                 .opt_def_id()
@@ -2333,27 +2307,6 @@ fn collect_import_edges(
         }
     }
     Ok(())
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn outer_macro_expansion(tcx: TyCtxt<'_>, expansion: ExpnId) -> Result<ExpnId, DefinitionError> {
-    let origins = &tcx.resolutions(()).macro_invocation_origins;
-    let mut current = expansion;
-    let mut visited = Vec::new();
-    loop {
-        if current == ExpnId::root() || visited.contains(&current) {
-            return Err(DefinitionError::IncompleteDependency);
-        }
-        visited.push(current);
-        let origin = origins
-            .get(&current)
-            .ok_or(DefinitionError::IncompleteDependency)?;
-        if origin.discovered_in_expansion == ExpnId::root() {
-            return Ok(current);
-        }
-        current = recorded_macro_expansion(tcx, origin.discovered_in_expansion)
-            .ok_or(DefinitionError::IncompleteDependency)?;
-    }
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -2831,6 +2784,121 @@ mod exact_tests {
             ),
             expected_derive_structure_edges(source, &actual.definitions)
         );
+    }
+
+    #[test]
+    fn generated_derive_dependencies_roll_up_to_the_written_macro() {
+        let source = concat!(
+            "macro_rules! make {\n",
+            "    () => {\n",
+            "        #[derive(Clone)]\n",
+            "        struct Generated;\n",
+            "    };\n",
+            "}\n",
+            "make!();\n",
+            "fn main() { let _ = Generated.clone(); }\n",
+        );
+        let graph = inspect(source);
+        let invocation = marker_range(source, "make!()");
+        let generated_impls = graph
+            .definitions
+            .iter()
+            .filter(|definition| definition.kind == DefinitionKind::Impl)
+            .collect::<Vec<_>>();
+        let [generated_impl] = generated_impls.as_slice() else {
+            panic!("expected one generated impl, got {generated_impls:?}");
+        };
+        assert!(matches!(
+            generated_impl.origin,
+            DefinitionOrigin::Expanded {
+                invocation_range,
+                ..
+            } if invocation_range == invocation
+        ));
+
+        let root = graph
+            .definitions
+            .iter()
+            .find(|definition| definition.kind == DefinitionKind::Crate)
+            .expect("the crate definition must exist");
+        let macro_dependencies = graph
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                if edge.kind != DependencyKind::MacroPath || edge.from != root.id {
+                    return None;
+                }
+                let DefinitionTarget::External(target) = edge.to else {
+                    return None;
+                };
+                let path = &graph.external_definitions[target.0 as usize].path;
+                matches!(path.as_str(), "std::clone::Clone" | "std::derive")
+                    .then_some((path.clone(), edge.sites.clone()))
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            macro_dependencies,
+            BTreeSet::from([
+                ("std::clone::Clone".to_owned(), vec![invocation]),
+                ("std::derive".to_owned(), vec![invocation]),
+            ])
+        );
+    }
+
+    #[test]
+    fn derive_macro_imports_keep_the_exact_element_site() {
+        let source = concat!(
+            "use std::clone::Clone as DeriveClone;\n",
+            "#[derive(DeriveClone, Debug)]\n",
+            "struct Value;\n",
+            "fn main() { let _ = Value.clone(); }\n",
+        );
+        let graph = inspect(source);
+        let value = graph
+            .definitions
+            .iter()
+            .find(|definition| {
+                definition.kind == DefinitionKind::Struct
+                    && definition
+                        .key
+                        .0
+                        .last()
+                        .and_then(|part| part.name.as_deref())
+                        == Some("Value")
+            })
+            .expect("the derived type must exist");
+        let clone_element = marker_in(source, "#[derive(DeriveClone, Debug)]", "DeriveClone");
+        let clone_macro_paths = graph
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                if edge.from != value.id || edge.kind != DependencyKind::MacroPath {
+                    return None;
+                }
+                let DefinitionTarget::External(target) = edge.to else {
+                    return None;
+                };
+                (graph.external_definitions[target.0 as usize].path == "std::clone::Clone")
+                    .then_some(edge.sites.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(clone_macro_paths, vec![vec![clone_element]]);
+
+        let clone_imports = graph
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                if edge.from != value.id || edge.kind != DependencyKind::ImportLeaf {
+                    return None;
+                }
+                let DefinitionTarget::Local(target) = edge.to else {
+                    return None;
+                };
+                (graph.definitions[target.0 as usize].kind == DefinitionKind::Use)
+                    .then_some(edge.sites.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(clone_imports, vec![vec![clone_element]]);
     }
 
     #[test]
@@ -5436,7 +5504,7 @@ mod exact_tests {
             Some("main"),
             0,
         );
-        let invocation = marker_range(source, "#[derive(Clone)]");
+        let invocation = marker_range(source, "Clone");
         let clone_impl = expanded(DefinitionKind::Impl, invocation, None, 0, Some(&root));
         let clone = named(
             expanded(
@@ -5508,7 +5576,8 @@ mod exact_tests {
         );
         let injected_std = find_local(definitions, DefinitionKind::ExternCrate, Some("std"));
         let injected_prelude = injected(DefinitionKind::Use, InjectedRole::PreludeImport, 0, &root);
-        let invocation = marker_range(source, "#[derive(Clone)]");
+        let invocation = marker_range(source, "Clone");
+        let derive_attribute = marker_range(source, "#[derive(Clone)]");
         let item_anchor = marker_range(source, "struct Derived");
 
         BTreeSet::from([
@@ -5558,7 +5627,7 @@ mod exact_tests {
                 &derived,
                 TargetRef::External(external("core", "std::derive")),
                 DependencyKind::MacroPath,
-                [invocation],
+                [derive_attribute],
             ),
             edge(
                 &injected_std,

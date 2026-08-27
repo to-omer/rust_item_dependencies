@@ -2,10 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rustc_lexer::{FrontmatterAllowed, TokenKind, tokenize};
-
+use crate::source::syntax::{
+    Delimiter, DelimiterPair, SourceSyntaxError, SourceToken, comma_list_segments,
+    tokenize_balanced_range,
+};
 use crate::source::{
-    AtomicGroupId, ByteRange, SourceInventory, SourceUnitId, WrittenUnit, WrittenUnitKind,
+    AtomicGroupId, ByteRange, DeriveTargetSourceFacts, SourceInventory, SourceUnitId, WrittenUnit,
+    WrittenUnitKind, derive_attribute_layout, validate_derive_target_facts,
     validate_macro_rule_facts,
 };
 
@@ -128,19 +131,6 @@ pub(crate) enum SourceRewriteError {
     InvalidUseTree,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LexToken {
-    kind: TokenKind,
-    range: ByteRange,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Delimiter {
-    Parenthesis,
-    Brace,
-    Bracket,
-}
-
 pub(crate) fn rewrite_source(
     inventory: &SourceInventory,
     retained: &BTreeSet<SourceUnitId>,
@@ -155,6 +145,16 @@ pub(crate) fn rewrite_source(
         .filter(|unit| unit.kind == WrittenUnitKind::UseItem && retained.contains(&unit.id))
     {
         deletions.extend(rewrite_use_item(inventory, item, retained)?);
+    }
+    for facts in &inventory.derive_targets {
+        let DeriveTargetSourceFacts::Complete { attributes, .. } = facts else {
+            continue;
+        };
+        for attribute in attributes {
+            if retained.contains(&attribute.attribute) {
+                deletions.extend(rewrite_derive_attribute(inventory, attribute, retained)?);
+            }
+        }
     }
 
     deletions.sort();
@@ -252,6 +252,8 @@ fn validate_inventory(inventory: &SourceInventory) -> Result<BTreeSet<u32>, Sour
     }
     validate_macro_rule_facts(&inventory.units, &inventory.macro_rules)
         .map_err(|_| SourceRewriteError::InvalidInventory)?;
+    validate_derive_target_facts(&inventory.units, &inventory.derive_targets)
+        .map_err(|_| SourceRewriteError::InvalidInventory)?;
     Ok(piece_boundaries)
 }
 
@@ -298,11 +300,22 @@ fn frontier_deletions(
     inventory: &SourceInventory,
     retained: &BTreeSet<SourceUnitId>,
 ) -> Result<Vec<ByteRange>, SourceRewriteError> {
+    let derive_elements = inventory
+        .derive_targets
+        .iter()
+        .filter_map(|facts| match facts {
+            DeriveTargetSourceFacts::Complete { attributes, .. } => Some(attributes),
+            DeriveTargetSourceFacts::Opaque { .. } => None,
+        })
+        .flat_map(|attributes| attributes.iter())
+        .flat_map(|attribute| attribute.elements.iter().copied())
+        .collect::<BTreeSet<_>>();
     inventory
         .units
         .iter()
         .filter(|unit| {
             unit.kind != WrittenUnitKind::UseLeaf
+                && !derive_elements.contains(&unit.id)
                 && !retained.contains(&unit.id)
                 && unit.parent.is_some_and(|parent| retained.contains(&parent))
         })
@@ -314,6 +327,94 @@ fn frontier_deletions(
             }
         })
         .collect()
+}
+
+fn rewrite_derive_attribute(
+    inventory: &SourceInventory,
+    facts: &crate::source::DeriveAttributeSourceFacts,
+    retained: &BTreeSet<SourceUnitId>,
+) -> Result<Vec<ByteRange>, SourceRewriteError> {
+    let attribute = inventory
+        .units
+        .get(facts.attribute.0 as usize)
+        .filter(|attribute| attribute.id == facts.attribute)
+        .ok_or(SourceRewriteError::InvalidInventory)?;
+    let elements = facts
+        .elements
+        .iter()
+        .map(|element| {
+            inventory
+                .units
+                .get(element.0 as usize)
+                .filter(|unit| unit.id == *element)
+                .ok_or(SourceRewriteError::InvalidInventory)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let retained_count = elements
+        .iter()
+        .filter(|element| retained.contains(&element.id))
+        .count();
+    if retained_count == elements.len() {
+        return Ok(Vec::new());
+    }
+    if retained_count == 0 {
+        return Err(SourceRewriteError::InvalidRetention);
+    }
+
+    let ranges = elements
+        .iter()
+        .map(|element| element.full_range)
+        .collect::<Vec<_>>();
+    let layout = derive_attribute_layout(&inventory.original, attribute.full_range, &ranges)
+        .map_err(|_| SourceRewriteError::InvalidInventory)?;
+    let elements_by_range = elements
+        .iter()
+        .map(|element| (element.full_range, element.id))
+        .collect::<BTreeMap<_, _>>();
+    let retained_layout = layout
+        .iter()
+        .map(|entry| {
+            elements_by_range
+                .get(&entry.element)
+                .map(|element| retained.contains(element))
+                .ok_or(SourceRewriteError::InvalidInventory)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut deletions = Vec::new();
+    let mut index = 0;
+    while index < layout.len() {
+        if retained_layout[index] {
+            index += 1;
+            continue;
+        }
+        let first = index;
+        while index < layout.len() && !retained_layout[index] {
+            index += 1;
+        }
+        let last = index - 1;
+        let deletion = if index < layout.len() || layout[last].following_comma.is_some() {
+            let comma = layout[last]
+                .following_comma
+                .ok_or(SourceRewriteError::InvalidInventory)?;
+            ByteRange {
+                start: layout[first].segment.start,
+                end: comma.end,
+            }
+        } else {
+            let comma = layout[first]
+                .previous_comma
+                .ok_or(SourceRewriteError::InvalidRetention)?;
+            ByteRange {
+                start: comma.start,
+                end: layout[last].segment.end,
+            }
+        };
+        if deletion.is_empty() {
+            return Err(SourceRewriteError::InvalidInventory);
+        }
+        deletions.push(deletion);
+    }
+    Ok(deletions)
 }
 
 fn rewrite_use_item(
@@ -348,20 +449,24 @@ fn rewrite_use_item(
         return Err(SourceRewriteError::InvalidRetention);
     }
 
-    let tokens = lex_range(&inventory.original, item.full_range)?;
-    let brace_pairs = delimiter_pairs(&tokens)?;
+    let (tokens, delimiter_pairs) = tokenize_balanced_range(&inventory.original, item.full_range)
+        .map_err(|error| match error {
+        SourceSyntaxError::InvalidRange => SourceRewriteError::InvalidInventory,
+        SourceSyntaxError::SourceTooLarge | SourceSyntaxError::InvalidSyntax => {
+            SourceRewriteError::InvalidUseTree
+        }
+    })?;
     let ranges = leaves
         .iter()
         .map(|leaf| leaf.full_range)
         .collect::<Vec<_>>();
-    let (open, close) = enclosing_brace(&tokens, &brace_pairs, &ranges, None)
+    let pair = enclosing_brace(&tokens, &delimiter_pairs, &ranges, None)
         .ok_or(SourceRewriteError::InvalidUseTree)?;
     let mut deletions = Vec::new();
     rewrite_group(
         &tokens,
-        &brace_pairs,
-        open,
-        close,
+        &delimiter_pairs,
+        pair,
         &leaves,
         retained,
         &mut deletions,
@@ -369,114 +474,46 @@ fn rewrite_use_item(
     Ok(deletions)
 }
 
-fn lex_range(source: &str, range: ByteRange) -> Result<Vec<LexToken>, SourceRewriteError> {
-    let input = source
-        .get(range.start as usize..range.end as usize)
-        .ok_or(SourceRewriteError::InvalidInventory)?;
-    let mut offset = range.start;
-    let mut tokens = Vec::new();
-    for token in tokenize(input, FrontmatterAllowed::No) {
-        let end = offset
-            .checked_add(token.len)
-            .ok_or(SourceRewriteError::InvalidUseTree)?;
-        tokens.push(LexToken {
-            kind: token.kind,
-            range: ByteRange { start: offset, end },
-        });
-        offset = end;
-    }
-    if offset != range.end {
-        return Err(SourceRewriteError::InvalidUseTree);
-    }
-    Ok(tokens)
-}
-
-fn delimiter_pairs(tokens: &[LexToken]) -> Result<BTreeMap<usize, usize>, SourceRewriteError> {
-    let mut stack = Vec::<(Delimiter, usize)>::new();
-    let mut braces = BTreeMap::new();
-    for (index, token) in tokens.iter().enumerate() {
-        let opening = match token.kind {
-            TokenKind::OpenParen => Some(Delimiter::Parenthesis),
-            TokenKind::OpenBrace => Some(Delimiter::Brace),
-            TokenKind::OpenBracket => Some(Delimiter::Bracket),
-            _ => None,
-        };
-        if let Some(delimiter) = opening {
-            stack.push((delimiter, index));
-            continue;
-        }
-        let closing = match token.kind {
-            TokenKind::CloseParen => Some(Delimiter::Parenthesis),
-            TokenKind::CloseBrace => Some(Delimiter::Brace),
-            TokenKind::CloseBracket => Some(Delimiter::Bracket),
-            _ => None,
-        };
-        let Some(delimiter) = closing else {
-            continue;
-        };
-        let Some((opening, opening_index)) = stack.pop() else {
-            return Err(SourceRewriteError::InvalidUseTree);
-        };
-        if opening != delimiter {
-            return Err(SourceRewriteError::InvalidUseTree);
-        }
-        if delimiter == Delimiter::Brace {
-            braces.insert(opening_index, index);
-        }
-    }
-    if !stack.is_empty() {
-        return Err(SourceRewriteError::InvalidUseTree);
-    }
-    Ok(braces)
-}
-
 fn enclosing_brace(
-    tokens: &[LexToken],
-    brace_pairs: &BTreeMap<usize, usize>,
+    tokens: &[SourceToken],
+    delimiter_pairs: &[DelimiterPair],
     leaves: &[ByteRange],
     within: Option<ByteRange>,
-) -> Option<(usize, usize)> {
-    brace_pairs
+) -> Option<DelimiterPair> {
+    delimiter_pairs
         .iter()
-        .filter_map(|(&open, &close)| {
+        .copied()
+        .filter(|pair| pair.delimiter == Delimiter::Brace)
+        .filter_map(|pair| {
             let range = ByteRange {
-                start: tokens[open].range.end,
-                end: tokens[close].range.start,
+                start: tokens[pair.open].range.end,
+                end: tokens[pair.close].range.start,
             };
             if within.is_some_and(|outer| !outer.contains(range))
                 || !leaves.iter().all(|leaf| range.contains(*leaf))
             {
                 return None;
             }
-            Some((range.len(), open, close))
+            Some((range.len(), pair))
         })
-        .min()
-        .map(|(_, open, close)| (open, close))
+        .min_by_key(|(size, pair)| (*size, pair.open, pair.close))
+        .map(|(_, pair)| pair)
 }
 
 fn rewrite_group(
-    tokens: &[LexToken],
-    brace_pairs: &BTreeMap<usize, usize>,
-    open: usize,
-    close: usize,
+    tokens: &[SourceToken],
+    delimiter_pairs: &[DelimiterPair],
+    pair: DelimiterPair,
     leaves: &[&WrittenUnit],
     retained: &BTreeSet<SourceUnitId>,
     deletions: &mut Vec<ByteRange>,
 ) -> Result<(), SourceRewriteError> {
-    let commas = direct_commas(tokens, open, close)?;
-    let group_start = tokens[open].range.end;
-    let group_end = tokens[close].range.start;
+    let segments =
+        comma_list_segments(tokens, pair).map_err(|_| SourceRewriteError::InvalidUseTree)?;
     let mut assigned = BTreeSet::new();
 
-    for segment_index in 0..=commas.len() {
-        let previous = segment_index
-            .checked_sub(1)
-            .and_then(|index| commas.get(index).copied());
-        let following = commas.get(segment_index).copied();
-        let segment = ByteRange {
-            start: previous.map_or(group_start, |comma| tokens[comma].range.end),
-            end: following.map_or(group_end, |comma| tokens[comma].range.start),
-        };
+    for list_segment in segments {
+        let segment = list_segment.range;
         let segment_leaves = leaves
             .iter()
             .copied()
@@ -499,14 +536,14 @@ fn rewrite_group(
             continue;
         }
         if kept == 0 {
-            let deletion = if let Some(comma) = following {
+            let deletion = if let Some(comma) = list_segment.following_comma {
                 ByteRange {
                     start: segment.start,
-                    end: tokens[comma].range.end,
+                    end: comma.end,
                 }
-            } else if let Some(comma) = previous {
+            } else if let Some(comma) = list_segment.previous_comma {
                 ByteRange {
-                    start: tokens[comma].range.start,
+                    start: comma.start,
                     end: segment.end,
                 }
             } else {
@@ -523,15 +560,13 @@ fn rewrite_group(
             .iter()
             .map(|leaf| leaf.full_range)
             .collect::<Vec<_>>();
-        let (child_open, child_close) =
-            enclosing_brace(tokens, brace_pairs, &leaf_ranges, Some(segment))
-                .filter(|pair| *pair != (open, close))
-                .ok_or(SourceRewriteError::InvalidUseTree)?;
+        let child = enclosing_brace(tokens, delimiter_pairs, &leaf_ranges, Some(segment))
+            .filter(|child| *child != pair)
+            .ok_or(SourceRewriteError::InvalidUseTree)?;
         rewrite_group(
             tokens,
-            brace_pairs,
-            child_open,
-            child_close,
+            delimiter_pairs,
+            child,
             &segment_leaves,
             retained,
             deletions,
@@ -542,46 +577,6 @@ fn rewrite_group(
         return Err(SourceRewriteError::InvalidUseTree);
     }
     Ok(())
-}
-
-fn direct_commas(
-    tokens: &[LexToken],
-    open: usize,
-    close: usize,
-) -> Result<Vec<usize>, SourceRewriteError> {
-    let mut stack = Vec::new();
-    let mut commas = Vec::new();
-    for (index, token) in tokens.iter().enumerate().take(close).skip(open + 1) {
-        let opening = match token.kind {
-            TokenKind::OpenParen => Some(Delimiter::Parenthesis),
-            TokenKind::OpenBrace => Some(Delimiter::Brace),
-            TokenKind::OpenBracket => Some(Delimiter::Bracket),
-            _ => None,
-        };
-        if let Some(delimiter) = opening {
-            stack.push(delimiter);
-            continue;
-        }
-        let closing = match token.kind {
-            TokenKind::CloseParen => Some(Delimiter::Parenthesis),
-            TokenKind::CloseBrace => Some(Delimiter::Brace),
-            TokenKind::CloseBracket => Some(Delimiter::Bracket),
-            _ => None,
-        };
-        if let Some(delimiter) = closing {
-            if stack.pop() != Some(delimiter) {
-                return Err(SourceRewriteError::InvalidUseTree);
-            }
-            continue;
-        }
-        if token.kind == TokenKind::Comma && stack.is_empty() {
-            commas.push(index);
-        }
-    }
-    if !stack.is_empty() {
-        return Err(SourceRewriteError::InvalidUseTree);
-    }
-    Ok(commas)
 }
 
 fn merge_deletions(
@@ -671,7 +666,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::source::{
-        CfgState, OriginalOffsetMap, OwnedPiece, PieceKind, SourceInventory, WrittenUnit,
+        CfgState, DeriveAttributeSourceFacts, DeriveTargetSourceFacts, OriginalOffsetMap,
+        OwnedPiece, PieceKind, SourceInventory, WrittenUnit,
     };
 
     use super::*;
@@ -895,6 +891,211 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rewrites_first_middle_and_last_derive_elements_as_one_flat_list() {
+        let source =
+            "#[derive(Clone, /* keep */ core::fmt::Debug, Default,)]\nstruct S;\nfn main(){}\n";
+        let mut inventory = derive_inventory(
+            source,
+            "#[derive(Clone, /* keep */ core::fmt::Debug, Default,)]\nstruct S;",
+            "#[derive(Clone, /* keep */ core::fmt::Debug, Default,)]",
+            &["Clone", "core::fmt::Debug", "Default"],
+        );
+
+        let retained = BTreeSet::from([
+            SourceUnitId(0),
+            SourceUnitId(1),
+            SourceUnitId(2),
+            SourceUnitId(4),
+            SourceUnitId(6),
+        ]);
+        let actual = rewrite_source(&inventory, &retained).unwrap();
+        assert_eq!(
+            actual.source,
+            "#[derive( /* keep */ core::fmt::Debug,)]\nstruct S;\nfn main(){}\n"
+        );
+        assert_piece_map(&inventory.original, &actual);
+
+        inventory.derive_targets[0] = DeriveTargetSourceFacts::Opaque {
+            target: SourceUnitId(1),
+            attributes: vec![DeriveAttributeSourceFacts {
+                attribute: SourceUnitId(2),
+                elements: vec![SourceUnitId(3), SourceUnitId(4), SourceUnitId(5)],
+                directly_written: true,
+            }],
+            helper_candidates: Vec::new(),
+        };
+        for unit in &mut inventory.units[2..=5] {
+            unit.atomic_group = AtomicGroupId(1);
+        }
+        let retained = BTreeSet::from([
+            SourceUnitId(0),
+            SourceUnitId(1),
+            SourceUnitId(2),
+            SourceUnitId(3),
+            SourceUnitId(4),
+            SourceUnitId(5),
+            SourceUnitId(6),
+        ]);
+        assert_eq!(
+            rewrite_source(&inventory, &retained).unwrap().source,
+            source
+        );
+    }
+
+    #[test]
+    fn rewrites_every_nonempty_three_element_derive_subset_and_reaches_a_fixed_point() {
+        let names = ["A", "B", "C"];
+        for trailing_comma in [false, true] {
+            let input_list = if trailing_comma { "A,B,C," } else { "A,B,C" };
+            let attribute = format!("#[derive({input_list})]");
+            let source = format!("{attribute}\nstruct S;\nfn main(){{}}\n");
+            let target = format!("{attribute}\nstruct S;");
+            let inventory = derive_inventory(&source, &target, &attribute, &names);
+
+            for mask in 1_u8..8 {
+                let kept = names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, name)| ((mask & (1 << index)) != 0).then_some(*name))
+                    .collect::<Vec<_>>();
+                let retained_elements = (0..names.len())
+                    .filter(|index| (mask & (1 << index)) != 0)
+                    .map(|index| (0, index))
+                    .collect::<Vec<_>>();
+                let retained = retained_derive_subset(&inventory, &retained_elements);
+
+                let actual = rewrite_source(&inventory, &retained).unwrap();
+                let mut expected_list = kept.join(",");
+                if trailing_comma {
+                    expected_list.push(',');
+                }
+                let expected_attribute = format!("#[derive({expected_list})]");
+                let expected = format!("{expected_attribute}\nstruct S;\nfn main(){{}}\n");
+                assert_eq!(
+                    actual.source, expected,
+                    "mask {mask:03b}, trailing comma: {trailing_comma}"
+                );
+                assert_piece_map(&inventory.original, &actual);
+
+                let expected_target = format!("{expected_attribute}\nstruct S;");
+                let fixed_inventory =
+                    derive_inventory(&actual.source, &expected_target, &expected_attribute, &kept);
+                let fixed = rewrite_source(&fixed_inventory, &all_units(&fixed_inventory)).unwrap();
+                assert_eq!(
+                    fixed.source, actual.source,
+                    "mask {mask:03b}, trailing comma: {trailing_comma}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn associates_line_and_block_comments_with_the_following_derive_element() {
+        let attribute = concat!(
+            "#[derive(\n",
+            "    First,\n",
+            "    // line comment\n",
+            "    Second,\n",
+            "    /* block comment */ Third,\n",
+            ")]",
+        );
+        let source = format!("{attribute}\nstruct S;\nfn main(){{}}\n");
+        let target = format!("{attribute}\nstruct S;");
+        let inventory =
+            derive_inventory(&source, &target, attribute, &["First", "Second", "Third"]);
+
+        let second =
+            rewrite_source(&inventory, &retained_derive_subset(&inventory, &[(0, 1)])).unwrap();
+        assert_eq!(
+            second.source,
+            concat!(
+                "#[derive(\n",
+                "    // line comment\n",
+                "    Second,\n",
+                ")]\n",
+                "struct S;\n",
+                "fn main(){}\n",
+            )
+        );
+        assert_piece_map(&inventory.original, &second);
+
+        let third =
+            rewrite_source(&inventory, &retained_derive_subset(&inventory, &[(0, 2)])).unwrap();
+        assert_eq!(
+            third.source,
+            concat!(
+                "#[derive(\n",
+                "    /* block comment */ Third,\n",
+                ")]\n",
+                "struct S;\n",
+                "fn main(){}\n",
+            )
+        );
+        assert_piece_map(&inventory.original, &third);
+    }
+
+    #[test]
+    fn rewrites_multiple_derive_attributes_independently() {
+        let first_attribute = "#[derive(A, B)]";
+        let second_attribute = "#[derive(C, D, E)]";
+        let target = concat!("#[derive(A, B)]\n", "#[derive(C, D, E)]\n", "struct S;");
+        let source = format!("{target}\nfn main(){{}}\n");
+        let inventory = derive_inventory_with_attributes(
+            &source,
+            target,
+            &[
+                (first_attribute, &["A", "B"]),
+                (second_attribute, &["C", "D", "E"]),
+            ],
+        );
+
+        let retained = retained_derive_subset(&inventory, &[(0, 1), (1, 0), (1, 2)]);
+        let actual = rewrite_source(&inventory, &retained).unwrap();
+        assert_eq!(
+            actual.source,
+            "#[derive( B)]\n#[derive(C, E)]\nstruct S;\nfn main(){}\n"
+        );
+        assert_piece_map(&inventory.original, &actual);
+
+        let mut without_first = retained;
+        let first_attribute = &inventory.derive_targets[0].attributes()[0];
+        without_first.remove(&first_attribute.attribute);
+        for element in &first_attribute.elements {
+            without_first.remove(element);
+        }
+        let actual = rewrite_source(&inventory, &without_first).unwrap();
+        assert_eq!(actual.source, "\n#[derive(C, E)]\nstruct S;\nfn main(){}\n");
+        assert_piece_map(&inventory.original, &actual);
+    }
+
+    #[test]
+    fn deletes_the_whole_derive_attribute_when_no_element_is_retained() {
+        let source = "#[derive(Clone, Debug)]\nstruct S;\nfn main(){}\n";
+        let inventory = derive_inventory(
+            source,
+            "#[derive(Clone, Debug)]\nstruct S;",
+            "#[derive(Clone, Debug)]",
+            &["Clone", "Debug"],
+        );
+        let retained = BTreeSet::from([SourceUnitId(0), SourceUnitId(1), SourceUnitId(5)]);
+
+        let actual = rewrite_source(&inventory, &retained).unwrap();
+        assert_eq!(actual.source, "\nstruct S;\nfn main(){}\n");
+        assert_piece_map(&inventory.original, &actual);
+
+        let invalid = BTreeSet::from([
+            SourceUnitId(0),
+            SourceUnitId(1),
+            SourceUnitId(2),
+            SourceUnitId(5),
+        ]);
+        assert_eq!(
+            rewrite_source(&inventory, &invalid),
+            Err(SourceRewriteError::InvalidRetention)
+        );
+    }
+
     fn inventory(source: &str, children: &[WrittenUnit]) -> SourceInventory {
         let (normalized, offsets) = OriginalOffsetMap::from_source(source).unwrap();
         let mut units = vec![WrittenUnit {
@@ -930,9 +1131,107 @@ mod tests {
             offsets,
             units,
             pieces,
+            derive_targets: Vec::new(),
             macro_rules: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         }
+    }
+
+    fn derive_inventory(
+        source: &str,
+        target_marker: &str,
+        attribute_marker: &str,
+        element_markers: &[&str],
+    ) -> SourceInventory {
+        derive_inventory_with_attributes(
+            source,
+            target_marker,
+            &[(attribute_marker, element_markers)],
+        )
+    }
+
+    fn derive_inventory_with_attributes(
+        source: &str,
+        target_marker: &str,
+        attributes: &[(&str, &[&str])],
+    ) -> SourceInventory {
+        let target = marker(source, target_marker);
+        let main = marker(source, "fn main(){}");
+        let mut children = vec![unit(WrittenUnitKind::Item, target.start, target.end, 0, 1)];
+        let mut attribute_facts = Vec::new();
+        for &(attribute_marker, element_markers) in attributes {
+            let attribute = marker(source, attribute_marker);
+            let attribute_id = SourceUnitId(children.len() as u32 + 1);
+            children.push(unit(
+                WrittenUnitKind::MacroInvocation,
+                attribute.start,
+                attribute.end,
+                1,
+                attribute_id.0,
+            ));
+            let mut elements = Vec::new();
+            for &element_marker in element_markers {
+                let element = marker(source, element_marker);
+                let element_id = SourceUnitId(children.len() as u32 + 1);
+                children.push(unit(
+                    WrittenUnitKind::MacroInvocation,
+                    element.start,
+                    element.end,
+                    attribute_id.0,
+                    element_id.0,
+                ));
+                elements.push(element_id);
+            }
+            attribute_facts.push(DeriveAttributeSourceFacts {
+                attribute: attribute_id,
+                elements,
+                directly_written: true,
+            });
+        }
+        let main_id = SourceUnitId(children.len() as u32 + 1);
+        children.push(unit(
+            WrittenUnitKind::Item,
+            main.start,
+            main.end,
+            0,
+            main_id.0,
+        ));
+        let mut inventory = inventory(source, &children);
+        inventory.derive_targets = vec![DeriveTargetSourceFacts::Complete {
+            target: SourceUnitId(1),
+            attributes: attribute_facts,
+            helper_candidates: Vec::new(),
+            influences: Vec::new(),
+            helpers: Vec::new(),
+        }];
+        inventory
+    }
+
+    fn retained_derive_subset(
+        inventory: &SourceInventory,
+        retained_elements: &[(usize, usize)],
+    ) -> BTreeSet<SourceUnitId> {
+        let attributes = inventory.derive_targets[0].attributes();
+        let elements = attributes
+            .iter()
+            .flat_map(|attribute| attribute.elements.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let mut retained = inventory
+            .units
+            .iter()
+            .map(|unit| unit.id)
+            .filter(|unit| !elements.contains(unit))
+            .collect::<BTreeSet<_>>();
+        retained.extend(
+            retained_elements
+                .iter()
+                .map(|&(attribute, element)| attributes[attribute].elements[element]),
+        );
+        retained
+    }
+
+    fn all_units(inventory: &SourceInventory) -> BTreeSet<SourceUnitId> {
+        inventory.units.iter().map(|unit| unit.id).collect()
     }
 
     fn unit(kind: WrittenUnitKind, start: u32, end: u32, parent: u32, group: u32) -> WrittenUnit {

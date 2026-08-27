@@ -15,7 +15,10 @@ use rustc_span::{FileName, RealFileName};
 use super::*;
 use crate::definitions::collect_definitions;
 use crate::graph::{DefinitionKind, DefinitionOrigin, DefinitionTarget};
-use crate::source::{SourceInventory, collect_source, refine_macro_rules_from_compiler};
+use crate::source::{
+    SourceInventory, collect_source, refine_attribute_macros_from_compiler,
+    refine_derive_targets_from_compiler, refine_macro_rules_from_compiler,
+};
 
 const FIXTURE: &str = include_str!("../../tests/fixtures/dependencies/expansion_graph.rs");
 
@@ -81,6 +84,68 @@ fn macro_expansions_preserve_exact_ownership_and_relations() {
     let expected = expected_graph(FIXTURE);
 
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn stacked_written_derive_attributes_are_independent_source_roots() {
+    let source = concat!(
+        "#[derive()]\n",
+        "#[derive(Clone, Debug)]\n",
+        "struct Derived;\n",
+        "fn main() { let _ = Derived.clone(); }\n",
+    );
+    let graph = inspect(source);
+    let expansion = |style, invocation| {
+        let invocation = marker(source, invocation);
+        graph
+            .expansions
+            .iter()
+            .find(|expansion| {
+                expansion.invocation_range == Some(invocation)
+                    && matches!(
+                        expansion.kind,
+                        ExpansionKind::Macro {
+                            style: actual,
+                            ..
+                        } if actual == style
+                    )
+            })
+            .cloned()
+            .expect("the macro expansion must have an exact written source")
+    };
+    let empty_outer = expansion(MacroStyle::Attribute, "#[derive()]");
+    let populated_outer = expansion(MacroStyle::Attribute, "#[derive(Clone, Debug)]");
+    let clone = expansion(MacroStyle::Derive, "Clone");
+    let debug = expansion(MacroStyle::Derive, "Debug");
+
+    for outer in [&empty_outer, &populated_outer] {
+        assert_eq!(outer.key_depth, 1);
+        assert!(outer.written);
+        assert_eq!(outer.owner, "<none>");
+        assert!(
+            graph
+                .parents
+                .iter()
+                .all(|relation| relation.child != *outer)
+        );
+    }
+    for child in [&clone, &debug] {
+        assert_eq!(child.key_depth, 2);
+        assert!(child.written);
+        assert_eq!(child.owner, "Derived");
+        assert_eq!(
+            graph
+                .parents
+                .iter()
+                .filter(|relation| relation.child == *child)
+                .map(|relation| (relation.parent.clone(), relation.relation))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                (populated_outer.clone(), RelationRef::DiscoveredIn),
+                (populated_outer.clone(), RelationRef::SemanticParent),
+            ])
+        );
+    }
 }
 
 fn inspect(source: &str) -> GraphRef {
@@ -176,6 +241,27 @@ impl Callbacks for ExpansionCallbacks {
     }
 
     fn after_expansion<'tcx>(&mut self, compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        {
+            let (_, krate) = tcx.resolver_for_lowering();
+            let krate = krate.borrow();
+            refine_attribute_macros_from_compiler(
+                compiler,
+                tcx,
+                &krate,
+                self.inventory
+                    .as_mut()
+                    .expect("source inventory must survive through expansion"),
+            )
+            .expect("attribute source inventory must be complete");
+        }
+        refine_derive_targets_from_compiler(
+            compiler,
+            tcx,
+            self.inventory
+                .as_mut()
+                .expect("source inventory must survive through expansion"),
+        )
+        .expect("derive source inventory must be complete");
         refine_macro_rules_from_compiler(
             compiler,
             tcx,
@@ -421,7 +507,7 @@ fn expected_graph(source: &str) -> GraphRef {
         node_range: Some(between(source, "#[derive(Clone)]", "struct Derived;")),
         target_range: Some(marker(source, "struct Derived;")),
         written: true,
-        owner: "Derived".to_owned(),
+        owner: "<none>".to_owned(),
         macro_definition: "std::derive".to_owned(),
     };
     let clone = ExpansionRef {
@@ -435,7 +521,7 @@ fn expected_graph(source: &str) -> GraphRef {
         invocation_range: Some(marker(source, "Clone")),
         node_range: Some(marker(source, "struct Derived;")),
         target_range: Some(marker(source, "struct Derived;")),
-        written: false,
+        written: true,
         owner: "Derived".to_owned(),
         macro_definition: "std::clone::Clone".to_owned(),
     };
@@ -471,6 +557,7 @@ fn expected_graph(source: &str) -> GraphRef {
         .collect();
     let uses = expansions
         .iter()
+        .filter(|expansion| expansion.owner != "<none>")
         .map(|expansion| ExpansionUseRef {
             owner: expansion.owner.clone(),
             expansion: expansion.clone(),
@@ -486,7 +573,7 @@ fn expected_graph(source: &str) -> GraphRef {
         generated("nested_generated", &nested),
         generated("forwarded_generated", &forwarded),
         generated("late", &define_late),
-        generated("Impl@650", &clone),
+        generated("Impl@659", &clone),
         generated("clone", &clone),
         generated("'_", &clone),
     ]);

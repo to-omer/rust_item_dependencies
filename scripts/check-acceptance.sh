@@ -59,6 +59,7 @@ echo "==> patched compiler observer fixtures"
     RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$queue_digest" \
         ./x test --ci=false --stage 2 --force-rerun --all-targets \
         compiler/rustc_span \
+        tests/ui-fulldeps/derive-observer.rs \
         tests/ui-fulldeps/selection-proof-trace.rs \
         tests/ui-fulldeps/macro-rule-observer.rs \
         tests/ui-fulldeps/proc-macro-load-guard.rs \
@@ -73,6 +74,7 @@ echo "==> patched compiler observer fixtures"
         tests/ui-fulldeps/typeck-impl-dependencies-drop.rs \
         tests/ui-fulldeps/typeck-impl-dependencies-for-loop.rs \
         tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs \
+        tests/ui-fulldeps/typeck-impl-dependencies-structural-pattern.rs \
         tests/ui-fulldeps/typeck-impl-dependencies-union.rs \
         tests/ui/resolve/error-recovery-import-observer.rs
 )

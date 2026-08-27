@@ -10,8 +10,13 @@ mod retained {
     fn unused_nested() -> i32 { 99 }
 }
 
+#[derive(Clone)]
 #[derive(proc_fixture::Answer)]
 struct Marker;
+
+#[derive(proc_fixture::Answer)]
+#[derive(Clone)]
+struct ReverseMarker;
 
 proc_fixture::make_unused!();
 
@@ -24,5 +29,6 @@ struct UnusedMarker;
 fn unused_outside() -> i32 { 100 }
 
 fn main() {
+    let _ = ReverseMarker.clone();
     println!("{}", retained::value() + Marker::answer() + proc_fixture::one!());
 }

@@ -1,3 +1,19 @@
+mod derive;
+pub(crate) mod syntax;
+
+#[cfg(rust_item_dependencies_patched)]
+pub(crate) use derive::refine_derive_targets_from_compiler;
+use derive::remap_derive_target_facts;
+pub(crate) use derive::{
+    DeriveAttributeSourceFacts, DeriveTargetSourceFacts, derive_attribute_layout,
+    validate_derive_target_facts,
+};
+#[allow(unused_imports)]
+pub(crate) use derive::{
+    DeriveHelperSourceFacts, DeriveListEntryLayout, DeriveSourceRequirement,
+    DeriveTargetObservation, ObservedDeriveHelper, refine_derive_targets,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -115,6 +131,7 @@ pub struct SourceInventory {
     pub(crate) offsets: OriginalOffsetMap,
     pub units: Vec<WrittenUnit>,
     pub pieces: Vec<OwnedPiece>,
+    pub(crate) derive_targets: Vec<DeriveTargetSourceFacts>,
     pub(crate) macro_rules: Vec<MacroRuleSourceFacts>,
     pub(crate) ownerless_attribute_invocations: Vec<SourceUnitId>,
 }
@@ -137,11 +154,86 @@ pub(crate) struct AttributeSource {
     pub target: SourceUnitId,
 }
 
-pub(crate) fn resolve_attribute_source(
+#[cfg(rust_item_dependencies_patched)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EditableMacroSource {
+    pub unit: SourceUnitId,
+    pub call_range: ByteRange,
+    pub role: EditableMacroSourceRole,
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EditableMacroSourceRole {
+    ProducesDefinitions,
+    TransparentAttribute,
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedOuterAttributeSource {
+    source: AttributeSource,
+    role: EditableMacroSourceRole,
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WrittenBuiltinDeriveOuter {
+    source: AttributeSource,
+    call_range: ByteRange,
+}
+
+#[derive(Clone, Copy)]
+enum AttributeInvocationRole {
+    AtomicMember,
+    DeriveAttribute,
+    DeriveHelper,
+}
+
+fn smallest_unique_active_unit(
+    units: &[WrittenUnit],
+    mut matches: impl FnMut(&WrittenUnit) -> bool,
+) -> Result<&WrittenUnit, SourceError> {
+    let mut candidates = units
+        .iter()
+        .filter(|unit| unit.cfg_state == CfgState::Active && matches(unit))
+        .collect::<Vec<_>>();
+    let smallest = candidates
+        .iter()
+        .map(|unit| unit.full_range.len())
+        .min()
+        .ok_or(SourceError::IncompleteAttributeObservation)?;
+    candidates.retain(|unit| unit.full_range.len() == smallest);
+    let [unit] = candidates.as_slice() else {
+        return Err(SourceError::IncompleteAttributeObservation);
+    };
+    Ok(unit)
+}
+
+fn derive_helper_owner(
+    units: &[WrittenUnit],
+    derive_target: SourceUnitId,
+    helper_range: ByteRange,
+    helper: Option<SourceUnitId>,
+) -> Result<SourceUnitId, SourceError> {
+    let target = units
+        .get(derive_target.0 as usize)
+        .filter(|unit| unit.id == derive_target && unit.cfg_state == CfgState::Active)
+        .ok_or(SourceError::InvalidInventory)?;
+    smallest_unique_active_unit(units, |unit| {
+        Some(unit.id) != helper
+            && target.full_range.contains(unit.full_range)
+            && unit.full_range.contains(helper_range)
+    })
+    .map(|unit| unit.id)
+}
+
+fn resolve_attribute_source_with_role(
     inventory: &SourceInventory,
     invocation_range: ByteRange,
     node_range: ByteRange,
     target_range: ByteRange,
+    role: AttributeInvocationRole,
 ) -> Result<AttributeSource, SourceError> {
     if invocation_range.start >= invocation_range.end
         || !node_range.contains(invocation_range)
@@ -149,40 +241,50 @@ pub(crate) fn resolve_attribute_source(
     {
         return Err(SourceError::IncompleteAttributeObservation);
     }
-    let mut targets = inventory
-        .units
-        .iter()
-        .filter(|unit| {
-            unit.cfg_state == CfgState::Active
-                && unit.full_range.contains(node_range)
-                && unit.full_range.contains(target_range)
-                && unit.full_range.contains(invocation_range)
-        })
-        .collect::<Vec<_>>();
-    let smallest = targets
-        .iter()
-        .map(|unit| unit.full_range.len())
-        .min()
-        .ok_or(SourceError::IncompleteAttributeObservation)?;
-    targets.retain(|unit| unit.full_range.len() == smallest);
-    let [target] = targets.as_slice() else {
-        return Err(SourceError::IncompleteAttributeObservation);
-    };
-
-    let invocations = inventory
-        .units
-        .iter()
-        .filter(|unit| {
-            unit.kind == WrittenUnitKind::MacroInvocation
-                && unit.cfg_state == CfgState::Active
-                && unit.parent == Some(target.id)
-                && unit.atomic_group == target.atomic_group
-                && unit.full_range.end <= target_range.start
-                && (unit.full_range == invocation_range
-                    || unit.full_range.contains(invocation_range))
-        })
-        .map(|unit| unit.id)
-        .collect::<Vec<_>>();
+    let target = smallest_unique_active_unit(&inventory.units, |unit| {
+        unit.full_range.contains(node_range)
+            && unit.full_range.contains(target_range)
+            && unit.full_range.contains(invocation_range)
+    })?;
+    let invocations =
+        inventory
+            .units
+            .iter()
+            .filter(|unit| {
+                unit.kind == WrittenUnitKind::MacroInvocation
+                    && unit.cfg_state == CfgState::Active
+                    && (unit.full_range == invocation_range
+                        || unit.full_range.contains(invocation_range))
+                    && match role {
+                        AttributeInvocationRole::AtomicMember => {
+                            unit.parent == Some(target.id)
+                                && unit.atomic_group == target.atomic_group
+                                && unit.full_range.end <= target_range.start
+                        }
+                        AttributeInvocationRole::DeriveAttribute => inventory
+                            .derive_targets
+                            .iter()
+                            .find(|facts| facts.target() == target.id)
+                            .is_some_and(|facts| {
+                                facts
+                                    .attributes()
+                                    .iter()
+                                    .any(|attribute| attribute.attribute == unit.id)
+                            }),
+                        AttributeInvocationRole::DeriveHelper => unit.parent == Some(target.id)
+                            && inventory.derive_targets.iter().any(|facts| {
+                                matches!(
+                                    facts,
+                                    DeriveTargetSourceFacts::Complete {
+                                        helpers,
+                                        ..
+                                    } if helpers.iter().any(|helper| helper.attribute == unit.id)
+                                )
+                            }),
+                    }
+            })
+            .map(|unit| unit.id)
+            .collect::<Vec<_>>();
     let invocation = match invocations.as_slice() {
         [] => None,
         [invocation] => Some(*invocation),
@@ -192,6 +294,301 @@ pub(crate) fn resolve_attribute_source(
         invocation,
         target: target.id,
     })
+}
+
+pub(crate) fn resolve_attribute_source(
+    inventory: &SourceInventory,
+    invocation_range: ByteRange,
+    node_range: ByteRange,
+    target_range: ByteRange,
+) -> Result<AttributeSource, SourceError> {
+    resolve_attribute_source_with_role(
+        inventory,
+        invocation_range,
+        node_range,
+        target_range,
+        AttributeInvocationRole::AtomicMember,
+    )
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn resolve_outer_attribute_source(
+    inventory: &SourceInventory,
+    invocation_range: ByteRange,
+    node_range: ByteRange,
+    target_range: ByteRange,
+) -> Result<ResolvedOuterAttributeSource, SourceError> {
+    let derive = resolve_attribute_source_with_role(
+        inventory,
+        invocation_range,
+        node_range,
+        target_range,
+        AttributeInvocationRole::DeriveAttribute,
+    )?;
+    if derive.invocation.is_some() {
+        Ok(ResolvedOuterAttributeSource {
+            source: derive,
+            role: EditableMacroSourceRole::TransparentAttribute,
+        })
+    } else {
+        Ok(ResolvedOuterAttributeSource {
+            source: resolve_attribute_source(
+                inventory,
+                invocation_range,
+                node_range,
+                target_range,
+            )?,
+            role: EditableMacroSourceRole::ProducesDefinitions,
+        })
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn resolve_written_builtin_derive_outer(
+    compiler: &Compiler,
+    inventory: &SourceInventory,
+    origins: &UnordMap<ExpnId, MacroInvocationOrigin>,
+    expansion: ExpnId,
+) -> Result<Option<WrittenBuiltinDeriveOuter>, SourceError> {
+    let mut chain = Vec::new();
+    let mut current = expansion;
+    while current != ExpnId::root() {
+        if chain.contains(&current) {
+            return Err(SourceError::IncompleteDeriveObservation);
+        }
+        let Some(origin) = origins.get(&current) else {
+            return Err(SourceError::IncompleteDeriveObservation);
+        };
+        if origin.implementation_kind != MacroImplementationKind::Builtin
+            || !matches!(
+                current.expn_data().kind,
+                ExpnKind::Macro(MacroKind::Attr, name) if name == sym::derive
+            )
+        {
+            return Ok(None);
+        }
+        chain.push(current);
+        current = origin.discovered_in_expansion;
+    }
+
+    let mut target = None;
+    let mut attributes = BTreeSet::new();
+    let mut resolved = None;
+    for current in chain {
+        let origin = origins
+            .get(&current)
+            .ok_or(SourceError::IncompleteDeriveObservation)?;
+        let call_range =
+            original_span_range(compiler, &inventory.offsets, current.expn_data().call_site)?;
+        let node_range =
+            original_span_range(compiler, &inventory.offsets, origin.invocation_node_span)?;
+        let target_range = original_span_range(
+            compiler,
+            &inventory.offsets,
+            origin
+                .target_span
+                .ok_or(SourceError::IncompleteDeriveObservation)?,
+        )?;
+        let source = resolve_attribute_source_with_role(
+            inventory,
+            call_range,
+            node_range,
+            target_range,
+            AttributeInvocationRole::DeriveAttribute,
+        )?;
+        let Some(attribute) = source.invocation else {
+            return Ok(None);
+        };
+        let directly_written = inventory
+            .derive_targets
+            .iter()
+            .find(|facts| facts.target() == source.target)
+            .and_then(|facts| {
+                facts
+                    .attributes()
+                    .iter()
+                    .find(|facts| facts.attribute == attribute)
+            })
+            .is_some_and(|facts| facts.directly_written);
+        if !directly_written
+            || target.is_some_and(|target| target != source.target)
+            || !attributes.insert(attribute)
+        {
+            return Ok(None);
+        }
+        target = Some(source.target);
+        if current == expansion {
+            resolved = Some(WrittenBuiltinDeriveOuter { source, call_range });
+        }
+    }
+    Ok(Some(
+        resolved.ok_or(SourceError::IncompleteDeriveObservation)?,
+    ))
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn resolve_derive_helper_source(
+    inventory: &SourceInventory,
+    invocation_range: ByteRange,
+    node_range: ByteRange,
+    target_range: ByteRange,
+) -> Result<Option<AttributeSource>, SourceError> {
+    let source = resolve_attribute_source_with_role(
+        inventory,
+        invocation_range,
+        node_range,
+        target_range,
+        AttributeInvocationRole::DeriveHelper,
+    )?;
+    Ok(source.invocation.map(|invocation| AttributeSource {
+        invocation: Some(invocation),
+        target: source.target,
+    }))
+}
+
+#[cfg(rust_item_dependencies_patched)]
+pub(crate) fn resolve_editable_macro_source(
+    compiler: &Compiler,
+    inventory: &SourceInventory,
+    origins: &UnordMap<ExpnId, MacroInvocationOrigin>,
+    expansion: ExpnId,
+) -> Result<Option<EditableMacroSource>, SourceError> {
+    let origin = origins
+        .get(&expansion)
+        .ok_or(SourceError::IncompleteDeriveObservation)?;
+    let data = expansion.expn_data();
+    let ExpnKind::Macro(kind, _) = data.kind else {
+        return Err(SourceError::IncompleteDeriveObservation);
+    };
+
+    match kind {
+        MacroKind::Bang => {
+            if origin.discovered_in_expansion != ExpnId::root() {
+                return Ok(None);
+            }
+            let call_range = original_span_range(compiler, &inventory.offsets, data.call_site)?;
+            let node_range =
+                original_span_range(compiler, &inventory.offsets, origin.invocation_node_span)?;
+            Ok(
+                resolve_written_bang_macro_source(inventory, call_range, node_range).map(|unit| {
+                    EditableMacroSource {
+                        unit,
+                        call_range,
+                        role: EditableMacroSourceRole::ProducesDefinitions,
+                    }
+                }),
+            )
+        }
+        MacroKind::Attr => {
+            let nested = origin.discovered_in_expansion != ExpnId::root();
+            if nested
+                && let Some(derive) =
+                    resolve_written_builtin_derive_outer(compiler, inventory, origins, expansion)?
+            {
+                return Ok(Some(EditableMacroSource {
+                    unit: derive
+                        .source
+                        .invocation
+                        .ok_or(SourceError::IncompleteDeriveObservation)?,
+                    call_range: derive.call_range,
+                    role: EditableMacroSourceRole::TransparentAttribute,
+                }));
+            }
+            if nested && origin.implementation_kind != MacroImplementationKind::InertAttribute {
+                return Ok(None);
+            }
+            let call_range = match original_span_range(compiler, &inventory.offsets, data.call_site)
+            {
+                Ok(call_range) => call_range,
+                Err(_) if nested => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            if nested
+                && !inventory.derive_targets.iter().any(|facts| {
+                    let DeriveTargetSourceFacts::Complete { helpers, .. } = facts else {
+                        return false;
+                    };
+                    helpers.iter().any(|helper| {
+                        inventory
+                            .units
+                            .get(helper.attribute.0 as usize)
+                            .is_some_and(|unit| unit.full_range.contains(call_range))
+                    })
+                })
+            {
+                return Ok(None);
+            }
+            let node_range =
+                original_span_range(compiler, &inventory.offsets, origin.invocation_node_span)?;
+            let target_range = original_span_range(
+                compiler,
+                &inventory.offsets,
+                origin
+                    .target_span
+                    .ok_or(SourceError::IncompleteAttributeObservation)?,
+            )?;
+            if nested {
+                let source =
+                    resolve_derive_helper_source(inventory, call_range, node_range, target_range)?;
+                return Ok(source.and_then(|source| {
+                    source.invocation.map(|unit| EditableMacroSource {
+                        unit,
+                        call_range,
+                        role: EditableMacroSourceRole::TransparentAttribute,
+                    })
+                }));
+            }
+            let resolved =
+                resolve_outer_attribute_source(inventory, call_range, node_range, target_range)?;
+            Ok(resolved.source.invocation.map(|unit| EditableMacroSource {
+                unit,
+                call_range,
+                role: resolved.role,
+            }))
+        }
+        MacroKind::Derive => {
+            let outer = origin.discovered_in_expansion;
+            if outer == ExpnId::root() {
+                return Err(SourceError::IncompleteDeriveObservation);
+            }
+            let Some(outer_source) =
+                resolve_written_builtin_derive_outer(compiler, inventory, origins, outer)?
+            else {
+                return Ok(None);
+            };
+            let facts = inventory
+                .derive_targets
+                .iter()
+                .find(|facts| facts.target() == outer_source.source.target)
+                .ok_or(SourceError::IncompleteDeriveObservation)?;
+            let DeriveTargetSourceFacts::Complete { attributes, .. } = facts else {
+                return Ok(None);
+            };
+            let attribute = attributes
+                .iter()
+                .find(|attribute| outer_source.source.invocation == Some(attribute.attribute))
+                .ok_or(SourceError::IncompleteDeriveObservation)?;
+            if origin.implementation_kind != MacroImplementationKind::Builtin {
+                return Err(SourceError::IncompleteDeriveObservation);
+            }
+            let call_range = original_span_range(compiler, &inventory.offsets, data.call_site)?;
+            let element = origin
+                .derive_source_index
+                .and_then(|index| attribute.elements.get(index))
+                .copied()
+                .ok_or(SourceError::IncompleteDeriveObservation)?;
+            let unit = inventory
+                .units
+                .get(element.0 as usize)
+                .filter(|unit| unit.full_range == call_range)
+                .ok_or(SourceError::IncompleteDeriveObservation)?;
+            Ok(Some(EditableMacroSource {
+                unit: unit.id,
+                call_range,
+                role: EditableMacroSourceRole::ProducesDefinitions,
+            }))
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -284,6 +681,7 @@ pub(crate) enum SourceError {
     InvalidSpan,
     InvalidInventory,
     IncompleteAttributeObservation,
+    IncompleteDeriveObservation,
     IncompleteMacroRuleObservation,
     IncompleteProceduralMacroObservation,
 }
@@ -471,6 +869,19 @@ struct PendingUnit {
     syntax_ordinal: u32,
 }
 
+#[derive(Clone, Debug)]
+struct PendingDeriveAttributeSourceFacts {
+    attribute: u32,
+    elements: Vec<u32>,
+    directly_written: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDeriveTargetSourceFacts {
+    attributes: Vec<PendingDeriveAttributeSourceFacts>,
+    helper_candidates: Vec<ByteRange>,
+}
+
 fn pending_units(units: &[WrittenUnit]) -> (Vec<PendingUnit>, BTreeMap<AtomicGroupId, u32>) {
     let representatives = units.iter().fold(
         BTreeMap::<AtomicGroupId, u32>::new(),
@@ -538,9 +949,10 @@ pub(crate) fn collect_source(
     )?;
     collector.record_configured_attributes(&krate.attrs, &configured_attrs, root_active);
     collector.visit_crate(krate);
-    let units = collector.finish()?;
+    let (units, derive_targets) = collector.finish()?;
     let pieces = own_lexical_pieces(&original, &units)?;
     validate_inventory(&original, &units, &pieces)?;
+    validate_derive_target_facts(&units, &derive_targets)?;
 
     Ok(SourceInventory {
         original,
@@ -548,6 +960,7 @@ pub(crate) fn collect_source(
         offsets,
         units,
         pieces,
+        derive_targets,
         macro_rules: Vec::new(),
         ownerless_attribute_invocations: Vec::new(),
     })
@@ -663,6 +1076,7 @@ fn refine_attribute_macros(
         return Err(SourceError::InvalidInventory);
     }
     validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
+    validate_derive_target_facts(&inventory.units, &inventory.derive_targets)?;
 
     let (mut pending, representatives) = pending_units(&inventory.units);
     let mut next_temporary =
@@ -740,6 +1154,7 @@ fn refine_attribute_macros(
     pending.retain(|unit| !removed.contains(&unit.temporary_id));
 
     let (units, id_map) = finish_pending_units(pending)?;
+    let derive_targets = remap_derive_target_facts(&inventory.derive_targets, &id_map)?;
     let mut ownerless_attribute_invocations = ownerless_invocations
         .into_iter()
         .map(|invocation| id_map[&invocation])
@@ -747,9 +1162,11 @@ fn refine_attribute_macros(
     ownerless_attribute_invocations.sort();
     let pieces = own_lexical_pieces(&inventory.original, &units)?;
     validate_inventory(&inventory.original, &units, &pieces)?;
+    validate_derive_target_facts(&units, &derive_targets)?;
     validate_ownerless_attribute_invocations(&units, &ownerless_attribute_invocations)?;
     inventory.units = units;
     inventory.pieces = pieces;
+    inventory.derive_targets = derive_targets;
     inventory.ownerless_attribute_invocations = ownerless_attribute_invocations;
     Ok(())
 }
@@ -775,6 +1192,7 @@ fn refine_macro_rules_outside_opaque_anchors(
         return Err(SourceError::InvalidInventory);
     }
     validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
+    validate_derive_target_facts(&inventory.units, &inventory.derive_targets)?;
     validate_ownerless_attribute_invocations(
         &inventory.units,
         &inventory.ownerless_attribute_invocations,
@@ -903,6 +1321,7 @@ fn refine_macro_rules_outside_opaque_anchors(
         });
     }
     macro_rules.sort_by_key(MacroRuleSourceFacts::definition);
+    let derive_targets = remap_derive_target_facts(&inventory.derive_targets, &id_map)?;
     let mut ownerless_attribute_invocations = inventory
         .ownerless_attribute_invocations
         .iter()
@@ -911,10 +1330,12 @@ fn refine_macro_rules_outside_opaque_anchors(
     ownerless_attribute_invocations.sort();
     let pieces = own_lexical_pieces(&inventory.original, &units)?;
     validate_inventory(&inventory.original, &units, &pieces)?;
+    validate_derive_target_facts(&units, &derive_targets)?;
     validate_macro_rule_facts(&units, &macro_rules)?;
     validate_ownerless_attribute_invocations(&units, &ownerless_attribute_invocations)?;
     inventory.units = units;
     inventory.pieces = pieces;
+    inventory.derive_targets = derive_targets;
     inventory.macro_rules = macro_rules;
     inventory.ownerless_attribute_invocations = ownerless_attribute_invocations;
     Ok(())
@@ -1161,6 +1582,7 @@ fn resolve_procedural_macro_anchors(
     observations: Vec<ObservedProceduralMacro>,
 ) -> Result<BTreeSet<ProceduralMacroAnchor>, SourceError> {
     validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
+    validate_derive_target_facts(&inventory.units, &inventory.derive_targets)?;
     validate_ownerless_attribute_invocations(
         &inventory.units,
         &inventory.ownerless_attribute_invocations,
@@ -1216,6 +1638,7 @@ fn merge_procedural_macro_atomic_groups(
     anchors: &BTreeSet<ProceduralMacroAnchor>,
 ) -> Result<(), SourceError> {
     validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
+    validate_derive_target_facts(&inventory.units, &inventory.derive_targets)?;
     validate_macro_rule_facts(&inventory.units, &inventory.macro_rules)?;
     validate_ownerless_attribute_invocations(
         &inventory.units,
@@ -1469,6 +1892,7 @@ struct UnitCollector<'a> {
     body_depth: u32,
     seen_macro_ranges: BTreeMap<ByteRange, u32>,
     seen_no_effect_cfg_attrs: BTreeSet<(ast::AttrId, ByteRange)>,
+    derive_targets: BTreeMap<u32, PendingDeriveTargetSourceFacts>,
     next_syntax_ordinal: u32,
     error: Option<SourceError>,
 }
@@ -1509,16 +1933,40 @@ impl<'a> UnitCollector<'a> {
             body_depth: 0,
             seen_macro_ranges: BTreeMap::new(),
             seen_no_effect_cfg_attrs: BTreeSet::new(),
+            derive_targets: BTreeMap::new(),
             next_syntax_ordinal: 1,
             error: None,
         })
     }
 
-    fn finish(mut self) -> Result<Vec<WrittenUnit>, SourceError> {
+    fn finish(mut self) -> Result<(Vec<WrittenUnit>, Vec<DeriveTargetSourceFacts>), SourceError> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
-        finish_pending_units(self.units).map(|(units, _)| units)
+        let (units, id_map) = finish_pending_units(self.units)?;
+        let mut derive_targets = self
+            .derive_targets
+            .into_iter()
+            .map(|(target, facts)| DeriveTargetSourceFacts::Opaque {
+                target: id_map[&target],
+                attributes: facts
+                    .attributes
+                    .into_iter()
+                    .map(|attribute| DeriveAttributeSourceFacts {
+                        attribute: id_map[&attribute.attribute],
+                        elements: attribute
+                            .elements
+                            .into_iter()
+                            .map(|element| id_map[&element])
+                            .collect(),
+                        directly_written: attribute.directly_written,
+                    })
+                    .collect(),
+                helper_candidates: facts.helper_candidates,
+            })
+            .collect::<Vec<_>>();
+        derive_targets.sort_by_key(DeriveTargetSourceFacts::target);
+        Ok((units, derive_targets))
     }
 
     fn current_parent(&self) -> u32 {
@@ -1715,6 +2163,45 @@ impl<'a> UnitCollector<'a> {
         Ok(id)
     }
 
+    fn derive_helper_candidates(&mut self, item: &ast::Item) -> Vec<ByteRange> {
+        let mut attributes = item.attrs.iter().collect::<Vec<_>>();
+        match &item.kind {
+            ast::ItemKind::Struct(_, _, data) | ast::ItemKind::Union(_, _, data) => {
+                attributes.extend(data.fields().iter().flat_map(|field| field.attrs.iter()));
+            }
+            ast::ItemKind::Enum(_, _, definition) => {
+                for variant in &definition.variants {
+                    attributes.extend(variant.attrs.iter());
+                    attributes.extend(
+                        variant
+                            .data
+                            .fields()
+                            .iter()
+                            .flat_map(|field| field.attrs.iter()),
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        let mut ranges = attributes
+            .into_iter()
+            .filter(|attribute| {
+                !attribute.has_name(sym::derive) && !attribute.has_name(sym::cfg_attr)
+            })
+            .filter_map(|attribute| match self.span_range(attribute.span) {
+                Ok(range) => Some(range),
+                Err(error) => {
+                    self.fail(error);
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        ranges.sort();
+        ranges.dedup();
+        ranges
+    }
+
     fn collect_use_leaves(
         &mut self,
         tree: &ast::UseTree,
@@ -1810,7 +2297,7 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
         let parent = self.current_parent();
         let id = self.add_unit(kind, range, active, parent, None);
 
-        let mut derive_ranges = Vec::new();
+        let mut derive_sources = BTreeMap::<ByteRange, (bool, Vec<ByteRange>)>::new();
         for attribute in item.attrs.iter().chain(
             configured
                 .as_ref()
@@ -1827,19 +2314,84 @@ impl<'ast> Visitor<'ast> for UnitCollector<'_> {
                 .min_by_key(|written| written.span.hi().0 - written.span.lo().0)
                 .map_or(attribute.span, |written| written.span);
             match self.span_range(written_span) {
-                Ok(attribute_range) => derive_ranges.push(attribute_range),
+                Ok(attribute_range) => {
+                    derive_sources
+                        .entry(attribute_range)
+                        .or_insert_with(|| (false, Vec::new()));
+                }
                 Err(error) => self.fail(error),
             }
         }
-        derive_ranges.sort();
-        derive_ranges.dedup();
-        for attribute_range in derive_ranges {
-            self.add_unit(
+
+        for attribute in item
+            .attrs
+            .iter()
+            .filter(|attribute| attribute.has_name(sym::derive))
+        {
+            let attribute_range = match self.span_range(attribute.span) {
+                Ok(range) => range,
+                Err(error) => {
+                    self.fail(error);
+                    continue;
+                }
+            };
+            let entry = derive_sources
+                .entry(attribute_range)
+                .or_insert_with(|| (true, Vec::new()));
+            entry.0 = true;
+            let Some(items) = attribute.meta_item_list() else {
+                continue;
+            };
+            for item in items {
+                let ast::MetaItemInner::MetaItem(item) = item else {
+                    continue;
+                };
+                match self.span_range(item.span) {
+                    Ok(range) => entry.1.push(range),
+                    Err(error) => self.fail(error),
+                }
+            }
+        }
+
+        let mut derive_attributes = Vec::with_capacity(derive_sources.len());
+        for (attribute_range, (directly_written, mut element_ranges)) in derive_sources {
+            element_ranges.sort();
+            element_ranges.dedup();
+            let attribute = self.add_unit(
                 WrittenUnitKind::MacroInvocation,
                 attribute_range,
                 active,
                 id,
                 Some(id),
+            );
+            let mut elements = Vec::with_capacity(element_ranges.len());
+            for element_range in element_ranges {
+                if element_range.is_empty() || !attribute_range.contains(element_range) {
+                    self.fail(SourceError::InvalidInventory);
+                    continue;
+                }
+                elements.push(self.add_unit(
+                    WrittenUnitKind::MacroInvocation,
+                    element_range,
+                    active,
+                    attribute,
+                    Some(id),
+                ));
+            }
+            derive_attributes.push(PendingDeriveAttributeSourceFacts {
+                attribute,
+                elements,
+                directly_written,
+            });
+        }
+        if !derive_attributes.is_empty() {
+            let helper_candidates = self.derive_helper_candidates(item);
+            self.derive_targets.insert(
+                id,
+                PendingDeriveTargetSourceFacts {
+                    attributes: derive_attributes,
+                    helper_candidates,
+                },
             );
         }
 
@@ -2461,6 +3013,7 @@ mod tests {
             offsets,
             units,
             pieces,
+            derive_targets: Vec::new(),
             macro_rules: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         };
@@ -2567,6 +3120,7 @@ mod tests {
             offsets,
             units,
             pieces,
+            derive_targets: Vec::new(),
             macro_rules: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         };
@@ -2961,6 +3515,7 @@ mod tests {
             offsets,
             units,
             pieces,
+            derive_targets: Vec::new(),
             macro_rules,
             ownerless_attribute_invocations: Vec::new(),
         }
