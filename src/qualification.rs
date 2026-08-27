@@ -723,6 +723,18 @@ fn collect_mono_qualification<'tcx>(
         const_trait_function_uses: Vec::new(),
     };
     collector.visit_mono(MonoTraceRoot::Fn(entry), CollectionMode::UsedItems)?;
+    for item_id in tcx.hir_free_items() {
+        if tcx.def_kind(item_id.owner_id) == DefKind::GlobalAsm {
+            let item = tcx.hir_item(item_id);
+            collector.visit_mono(
+                MonoTraceRoot::GlobalAsm {
+                    item_id,
+                    trigger_span: item.span,
+                },
+                CollectionMode::UsedItems,
+            )?;
+        }
+    }
     Ok((
         collector.mono_proofs,
         collector.required_const_uses,
@@ -787,24 +799,26 @@ impl<'tcx> MonoQualificationCollector<'tcx> {
             self.visit_mono_item(item.node, item.span, CollectionMode::UsedItems)?;
         }
 
-        let (owner, instance, body) = match root {
+        let (owner, instance_and_body) = match root {
             MonoTraceRoot::Fn(instance) => (
                 MonoTraceNode::Item(MonoItem::Fn(instance)),
-                instance,
-                self.tcx.instance_mir(instance.def),
+                Some((instance, self.tcx.instance_mir(instance.def))),
             ),
             MonoTraceRoot::Static { def_id, .. } => {
                 let instance = Instance::mono(self.tcx, def_id);
                 (
                     MonoTraceNode::Item(MonoItem::Static(def_id)),
-                    instance,
-                    self.tcx.instance_mir(instance.def),
+                    Some((instance, self.tcx.instance_mir(instance.def))),
                 )
+            }
+            MonoTraceRoot::GlobalAsm { item_id, .. } => {
+                (MonoTraceNode::Item(MonoItem::GlobalAsm(item_id)), None)
             }
         };
         let collection = probe_collection_for_mode(mode);
-        let targets =
-            self.required_const_targets(&format!("{owner:?}"), instance, body, collection)?;
+        let targets = instance_and_body.map_or(Ok(Vec::new()), |(instance, body)| {
+            self.required_const_targets(&format!("{owner:?}"), instance, body, collection)
+        })?;
         self.validate_associated_const_observations(owner, successors, &targets)?;
         for target in targets {
             self.visit_const(target.global_id, mode)?;
@@ -841,7 +855,13 @@ impl<'tcx> MonoQualificationCollector<'tcx> {
                 },
                 mode,
             ),
-            MonoItem::GlobalAsm(_) => Err(ProbeError::MonoObservationIncomplete),
+            MonoItem::GlobalAsm(item_id) => self.visit_mono(
+                MonoTraceRoot::GlobalAsm {
+                    item_id,
+                    trigger_span: span,
+                },
+                mode,
+            ),
         }
     }
 

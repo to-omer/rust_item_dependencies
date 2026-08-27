@@ -21,3 +21,4 @@
 0020-rustc-preserve-associated-struct-path-arguments.patch
 0021-rustc-guard-proc-macro-dynamic-library-loading.patch
 0022-rustc-expose-external-crate-load-requirements.patch
+0023-rustc-expose-global-assembly-monomorphization-roots.patch

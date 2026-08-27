@@ -1778,6 +1778,7 @@ fn assert_roots_and_nodes(graph: &DependencyGraph) {
         let kind = match &node.key {
             MonoKey::Instance { .. } => "instance",
             MonoKey::Static { .. } => "static",
+            MonoKey::GlobalAsm { .. } => "global-asm",
             MonoKey::VTable { .. } => "vtable",
             MonoKey::Allocation(_) => "allocation",
         };

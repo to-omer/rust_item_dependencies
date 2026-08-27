@@ -14,7 +14,6 @@ pub enum UnsupportedReason {
     ExternalCompileTimeResource,
     ExternalDependency,
     ProcMacro,
-    Assembly,
     NativeLinkOrCustomRuntime,
     ExternalNativeLink,
     UnsupportedTarget,

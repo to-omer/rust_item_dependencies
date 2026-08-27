@@ -289,6 +289,184 @@ fn no_main_uses_existing_external_symbol_roots_without_standard_entry_roots() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn unreachable_inline_assembly_is_removed_with_its_owner() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "fn unused_assembly() { unsafe { core::arch::asm!(\"\"); } }\n",
+        "#[cfg(any())]\n",
+        "fn inactive_assembly() { unsafe { core::arch::asm!(\"\"); } }\n",
+        "fn unused_plain() {}\n",
+        "fn main() { println!(\"7\"); }\n",
+    );
+    let expected = "\n\n\nfn main() { println!(\"7\"); }\n";
+
+    let verified = analyzer
+        .reduce_and_verify(&input(source, &target))
+        .expect("assembly in an unreachable owner must not block reduction");
+    assert_verified("unreachable inline assembly", source, expected, &verified);
+
+    let fixed = analyzer
+        .reduce_and_verify(&input(expected, &target))
+        .expect("the assembly-free reduction must remain reducible");
+    assert_eq!(fixed.reduced_source(), expected);
+
+    let options = CompilationOptions::default();
+    let original_output = compile_and_run(
+        &input(source, &target),
+        &options,
+        "unreachable_assembly_original",
+    );
+    let reduced_output = compile_and_run(
+        &input(expected, &target),
+        &options,
+        "unreachable_assembly_reduced",
+    );
+    assert!(original_output.status.success());
+    assert_eq!(original_output.stdout, b"7\n");
+    assert!(original_output.stderr.is_empty());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn required_assembly_preserves_every_active_source_unit() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let cases = [
+        (
+            "inline assembly",
+            "required_inline_assembly",
+            concat!(
+                "fn unused() {}\n",
+                "fn main() { unsafe { core::arch::asm!(\"\"); } println!(\"ok\"); }\n",
+            ),
+            0,
+        ),
+        (
+            "macro-generated inline assembly",
+            "required_macro_assembly",
+            concat!(
+                "macro_rules! run_assembly { () => { unsafe { core::arch::asm!(\"\"); } }; }\n",
+                "fn unused() {}\n",
+                "fn main() { run_assembly!(); println!(\"ok\"); }\n",
+            ),
+            0,
+        ),
+        (
+            "naked assembly",
+            "required_naked_assembly",
+            concat!(
+                "#[unsafe(naked)]\n",
+                "#[unsafe(no_mangle)]\n",
+                "pub unsafe extern \"C\" fn rid_naked() { core::arch::naked_asm!(\"\"); }\n",
+                "fn unused() {}\n",
+                "fn main() { println!(\"ok\"); }\n",
+            ),
+            0,
+        ),
+        (
+            "global assembly",
+            "required_global_assembly",
+            concat!(
+                "fn assembly_function_symbol() {}\n",
+                "static ASSEMBLY_STATIC_SYMBOL: u8 = 1;\n",
+                "core::arch::global_asm!(\n",
+                "    \"/* {} {} {} */\",\n",
+                "    sym assembly_function_symbol,\n",
+                "    sym ASSEMBLY_STATIC_SYMBOL,\n",
+                "    const 7,\n",
+                ");\n",
+                "fn unused() {}\n",
+                "fn main() { println!(\"ok\"); }\n",
+            ),
+            1,
+        ),
+    ];
+
+    for (case, artifact, source, expected_global_roots) in cases {
+        let source_input = input(source, &target);
+        let verified = analyzer
+            .reduce_and_verify(&source_input)
+            .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_verified(case, source, source, &verified);
+        assert_eq!(
+            verified
+                .original_analysis()
+                .roots()
+                .iter()
+                .filter(|root| root.reason == RootReason::GlobalAssembly)
+                .count(),
+            expected_global_roots,
+            "{case}",
+        );
+
+        let fixed = analyzer
+            .reduce_and_verify(&source_input)
+            .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
+        assert_eq!(fixed.reduced_source(), source, "{case}");
+
+        let output = compile_and_run(&source_input, &CompilationOptions::default(), artifact);
+        assert!(output.status.success(), "{case}: {output:?}");
+        assert_eq!(output.stdout, b"ok\n", "{case}");
+        assert!(output.stderr.is_empty(), "{case}: {output:?}");
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn no_main_with_a_rust_entry_and_global_assembly_uses_the_same_roots() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "#![no_main]\n",
+        "core::arch::global_asm!(\"\");\n",
+        "fn unused() {}\n",
+        "#[unsafe(export_name = \"main\")]\n",
+        "pub extern \"C\" fn entry(\n",
+        "    _argc: core::ffi::c_int,\n",
+        "    _argv: *const *const core::ffi::c_char,\n",
+        ") -> core::ffi::c_int { 0 }\n",
+    );
+    let source_input = input(source, &target);
+
+    let verified = analyzer
+        .reduce_and_verify(&source_input)
+        .expect("a Rust target entry may coexist with global assembly");
+    assert_verified("no_main with global assembly", source, source, &verified);
+    assert_eq!(
+        verified
+            .original_analysis()
+            .roots()
+            .iter()
+            .filter(|root| root.reason == RootReason::GlobalAssembly)
+            .count(),
+        1,
+    );
+    assert_eq!(
+        verified
+            .original_analysis()
+            .roots()
+            .iter()
+            .filter(|root| root.reason == RootReason::ExternalSymbol)
+            .count(),
+        1,
+    );
+
+    let output = compile_and_run(
+        &source_input,
+        &CompilationOptions::default(),
+        "no_main_global_assembly",
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn compiler_roots_keep_only_the_required_external_crate_loading_source() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();

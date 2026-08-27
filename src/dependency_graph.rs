@@ -357,6 +357,9 @@ pub enum MonoKey {
     Static {
         definition: DefinitionKey,
     },
+    GlobalAsm {
+        definition: DefinitionKey,
+    },
     VTable {
         concrete_type: CanonicalCompilerTerm,
         trait_reference: Option<CanonicalCompilerTerm>,
@@ -530,6 +533,7 @@ pub enum RootReason {
     UsedAttribute,
     ExternalSymbol,
     NativeLink,
+    GlobalAssembly,
 }
 
 impl RootReason {
@@ -630,6 +634,7 @@ impl DependencyGraph {
             || mono_nodes
                 .iter()
                 .any(|node| invalid_mono_node(node, &definitions))
+            || !global_assembly_nodes_match_definitions(&definitions, &mono_nodes)
         {
             return Err(DependencyGraphError::InvalidMonoNode);
         }
@@ -763,15 +768,23 @@ pub(crate) fn valid_roots(
         return false;
     }
 
-    let main_count = roots
+    let mut reason_counts = BTreeMap::new();
+    for root in roots {
+        *reason_counts.entry(root.reason).or_insert(0) += 1;
+    }
+    let reason_count = |reason| reason_counts.get(&reason).copied().unwrap_or_default();
+    let main_count = reason_count(RootReason::Main);
+    let start_count = reason_count(RootReason::StartInstance);
+    let global_assembly_count = reason_count(RootReason::GlobalAssembly);
+    let global_asm_count = mono_nodes
         .iter()
-        .filter(|root| root.reason == RootReason::Main)
+        .filter(|node| matches!(node.key, MonoKey::GlobalAsm { .. }))
         .count();
-    let start_count = roots
-        .iter()
-        .filter(|root| root.reason == RootReason::StartInstance)
-        .count();
-    if main_count > 1 || start_count > 1 || main_count != start_count {
+    if main_count > 1
+        || start_count > 1
+        || main_count != start_count
+        || global_assembly_count != global_asm_count
+    {
         return false;
     }
 
@@ -860,6 +873,10 @@ pub(crate) fn valid_roots(
                     }),
                 _ => false,
             },
+            RootReason::GlobalAssembly => matches!(
+                mono_node(root.node).map(|node| &node.key),
+                Some(MonoKey::GlobalAsm { .. })
+            ),
         }
     })
 }
@@ -1116,6 +1133,18 @@ fn invalid_mono_node(node: &MonoNode, definitions: &DefinitionGraph) -> bool {
                     != DefinitionReferenceKey::Local(definition.clone())
             });
         }
+        MonoKey::GlobalAsm { definition } => {
+            return match node.materialized_definition {
+                Some(DefinitionTarget::Local(id)) => definitions
+                    .definitions
+                    .get(id.0 as usize)
+                    .is_none_or(|materialized| {
+                        materialized.kind != crate::graph::DefinitionKind::GlobalAsm
+                            || materialized.key != *definition
+                    }),
+                Some(DefinitionTarget::External(_)) | None => true,
+            };
+        }
         MonoKey::VTable { .. } => return node.materialized_definition.is_some(),
         MonoKey::Allocation(allocation) => {
             return node.materialized_definition.is_some()
@@ -1143,6 +1172,26 @@ fn invalid_mono_node(node: &MonoNode, definitions: &DefinitionGraph) -> bool {
         }
         _ => true,
     }
+}
+
+fn global_assembly_nodes_match_definitions(
+    definitions: &DefinitionGraph,
+    mono_nodes: &[MonoNode],
+) -> bool {
+    let definitions = definitions
+        .definitions
+        .iter()
+        .filter(|definition| definition.kind == crate::graph::DefinitionKind::GlobalAsm)
+        .map(|definition| &definition.key)
+        .collect::<BTreeSet<_>>();
+    let mono_nodes = mono_nodes
+        .iter()
+        .filter_map(|node| match &node.key {
+            MonoKey::GlobalAsm { definition } => Some(definition),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    definitions == mono_nodes
 }
 
 fn valid_allocation_paths(mono_nodes: &[MonoNode], edges: &[DependencyEdge]) -> bool {
@@ -2246,6 +2295,15 @@ mod tests {
         roots: Vec<RootRecord>,
     ) -> Result<DependencyGraph, DependencyGraphError> {
         let (definitions, _, _) = allocation_graph_parts();
+        mono_graph(definitions, mono_nodes, edges, roots)
+    }
+
+    fn mono_graph(
+        definitions: DefinitionGraph,
+        mono_nodes: Vec<MonoNode>,
+        edges: Vec<DependencyEdge>,
+        roots: Vec<RootRecord>,
+    ) -> Result<DependencyGraph, DependencyGraphError> {
         DependencyGraph::new(
             definitions,
             Vec::new(),
@@ -2254,6 +2312,41 @@ mod tests {
             edges,
             roots,
         )
+    }
+
+    fn global_assembly_graph_parts() -> (
+        DefinitionGraph,
+        Vec<MonoNode>,
+        Vec<DependencyEdge>,
+        Vec<RootRecord>,
+    ) {
+        let (mut definitions, _, _) = allocation_graph_parts();
+        definitions.external_definitions.clear();
+        let definition = &mut definitions.definitions[0];
+        definition.kind = DefinitionKind::GlobalAsm;
+        definition.key.0[0].kind = DefinitionKind::GlobalAsm;
+        definition.key.0[0].name = None;
+        let definition_key = definition.key.clone();
+        let mono_nodes = vec![MonoNode {
+            id: MonoId(0),
+            key: MonoKey::GlobalAsm {
+                definition: definition_key,
+            },
+            materialized_definition: Some(DefinitionTarget::Local(DefinitionId(0))),
+            allocation_observation: None,
+        }];
+        let edges = vec![DependencyEdge {
+            from: GraphNode::Mono(MonoId(0)),
+            to: GraphNode::Definition(DefinitionId(0)),
+            kind: DependencyKind::MaterializesDefinition,
+            sites: Vec::new(),
+            evidence: EvidenceOrigin::Derived,
+        }];
+        let roots = vec![RootRecord {
+            node: GraphNode::Mono(MonoId(0)),
+            reason: RootReason::GlobalAssembly,
+        }];
+        (definitions, mono_nodes, edges, roots)
     }
 
     fn allocation_key(nodes: &mut [MonoNode], id: u32) -> &mut AllocationKey {
@@ -2810,6 +2903,63 @@ mod tests {
             &definitions,
             &mono_nodes,
         ));
+    }
+
+    #[test]
+    fn global_assembly_requires_an_exact_definition_node_and_root() {
+        let (definitions, mono_nodes, edges, roots) = global_assembly_graph_parts();
+
+        assert!(mono_graph(definitions, mono_nodes, edges, roots).is_ok());
+    }
+
+    #[test]
+    fn global_assembly_rejects_a_mono_node_for_another_definition_kind() {
+        let (mut definitions, mut mono_nodes, edges, roots) = global_assembly_graph_parts();
+        definitions.definitions[0].kind = DefinitionKind::Function;
+        definitions.definitions[0].key.0[0].kind = DefinitionKind::Function;
+        let MonoKey::GlobalAsm { definition } = &mut mono_nodes[0].key else {
+            panic!("expected a global assembly node")
+        };
+        *definition = definitions.definitions[0].key.clone();
+
+        assert_eq!(
+            mono_graph(definitions, mono_nodes, edges, roots),
+            Err(DependencyGraphError::InvalidMonoNode)
+        );
+    }
+
+    #[test]
+    fn global_assembly_rejects_a_missing_mono_node() {
+        let (definitions, _, _, _) = global_assembly_graph_parts();
+
+        assert_eq!(
+            mono_graph(definitions, Vec::new(), Vec::new(), Vec::new()),
+            Err(DependencyGraphError::InvalidMonoNode)
+        );
+    }
+
+    #[test]
+    fn global_assembly_rejects_missing_duplicate_and_fake_roots() {
+        let (definitions, mono_nodes, edges, roots) = global_assembly_graph_parts();
+        let root = roots[0];
+        for invalid_roots in [
+            Vec::new(),
+            vec![root, root],
+            vec![RootRecord {
+                node: GraphNode::Definition(DefinitionId(0)),
+                reason: RootReason::GlobalAssembly,
+            }],
+        ] {
+            assert_eq!(
+                mono_graph(
+                    definitions.clone(),
+                    mono_nodes.clone(),
+                    edges.clone(),
+                    invalid_roots,
+                ),
+                Err(DependencyGraphError::InvalidRoot)
+            );
+        }
     }
 
     #[test]

@@ -652,6 +652,7 @@ pub(crate) enum RetentionError {
     InvalidConstraint,
     IncompleteMemberConstraints,
     IncompleteExternalCrateConstraints,
+    IncompleteOpaqueSourceConstraints,
     UnsupportedExternalNativeLink,
 }
 
@@ -780,6 +781,13 @@ fn close_deterministic_constraints(
             if compile_required.contains(&requirement.trigger) {
                 retained_units.insert(requirement.required);
             }
+        }
+        if constraints
+            .preserve_active_source_triggers
+            .iter()
+            .any(|trigger| compile_required.contains(trigger))
+        {
+            retained_units.extend(constraints.active_source_units.iter().copied());
         }
         close_source_requirements(constraints, retained_units);
 
@@ -1022,6 +1030,8 @@ struct ValidatedConstraints {
     conditional_member_requirements: Vec<ConditionalSourceRequirement>,
     disjunctions: Vec<SourceDisjunction>,
     compiler_disjunctions: Vec<CompilerSourceDisjunction>,
+    preserve_active_source_triggers: Vec<GraphNode>,
+    active_source_units: Vec<SourceUnitId>,
 }
 
 impl ValidatedConstraints {
@@ -1202,6 +1212,14 @@ fn validate_constraints(
         definition_units,
         &constraints.external_crates,
     )?;
+    let preserve_active_source_triggers =
+        validate_preserve_active_source_requirements(source, graph, definition_units)?;
+    let active_source_units = source
+        .units
+        .iter()
+        .filter(|unit| unit.cfg_state == CfgState::Active)
+        .map(|unit| unit.id)
+        .collect();
 
     Ok(ValidatedConstraints {
         atomic_groups: actual_groups
@@ -1216,7 +1234,52 @@ fn validate_constraints(
         conditional_member_requirements: conditional_members,
         disjunctions,
         compiler_disjunctions,
+        preserve_active_source_triggers,
+        active_source_units,
     })
+}
+
+fn validate_preserve_active_source_requirements(
+    source: &SourceInventory,
+    graph: &DependencyGraph,
+    definition_units: &[SourceUnitId],
+) -> Result<Vec<GraphNode>, RetentionError> {
+    let crate_definition = graph
+        .definitions
+        .definitions
+        .iter()
+        .find(|definition| definition.parent.is_none())
+        .map(|definition| definition.id)
+        .ok_or(RetentionError::IncompleteOpaqueSourceConstraints)?;
+    let opaque_edges = graph
+        .definitions
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == crate::graph::DependencyKind::OpaqueSource)
+        .collect::<Vec<_>>();
+    let triggers = opaque_edges
+        .iter()
+        .map(|edge| edge.from)
+        .collect::<BTreeSet<_>>();
+    if opaque_edges.iter().any(|edge| {
+        let index = edge.from.0 as usize;
+        let owner = definition_units
+            .get(index)
+            .and_then(|unit| source.units.get(unit.0 as usize));
+        edge.to != DefinitionTarget::Local(crate_definition)
+            || edge.sites.is_empty()
+            || graph.definitions.definitions.get(index).is_none()
+            || owner.is_none_or(|owner| {
+                owner.cfg_state != CfgState::Active
+                    || edge
+                        .sites
+                        .iter()
+                        .any(|site| !owner.full_range.contains(*site))
+            })
+    }) {
+        return Err(RetentionError::IncompleteOpaqueSourceConstraints);
+    }
+    Ok(triggers.into_iter().map(GraphNode::Definition).collect())
 }
 
 pub(crate) fn collect_macro_rule_expansion_constraints(
@@ -1722,7 +1785,7 @@ mod tests {
         MonoInstanceRole, MonoKey, MonoNode, ObservationSite, RootReason, RootRecord,
     };
     use crate::graph::{
-        Definition, DefinitionGraph, DefinitionKey, DefinitionKeyPart,
+        Definition, DefinitionEdge, DefinitionGraph, DefinitionKey, DefinitionKeyPart,
         DependencyKind as DefinitionDependencyKind, ExternalDefinition, ExternalDefinitionId,
         ExternalDefinitionKey, GeneratedRole, InjectedRole,
     };
@@ -1886,6 +1949,19 @@ mod tests {
         }
     }
 
+    fn opaque_source_edge(
+        from: u32,
+        to: u32,
+        sites: impl IntoIterator<Item = ByteRange>,
+    ) -> DefinitionEdge {
+        DefinitionEdge {
+            from: DefinitionId(from),
+            to: DefinitionTarget::Local(DefinitionId(to)),
+            kind: DefinitionDependencyKind::OpaqueSource,
+            sites: sites.into_iter().collect(),
+        }
+    }
+
     fn graph(definitions: Vec<Definition>, mut edges: Vec<DependencyEdge>) -> DependencyGraph {
         let main = definitions
             .iter()
@@ -2042,6 +2118,101 @@ mod tests {
         ExternalCrateLoad {
             direct,
             closure: closure.into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn opaque_source_preservation_depends_on_owner_reachability() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let mut inactive = unit(4, WrittenUnitKind::Item, (31, 40), Some(0), 4);
+        inactive.cfg_state = CfgState::Inactive;
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
+            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
+            unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
+            unit(3, WrittenUnitKind::Item, (21, 30), Some(0), 3),
+            inactive,
+        ];
+        let inventory = inventory(source, units.clone());
+        let definitions = vec![
+            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+            written_definition(2, DefinitionKind::Function, &units[2], Some(0), "unused_a"),
+            written_definition(3, DefinitionKind::Function, &units[3], Some(0), "unused_b"),
+        ];
+        for (trigger, site, expected) in [
+            (
+                1,
+                ByteRange { start: 3, end: 8 },
+                BTreeSet::from([
+                    SourceUnitId(0),
+                    SourceUnitId(1),
+                    SourceUnitId(2),
+                    SourceUnitId(3),
+                ]),
+            ),
+            (
+                2,
+                ByteRange { start: 13, end: 18 },
+                BTreeSet::from([SourceUnitId(0), SourceUnitId(1)]),
+            ),
+        ] {
+            let mut graph = graph(
+                definitions.clone(),
+                vec![edge(
+                    GraphNode::Definition(DefinitionId(1)),
+                    GraphNode::Definition(DefinitionId(0)),
+                )],
+            );
+            graph.definitions.edges = vec![opaque_source_edge(trigger, 0, [site])];
+
+            let retention = compute_retention(
+                &inventory,
+                &graph,
+                &complete_constraints(&inventory, &graph),
+            )
+            .unwrap();
+
+            assert_eq!(retention.retained_units, expected, "trigger {trigger}");
+        }
+    }
+
+    #[test]
+    fn opaque_source_edges_require_the_crate_target_and_source_evidence() {
+        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
+            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
+        ];
+        let inventory = inventory(source, units.clone());
+        let definitions = vec![
+            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
+        ];
+
+        for opaque_edge in [
+            opaque_source_edge(1, 1, [ByteRange { start: 3, end: 8 }]),
+            opaque_source_edge(1, 0, []),
+            opaque_source_edge(1, 0, [ByteRange { start: 20, end: 21 }]),
+            opaque_source_edge(1, 0, [ByteRange { start: 33, end: 34 }]),
+        ] {
+            let mut graph = graph(
+                definitions.clone(),
+                vec![edge(
+                    GraphNode::Definition(DefinitionId(1)),
+                    GraphNode::Definition(DefinitionId(0)),
+                )],
+            );
+            graph.definitions.edges = vec![opaque_edge];
+
+            assert_eq!(
+                compute_retention(
+                    &inventory,
+                    &graph,
+                    &complete_constraints(&inventory, &graph),
+                ),
+                Err(RetentionError::IncompleteOpaqueSourceConstraints)
+            );
         }
     }
 

@@ -1988,7 +1988,6 @@ impl<'ast> Visitor<'ast> for UnexpandedValidator<'_> {
             ast::ItemKind::Mod(_, _, ast::ModKind::Unloaded) => {
                 self.reject(UnsupportedReason::AdditionalSourceFile, item.span)
             }
-            ast::ItemKind::GlobalAsm(_) => self.reject(UnsupportedReason::Assembly, item.span),
             ast::ItemKind::ExternCrate(original, identifier) => {
                 let name = original.unwrap_or(identifier.name);
                 if !supported_external_crate(name, self.direct_external_crates) {
@@ -2031,9 +2030,6 @@ impl<'ast> Visitor<'ast> for UnexpandedValidator<'_> {
 
     fn visit_expr(&mut self, expression: &'ast ast::Expr) {
         let active = self.configured(expression).is_some();
-        if active && matches!(expression.kind, ast::ExprKind::InlineAsm(_)) {
-            self.reject(UnsupportedReason::Assembly, expression.span);
-        }
         self.active_stack.push(active);
         visit::walk_expr(self, expression);
         self.active_stack.pop();
@@ -2154,20 +2150,16 @@ impl ExpandedValidator<'_> {
 impl<'ast> Visitor<'ast> for ExpandedValidator<'_> {
     fn visit_item(&mut self, item: &'ast ast::Item) {
         self.validate_attributes(&item.attrs);
-        match &item.kind {
-            ast::ItemKind::GlobalAsm(_) => self.reject(UnsupportedReason::Assembly, item.span),
-            ast::ItemKind::ExternCrate(original, identifier) => {
-                let name = original.unwrap_or(identifier.name);
-                let reason = external_crate_reason(name);
-                let provided_by_external_macro = reason == UnsupportedReason::ExternalDependency
-                    && item.span.in_external_macro(self.compiler.sess.source_map());
-                if !supported_external_crate(name, self.direct_external_crates)
-                    && !provided_by_external_macro
-                {
-                    self.reject(reason, item.span);
-                }
+        if let ast::ItemKind::ExternCrate(original, identifier) = &item.kind {
+            let name = original.unwrap_or(identifier.name);
+            let reason = external_crate_reason(name);
+            let provided_by_external_macro = reason == UnsupportedReason::ExternalDependency
+                && item.span.in_external_macro(self.compiler.sess.source_map());
+            if !supported_external_crate(name, self.direct_external_crates)
+                && !provided_by_external_macro
+            {
+                self.reject(reason, item.span);
             }
-            _ => {}
         }
         visit::walk_item(self, item);
     }
@@ -2180,13 +2172,6 @@ impl<'ast> Visitor<'ast> for ExpandedValidator<'_> {
     fn visit_foreign_item(&mut self, item: &'ast ast::ForeignItem) {
         self.validate_attributes(&item.attrs);
         visit::walk_item(self, item);
-    }
-
-    fn visit_expr(&mut self, expression: &'ast ast::Expr) {
-        if matches!(expression.kind, ast::ExprKind::InlineAsm(_)) {
-            self.reject(UnsupportedReason::Assembly, expression.span);
-        }
-        visit::walk_expr(self, expression);
     }
 }
 
@@ -3008,20 +2993,6 @@ mod tests {
             "#[path = \"external.rs\"]",
         );
         assert_unsupported(
-            "fn main() { unsafe { core::arch::asm!(\"\"); } }\n",
-            UnsupportedReason::Assembly,
-            "core::arch::asm!(\"\")",
-        );
-        assert_unsupported(
-            concat!(
-                "#![no_main]\n",
-                "#[unsafe(export_name = \"main\")]\n",
-                "pub extern \"C\" fn entry() -> i32 { unsafe { core::arch::asm!(\"\"); } 0 }\n",
-            ),
-            UnsupportedReason::Assembly,
-            "core::arch::asm!(\"\")",
-        );
-        assert_unsupported(
             "extern crate unavailable;\nfn main() {}\n",
             UnsupportedReason::ExternalDependency,
             "extern crate unavailable;",
@@ -3526,16 +3497,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_assembly_and_native_linkage_are_rejected_at_the_written_invocation() {
-        assert_unsupported(
-            concat!(
-                "macro_rules! assembly { () => { core::arch::global_asm!(\"\"); }; }\n",
-                "assembly!();\n",
-                "fn main() {}\n",
-            ),
-            UnsupportedReason::Assembly,
-            "assembly!()",
-        );
+    fn expanded_native_linkage_is_rejected_at_the_written_invocation() {
         assert_unsupported(
             concat!(
                 "macro_rules! linkage { () => { #[no_link] extern crate std; }; }\n",
@@ -3544,6 +3506,33 @@ mod tests {
             ),
             UnsupportedReason::NativeLinkOrCustomRuntime,
             "linkage!()",
+        );
+    }
+
+    #[test]
+    fn assembly_is_inside_the_supported_source_boundary() {
+        for source in [
+            "fn main() { unsafe { core::arch::asm!(\"\"); } }\n",
+            concat!(
+                "macro_rules! assembly { () => { core::arch::global_asm!(\"\"); }; }\n",
+                "assembly!();\n",
+                "fn main() {}\n",
+            ),
+            concat!(
+                "#![no_main]\n",
+                "core::arch::global_asm!(\"\");\n",
+                "#[unsafe(export_name = \"main\")]\n",
+                "pub extern \"C\" fn entry() -> core::ffi::c_int { 0 }\n",
+            ),
+        ] {
+            assert!(inspect(source).is_ok());
+        }
+        assert_eq!(
+            inspect("#![no_main]\ncore::arch::global_asm!(\"\");\n"),
+            Err(InputError::UnsupportedInput {
+                reason: UnsupportedReason::MissingTargetEntry,
+                range: None,
+            })
         );
     }
 
