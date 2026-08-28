@@ -1,6 +1,14 @@
+mod declarative_macro;
 mod derive;
 pub(crate) mod syntax;
 
+#[cfg(test)]
+pub(crate) use declarative_macro::MacroRepetitionElementSourceFacts;
+pub(crate) use declarative_macro::{
+    MacroRepetitionSourceFacts, MacroTemplateSourceFacts, validate_declarative_macro_source_facts,
+};
+#[cfg(rust_item_dependencies_patched)]
+pub(crate) use declarative_macro::{ValidatedDeclarativeOutput, ValidatedDeclarativeOutputMeaning};
 #[cfg(rust_item_dependencies_patched)]
 pub(crate) use derive::refine_derive_targets_from_compiler;
 use derive::remap_derive_target_facts;
@@ -15,12 +23,16 @@ pub(crate) use derive::{
 };
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(rust_item_dependencies_patched, test))]
+use std::hash::Hash;
 use std::sync::Arc;
 
 use rustc_ast as ast;
 use rustc_ast::HasAttrs;
 use rustc_ast::tokenstream::LazyAttrTokenStream;
 use rustc_ast::visit::{self, AssocCtxt, Visitor};
+#[cfg(any(rust_item_dependencies_patched, test))]
+use rustc_data_structures::fx::FxHashMap;
 #[cfg(rust_item_dependencies_patched)]
 use rustc_data_structures::unord::UnordMap;
 use rustc_expand::config::{StripUnconfigured, features, pre_configure_attrs};
@@ -55,6 +67,51 @@ impl ByteRange {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SourceUnitId(pub u32);
+
+/// Chooses the expansion relation which generated a macro invocation.
+/// rustc's discovery relation is authoritative; source-call context is only
+/// a fallback when no discovery relation was recorded. Whether an editable
+/// source anchor can stop contributor inheritance is decided separately.
+pub(crate) fn declarative_generation_parent<Id: Copy>(
+    discovered_in: Option<Id>,
+    source_call: Option<Id>,
+) -> Option<Id> {
+    discovered_in.or(source_call)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeclarativeContributorParent<Id> {
+    Root,
+    Parent(Id),
+    Incomplete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeclarativeGenerationParentState {
+    RefinedLocal { link_complete: bool },
+    LocalIncomplete,
+    Opaque,
+}
+
+pub(crate) fn resolve_declarative_contributor_parent<Id: Copy>(
+    generation_parent: Option<Id>,
+    has_editable_anchor: bool,
+    parent_state: Option<DeclarativeGenerationParentState>,
+) -> DeclarativeContributorParent<Id> {
+    match (generation_parent, parent_state) {
+        (
+            Some(parent),
+            Some(DeclarativeGenerationParentState::RefinedLocal {
+                link_complete: true,
+            }),
+        ) => DeclarativeContributorParent::Parent(parent),
+        (Some(_), Some(DeclarativeGenerationParentState::Opaque)) if has_editable_anchor => {
+            DeclarativeContributorParent::Root
+        }
+        (None, None) if has_editable_anchor => DeclarativeContributorParent::Root,
+        _ => DeclarativeContributorParent::Incomplete,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct AtomicGroupId(pub u32);
@@ -102,6 +159,26 @@ impl WrittenUnitKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum DeclarativeSourceUnitKind {
+    TemplateComponent,
+    MatcherElement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SourceUnitIdentityKind {
+    Written(WrittenUnitKind),
+    Declarative(DeclarativeSourceUnitKind),
+}
+
+/// One stable written-source component shared by every token of a generated
+/// macro product. Dense source-inventory IDs are deliberately excluded.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MacroProductSource {
+    pub kind: SourceUnitIdentityKind,
+    pub range: ByteRange,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WrittenUnit {
     pub id: SourceUnitId,
@@ -135,6 +212,8 @@ pub struct SourceInventory {
     pub pieces: Vec<OwnedPiece>,
     pub(crate) derive_targets: Vec<DeriveTargetSourceFacts>,
     pub(crate) macro_rules: Vec<MacroRuleSourceFacts>,
+    pub(crate) macro_templates: Vec<MacroTemplateSourceFacts>,
+    pub(crate) macro_repetitions: Vec<MacroRepetitionSourceFacts>,
     pub(crate) ownerless_attribute_invocations: Vec<SourceUnitId>,
 }
 
@@ -148,6 +227,128 @@ impl SourceInventory {
             .ok()?;
         self.units.get(invocation.0 as usize)?.parent
     }
+
+    pub(crate) fn macro_rule_selection_index(
+        &self,
+    ) -> Result<MacroRuleSelectionIndex, SourceError> {
+        MacroRuleSelectionIndex::new(&self.units, &self.macro_rules)
+    }
+
+    pub(crate) fn declarative_unit_kinds(
+        &self,
+    ) -> Result<Vec<Option<DeclarativeSourceUnitKind>>, SourceError> {
+        declarative_macro::declarative_unit_kinds(&self.units)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExactRuleMatch {
+    Unique(SourceUnitId),
+    Ambiguous,
+}
+
+#[derive(Clone, Copy)]
+struct WholeDefinitionPrefix {
+    start: u32,
+    largest_ends: [Option<u32>; 2],
+}
+
+/// Resolves selected rule ranges without rescanning every source unit for
+/// every macro invocation.
+pub(crate) struct MacroRuleSelectionIndex {
+    exact_rules: BTreeMap<ByteRange, ExactRuleMatch>,
+    whole_prefixes: Vec<WholeDefinitionPrefix>,
+}
+
+impl MacroRuleSelectionIndex {
+    fn new(
+        units: &[WrittenUnit],
+        macro_rules: &[MacroRuleSourceFacts],
+    ) -> Result<Self, SourceError> {
+        let mut exact_rules = BTreeMap::new();
+        for unit in units.iter().filter(|unit| {
+            unit.kind == WrittenUnitKind::MacroRule && unit.cfg_state == CfgState::Active
+        }) {
+            match exact_rules.entry(unit.full_range) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(ExactRuleMatch::Unique(unit.id));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    entry.insert(ExactRuleMatch::Ambiguous);
+                }
+            }
+        }
+
+        let mut whole_ranges = macro_rules
+            .iter()
+            .filter_map(|facts| match facts {
+                MacroRuleSourceFacts::Whole { definition } => Some(*definition),
+                MacroRuleSourceFacts::Refined { .. } => None,
+            })
+            .map(|definition| {
+                units
+                    .get(definition.0 as usize)
+                    .filter(|unit| {
+                        unit.id == definition
+                            && unit.kind == WrittenUnitKind::MacroDefinition
+                            && unit.cfg_state == CfgState::Active
+                    })
+                    .map(|unit| unit.full_range)
+                    .ok_or(SourceError::InvalidInventory)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        whole_ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
+
+        let mut largest_ends = [None, None];
+        let mut whole_prefixes = Vec::with_capacity(whole_ranges.len());
+        for range in whole_ranges {
+            if largest_ends[0].is_none_or(|largest| range.end >= largest) {
+                largest_ends[1] = largest_ends[0];
+                largest_ends[0] = Some(range.end);
+            } else if largest_ends[1].is_none_or(|second| range.end > second) {
+                largest_ends[1] = Some(range.end);
+            }
+            whole_prefixes.push(WholeDefinitionPrefix {
+                start: range.start,
+                largest_ends,
+            });
+        }
+
+        Ok(Self {
+            exact_rules,
+            whole_prefixes,
+        })
+    }
+
+    pub(crate) fn selected_rule(
+        &self,
+        selected_range: ByteRange,
+    ) -> Result<Option<SourceUnitId>, SourceError> {
+        match self.exact_rules.get(&selected_range) {
+            Some(ExactRuleMatch::Unique(rule)) => return Ok(Some(*rule)),
+            Some(ExactRuleMatch::Ambiguous) => return Err(SourceError::InvalidInventory),
+            None => {}
+        }
+
+        let prefix_count = self
+            .whole_prefixes
+            .partition_point(|prefix| prefix.start <= selected_range.start);
+        let enclosing = prefix_count
+            .checked_sub(1)
+            .and_then(|index| self.whole_prefixes.get(index))
+            .map_or(0, |prefix| {
+                prefix
+                    .largest_ends
+                    .iter()
+                    .flatten()
+                    .filter(|&&end| selected_range.end <= end)
+                    .count()
+            });
+        match enclosing {
+            1 => Ok(None),
+            _ => Err(SourceError::IncompleteMacroRuleObservation),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,7 +360,13 @@ pub(crate) struct AttributeSource {
 #[cfg(rust_item_dependencies_patched)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EditableMacroSource {
+    /// A written source unit that anchors the expansion's provenance. A
+    /// late-parsed invocation may be contained by this unit without being an
+    /// independently editable invocation.
     pub unit: SourceUnitId,
+    /// The same unit when the observed bang-macro node exactly matches it and
+    /// its matcher input can therefore be split independently.
+    pub exact_invocation: Option<SourceUnitId>,
     pub call_range: ByteRange,
     pub role: EditableMacroSourceRole,
 }
@@ -449,146 +656,288 @@ fn resolve_derive_helper_source(
 }
 
 #[cfg(rust_item_dependencies_patched)]
-pub(crate) fn resolve_editable_macro_source(
-    compiler: &Compiler,
-    inventory: &SourceInventory,
-    origins: &UnordMap<ExpnId, MacroInvocationOrigin>,
-    expansion: ExpnId,
-) -> Result<Option<EditableMacroSource>, SourceError> {
-    let origin = origins
-        .get(&expansion)
-        .ok_or(SourceError::IncompleteDeriveObservation)?;
-    let data = expansion.expn_data();
-    let ExpnKind::Macro(kind, _) = data.kind else {
-        return Err(SourceError::IncompleteDeriveObservation);
-    };
+pub(crate) struct EditableMacroSourceResolver<'a> {
+    origins: &'a UnordMap<ExpnId, MacroInvocationOrigin>,
+    declarative_discovery_anchors: FxHashMap<ExpnId, bool>,
+}
 
-    match kind {
-        MacroKind::Bang => {
-            if origin.discovered_in_expansion != ExpnId::root() {
-                return Ok(None);
-            }
-            let call_range = original_span_range(compiler, &inventory.offsets, data.call_site)?;
-            let node_range =
-                original_span_range(compiler, &inventory.offsets, origin.invocation_node_span)?;
-            Ok(
-                resolve_written_bang_macro_source(inventory, call_range, node_range).map(|unit| {
-                    EditableMacroSource {
-                        unit,
-                        call_range,
-                        role: EditableMacroSourceRole::ProducesDefinitions,
-                    }
-                }),
-            )
+#[cfg(any(rust_item_dependencies_patched, test))]
+fn declarative_discovery_anchors<Id: Copy + Eq + Hash>(
+    starts: impl IntoIterator<Item = Id>,
+    root: Id,
+    mut link: impl FnMut(Id) -> Option<(bool, Id)>,
+) -> FxHashMap<Id, bool> {
+    // 0 is unresolved, 1 is on the current chain, and 2 is resolved. Missing
+    // nodes, cycles, and non-declarative/non-macro ancestors all resolve to
+    // false rather than allowing their descendants to claim a source anchor.
+    let mut states = FxHashMap::<Id, u8>::default();
+    let mut resolved = FxHashMap::default();
+    for start in starts {
+        if states.get(&start) == Some(&2) {
+            continue;
         }
-        MacroKind::Attr => {
-            let nested = origin.discovered_in_expansion != ExpnId::root();
-            if nested
-                && let Some(derive) =
-                    resolve_written_builtin_derive_outer(compiler, inventory, origins, expansion)?
-            {
-                return Ok(Some(EditableMacroSource {
-                    unit: derive
-                        .source
-                        .invocation
-                        .ok_or(SourceError::IncompleteDeriveObservation)?,
-                    call_range: derive.call_range,
-                    role: EditableMacroSourceRole::TransparentAttribute,
-                }));
+        let mut path = Vec::new();
+        let mut current = start;
+        let valid = loop {
+            if current == root {
+                break true;
             }
-            if nested && origin.implementation_kind != MacroImplementationKind::InertAttribute {
-                return Ok(None);
+            match states.get(&current).copied().unwrap_or(0) {
+                2 => break resolved.get(&current).copied().unwrap_or(false),
+                1 => break false,
+                0 => {}
+                _ => unreachable!("macro discovery traversal state is internal"),
             }
-            let call_range = match original_span_range(compiler, &inventory.offsets, data.call_site)
-            {
-                Ok(call_range) => call_range,
-                Err(_) if nested => return Ok(None),
-                Err(error) => return Err(error),
+            let Some((current_is_declarative_macro, parent)) = link(current) else {
+                break false;
             };
-            if nested
-                && !inventory.derive_targets.iter().any(|facts| {
-                    let DeriveTargetSourceFacts::Complete { helpers, .. } = facts else {
-                        return false;
-                    };
-                    helpers.iter().any(|helper| {
-                        inventory
-                            .units
-                            .get(helper.attribute.0 as usize)
-                            .is_some_and(|unit| unit.full_range.contains(call_range))
-                    })
+            states.insert(current, 1);
+            path.push(current);
+            if !current_is_declarative_macro {
+                break false;
+            }
+            current = parent;
+        };
+        for expansion in path.into_iter().rev() {
+            states.insert(expansion, 2);
+            resolved.insert(expansion, valid);
+        }
+    }
+    resolved
+}
+
+#[cfg(any(rust_item_dependencies_patched, test))]
+fn can_anchor_declarative_discovery(is_declarative: bool, is_macro_expansion: bool) -> bool {
+    is_declarative && is_macro_expansion
+}
+
+#[cfg(any(rust_item_dependencies_patched, test))]
+fn bang_macro_source_spans_are_written(
+    call_site_has_root_context: bool,
+    call_site_from_expansion: bool,
+    invocation_node_from_expansion: bool,
+) -> bool {
+    call_site_has_root_context && !call_site_from_expansion && !invocation_node_from_expansion
+}
+
+#[cfg(rust_item_dependencies_patched)]
+impl<'a> EditableMacroSourceResolver<'a> {
+    pub(crate) fn new(origins: &'a UnordMap<ExpnId, MacroInvocationOrigin>) -> Self {
+        let ordered = origins
+            .items()
+            .map(|(&expansion, _)| (expansion.expn_hash().local_hash().as_u64(), expansion))
+            .into_sorted_stable_ord_by_key(|entry| &entry.0);
+        let declarative_discovery_anchors = declarative_discovery_anchors(
+            ordered.into_iter().map(|(_, expansion)| expansion),
+            ExpnId::root(),
+            |expansion| {
+                origins.get(&expansion).map(|origin| {
+                    (
+                        can_anchor_declarative_discovery(
+                            origin.implementation_kind == MacroImplementationKind::Declarative,
+                            matches!(expansion.expn_data().kind, ExpnKind::Macro(..)),
+                        ),
+                        origin.discovered_in_expansion,
+                    )
                 })
-            {
-                return Ok(None);
-            }
-            let node_range =
-                original_span_range(compiler, &inventory.offsets, origin.invocation_node_span)?;
-            let target_range = original_span_range(
-                compiler,
-                &inventory.offsets,
-                origin
-                    .target_span
-                    .ok_or(SourceError::IncompleteAttributeObservation)?,
-            )?;
-            if nested {
-                let source =
-                    resolve_derive_helper_source(inventory, call_range, node_range, target_range)?;
-                return Ok(source.and_then(|source| {
-                    source.invocation.map(|unit| EditableMacroSource {
-                        unit,
-                        call_range,
-                        role: EditableMacroSourceRole::TransparentAttribute,
-                    })
-                }));
-            }
-            let resolved =
-                resolve_outer_attribute_source(inventory, call_range, node_range, target_range)?;
-            Ok(resolved.source.invocation.map(|unit| EditableMacroSource {
-                unit,
-                call_range,
-                role: resolved.role,
-            }))
+            },
+        );
+        Self {
+            origins,
+            declarative_discovery_anchors,
         }
-        MacroKind::Derive => {
-            let outer = origin.discovered_in_expansion;
-            if outer == ExpnId::root() {
-                return Err(SourceError::IncompleteDeriveObservation);
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        compiler: &Compiler,
+        inventory: &SourceInventory,
+        expansion: ExpnId,
+    ) -> Result<Option<EditableMacroSource>, SourceError> {
+        let origin = self
+            .origins
+            .get(&expansion)
+            .ok_or(SourceError::IncompleteDeriveObservation)?;
+        let data = expansion.expn_data();
+        let ExpnKind::Macro(kind, _) = data.kind else {
+            return Err(SourceError::IncompleteDeriveObservation);
+        };
+
+        match kind {
+            MacroKind::Bang => {
+                // A call can be discovered while an enclosing declarative
+                // macro expands, for example when it captures an expression.
+                // Root hygiene and a wholly declarative discovery chain allow
+                // the unique containing written invocation to be used as an
+                // indivisible provenance anchor below.
+                if !bang_macro_source_spans_are_written(
+                    data.call_site.ctxt().outer_expn() == ExpnId::root(),
+                    data.call_site.from_expansion(),
+                    origin.invocation_node_span.from_expansion(),
+                ) {
+                    return Ok(None);
+                }
+                if origin.discovered_in_expansion != ExpnId::root()
+                    && !self
+                        .declarative_discovery_anchors
+                        .get(&origin.discovered_in_expansion)
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    // A procedural or built-in macro can copy a written input
+                    // span onto generated tokens. Root hygiene alone therefore
+                    // does not provide a source anchor. A wholly declarative
+                    // chain may only attempt the unique range resolution below;
+                    // it does not make the late-parsed call independently
+                    // editable.
+                    return Ok(None);
+                }
+                let call_range = original_span_range(compiler, &inventory.offsets, data.call_site)?;
+                let node_range =
+                    original_span_range(compiler, &inventory.offsets, origin.invocation_node_span)?;
+                Ok(
+                    resolve_written_bang_macro_source(inventory, call_range, node_range).map(
+                        |unit| EditableMacroSource {
+                            unit,
+                            exact_invocation: inventory
+                                .units
+                                .get(unit.0 as usize)
+                                .filter(|source| {
+                                    source.full_range == call_range
+                                        || source.full_range == node_range
+                                })
+                                .map(|source| source.id),
+                            call_range,
+                            role: EditableMacroSourceRole::ProducesDefinitions,
+                        },
+                    ),
+                )
             }
-            let Some(outer_source) =
-                resolve_written_builtin_derive_outer(compiler, inventory, origins, outer)?
-            else {
-                return Ok(None);
-            };
-            let facts = inventory
-                .derive_targets
-                .iter()
-                .find(|facts| facts.target() == outer_source.source.target)
-                .ok_or(SourceError::IncompleteDeriveObservation)?;
-            let DeriveTargetSourceFacts::Complete { attributes, .. } = facts else {
-                return Ok(None);
-            };
-            let attribute = attributes
-                .iter()
-                .find(|attribute| outer_source.source.invocation == Some(attribute.attribute))
-                .ok_or(SourceError::IncompleteDeriveObservation)?;
-            if origin.implementation_kind != MacroImplementationKind::Builtin {
-                return Err(SourceError::IncompleteDeriveObservation);
+            MacroKind::Attr => {
+                let nested = origin.discovered_in_expansion != ExpnId::root();
+                if nested
+                    && let Some(derive) = resolve_written_builtin_derive_outer(
+                        compiler,
+                        inventory,
+                        self.origins,
+                        expansion,
+                    )?
+                {
+                    return Ok(Some(EditableMacroSource {
+                        unit: derive
+                            .source
+                            .invocation
+                            .ok_or(SourceError::IncompleteDeriveObservation)?,
+                        exact_invocation: None,
+                        call_range: derive.call_range,
+                        role: EditableMacroSourceRole::TransparentAttribute,
+                    }));
+                }
+                if nested && origin.implementation_kind != MacroImplementationKind::InertAttribute {
+                    return Ok(None);
+                }
+                let call_range =
+                    match original_span_range(compiler, &inventory.offsets, data.call_site) {
+                        Ok(call_range) => call_range,
+                        Err(_) if nested => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                if nested
+                    && !inventory.derive_targets.iter().any(|facts| {
+                        let DeriveTargetSourceFacts::Complete { helpers, .. } = facts else {
+                            return false;
+                        };
+                        helpers.iter().any(|helper| {
+                            inventory
+                                .units
+                                .get(helper.attribute.0 as usize)
+                                .is_some_and(|unit| unit.full_range.contains(call_range))
+                        })
+                    })
+                {
+                    return Ok(None);
+                }
+                let node_range =
+                    original_span_range(compiler, &inventory.offsets, origin.invocation_node_span)?;
+                let target_range = original_span_range(
+                    compiler,
+                    &inventory.offsets,
+                    origin
+                        .target_span
+                        .ok_or(SourceError::IncompleteAttributeObservation)?,
+                )?;
+                if nested {
+                    let source = resolve_derive_helper_source(
+                        inventory,
+                        call_range,
+                        node_range,
+                        target_range,
+                    )?;
+                    return Ok(source.and_then(|source| {
+                        source.invocation.map(|unit| EditableMacroSource {
+                            unit,
+                            exact_invocation: None,
+                            call_range,
+                            role: EditableMacroSourceRole::TransparentAttribute,
+                        })
+                    }));
+                }
+                let resolved = resolve_outer_attribute_source(
+                    inventory,
+                    call_range,
+                    node_range,
+                    target_range,
+                )?;
+                Ok(resolved.source.invocation.map(|unit| EditableMacroSource {
+                    unit,
+                    exact_invocation: None,
+                    call_range,
+                    role: resolved.role,
+                }))
             }
-            let call_range = original_span_range(compiler, &inventory.offsets, data.call_site)?;
-            let element = origin
-                .derive_source_index
-                .and_then(|index| attribute.elements.get(index))
-                .copied()
-                .ok_or(SourceError::IncompleteDeriveObservation)?;
-            let unit = inventory
-                .units
-                .get(element.0 as usize)
-                .filter(|unit| unit.full_range == call_range)
-                .ok_or(SourceError::IncompleteDeriveObservation)?;
-            Ok(Some(EditableMacroSource {
-                unit: unit.id,
-                call_range,
-                role: EditableMacroSourceRole::ProducesDefinitions,
-            }))
+            MacroKind::Derive => {
+                let outer = origin.discovered_in_expansion;
+                if outer == ExpnId::root() {
+                    return Err(SourceError::IncompleteDeriveObservation);
+                }
+                let Some(outer_source) =
+                    resolve_written_builtin_derive_outer(compiler, inventory, self.origins, outer)?
+                else {
+                    return Ok(None);
+                };
+                let facts = inventory
+                    .derive_targets
+                    .iter()
+                    .find(|facts| facts.target() == outer_source.source.target)
+                    .ok_or(SourceError::IncompleteDeriveObservation)?;
+                let DeriveTargetSourceFacts::Complete { attributes, .. } = facts else {
+                    return Ok(None);
+                };
+                let attribute = attributes
+                    .iter()
+                    .find(|attribute| outer_source.source.invocation == Some(attribute.attribute))
+                    .ok_or(SourceError::IncompleteDeriveObservation)?;
+                if origin.implementation_kind != MacroImplementationKind::Builtin {
+                    return Err(SourceError::IncompleteDeriveObservation);
+                }
+                let call_range = original_span_range(compiler, &inventory.offsets, data.call_site)?;
+                let element = origin
+                    .derive_source_index
+                    .and_then(|index| attribute.elements.get(index))
+                    .copied()
+                    .ok_or(SourceError::IncompleteDeriveObservation)?;
+                let unit = inventory
+                    .units
+                    .get(element.0 as usize)
+                    .filter(|unit| unit.full_range == call_range)
+                    .ok_or(SourceError::IncompleteDeriveObservation)?;
+                Ok(Some(EditableMacroSource {
+                    unit: unit.id,
+                    exact_invocation: None,
+                    call_range,
+                    role: EditableMacroSourceRole::ProducesDefinitions,
+                }))
+            }
         }
     }
 }
@@ -685,6 +1034,7 @@ pub(crate) enum SourceError {
     IncompleteAttributeObservation,
     IncompleteDeriveObservation,
     IncompleteMacroRuleObservation,
+    IncompleteDeclarativeMacroObservation,
     IncompleteProceduralMacroObservation,
 }
 
@@ -1018,6 +1368,8 @@ pub(crate) fn collect_source(
         pieces,
         derive_targets,
         macro_rules: Vec::new(),
+        macro_templates: Vec::new(),
+        macro_repetitions: Vec::new(),
         ownerless_attribute_invocations: Vec::new(),
     })
 }
@@ -1406,7 +1758,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
 ) -> Result<(), SourceError> {
     let procedural = collect_procedural_macro_observations(compiler, tcx, inventory)?;
     let opaque_anchors = resolve_procedural_macro_anchors(inventory, procedural)?;
-    let opaque_ranges = opaque_anchors
+    let mut opaque_ranges = opaque_anchors
         .iter()
         .map(|anchor| anchor.range)
         .collect::<BTreeSet<_>>();
@@ -1508,6 +1860,25 @@ pub(crate) fn refine_macro_rules_from_compiler(
             definition_range.start = definition_range.start.min(rule.start);
             definition_range.end = definition_range.end.max(rule.end);
         }
+        // rustc_resolve gives `macro_rules!` definitions public visibility exactly when
+        // `#[macro_export]` exposes them. Preserve every rule only when this crate emits metadata
+        // that a downstream crate can consume; an executable has no downstream macro contract.
+        if tcx.needs_metadata() && tcx.visibility(definition).is_public() {
+            let candidates = inventory
+                .units
+                .iter()
+                .filter(|unit| {
+                    unit.kind == WrittenUnitKind::MacroDefinition
+                        && unit.cfg_state == CfgState::Active
+                        && unit.full_range.contains(definition_range)
+                })
+                .collect::<Vec<_>>();
+            let [definition] = candidates.as_slice() else {
+                return Err(SourceError::IncompleteMacroRuleObservation);
+            };
+            opaque_ranges.insert(definition.full_range);
+            continue;
+        }
         observations.push(ObservedMacroRules {
             definition_range,
             rule_ranges,
@@ -1518,6 +1889,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
         return Err(SourceError::IncompleteMacroRuleObservation);
     }
     refine_macro_rules_outside_opaque_anchors(inventory, observations, &opaque_ranges)?;
+    declarative_macro::refine_declarative_macros_from_compiler(compiler, tcx, inventory)?;
     merge_procedural_macro_atomic_groups(inventory, &opaque_anchors)
 }
 
@@ -3170,16 +3542,19 @@ fn validate_inventory(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(rust_item_dependencies_patched)]
+    use std::process::Command;
     use std::sync::Arc;
 
     use super::{
         AtomicGroupId, ByteRange, CfgState, MacroRuleSourceFacts, ObservedMacroRules,
         ObservedProceduralMacro, OriginalOffsetMap, PieceKind, ProceduralTargetKind, SourceError,
         SourceInventory, SourceUnitId, WrittenUnit, WrittenUnitKind,
-        merge_procedural_macro_atomic_groups, own_lexical_pieces, refine_macro_rules,
-        refine_macro_rules_outside_opaque_anchors, resolve_procedural_macro_anchors,
-        validate_macro_rule_facts,
+        bang_macro_source_spans_are_written, can_anchor_declarative_discovery,
+        declarative_discovery_anchors, merge_procedural_macro_atomic_groups, own_lexical_pieces,
+        refine_macro_rules, refine_macro_rules_outside_opaque_anchors,
+        resolve_procedural_macro_anchors, validate_macro_rule_facts,
     };
     use crate::rewrite::rewrite_source;
 
@@ -3353,6 +3728,8 @@ mod tests {
             pieces,
             derive_targets: Vec::new(),
             macro_rules: Vec::new(),
+            macro_templates: Vec::new(),
+            macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         };
         let mut unselected_inventory = inventory.clone();
@@ -3460,6 +3837,8 @@ mod tests {
             pieces,
             derive_targets: Vec::new(),
             macro_rules: Vec::new(),
+            macro_templates: Vec::new(),
+            macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         };
 
@@ -3471,9 +3850,11 @@ mod tests {
 
     #[test]
     fn procedural_bang_macro_merges_every_group_inside_its_invocation() {
-        let source = Arc::<str>::from("outer!(inner!());\nfn untouched() {}\n");
-        let outer = marker(&source, "outer!(inner!());");
-        let inner = marker(&source, "inner!()");
+        let source = Arc::<str>::from("outer!(inner!(left, right));\nfn untouched() {}\n");
+        let outer = marker(&source, "outer!(inner!(left, right));");
+        let inner = marker(&source, "inner!(left, right)");
+        let left = marker(&source, "left");
+        let right = marker(&source, "right");
         let untouched = marker(&source, "fn untouched() {}");
         let units = vec![
             unit(
@@ -3488,10 +3869,12 @@ mod tests {
             ),
             unit(1, WrittenUnitKind::MacroInvocation, outer, Some(0), 1),
             unit(2, WrittenUnitKind::MacroInvocation, inner, Some(1), 2),
-            unit(3, WrittenUnitKind::Item, untouched, Some(0), 3),
+            unit(3, WrittenUnitKind::NestedItem, left, Some(2), 3),
+            unit(4, WrittenUnitKind::NestedItem, right, Some(2), 4),
+            unit(5, WrittenUnitKind::Item, untouched, Some(0), 5),
         ];
         let mut inventory = test_inventory(source, units, Vec::new());
-        let invocation_range = marker(&inventory.original, "outer!(inner!())");
+        let invocation_range = marker(&inventory.original, "outer!(inner!(left, right))");
 
         let anchors = resolve_procedural_macro_anchors(
             &inventory,
@@ -3507,14 +3890,361 @@ mod tests {
             inventory.units[1].atomic_group,
             inventory.units[2].atomic_group
         );
+        assert_eq!(
+            inventory.units[1].atomic_group,
+            inventory.units[3].atomic_group
+        );
+        assert_eq!(
+            inventory.units[1].atomic_group,
+            inventory.units[4].atomic_group
+        );
         assert_ne!(
             inventory.units[0].atomic_group,
             inventory.units[1].atomic_group
         );
         assert_ne!(
             inventory.units[1].atomic_group,
-            inventory.units[3].atomic_group
+            inventory.units[5].atomic_group
         );
+    }
+
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn exact_matcher_elements_split_from_a_function_but_late_parsed_inputs_do_not() {
+        let source = concat!(
+            "macro_rules! elements {\n",
+            "    ($($name:ident),*) => {{ $(fn $name() {})* 0 }};\n",
+            "}\n",
+            "fn main() {\n",
+            "    let _ = elements!(direct_dead, direct_other);\n",
+            "    assert_eq!(elements!(late_dead, late_other), 0);\n",
+            "}\n",
+        )
+        .to_owned();
+        let direct_range = marker(&source, "elements!(direct_dead, direct_other)");
+        let late_range = marker(&source, "elements!(late_dead, late_other)");
+        let version = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+            .arg("-Vv")
+            .output()
+            .unwrap();
+        let target = String::from_utf8(version.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap()
+            .to_owned();
+        let analysis = crate::Analyzer::new()
+            .unwrap()
+            .analyze(&crate::SourceInput::binary(
+                source,
+                crate::Edition::Rust2024,
+                target,
+            ))
+            .unwrap();
+        let direct = analysis
+            .source_units()
+            .iter()
+            .find(|unit| {
+                unit.kind == WrittenUnitKind::MacroInvocation && unit.full_range == direct_range
+            })
+            .expect("the directly parsed invocation must have an exact source unit");
+        let elements = analysis
+            .source_units()
+            .iter()
+            .filter(|unit| {
+                unit.kind == WrittenUnitKind::NestedItem && unit.parent == Some(direct.id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(elements.len(), 2);
+        assert!(
+            elements
+                .iter()
+                .all(|element| element.atomic_group != direct.atomic_group)
+        );
+        assert_ne!(elements[0].atomic_group, elements[1].atomic_group);
+
+        assert!(!analysis.source_units().iter().any(|unit| {
+            unit.kind == WrittenUnitKind::MacroInvocation && unit.full_range == late_range
+        }));
+        assert!(!analysis.source_units().iter().any(|unit| {
+            unit.kind == WrittenUnitKind::NestedItem && late_range.contains(unit.full_range)
+        }));
+    }
+
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn external_declarative_discovery_anchors_the_outer_call_but_refines_local_output() {
+        let source = concat!(
+            "macro_rules! component {\n",
+            "    () => {{ fn removable() -> u32 { 99 } 0 }};\n",
+            "}\n",
+            "fn main() { assert_eq!(component!(), 0); }\n",
+        )
+        .to_owned();
+        let nested_call = marker(&source, "component!()");
+        let removable = marker(&source, "fn removable() -> u32 { 99 }");
+        let version = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+            .arg("-Vv")
+            .output()
+            .unwrap();
+        let target = String::from_utf8(version.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap()
+            .to_owned();
+        let input =
+            crate::SourceInput::binary(source.clone(), crate::Edition::Rust2024, target.clone());
+        let analyzer = crate::Analyzer::new().unwrap();
+        let analysis = analyzer.analyze(&input).unwrap();
+
+        assert!(!analysis.source_units().iter().any(|unit| {
+            unit.kind == WrittenUnitKind::MacroInvocation && unit.full_range == nested_call
+        }));
+        let anchors = analysis
+            .source_units()
+            .iter()
+            .filter(|unit| {
+                unit.kind == WrittenUnitKind::MacroInvocation
+                    && unit.full_range.contains(nested_call)
+            })
+            .collect::<Vec<_>>();
+        let smallest = anchors
+            .iter()
+            .map(|unit| unit.full_range.len())
+            .min()
+            .unwrap();
+        let smallest_anchors = anchors
+            .iter()
+            .copied()
+            .filter(|unit| unit.full_range.len() == smallest)
+            .collect::<Vec<_>>();
+        let [anchor] = smallest_anchors.as_slice() else {
+            panic!("the nested call must have one indivisible outer source anchor")
+        };
+        let expansion = analysis
+            .graph()
+            .expansions
+            .iter()
+            .find(|expansion| {
+                expansion
+                    .key
+                    .0
+                    .last()
+                    .is_some_and(|part| part.invocation_range == Some(nested_call))
+            })
+            .expect("the local nested expansion must be observed");
+        assert_eq!(expansion.written_invocation, Some(anchor.id));
+        assert!(analysis.source_units().iter().any(|unit| {
+            unit.kind == WrittenUnitKind::NestedItem && unit.full_range == removable
+        }));
+
+        let reduced = analyzer.reduce_and_verify(&input).unwrap();
+        assert!(!reduced.reduced_source().contains("removable"));
+        assert!(reduced.reduced_source().contains("component!()"));
+        let fixed = analyzer
+            .reduce_and_verify(&crate::SourceInput::binary(
+                reduced.reduced_source().to_owned(),
+                crate::Edition::Rust2024,
+                target,
+            ))
+            .unwrap();
+        assert_eq!(fixed.reduced_source(), reduced.reduced_source());
+    }
+
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn generated_macro_call_with_a_root_source_range_is_not_directly_editable() {
+        let source = concat!(
+            "macro_rules! child {\n",
+            "    () => {{ fn removable() -> u32 { 99 } 0 }};\n",
+            "}\n",
+            "macro_rules! construct {\n",
+            "    ($name:ident) => { $name!() };\n",
+            "}\n",
+            "fn main() { assert_eq!(construct!(child), 0); }\n",
+        )
+        .to_owned();
+        let generated_call_range = marker(&source, "$name!()");
+        let version = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+            .arg("-Vv")
+            .output()
+            .unwrap();
+        let target = String::from_utf8(version.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap()
+            .to_owned();
+        let analysis = crate::Analyzer::new()
+            .unwrap()
+            .analyze(&crate::SourceInput::binary(
+                source,
+                crate::Edition::Rust2024,
+                target,
+            ))
+            .unwrap();
+
+        let construct = analysis
+            .graph()
+            .expansions
+            .iter()
+            .find(|expansion| {
+                matches!(
+                    &expansion.kind,
+                    crate::dependency_graph::ExpansionKind::Macro { name, .. }
+                        if name == "construct"
+                )
+            })
+            .expect("the written parent invocation must be observed");
+        let generated_child = analysis
+            .graph()
+            .expansions
+            .iter()
+            .find(|expansion| {
+                matches!(
+                    &expansion.kind,
+                    crate::dependency_graph::ExpansionKind::Macro { name, .. }
+                        if name == "child"
+                ) && expansion
+                    .key
+                    .0
+                    .last()
+                    .is_some_and(|part| part.invocation_range == Some(generated_call_range))
+            })
+            .expect("the call assembled by the parent transcriber must be observed");
+
+        assert_eq!(generated_child.discovered_in, Some(construct.id));
+        assert_eq!(generated_child.source_call_parent, Some(construct.id));
+        assert_eq!(generated_child.written_invocation, None);
+        assert!(!analysis.source_units().iter().any(|unit| {
+            unit.kind == WrittenUnitKind::MacroInvocation && unit.full_range == generated_call_range
+        }));
+    }
+
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn duplicated_captured_call_refines_one_template_only_after_all_producers_are_observed() {
+        let source = concat!(
+            "macro_rules! component {\n",
+            "    ($unused:ident) => {{ fn removable() -> u32 { 99 } 0 }};\n",
+            "}\n",
+            "macro_rules! duplicate {\n",
+            "    ($value:expr) => { ($value, $value) };\n",
+            "}\n",
+            "fn main() { assert_eq!(duplicate!(component!(tag)), (0, 0)); }\n",
+        )
+        .to_owned();
+        let written_call = marker(&source, "component!(tag)");
+        let removable = marker(&source, "fn removable() -> u32 { 99 }");
+        let version = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+            .arg("-Vv")
+            .output()
+            .unwrap();
+        let target = String::from_utf8(version.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap()
+            .to_owned();
+        let input =
+            crate::SourceInput::binary(source.clone(), crate::Edition::Rust2024, target.clone());
+        let analyzer = crate::Analyzer::new().unwrap();
+        let analysis = analyzer.analyze(&input).unwrap();
+
+        let producers = analysis
+            .graph()
+            .expansions
+            .iter()
+            .filter(|expansion| {
+                matches!(
+                    &expansion.kind,
+                    crate::dependency_graph::ExpansionKind::Macro { name, .. }
+                        if name == "component"
+                ) && expansion
+                    .key
+                    .0
+                    .last()
+                    .is_some_and(|part| part.invocation_range == Some(written_call))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(producers.len(), 2);
+        assert_ne!(producers[0].id, producers[1].id);
+        assert!(analysis.source_units().iter().any(|unit| {
+            unit.kind == WrittenUnitKind::NestedItem && unit.full_range == removable
+        }));
+        assert!(!analysis.source_units().iter().any(|unit| {
+            unit.kind == WrittenUnitKind::NestedItem && written_call.contains(unit.full_range)
+        }));
+
+        let reduced = analyzer.reduce_and_verify(&input).unwrap();
+        assert!(!reduced.reduced_source().contains("removable"));
+        assert!(reduced.reduced_source().contains("component!(tag)"));
+        let fixed = analyzer
+            .reduce_and_verify(&crate::SourceInput::binary(
+                reduced.reduced_source().to_owned(),
+                crate::Edition::Rust2024,
+                target,
+            ))
+            .unwrap();
+        assert_eq!(fixed.reduced_source(), reduced.reduced_source());
+    }
+
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn duplicated_output_reference_removes_an_unused_template_with_complete_output_provenance() {
+        let source = concat!(
+            "macro_rules! component {\n",
+            "    ($value:expr) => {{ fn must_stay() -> u32 { 99 } $value }};\n",
+            "}\n",
+            "macro_rules! duplicate {\n",
+            "    ($value:expr) => { ($value, $value) };\n",
+            "}\n",
+            "fn main() { assert_eq!(duplicate!(component!(0)), (0, 0)); }\n",
+        )
+        .to_owned();
+        let must_stay = marker(&source, "fn must_stay() -> u32 { 99 }");
+        let version = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+            .arg("-Vv")
+            .output()
+            .unwrap();
+        let target = String::from_utf8(version.stdout)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .unwrap()
+            .to_owned();
+        let input = crate::SourceInput::binary(source, crate::Edition::Rust2024, target.clone());
+        let analyzer = crate::Analyzer::new().unwrap();
+        let analysis = analyzer.analyze(&input).unwrap();
+
+        assert_eq!(
+            analysis
+                .graph()
+                .expansions
+                .iter()
+                .filter(|expansion| matches!(
+                    &expansion.kind,
+                    crate::dependency_graph::ExpansionKind::Macro { name, .. }
+                        if name == "component"
+                ))
+                .count(),
+            2
+        );
+        assert!(analysis.source_units().iter().any(|unit| {
+            unit.kind == WrittenUnitKind::NestedItem && unit.full_range == must_stay
+        }));
+        let reduced = analyzer.reduce_and_verify(&input).unwrap();
+        assert!(!reduced.reduced_source().contains("must_stay"));
+        assert!(reduced.reduced_source().contains("$value"));
+        let fixed = analyzer
+            .reduce_and_verify(&crate::SourceInput::binary(
+                reduced.reduced_source().to_owned(),
+                crate::Edition::Rust2024,
+                target,
+            ))
+            .unwrap();
+        assert_eq!(fixed.reduced_source(), reduced.reduced_source());
     }
 
     #[test]
@@ -3832,6 +4562,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn declarative_discovery_anchors_are_memoized_and_fail_closed() {
+        assert!(can_anchor_declarative_discovery(true, true));
+        assert!(!can_anchor_declarative_discovery(false, true));
+        assert!(!can_anchor_declarative_discovery(true, false));
+
+        let mut links = BTreeMap::new();
+        for expansion in 1..=1024 {
+            links.insert(expansion, (true, expansion - 1));
+        }
+        links.insert(2000, (false, 0));
+        links.insert(2001, (true, 2000));
+        // The production predicate maps built-in and procedural macro
+        // ancestors to false before this memo is built.
+        links.insert(2100, (false, 0));
+        links.insert(2101, (true, 2100));
+        links.insert(3000, (true, 3001));
+        links.insert(4000, (true, 4001));
+        links.insert(4001, (true, 4000));
+
+        let anchors =
+            declarative_discovery_anchors(links.keys().copied().chain([5000]), 0, |expansion| {
+                links.get(&expansion).copied()
+            });
+        assert!(
+            (1..=1024).all(|expansion| anchors.get(&expansion) == Some(&true)),
+            "a deep wholly declarative chain remains anchorable"
+        );
+        for expansion in [2000, 2001, 2100, 2101, 3000, 4000, 4001] {
+            assert_eq!(anchors.get(&expansion), Some(&false));
+        }
+        assert_eq!(anchors.get(&5000), None);
+    }
+
+    #[test]
+    fn generated_invocation_node_span_cannot_claim_written_source() {
+        assert!(bang_macro_source_spans_are_written(true, false, false));
+        assert!(!bang_macro_source_spans_are_written(true, false, true));
+    }
+
     fn unit(
         id: u32,
         kind: WrittenUnitKind,
@@ -3865,6 +4635,8 @@ mod tests {
             pieces,
             derive_targets: Vec::new(),
             macro_rules,
+            macro_templates: Vec::new(),
+            macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         }
     }

@@ -1,36 +1,31 @@
 //! Ownership-preserving conversion of compiler expansion provenance.
 
 #[cfg(rust_item_dependencies_patched)]
-use std::collections::{BTreeMap, BTreeSet};
-
+use rustc_data_structures::fx::FxHashMap;
 use rustc_interface::interface::Compiler;
 use rustc_middle::ty::TyCtxt;
 #[cfg(rust_item_dependencies_patched)]
-use rustc_middle::ty::{
-    MacroImplementationKind as RustcImplementationKind, MacroInvocationFragmentKind,
-    MacroInvocationOrigin,
-};
+use rustc_span::ExpnId;
 #[cfg(rust_item_dependencies_patched)]
-use rustc_span::hygiene::{AstPass, DesugaringKind as RustcDesugaringKind};
-#[cfg(rust_item_dependencies_patched)]
-use rustc_span::{ExpnId, ExpnKind, MacroKind, Span};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::definitions::{CollectedDefinitions, DefinitionError};
+use crate::dependency_graph::{DependencyEdge, ExpansionId, ExpansionNode};
+#[cfg(rust_item_dependencies_patched)]
+use crate::dependency_graph::{DependencyKind, ExpansionKind, GraphNode, MacroImplementationKind};
 #[cfg(rust_item_dependencies_patched)]
 use crate::dependency_graph::{
-    AstPassKind, DependencyKind, DesugaringKind, EvidenceOrigin, ExpansionFragmentKind,
-    ExpansionId, ExpansionKey, ExpansionKeyPart, ExpansionKind, GraphNode, MacroImplementationKind,
-    MacroStyle, ObservationSite,
+    EvidenceOrigin, ExpansionFragmentKind, ExpansionKey, ExpansionKeyPart, ObservationSite,
 };
-use crate::dependency_graph::{DependencyEdge, ExpansionNode};
 #[cfg(rust_item_dependencies_patched)]
 use crate::graph::{DefinitionId, DefinitionOrigin, DefinitionTarget};
-use crate::source::SourceInventory;
+#[cfg(all(test, rust_item_dependencies_patched))]
+use crate::source::ByteRange;
 #[cfg(rust_item_dependencies_patched)]
-use crate::source::{
-    ByteRange, EditableMacroSource, EditableMacroSourceRole, SourceError, original_span_range,
-    resolve_editable_macro_source,
-};
+use crate::source::EditableMacroSourceRole;
+use crate::source::SourceInventory;
+#[cfg(all(test, rust_item_dependencies_patched))]
+use crate::source::SourceUnitId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExpansionError {
@@ -45,9 +40,55 @@ impl From<DefinitionError> for ExpansionError {
     }
 }
 
+mod output;
+mod provenance;
+
+#[cfg(test)]
+pub(crate) use output::{
+    MacroCompleteOutputMeaning, MacroOutputMaterializationGroup, MacroOutputSlice,
+};
+pub(crate) use output::{
+    MacroCompleteOutputMeaningInventory, MacroDefinitionProductRole, MacroOutputRange,
+    MacroOwnerEffect, MacroProducerCoverage, MacroProducerCoverageInventory,
+    macro_definition_product_role, validated_outputless_macro_expansions,
+};
+pub(crate) use provenance::{
+    MacroContributorDag, MacroContributorSetId, MacroProvenance, collect_macro_provenance,
+};
+
+#[cfg(rust_item_dependencies_patched)]
+use output::lower_macro_output_inventories;
+#[cfg(all(test, rust_item_dependencies_patched))]
+use output::{MacroOutputClass, coalesce_definition_identity_cohorts};
+#[cfg(rust_item_dependencies_patched)]
+use provenance::PreparedExpansionOrigin;
+
 pub(crate) struct CollectedExpansions {
     pub nodes: Vec<ExpansionNode>,
     pub edges: Vec<DependencyEdge>,
+    macro_producer_coverage: MacroProducerCoverageInventory,
+    macro_complete_output_meaning: MacroCompleteOutputMeaningInventory,
+    outputless_macro_expansions: Vec<ExpansionId>,
+}
+
+impl CollectedExpansions {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<ExpansionNode>,
+        Vec<DependencyEdge>,
+        MacroProducerCoverageInventory,
+        MacroCompleteOutputMeaningInventory,
+        Vec<ExpansionId>,
+    ) {
+        (
+            self.nodes,
+            self.edges,
+            self.macro_producer_coverage,
+            self.macro_complete_output_meaning,
+            self.outputless_macro_expansions,
+        )
+    }
 }
 
 #[cfg(not(rust_item_dependencies_patched))]
@@ -56,136 +97,55 @@ pub(crate) fn collect_expansions(
     _tcx: TyCtxt<'_>,
     _source: &SourceInventory,
     _definitions: &mut CollectedDefinitions,
+    _provenance: &MacroProvenance,
 ) -> Result<CollectedExpansions, ExpansionError> {
     Err(ExpansionError::IncompleteOrigin)
 }
 
 #[cfg(rust_item_dependencies_patched)]
 pub(crate) fn collect_expansions(
-    compiler: &Compiler,
+    _compiler: &Compiler,
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
     definitions: &mut CollectedDefinitions,
+    provenance: &MacroProvenance,
 ) -> Result<CollectedExpansions, ExpansionError> {
-    let origins = &tcx.resolutions(()).macro_invocation_origins;
-    let mut expansion_ids = Vec::<ExpnId>::new();
-    let sorted_origins = origins
-        .items()
-        .map(|(&expansion, origin)| {
-            (
-                expansion.expn_hash().local_hash().as_u64(),
-                expansion,
-                origin,
-            )
-        })
-        .into_sorted_stable_ord_by_key(|record| &record.0);
-    for (_, expansion, origin) in sorted_origins {
-        add_expansion_closure(origins, expansion, &mut expansion_ids)?;
-        add_expansion_closure(origins, origin.discovered_in_expansion, &mut expansion_ids)?;
-    }
-    for definition in tcx.iter_local_def_id() {
-        add_expansion_closure(
-            origins,
-            tcx.expn_that_defined(definition.to_def_id()),
-            &mut expansion_ids,
-        )?;
-    }
-    expansion_ids.retain(|expansion| *expansion != ExpnId::root());
-
-    let mut raw = Vec::with_capacity(expansion_ids.len());
-    for expansion in expansion_ids {
-        let origin = origins.get(&expansion);
-        let data = expansion.expn_data();
-        let kind = expansion_kind(&data.kind)?;
-        let macro_definition = data
-            .macro_def_id
+    let mut raw = Vec::with_capacity(provenance.origins.ordered.len());
+    for prepared in &provenance.origins.ordered {
+        let macro_definition = prepared
+            .macro_definition
             .map(|definition| definitions.target(tcx, definition))
             .transpose()?;
-        let macro_definition_key = data
-            .macro_def_id
+        let macro_definition_key = prepared
+            .macro_definition
             .map(|definition| definitions.target_key(tcx, definition))
             .transpose()?;
-        let invocation_range = source_range(compiler, source, data.call_site)?;
-        let node_range = origin
-            .map(|origin| source_range(compiler, source, origin.invocation_node_span))
-            .transpose()?
-            .flatten();
-        let target_range = origin
-            .and_then(|origin| origin.target_span)
-            .map(|span| source_range(compiler, source, span))
-            .transpose()?
-            .flatten();
-        let mut discovered_in = origin
-            .map(|origin| origin.discovered_in_expansion)
-            .filter(|parent| *parent != ExpnId::root());
-        let mut semantic_parent = (data.parent != ExpnId::root()).then_some(data.parent);
-        let source_call = data.call_site.ctxt().outer_expn();
-        let mut source_call_parent =
-            (source_call != ExpnId::root() && source_call != expansion).then_some(source_call);
-        let fragment = origin.map(|origin| fragment_kind(origin.fragment_kind));
-        let implementation = origin.map(|origin| implementation_kind(origin.implementation_kind));
-        let selected_macro_rule = origin
-            .map(|origin| selected_macro_rule_range(compiler, tcx, source, origin))
-            .transpose()?
-            .flatten();
-        let attribute_like = matches!(
-            &data.kind,
-            ExpnKind::Macro(MacroKind::Attr | MacroKind::Derive, _)
-        );
-        let editable_source = match origin {
-            Some(origin) => {
-                let editable = resolve_editable_macro_source(compiler, source, origins, expansion)
-                    .map_err(expansion_source_error)?;
-                if origin.discovered_in_expansion == ExpnId::root() && editable.is_none() {
-                    return Err(ExpansionError::IncompleteOrigin);
-                }
-                editable
-            }
-            None => None,
-        };
-        if editable_source
-            .is_some_and(|editable| editable.role == EditableMacroSourceRole::TransparentAttribute)
-        {
-            discovered_in = None;
-            semantic_parent = None;
-            source_call_parent = None;
-        }
-        let identity_parent = discovered_in.or(source_call_parent).or(semantic_parent);
-        let written_invocation = editable_source.map(|editable| editable.unit);
-        let source_owner = origin
-            .map(|origin| {
-                expansion_source_owner(
-                    compiler,
-                    source,
-                    definitions,
-                    origin,
-                    editable_source,
-                    attribute_like,
-                )
-            })
+        let source_owner = prepared
+            .parent_definition
+            .map(|_| expansion_source_owner(source, definitions, prepared))
             .transpose()?
             .flatten();
         raw.push(RawExpansion {
-            compiler_id: expansion,
-            identity_parent,
-            kind: kind.clone(),
+            compiler_id: prepared.compiler_id,
+            identity_parent: prepared.parents.identity(),
+            kind: prepared.kind.clone(),
             part: ExpansionKeyPart {
-                kind,
-                fragment,
-                implementation,
-                invocation_range,
-                node_range,
-                target_range,
+                kind: prepared.kind.clone(),
+                fragment: prepared.fragment,
+                implementation: prepared.implementation,
+                invocation_range: prepared.invocation_range,
+                node_range: prepared.node_range,
+                target_range: prepared.target_range,
                 macro_definition: macro_definition_key,
-                selected_macro_rule,
+                selected_macro_rule: prepared.selected_rule.map(|selected| selected.range),
                 same_role_ordinal: 0,
             },
-            fragment,
-            implementation,
-            discovered_in,
-            semantic_parent,
-            source_call_parent,
-            written_invocation,
+            fragment: prepared.fragment,
+            implementation: prepared.implementation,
+            discovered_in: prepared.parents.discovered_in,
+            semantic_parent: prepared.parents.semantic,
+            source_call_parent: prepared.parents.source_call,
+            written_invocation: prepared.written_invocation(),
             source_owner,
             macro_definition,
             key: ExpansionKey(Vec::new()),
@@ -194,16 +154,15 @@ pub(crate) fn collect_expansions(
 
     assign_expansion_keys(&mut raw)?;
     raw.sort_by(|left, right| left.key.cmp(&right.key));
-    let compiler_ids = raw
+    let expansion_ids = raw
         .iter()
         .enumerate()
         .map(|(index, expansion)| (expansion.compiler_id, ExpansionId(index as u32)))
-        .collect::<Vec<_>>();
-    let expansion_id = |compiler_id: ExpnId| {
-        compiler_ids
-            .iter()
-            .find_map(|(candidate, id)| (*candidate == compiler_id).then_some(*id))
-    };
+        .collect::<FxHashMap<_, _>>();
+    if expansion_ids.len() != raw.len() {
+        return Err(ExpansionError::IncompleteOrigin);
+    }
+    let expansion_id = |compiler_id: ExpnId| expansion_ids.get(&compiler_id).copied();
 
     let mut nodes = Vec::with_capacity(raw.len());
     let mut edges = Vec::new();
@@ -259,6 +218,7 @@ pub(crate) fn collect_expansions(
         }
     }
 
+    let mut generated_by = Vec::new();
     for definition in tcx.iter_local_def_id() {
         let Some(id) = definitions.definition_id(definition) else {
             return Err(ExpansionError::IncompleteOrigin);
@@ -274,7 +234,17 @@ pub(crate) fn collect_expansions(
             }
             DefinitionOrigin::Written { .. } | DefinitionOrigin::Injected { .. } => continue,
         };
-        let expansion = nearest_observed_expansion(origins, compiler_expansion, &expansion_id)?;
+        generated_by.push((id, compiler_expansion));
+    }
+    let generated_expansions = provenance.nearest_collected_expansions(
+        generated_by.iter().map(|(_, expansion)| *expansion),
+        &expansion_ids,
+    )?;
+    for (id, compiler_expansion) in generated_by {
+        let expansion = generated_expansions
+            .get(&compiler_expansion)
+            .copied()
+            .ok_or(ExpansionError::IncompleteOrigin)?;
         edges.push(structural_edge(
             GraphNode::Definition(id),
             GraphNode::Expansion(expansion),
@@ -282,7 +252,28 @@ pub(crate) fn collect_expansions(
         ));
     }
 
-    Ok(CollectedExpansions { nodes, edges })
+    let mut outputless_macro_expansions = provenance
+        .outputless_producers
+        .iter()
+        .map(|compiler_id| expansion_id(*compiler_id).ok_or(ExpansionError::IncompleteOrigin))
+        .collect::<Result<Vec<_>, _>>()?;
+    outputless_macro_expansions.sort();
+    let outputless_macro_expansions =
+        validated_outputless_macro_expansions(&nodes, &edges, &outputless_macro_expansions)
+            .ok_or(ExpansionError::IncompleteOrigin)?
+            .into_iter()
+            .collect();
+
+    let (macro_producer_coverage, macro_complete_output_meaning) =
+        lower_macro_output_inventories(definitions, provenance, &raw, expansion_ids, &edges)?;
+
+    Ok(CollectedExpansions {
+        nodes,
+        edges,
+        macro_producer_coverage,
+        macro_complete_output_meaning,
+        outputless_macro_expansions,
+    })
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -303,253 +294,72 @@ struct RawExpansion {
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn add_expansion_closure(
-    origins: &rustc_data_structures::unord::UnordMap<ExpnId, MacroInvocationOrigin>,
-    expansion: ExpnId,
-    output: &mut Vec<ExpnId>,
-) -> Result<(), ExpansionError> {
-    if expansion == ExpnId::root() || output.contains(&expansion) {
-        return Ok(());
-    }
-    output.push(expansion);
-    let data = expansion.expn_data();
-    if let Some(origin) = origins.get(&expansion) {
-        add_expansion_closure(origins, origin.discovered_in_expansion, output)?;
-    }
-    add_expansion_closure(origins, data.parent, output)?;
-    let source_call_parent = data.call_site.ctxt().outer_expn();
-    if source_call_parent != expansion {
-        add_expansion_closure(origins, source_call_parent, output)?;
-    }
-    Ok(())
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn expansion_kind(kind: &ExpnKind) -> Result<ExpansionKind, ExpansionError> {
-    Ok(match kind {
-        ExpnKind::Root => return Err(ExpansionError::IncompleteOrigin),
-        ExpnKind::Macro(style, name) => ExpansionKind::Macro {
-            style: match style {
-                MacroKind::Bang => MacroStyle::Bang,
-                MacroKind::Attr => MacroStyle::Attribute,
-                MacroKind::Derive => MacroStyle::Derive,
-            },
-            name: name.to_string(),
-        },
-        ExpnKind::AstPass(pass) => ExpansionKind::AstPass(match pass {
-            AstPass::StdImports => AstPassKind::StandardImports,
-            AstPass::TestHarness => AstPassKind::TestHarness,
-            AstPass::ProcMacroHarness => AstPassKind::ProcMacroHarness,
-        }),
-        ExpnKind::Desugaring(kind) => ExpansionKind::Desugaring(match kind {
-            RustcDesugaringKind::QuestionMark => DesugaringKind::QuestionMark,
-            RustcDesugaringKind::TryBlock => DesugaringKind::TryBlock,
-            RustcDesugaringKind::YeetExpr => DesugaringKind::YeetExpression,
-            RustcDesugaringKind::OpaqueTy => DesugaringKind::OpaqueType,
-            RustcDesugaringKind::Async => DesugaringKind::Async,
-            RustcDesugaringKind::Await => DesugaringKind::Await,
-            RustcDesugaringKind::ForLoop => DesugaringKind::ForLoop,
-            RustcDesugaringKind::WhileLoop => DesugaringKind::WhileLoop,
-            RustcDesugaringKind::BoundModifier => DesugaringKind::BoundModifier,
-            RustcDesugaringKind::Contract => DesugaringKind::Contract,
-            RustcDesugaringKind::PatTyRange => DesugaringKind::PatternTypeRange,
-            RustcDesugaringKind::FormatLiteral { source: true } => {
-                DesugaringKind::WrittenFormatLiteral
-            }
-            RustcDesugaringKind::FormatLiteral { source: false } => {
-                DesugaringKind::ExpandedFormatLiteral
-            }
-            RustcDesugaringKind::RangeExpr => DesugaringKind::RangeExpression,
-        }),
-    })
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn fragment_kind(kind: MacroInvocationFragmentKind) -> ExpansionFragmentKind {
-    match kind {
-        MacroInvocationFragmentKind::OptExpr => ExpansionFragmentKind::OptionalExpression,
-        MacroInvocationFragmentKind::MethodReceiverExpr => {
-            ExpansionFragmentKind::MethodReceiverExpression
-        }
-        MacroInvocationFragmentKind::Expr => ExpansionFragmentKind::Expression,
-        MacroInvocationFragmentKind::Pat => ExpansionFragmentKind::Pattern,
-        MacroInvocationFragmentKind::Ty => ExpansionFragmentKind::Type,
-        MacroInvocationFragmentKind::Stmts => ExpansionFragmentKind::Statements,
-        MacroInvocationFragmentKind::Items => ExpansionFragmentKind::Items,
-        MacroInvocationFragmentKind::TraitItems => ExpansionFragmentKind::TraitItems,
-        MacroInvocationFragmentKind::ImplItems => ExpansionFragmentKind::ImplItems,
-        MacroInvocationFragmentKind::TraitImplItems => ExpansionFragmentKind::TraitImplItems,
-        MacroInvocationFragmentKind::ForeignItems => ExpansionFragmentKind::ForeignItems,
-        MacroInvocationFragmentKind::Arms => ExpansionFragmentKind::Arms,
-        MacroInvocationFragmentKind::ExprFields => ExpansionFragmentKind::ExpressionFields,
-        MacroInvocationFragmentKind::PatFields => ExpansionFragmentKind::PatternFields,
-        MacroInvocationFragmentKind::GenericParams => ExpansionFragmentKind::GenericParameters,
-        MacroInvocationFragmentKind::Params => ExpansionFragmentKind::Parameters,
-        MacroInvocationFragmentKind::FieldDefs => ExpansionFragmentKind::FieldDefinitions,
-        MacroInvocationFragmentKind::Variants => ExpansionFragmentKind::Variants,
-        MacroInvocationFragmentKind::WherePredicates => ExpansionFragmentKind::WherePredicates,
-        MacroInvocationFragmentKind::Crate => ExpansionFragmentKind::Crate,
-    }
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn implementation_kind(kind: RustcImplementationKind) -> MacroImplementationKind {
-    match kind {
-        RustcImplementationKind::Builtin => MacroImplementationKind::Builtin,
-        RustcImplementationKind::Declarative => MacroImplementationKind::Declarative,
-        RustcImplementationKind::Procedural => MacroImplementationKind::Procedural,
-        RustcImplementationKind::Legacy => MacroImplementationKind::Legacy,
-        RustcImplementationKind::InertAttribute => MacroImplementationKind::InertAttribute,
-        RustcImplementationKind::GlobDelegation => MacroImplementationKind::GlobDelegation,
-    }
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn source_range(
-    compiler: &Compiler,
-    source: &SourceInventory,
-    span: Span,
-) -> Result<Option<ByteRange>, ExpansionError> {
-    if span.is_dummy() {
-        return Ok(None);
-    }
-    let source_map = compiler.sess.source_map();
-    let start = source_map.lookup_byte_offset(span.lo());
-    let end = source_map.lookup_byte_offset(span.hi());
-    if start.sf.start_pos != end.sf.start_pos {
-        return Err(ExpansionError::InvalidSpan);
-    }
-    if start.sf.name.short().to_string() != "main.rs" {
-        return Ok(None);
-    }
-    original_span_range(compiler, &source.offsets, span)
-        .map(Some)
-        .map_err(|_| ExpansionError::InvalidSpan)
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn selected_macro_rule_range(
-    compiler: &Compiler,
-    tcx: TyCtxt<'_>,
-    source: &SourceInventory,
-    origin: &MacroInvocationOrigin,
-) -> Result<Option<ByteRange>, ExpansionError> {
-    let Some(selection) = origin.selected_macro_rule else {
-        return Ok(None);
-    };
-    let resolutions = tcx.resolutions(());
-    let rules = resolutions
-        .macro_rules_definitions
-        .get(&selection.definition)
-        .ok_or(ExpansionError::IncompleteOrigin)?;
-    let rule = rules
-        .get(selection.rule_index)
-        .ok_or(ExpansionError::IncompleteOrigin)?;
-    if resolutions
-        .expn_that_defined
-        .contains_key(&selection.definition)
-    {
-        return Ok(None);
-    }
-    let start =
-        source_range(compiler, source, rule.start_span)?.ok_or(ExpansionError::IncompleteOrigin)?;
-    let end =
-        source_range(compiler, source, rule.end_span)?.ok_or(ExpansionError::IncompleteOrigin)?;
-    let range = ByteRange {
-        start: start.start,
-        end: end.end,
-    };
-    if range.start >= range.end
-        || !source.units.iter().any(|unit| {
-            unit.kind == crate::source::WrittenUnitKind::MacroRule && unit.full_range == range
-        })
-    {
-        return Err(ExpansionError::IncompleteOrigin);
-    }
-    Ok(Some(range))
-}
-
-#[cfg(rust_item_dependencies_patched)]
 fn expansion_source_owner(
-    compiler: &Compiler,
     source: &SourceInventory,
     definitions: &CollectedDefinitions,
-    origin: &MacroInvocationOrigin,
-    editable_source: Option<EditableMacroSource>,
-    attribute_like: bool,
+    origin: &PreparedExpansionOrigin,
 ) -> Result<Option<DefinitionId>, ExpansionError> {
-    if editable_source
+    if origin
+        .editable_source
         .is_some_and(|editable| editable.role == EditableMacroSourceRole::TransparentAttribute)
     {
         return Ok(None);
     }
-    let written_invocation = editable_source.map(|editable| editable.unit);
-    if let Some(target_span) = origin.target_span {
-        if let Some(target_range) = source_range(compiler, source, target_span)? {
-            let mut candidates = definitions
-                .graph
-                .definitions
-                .iter()
-                .filter_map(|definition| match definition.origin {
-                    DefinitionOrigin::Written { anchor, .. }
-                        if target_range.contains(anchor)
-                            && !matches!(definition.kind, crate::graph::DefinitionKind::Crate) =>
-                    {
-                        Some((definition.key.0.len(), definition.id))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            candidates.sort();
-            if let Some(&(depth, owner)) = candidates.first()
-                && candidates
-                    .get(1)
-                    .is_none_or(|candidate| candidate.0 != depth)
-            {
-                return Ok(Some(owner));
-            }
-            if candidates.is_empty()
-                && attribute_like
-                && (origin.discovered_in_expansion != ExpnId::root()
-                    || written_invocation.is_some_and(|invocation| {
-                        source
-                            .ownerless_attribute_target(invocation)
-                            .and_then(|target| source.units.get(target.0 as usize))
-                            .is_some_and(|target| target.full_range.contains(target_range))
-                            || definitions.graph.definitions.iter().any(|definition| {
-                                matches!(
-                                    definition.origin,
-                                    DefinitionOrigin::Expanded {
-                                        invocation: definition_invocation,
-                                        ..
-                                    } if definition_invocation == invocation
-                                )
-                            })
-                    }))
-            {
-                return Ok(None);
-            }
-            return Err(ExpansionError::IncompleteOrigin);
+    let written_invocation = origin.written_invocation();
+    if let Some(target_range) = origin.target_range {
+        let mut candidates = definitions
+            .graph
+            .definitions
+            .iter()
+            .filter_map(|definition| match definition.origin {
+                DefinitionOrigin::Written { anchor, .. }
+                    if target_range.contains(anchor)
+                        && !matches!(definition.kind, crate::graph::DefinitionKind::Crate) =>
+                {
+                    Some((definition.key.0.len(), definition.id))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        if let Some(&(depth, owner)) = candidates.first()
+            && candidates
+                .get(1)
+                .is_none_or(|candidate| candidate.0 != depth)
+        {
+            return Ok(Some(owner));
         }
+        if candidates.is_empty()
+            && origin.attribute_like
+            && (origin.parents.discovered_in.is_some()
+                || written_invocation.is_some_and(|invocation| {
+                    source
+                        .ownerless_attribute_target(invocation)
+                        .and_then(|target| source.units.get(target.0 as usize))
+                        .is_some_and(|target| target.full_range.contains(target_range))
+                        || definitions.graph.definitions.iter().any(|definition| {
+                            matches!(
+                                definition.origin,
+                                DefinitionOrigin::Expanded {
+                                    invocation: definition_invocation,
+                                    ..
+                                } if definition_invocation == invocation
+                            )
+                        })
+                }))
+        {
+            return Ok(None);
+        }
+        return Err(ExpansionError::IncompleteOrigin);
     }
     definitions
-        .definition_id(origin.parent_definition)
+        .definition_id(
+            origin
+                .parent_definition
+                .ok_or(ExpansionError::IncompleteOrigin)?,
+        )
         .map(Some)
         .ok_or(ExpansionError::IncompleteOrigin)
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn expansion_source_error(error: SourceError) -> ExpansionError {
-    match error {
-        SourceError::InvalidSpan => ExpansionError::InvalidSpan,
-        SourceError::SourceTooLarge
-        | SourceError::NormalizationMismatch
-        | SourceError::InvalidInventory
-        | SourceError::IncompleteAttributeObservation
-        | SourceError::IncompleteDeriveObservation
-        | SourceError::IncompleteMacroRuleObservation
-        | SourceError::IncompleteProceduralMacroObservation => ExpansionError::IncompleteOrigin,
-    }
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -610,26 +420,6 @@ fn assign_expansion_keys(raw: &mut [RawExpansion]) -> Result<(), ExpansionError>
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn nearest_observed_expansion(
-    origins: &rustc_data_structures::unord::UnordMap<ExpnId, MacroInvocationOrigin>,
-    mut expansion: ExpnId,
-    lookup: &impl Fn(ExpnId) -> Option<ExpansionId>,
-) -> Result<ExpansionId, ExpansionError> {
-    let mut visited = Vec::new();
-    while expansion != ExpnId::root() && !visited.contains(&expansion) {
-        visited.push(expansion);
-        if let Some(id) = lookup(expansion) {
-            return Ok(id);
-        }
-        expansion = origins.get(&expansion).map_or_else(
-            || expansion.expn_data().call_site.ctxt().outer_expn(),
-            |origin| origin.discovered_in_expansion,
-        );
-    }
-    Err(ExpansionError::IncompleteOrigin)
-}
-
-#[cfg(rust_item_dependencies_patched)]
 fn definition_expansion(
     tcx: TyCtxt<'_>,
     mut definition: rustc_hir::def_id::LocalDefId,
@@ -652,6 +442,14 @@ fn definition_expansion(
 
 #[cfg(rust_item_dependencies_patched)]
 fn expansion_site(expansion: &RawExpansion) -> Vec<ObservationSite> {
+    if expansion.written_invocation.is_none() {
+        // A generated invocation can reuse a transcriber or call-site span,
+        // but that range is provenance rather than a written use site. Its
+        // source requirements are carried by the producer materialization;
+        // gating the use edge on that same source creates a circular reason
+        // to discard a semantically required child expansion.
+        return vec![ObservationSite::CompilerGenerated];
+    }
     expansion
         .part
         .invocation_range

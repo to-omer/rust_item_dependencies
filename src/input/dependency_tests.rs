@@ -5,6 +5,7 @@ use std::process::Command;
 use super::{
     Edition, SourceInput, inspect_source_with_dependencies,
     inspect_source_with_dependencies_at_original_coordinates, inspect_source_with_reduction,
+    normalize_expansion_ranges,
 };
 use crate::compiler_terms::CanonicalCompilerTerm;
 use crate::dependency_graph::{
@@ -263,6 +264,44 @@ fn rewritten_collection_uses_original_coordinates_for_compiler_identity() {
     .expect("the original source must reduce");
     assert!(!original.rewrite.source.contains("unused_prefix"));
 
+    let reduced_marker = marker_range_nth(&original.rewrite.source, "identity(VALUE)", 0);
+    let original_marker = marker_range_nth(REWRITTEN_COORDINATES, "identity(VALUE)", 0);
+    let kind = crate::dependency_graph::ExpansionKind::Macro {
+        style: crate::dependency_graph::MacroStyle::Bang,
+        name: "probe".to_owned(),
+    };
+    let id = crate::dependency_graph::ExpansionId(7);
+    let mut probe = [crate::dependency_graph::ExpansionNode {
+        id,
+        key: crate::dependency_graph::ExpansionKey(vec![
+            crate::dependency_graph::ExpansionKeyPart {
+                kind: kind.clone(),
+                fragment: Some(crate::dependency_graph::ExpansionFragmentKind::Expression),
+                implementation: Some(crate::dependency_graph::MacroImplementationKind::Declarative),
+                invocation_range: Some(reduced_marker),
+                node_range: Some(reduced_marker),
+                target_range: None,
+                macro_definition: None,
+                selected_macro_rule: None,
+                same_role_ordinal: 0,
+            },
+        ]),
+        kind,
+        fragment: Some(crate::dependency_graph::ExpansionFragmentKind::Expression),
+        implementation: Some(crate::dependency_graph::MacroImplementationKind::Declarative),
+        discovered_in: None,
+        semantic_parent: None,
+        source_call_parent: None,
+        written_invocation: None,
+        source_owner: None,
+        macro_definition: None,
+    }];
+    normalize_expansion_ranges(&mut probe, &original.rewrite)
+        .expect("coordinate normalization must accept a retained reduced range");
+    assert_eq!(probe[0].id, id);
+    assert_eq!(probe[0].key.0[0].invocation_range, Some(original_marker));
+    assert_eq!(probe[0].key.0[0].node_range, Some(original_marker));
+
     let reduced = inspect_source_with_dependencies_at_original_coordinates(
         &SourceInput::binary(original.rewrite.source.clone(), Edition::Rust2024, target),
         &sysroot,
@@ -324,7 +363,8 @@ fn rewritten_macro_rule_requirements_keep_their_collected_source_ids() {
     assert!(
         reduced
             .constraints
-            .macro_rule_selection_requirements
+            .macro_rule_selections()
+            .expect("declarative macro facts must be attached atomically")
             .iter()
             .any(|requirement| {
                 let selected_range = reduced.graph.expansions[requirement.expansion.0 as usize]
@@ -2480,6 +2520,13 @@ fn assert_proofs(graph: &DependencyGraph) {
                 ),
                 6
             ),
+            (
+                (
+                    MonoDependencyKind::SourceAssociatedItem,
+                    MonoCollection::Mentioned
+                ),
+                13
+            ),
         ])
     );
     assert_eq!(
@@ -2642,6 +2689,70 @@ fn assert_proofs(graph: &DependencyGraph) {
             MonoDependencyKind::VTableConstruction,
             MonoCollection::Used,
             vec![source_site(FIXTURE, "&first")],
+        ),
+        proof_use_with_evidence(
+            "dependencies",
+            associated_proof(
+                "Dispatch::invoke",
+                "Dispatch",
+                &default_impl,
+                &[&default_impl, "Dispatch"],
+            ),
+            MonoDependencyKind::SourceAssociatedItem,
+            MonoCollection::Mentioned,
+            vec![source_site(FIXTURE, "Dispatch::<u16>::invoke(&defaulted)")],
+            EvidenceOrigin::PatchedObserver,
+        ),
+        proof_use_with_evidence(
+            "dependencies",
+            associated_proof(
+                &format!("{override_impl}::invoke"),
+                &override_impl,
+                &override_impl,
+                &[&override_impl, "Dispatch"],
+            ),
+            MonoDependencyKind::SourceAssociatedItem,
+            MonoCollection::Mentioned,
+            vec![source_site(FIXTURE, "Dispatch::<u32>::invoke(&overridden)")],
+            EvidenceOrigin::PatchedObserver,
+        ),
+        proof_use_with_evidence(
+            "dependencies",
+            expected_proof("associated", Vec::new()),
+            MonoDependencyKind::SourceAssociatedItem,
+            MonoCollection::Mentioned,
+            vec![source_site(FIXTURE, "object.inherited()")],
+            EvidenceOrigin::PatchedObserver,
+        ),
+        proof_use_with_evidence(
+            "dependencies",
+            expected_proof("associated", Vec::new()),
+            MonoDependencyKind::SourceAssociatedItem,
+            MonoCollection::Mentioned,
+            vec![source_site(FIXTURE, "object.selected()")],
+            EvidenceOrigin::PatchedObserver,
+        ),
+        proof_use(
+            "dependencies",
+            obligation_proof(vec![(
+                ProofRelationKind::TraitDefinition,
+                0,
+                "std::marker::MetaSized",
+            )]),
+            MonoDependencyKind::SourceAssociatedItem,
+            MonoCollection::Mentioned,
+            vec![source_site(FIXTURE, "Dispatch::<u16>::invoke(&defaulted)")],
+        ),
+        proof_use(
+            "dependencies",
+            obligation_proof(vec![(
+                ProofRelationKind::TraitDefinition,
+                0,
+                "std::marker::MetaSized",
+            )]),
+            MonoDependencyKind::SourceAssociatedItem,
+            MonoCollection::Mentioned,
+            vec![source_site(FIXTURE, "Dispatch::<u32>::invoke(&overridden)")],
         ),
         proof_use_with_evidence(
             "dependencies",

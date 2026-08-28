@@ -67,58 +67,73 @@ const SYSROOT_MACRO_INPUT: &str =
 const SYSROOT_MACRO_EXPECTED: &str =
     include_str!("../../tests/fixtures/retention/sysroot_macro_fixed_point.expected.rs");
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_IMPL_INPUT: &str = "trait T{fn f(&self);} struct S; impl T for S{fn f(&self){}} macro_rules! m{()=>{fn main(){} fn sibling(){S.f();}}} m!();";
+const GENERATED_SIBLING_IMPL_INPUT: &str = "trait T{fn f(&self);}struct S;impl T for S{fn f(&self){}}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){S.f();}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_DEFAULT_IMPL_INPUT: &str = "trait T{fn f(&self){}} struct S; impl T for S{} macro_rules! m{()=>{fn main(){} fn sibling(){S.f();}}} m!();";
+const GENERATED_SIBLING_IMPL_EXPECTED: &str = "trait T{fn f(&self);}struct S;impl T for S{fn f(&self){}}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){S.f();}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_BLANKET_IMPL_INPUT: &str = "trait T{fn f(&self);} struct S; impl<U> T for U{fn f(&self){}} macro_rules! m{()=>{fn main(){} fn sibling(){S.f();}}} m!();";
+const GENERATED_SIBLING_DEFAULT_IMPL_INPUT: &str = "trait T{fn f(&self){}}struct S;impl T for S{}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){S.f();}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_NESTED_IMPL_INPUT: &str = "trait Bound{} trait T{fn f(&self);} struct S; impl Bound for S{} struct Wrap<U>(U); impl<U:Bound> T for Wrap<U>{fn f(&self){}} macro_rules! m{()=>{fn main(){} fn sibling(){Wrap(S).f();}}} m!();";
+const GENERATED_SIBLING_DEFAULT_IMPL_EXPECTED: &str = "trait T{fn f(&self){}}struct S;impl T for S{}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){S.f();}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_WHERE_CLAUSE_INPUT: &str = "trait T{} struct S; impl T for S{} macro_rules! m{()=>{fn main(){} fn sibling() where S:T {}}} m!();";
+const GENERATED_SIBLING_BLANKET_IMPL_INPUT: &str = "trait T{fn f(&self);}struct S;impl<U>T for U{fn f(&self){}}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){S.f();}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_ASSOC_CONST_SIGNATURE_INPUT: &str = "trait T{const N:usize;} struct S; impl T for S{const N:usize=1;} macro_rules! m{()=>{fn main(){} fn sibling(_: [(); <S as T>::N]){}}} m!();";
+const GENERATED_SIBLING_BLANKET_IMPL_EXPECTED: &str = "trait T{fn f(&self);}struct S;impl<U>T for U{fn f(&self){}}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){S.f();}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_ASSOC_TYPE_SIGNATURE_INPUT: &str = "trait T{type A;} struct S; impl T for S{type A=();} macro_rules! m{()=>{fn main(){} fn sibling(_: <S as T>::A){}}} m!();";
+const GENERATED_SIBLING_NESTED_IMPL_INPUT: &str = "trait Bound{}trait T{fn f(&self);}struct S;impl Bound for S{}struct Wrap<U>(U);impl<U:Bound>T for Wrap<U>{fn f(&self){}}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){Wrap(S).f();}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_OVERLOADED_AUTODEREF_INPUT: &str = "trait T{fn f(&self);} struct S; impl T for S{fn f(&self){}} struct W(S); impl std::ops::Deref for W{type Target=S;fn deref(&self)->&S{&self.0}} macro_rules! m{()=>{fn main(){} fn sibling(w:W){w.f();}}} m!();";
+const GENERATED_SIBLING_NESTED_IMPL_EXPECTED: &str = "trait Bound{}trait T{fn f(&self);}struct S;impl Bound for S{}struct Wrap<U>(U);impl<U:Bound>T for Wrap<U>{fn f(&self){}}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){Wrap(S).f();}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_NESTED_AUTODEREF_INPUT: &str = "trait Bound{}trait T{fn f(&self);}struct S;impl Bound for S{}impl T for S{fn f(&self){}}struct W<U>(U);impl<U:Bound> std::ops::Deref for W<U>{type Target=U;fn deref(&self)->&U{&self.0}}struct Dead;macro_rules! m{()=>{fn main(){}fn sibling(w:W<S>){w.f();}}}m!();";
+const GENERATED_SIBLING_WHERE_CLAUSE_INPUT: &str = "trait T{}struct S;impl T for S{}macro_rules! m{()=>{fn main(){sibling()}fn sibling()where S:T{}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_NESTED_AUTODEREF_EXPECTED: &str = "trait Bound{}trait T{fn f(&self);}struct S;impl Bound for S{}impl T for S{fn f(&self){}}struct W<U>(U);impl<U:Bound> std::ops::Deref for W<U>{type Target=U;fn deref(&self)->&U{&self.0}}macro_rules! m{()=>{fn main(){}fn sibling(w:W<S>){w.f();}}}m!();";
+const GENERATED_SIBLING_WHERE_CLAUSE_EXPECTED: &str = "trait T{}struct S;impl T for S{}macro_rules! m{()=>{fn main(){sibling()}fn sibling()where S:T{}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_GENERIC_BLANKET_INPUT: &str = "trait T{fn f(&self);}impl<U> T for U{fn f(&self){}}struct Dead;macro_rules! m{()=>{fn main(){}fn sibling<U>(u:U){u.f();}}}m!();";
+const GENERATED_SIBLING_ASSOC_CONST_SIGNATURE_INPUT: &str = "trait T{const N:usize;}struct S;impl T for S{const N:usize=1;}macro_rules! m{()=>{fn main(){sibling([()])}fn sibling(_:[();<S as T>::N]){}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_GENERIC_BLANKET_EXPECTED: &str = "trait T{fn f(&self);}impl<U> T for U{fn f(&self){}}macro_rules! m{()=>{fn main(){}fn sibling<U>(u:U){u.f();}}}m!();";
+const GENERATED_SIBLING_ASSOC_CONST_SIGNATURE_EXPECTED: &str = "trait T{const N:usize;}struct S;impl T for S{const N:usize=1;}macro_rules! m{()=>{fn main(){sibling([()])}fn sibling(_:[();<S as T>::N]){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_PARAM_INPUT: &str = "trait T{fn f(&self);}struct S;impl T for S{fn f(&self){}}macro_rules! m{()=>{fn main(){}fn sibling<U:T>(u:U){u.f();}}}m!();";
+const GENERATED_SIBLING_ASSOC_TYPE_SIGNATURE_INPUT: &str = "trait T{type A;}struct S;impl T for S{type A=();}macro_rules! m{()=>{fn main(){sibling(())}fn sibling(_:<S as T>::A){}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_PARAM_EXPECTED: &str =
-    "trait T{fn f(&self);}macro_rules! m{()=>{fn main(){}fn sibling<U:T>(u:U){u.f();}}}m!();";
+const GENERATED_SIBLING_ASSOC_TYPE_SIGNATURE_EXPECTED: &str = "trait T{type A;}struct S;impl T for S{type A=();}macro_rules! m{()=>{fn main(){sibling(())}fn sibling(_:<S as T>::A){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_SIGNATURE_WF_INPUT: &str = "trait B{}struct Need<T:B>(T);struct S;impl B for S{}struct Dead;macro_rules! m{()=>{fn main(){}fn sibling(_:Need<S>){}}}m!();";
+const GENERATED_SIBLING_OVERLOADED_AUTODEREF_INPUT: &str = "trait T{fn f(&self);}struct S;impl T for S{fn f(&self){}}struct W(S);impl std::ops::Deref for W{type Target=S;fn deref(&self)->&S{&self.0}}macro_rules! m{()=>{fn main(){sibling(W(S))}fn sibling(w:W){w.f();}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_SIGNATURE_WF_EXPECTED: &str = "trait B{}struct Need<T:B>(T);struct S;impl B for S{}macro_rules! m{()=>{fn main(){}fn sibling(_:Need<S>){}}}m!();";
+const GENERATED_SIBLING_OVERLOADED_AUTODEREF_EXPECTED: &str = "trait T{fn f(&self);}struct S;impl T for S{fn f(&self){}}struct W(S);impl std::ops::Deref for W{type Target=S;fn deref(&self)->&S{&self.0}}macro_rules! m{()=>{fn main(){sibling(W(S))}fn sibling(w:W){w.f();}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_SIGNATURE_WF_FORMS_INPUT: &str = "trait B{}struct S;impl B for S{}struct X<U:B=S>(U);trait Outer:B{}impl Outer for S{}trait T{type A:B;}impl T for S{type A=S;}struct Dead;macro_rules! m{()=>{fn main(){}fn sibling(_:X,_:<S as T>::A)where S:Outer{}}}m!();";
+const GENERATED_SIBLING_NESTED_AUTODEREF_INPUT: &str = "trait Bound{}trait T{fn f(&self);}struct S;impl Bound for S{}impl T for S{fn f(&self){}}struct W<U>(U);impl<U:Bound>std::ops::Deref for W<U>{type Target=U;fn deref(&self)->&U{&self.0}}struct Dead;macro_rules! m{()=>{fn main(){sibling(W(S))}fn sibling(w:W<S>){w.f();}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_SIGNATURE_WF_FORMS_EXPECTED: &str = "trait B{}struct S;impl B for S{}struct X<U:B=S>(U);trait Outer:B{}impl Outer for S{}trait T{type A:B;}impl T for S{type A=S;}macro_rules! m{()=>{fn main(){}fn sibling(_:X,_:<S as T>::A)where S:Outer{}}}m!();";
+const GENERATED_SIBLING_NESTED_AUTODEREF_EXPECTED: &str = "trait Bound{}trait T{fn f(&self);}struct S;impl Bound for S{}impl T for S{fn f(&self){}}struct W<U>(U);impl<U:Bound>std::ops::Deref for W<U>{type Target=U;fn deref(&self)->&U{&self.0}}macro_rules! m{()=>{fn main(){sibling(W(S))}fn sibling(w:W<S>){w.f();}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_EXTERNAL_DEFAULT_OVERRIDE_INPUT: &str = "struct Reader;impl std::io::Read for Reader{fn read(&mut self,_:&mut[u8])->std::io::Result<usize>{Ok(0)}fn read_to_end(&mut self,_:&mut Vec<u8>)->std::io::Result<usize>{Ok(1)}fn read_to_string(&mut self,_:&mut String)->std::io::Result<usize>{Ok(2)}}macro_rules! m{()=>{fn main(){}fn sibling(){let mut r=Reader;let _=std::io::Read::read_to_end(&mut r,&mut Vec::new());}}}m!();";
+const GENERATED_SIBLING_GENERIC_BLANKET_INPUT: &str = "trait T{fn f(&self);}impl<U>T for U{fn f(&self){}}struct Dead;macro_rules! m{()=>{fn main(){sibling(())}fn sibling<U>(u:U){u.f();}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_EXTERNAL_DEFAULT_OVERRIDE_EXPECTED: &str = "struct Reader;impl std::io::Read for Reader{fn read(&mut self,_:&mut[u8])->std::io::Result<usize>{Ok(0)}fn read_to_end(&mut self,_:&mut Vec<u8>)->std::io::Result<usize>{Ok(1)}}macro_rules! m{()=>{fn main(){}fn sibling(){let mut r=Reader;let _=std::io::Read::read_to_end(&mut r,&mut Vec::new());}}}m!();";
+const GENERATED_SIBLING_GENERIC_BLANKET_EXPECTED: &str = "trait T{fn f(&self);}impl<U>T for U{fn f(&self){}}macro_rules! m{()=>{fn main(){sibling(())}fn sibling<U>(u:U){u.f();}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_NESTED_COPY_INPUT: &str = "struct Inner;impl Clone for Inner{fn clone(&self)->Self{Inner}}impl Copy for Inner{}struct Outer(Inner);impl Clone for Outer{fn clone(&self)->Self{*self}}impl Copy for Outer{}struct Dead;macro_rules! m{()=>{fn main(){}fn sibling(){require_copy::<Outer>();}fn require_copy<T:Copy>(){}}}m!();";
+const GENERATED_SIBLING_PARAM_INPUT: &str = "trait T{fn f(&self);}struct S;impl T for S{fn f(&self){}}macro_rules! m{()=>{fn main(){sibling(S)}fn sibling<U:T>(u:U){u.f();}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_NESTED_COPY_EXPECTED: &str = "struct Inner;impl Clone for Inner{fn clone(&self)->Self{Inner}}impl Copy for Inner{}struct Outer(Inner);impl Clone for Outer{fn clone(&self)->Self{*self}}impl Copy for Outer{}macro_rules! m{()=>{fn main(){}fn sibling(){require_copy::<Outer>();}fn require_copy<T:Copy>(){}}}m!();";
+const GENERATED_SIBLING_PARAM_EXPECTED: &str = "trait T{fn f(&self);}struct S;impl T for S{fn f(&self){}}macro_rules! m{()=>{fn main(){sibling(S)}fn sibling<U:T>(u:U){u.f();}}}m!();";
+#[cfg(rust_item_dependencies_patched)]
+const GENERATED_SIBLING_SIGNATURE_WF_INPUT: &str = "trait B{}struct Need<T:B>(T);struct S;impl B for S{}struct Dead;macro_rules! m{()=>{fn main(){sibling(Need(S))}fn sibling(_:Need<S>){}fn dead(){}}}m!();";
+#[cfg(rust_item_dependencies_patched)]
+const GENERATED_SIBLING_SIGNATURE_WF_EXPECTED: &str = "trait B{}struct Need<T:B>(T);struct S;impl B for S{}macro_rules! m{()=>{fn main(){sibling(Need(S))}fn sibling(_:Need<S>){}}}m!();";
+#[cfg(rust_item_dependencies_patched)]
+const GENERATED_SIBLING_SIGNATURE_WF_FORMS_INPUT: &str = "trait B{}struct S;impl B for S{}struct X<U:B=S>(U);trait Outer:B{}impl Outer for S{}trait T{type A:B;}impl T for S{type A=S;}struct Dead;macro_rules! m{()=>{fn main(){sibling(X(S),S)}fn sibling(_:X,_:<S as T>::A)where S:Outer{}fn dead(){}}}m!();";
+#[cfg(rust_item_dependencies_patched)]
+const GENERATED_SIBLING_SIGNATURE_WF_FORMS_EXPECTED: &str = "trait B{}struct S;impl B for S{}struct X<U:B=S>(U);trait Outer:B{}impl Outer for S{}trait T{type A:B;}impl T for S{type A=S;}macro_rules! m{()=>{fn main(){sibling(X(S),S)}fn sibling(_:X,_:<S as T>::A)where S:Outer{}}}m!();";
+#[cfg(rust_item_dependencies_patched)]
+const GENERATED_SIBLING_EXTERNAL_DEFAULT_OVERRIDE_INPUT: &str = "struct Reader;impl std::io::Read for Reader{fn read(&mut self,_:&mut[u8])->std::io::Result<usize>{Ok(0)}fn read_to_end(&mut self,_:&mut Vec<u8>)->std::io::Result<usize>{Ok(1)}fn read_to_string(&mut self,_:&mut String)->std::io::Result<usize>{Ok(2)}}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){let mut r=Reader;let _=std::io::Read::read_to_end(&mut r,&mut Vec::new());}fn dead(){}}}m!();";
+#[cfg(rust_item_dependencies_patched)]
+const GENERATED_SIBLING_EXTERNAL_DEFAULT_OVERRIDE_EXPECTED: &str = "struct Reader;impl std::io::Read for Reader{fn read(&mut self,_:&mut[u8])->std::io::Result<usize>{Ok(0)}fn read_to_end(&mut self,_:&mut Vec<u8>)->std::io::Result<usize>{Ok(1)}}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){let mut r=Reader;let _=std::io::Read::read_to_end(&mut r,&mut Vec::new());}}}m!();";
+#[cfg(rust_item_dependencies_patched)]
+const GENERATED_SIBLING_NESTED_COPY_INPUT: &str = "struct Inner;impl Clone for Inner{fn clone(&self)->Self{Inner}}impl Copy for Inner{}struct Outer(Inner);impl Clone for Outer{fn clone(&self)->Self{*self}}impl Copy for Outer{}struct Dead;macro_rules! m{()=>{fn main(){sibling()}fn sibling(){require_copy::<Outer>();}fn require_copy<T:Copy>(){}fn dead(){}}}m!();";
+#[cfg(rust_item_dependencies_patched)]
+const GENERATED_SIBLING_NESTED_COPY_EXPECTED: &str = "struct Inner;impl Clone for Inner{fn clone(&self)->Self{Inner}}impl Copy for Inner{}struct Outer(Inner);impl Clone for Outer{fn clone(&self)->Self{*self}}impl Copy for Outer{}macro_rules! m{()=>{fn main(){sibling()}fn sibling(){require_copy::<Outer>();}fn require_copy<T:Copy>(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
 const ORDINARY_COPY_MOVE_INPUT: &str = "struct S;impl Clone for S{fn clone(&self)->Self{S}}impl Copy for S{}struct Dead;fn main(){let x=S;let _a=x;let _b=x;}";
 #[cfg(rust_item_dependencies_patched)]
 const ORDINARY_COPY_MOVE_EXPECTED: &str = "struct S;impl Clone for S{fn clone(&self)->Self{S}}impl Copy for S{}fn main(){let x=S;let _a=x;let _b=x;}";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_DROP_INPUT: &str = "struct Value;impl Drop for Value{fn drop(&mut self){}}struct Dead;macro_rules! m{()=>{fn main(){}fn sibling(_:Value){}}}m!();";
+const GENERATED_SIBLING_DROP_INPUT: &str = "struct Value;impl Drop for Value{fn drop(&mut self){}}struct Dead;macro_rules! m{()=>{fn main(){sibling(Value)}fn sibling(_:Value){}fn dead(){}}}m!();";
 #[cfg(rust_item_dependencies_patched)]
-const GENERATED_SIBLING_DROP_EXPECTED: &str = "struct Value;impl Drop for Value{fn drop(&mut self){}}macro_rules! m{()=>{fn main(){}fn sibling(_:Value){}}}m!();";
+const GENERATED_SIBLING_DROP_EXPECTED: &str = "struct Value;impl Drop for Value{fn drop(&mut self){}}macro_rules! m{()=>{fn main(){sibling(Value)}fn sibling(_:Value){}}}m!();";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct UnitRef {
@@ -139,6 +154,24 @@ const MACRO_RETAINED: &[UnitRef] = &[
     unit(WrittenUnitKind::MacroDefinition, 0, 94),
     #[cfg(rust_item_dependencies_patched)]
     unit(WrittenUnitKind::MacroRule, 21, 93),
+    #[cfg(rust_item_dependencies_patched)]
+    unit(WrittenUnitKind::NestedItem, 26, 45),
+    #[cfg(rust_item_dependencies_patched)]
+    unit(WrittenUnitKind::NestedItem, 45, 58),
+    unit(WrittenUnitKind::MacroInvocation, 130, 141),
+];
+
+const MACRO_INVENTORY: &[UnitRef] = &[
+    unit(WrittenUnitKind::CrateRoot, 0, 212),
+    unit(WrittenUnitKind::MacroDefinition, 0, 94),
+    #[cfg(rust_item_dependencies_patched)]
+    unit(WrittenUnitKind::MacroRule, 21, 93),
+    #[cfg(rust_item_dependencies_patched)]
+    unit(WrittenUnitKind::NestedItem, 26, 45),
+    #[cfg(rust_item_dependencies_patched)]
+    unit(WrittenUnitKind::NestedItem, 45, 58),
+    #[cfg(rust_item_dependencies_patched)]
+    unit(WrittenUnitKind::NestedItem, 58, 92),
     unit(WrittenUnitKind::Item, 94, 119),
     unit(WrittenUnitKind::MacroInvocation, 130, 141),
 ];
@@ -152,20 +185,22 @@ const DIRECT_MACRO_RETAINED: &[UnitRef] = &[
 
 #[cfg(rust_item_dependencies_patched)]
 const GENERATED_SIBLING_IMPL_RETAINED: &[UnitRef] = &[
-    unit(WrittenUnitKind::CrateRoot, 0, 120),
+    unit(WrittenUnitKind::CrateRoot, 0, 135),
     unit(WrittenUnitKind::Item, 0, 21),
     unit(WrittenUnitKind::TraitMember, 8, 20),
-    unit(WrittenUnitKind::Item, 22, 31),
-    unit(WrittenUnitKind::Item, 32, 59),
-    unit(WrittenUnitKind::ImplMember, 45, 58),
-    unit(WrittenUnitKind::MacroDefinition, 60, 114),
-    unit(WrittenUnitKind::MacroRule, 75, 113),
-    unit(WrittenUnitKind::MacroInvocation, 115, 120),
+    unit(WrittenUnitKind::Item, 21, 30),
+    unit(WrittenUnitKind::Item, 30, 57),
+    unit(WrittenUnitKind::ImplMember, 43, 56),
+    unit(WrittenUnitKind::MacroDefinition, 57, 130),
+    unit(WrittenUnitKind::MacroRule, 72, 129),
+    unit(WrittenUnitKind::NestedItem, 77, 97),
+    unit(WrittenUnitKind::NestedItem, 97, 117),
+    unit(WrittenUnitKind::MacroInvocation, 130, 135),
 ];
 
 #[cfg(rust_item_dependencies_patched)]
 const GENERATED_SIBLING_NESTED_COPY_RETAINED: &[UnitRef] = &[
-    unit(WrittenUnitKind::CrateRoot, 0, 290),
+    unit(WrittenUnitKind::CrateRoot, 0, 310),
     unit(WrittenUnitKind::Item, 0, 13),
     unit(WrittenUnitKind::Item, 13, 63),
     unit(WrittenUnitKind::ImplMember, 34, 62),
@@ -174,9 +209,12 @@ const GENERATED_SIBLING_NESTED_COPY_RETAINED: &[UnitRef] = &[
     unit(WrittenUnitKind::Item, 104, 154),
     unit(WrittenUnitKind::ImplMember, 125, 153),
     unit(WrittenUnitKind::Item, 154, 175),
-    unit(WrittenUnitKind::MacroDefinition, 187, 285),
-    unit(WrittenUnitKind::MacroRule, 202, 284),
-    unit(WrittenUnitKind::MacroInvocation, 285, 290),
+    unit(WrittenUnitKind::MacroDefinition, 187, 305),
+    unit(WrittenUnitKind::MacroRule, 202, 304),
+    unit(WrittenUnitKind::NestedItem, 207, 227),
+    unit(WrittenUnitKind::NestedItem, 227, 265),
+    unit(WrittenUnitKind::NestedItem, 265, 292),
+    unit(WrittenUnitKind::MacroInvocation, 305, 310),
 ];
 
 #[cfg(rust_item_dependencies_patched)]
@@ -234,7 +272,7 @@ const fn unit(kind: WrittenUnitKind, start: u32, end: u32) -> UnitRef {
 #[test]
 fn retention_fixtures_have_exact_independent_byte_oracles() {
     assert_eq!((ITEM_INPUT.len(), ITEM_EXPECTED.len()), (170, 72));
-    assert_eq!((MACRO_INPUT.len(), MACRO_EXPECTED.len()), (212, 131));
+    assert_eq!((MACRO_INPUT.len(), MACRO_EXPECTED.len()), (212, 72));
     #[cfg(rust_item_dependencies_patched)]
     assert_eq!(
         (DIRECT_MACRO_INPUT.len(), DIRECT_MACRO_EXPECTED.len()),
@@ -253,7 +291,8 @@ fn retention_fixtures_have_exact_independent_byte_oracles() {
     );
 
     assert!(!ITEM_EXPECTED.contains("dead_"));
-    assert!(MACRO_EXPECTED.contains("sibling_dependency"));
+    assert!(MACRO_EXPECTED.contains("fn needed()"));
+    assert!(!MACRO_EXPECTED.contains("sibling"));
     assert!(!MACRO_EXPECTED.contains("fn dead()"));
     assert!(MACRO_INPUT.contains("dead_program!()"));
     assert!(MACRO_INPUT.contains("dead_generated"));
@@ -276,7 +315,7 @@ fn retention_fixtures_have_exact_independent_byte_oracles() {
 #[test]
 fn source_inventory_contains_every_handwritten_retention_unit() {
     assert_inventory_units(&inspect_inventory(ITEM_INPUT), ITEM_RETAINED);
-    assert_inventory_units(&inspect_inventory(MACRO_INPUT), MACRO_RETAINED);
+    assert_inventory_units(&inspect_inventory(MACRO_INPUT), MACRO_INVENTORY);
     #[cfg(rust_item_dependencies_patched)]
     assert_inventory_units(
         &inspect_inventory(DIRECT_MACRO_INPUT),
@@ -465,9 +504,11 @@ fn inactive_cfg_component_ranges_preserve_crlf_unicode_and_neighboring_comments(
 fn generated_sibling_method_keeps_the_required_impl_shell() {
     let first = inspect_reduction(GENERATED_SIBLING_IMPL_INPUT);
 
-    assert_eq!(first.rewrite.source, GENERATED_SIBLING_IMPL_INPUT);
+    assert_eq!(first.rewrite.source, GENERATED_SIBLING_IMPL_EXPECTED);
     assert_retained_units(&first, GENERATED_SIBLING_IMPL_RETAINED);
     assert_piece_map(&first.source, &first.rewrite);
+    assert!(first.rewrite.source.contains("fn sibling()"));
+    assert!(!first.rewrite.source.contains("fn dead()"));
 
     let second = inspect_reduction(&first.rewrite.source);
     assert_eq!(second.rewrite.source, first.rewrite.source);
@@ -476,14 +517,28 @@ fn generated_sibling_method_keeps_the_required_impl_shell() {
 #[test]
 #[cfg(rust_item_dependencies_patched)]
 fn generated_sibling_keeps_default_blanket_and_nested_local_impls() {
-    for (case, source) in [
-        ("default method", GENERATED_SIBLING_DEFAULT_IMPL_INPUT),
-        ("blanket impl", GENERATED_SIBLING_BLANKET_IMPL_INPUT),
-        ("nested obligation", GENERATED_SIBLING_NESTED_IMPL_INPUT),
+    for (case, source, expected) in [
+        (
+            "default method",
+            GENERATED_SIBLING_DEFAULT_IMPL_INPUT,
+            GENERATED_SIBLING_DEFAULT_IMPL_EXPECTED,
+        ),
+        (
+            "blanket impl",
+            GENERATED_SIBLING_BLANKET_IMPL_INPUT,
+            GENERATED_SIBLING_BLANKET_IMPL_EXPECTED,
+        ),
+        (
+            "nested obligation",
+            GENERATED_SIBLING_NESTED_IMPL_INPUT,
+            GENERATED_SIBLING_NESTED_IMPL_EXPECTED,
+        ),
     ] {
         let first = inspect_reduction(source);
-        assert_eq!(first.rewrite.source, source, "{case}");
+        assert_eq!(first.rewrite.source, expected, "{case}");
         assert_piece_map(&first.source, &first.rewrite);
+        assert!(first.rewrite.source.contains("fn sibling()"), "{case}");
+        assert!(!first.rewrite.source.contains("fn dead()"), "{case}");
 
         let second = inspect_reduction(&first.rewrite.source);
         assert_eq!(second.rewrite.source, first.rewrite.source, "{case}");
@@ -493,25 +548,37 @@ fn generated_sibling_keeps_default_blanket_and_nested_local_impls() {
 #[test]
 #[cfg(rust_item_dependencies_patched)]
 fn generated_sibling_where_clause_keeps_the_required_impl() {
-    assert_generated_sibling_unchanged(GENERATED_SIBLING_WHERE_CLAUSE_INPUT);
+    assert_generated_sibling_reduction(
+        GENERATED_SIBLING_WHERE_CLAUSE_INPUT,
+        GENERATED_SIBLING_WHERE_CLAUSE_EXPECTED,
+    );
 }
 
 #[test]
 #[cfg(rust_item_dependencies_patched)]
 fn generated_sibling_associated_const_signature_keeps_the_required_impl() {
-    assert_generated_sibling_unchanged(GENERATED_SIBLING_ASSOC_CONST_SIGNATURE_INPUT);
+    assert_generated_sibling_reduction(
+        GENERATED_SIBLING_ASSOC_CONST_SIGNATURE_INPUT,
+        GENERATED_SIBLING_ASSOC_CONST_SIGNATURE_EXPECTED,
+    );
 }
 
 #[test]
 #[cfg(rust_item_dependencies_patched)]
 fn generated_sibling_associated_type_signature_keeps_the_required_impl() {
-    assert_generated_sibling_unchanged(GENERATED_SIBLING_ASSOC_TYPE_SIGNATURE_INPUT);
+    assert_generated_sibling_reduction(
+        GENERATED_SIBLING_ASSOC_TYPE_SIGNATURE_INPUT,
+        GENERATED_SIBLING_ASSOC_TYPE_SIGNATURE_EXPECTED,
+    );
 }
 
 #[test]
 #[cfg(rust_item_dependencies_patched)]
 fn generated_sibling_overloaded_autoderef_keeps_the_required_impls() {
-    assert_generated_sibling_unchanged(GENERATED_SIBLING_OVERLOADED_AUTODEREF_INPUT);
+    assert_generated_sibling_reduction(
+        GENERATED_SIBLING_OVERLOADED_AUTODEREF_INPUT,
+        GENERATED_SIBLING_OVERLOADED_AUTODEREF_EXPECTED,
+    );
 }
 
 #[test]
@@ -525,6 +592,8 @@ fn generated_sibling_autoderef_keeps_the_nested_bound_impl() {
     );
     assert_piece_map(&first.source, &first.rewrite);
     assert!(!first.rewrite.source.contains("struct Dead"));
+    assert!(first.rewrite.source.contains("fn sibling("));
+    assert!(!first.rewrite.source.contains("fn dead()"));
 
     let second = inspect_reduction(&first.rewrite.source);
     assert_eq!(second.rewrite.source, first.rewrite.source);
@@ -539,12 +608,16 @@ fn generic_user_defined_and_param_selections_retain_different_impls() {
         GENERATED_SIBLING_GENERIC_BLANKET_EXPECTED
     );
     assert_piece_map(&blanket.source, &blanket.rewrite);
+    assert!(blanket.rewrite.source.contains("fn sibling<"));
+    assert!(!blanket.rewrite.source.contains("fn dead()"));
     let blanket_again = inspect_reduction(&blanket.rewrite.source);
     assert_eq!(blanket_again.rewrite.source, blanket.rewrite.source);
 
     let parameter = inspect_reduction(GENERATED_SIBLING_PARAM_INPUT);
     assert_eq!(parameter.rewrite.source, GENERATED_SIBLING_PARAM_EXPECTED);
     assert_piece_map(&parameter.source, &parameter.rewrite);
+    assert!(parameter.rewrite.source.contains("fn sibling<"));
+    assert!(!parameter.rewrite.source.contains("fn dead()"));
     let parameter_again = inspect_reduction(&parameter.rewrite.source);
     assert_eq!(parameter_again.rewrite.source, parameter.rewrite.source);
 }
@@ -560,6 +633,8 @@ fn generated_sibling_signature_well_formedness_keeps_the_selected_impl() {
     );
     assert_piece_map(&first.source, &first.rewrite);
     assert!(!first.rewrite.source.contains("struct Dead"));
+    assert!(first.rewrite.source.contains("fn sibling("));
+    assert!(!first.rewrite.source.contains("fn dead()"));
 
     let second = inspect_reduction(&first.rewrite.source);
     assert_eq!(second.rewrite.source, first.rewrite.source);
@@ -577,6 +652,8 @@ fn generated_sibling_signature_well_formedness_covers_defaults_and_supertraits()
     assert_piece_map(&first.source, &first.rewrite);
     assert!(first.rewrite.source.contains("impl B for S"));
     assert!(!first.rewrite.source.contains("struct Dead"));
+    assert!(first.rewrite.source.contains("fn sibling("));
+    assert!(!first.rewrite.source.contains("fn dead()"));
 
     let second = inspect_reduction(&first.rewrite.source);
     assert_eq!(second.rewrite.source, first.rewrite.source);
@@ -611,6 +688,8 @@ fn generated_sibling_external_default_override_retains_only_the_selected_member(
         })
         .expect("the external trait impl must have one handwritten shell");
     assert!(first.retention.retained_units.contains(&impl_shell.id));
+    assert!(first.rewrite.source.contains("fn sibling()"));
+    assert!(!first.rewrite.source.contains("fn dead()"));
 
     let second = inspect_reduction(&first.rewrite.source);
     assert_eq!(second.rewrite.source, first.rewrite.source);
@@ -624,6 +703,8 @@ fn generated_sibling_copy_keeps_nested_manual_copy_coherence() {
     assert_eq!(first.rewrite.source, GENERATED_SIBLING_NESTED_COPY_EXPECTED);
     assert_piece_map(&first.source, &first.rewrite);
     assert_retained_units(&first, GENERATED_SIBLING_NESTED_COPY_RETAINED);
+    assert!(first.rewrite.source.contains("fn sibling()"));
+    assert!(!first.rewrite.source.contains("fn dead()"));
 
     let second = inspect_reduction(&first.rewrite.source);
     assert_eq!(second.rewrite.source, first.rewrite.source);
@@ -656,6 +737,8 @@ fn generated_sibling_adt_keeps_its_exact_drop_implementation() {
         BTreeSet::from(["fn drop(&mut self){}".to_owned()])
     );
     assert!(!first.rewrite.source.contains("struct Dead"));
+    assert!(first.rewrite.source.contains("fn sibling("));
+    assert!(!first.rewrite.source.contains("fn dead()"));
     assert_compiles(&first.rewrite.source);
 
     let second = inspect_reduction(&first.rewrite.source);
@@ -694,7 +777,7 @@ fn dead_top_level_macro_does_not_follow_crate_expansion_use() {
 
 #[test]
 #[cfg(rust_item_dependencies_patched)]
-fn semantic_and_compile_closures_are_not_conflated() {
+fn semantic_and_compile_closures_use_exact_macro_products() {
     let item = inspect_reduction(ITEM_INPUT);
     let expected_item = BTreeSet::from([
         "<crate>".to_owned(),
@@ -739,8 +822,6 @@ fn semantic_and_compile_closures_are_not_conflated() {
             "program".to_owned(),
             "main".to_owned(),
             "needed".to_owned(),
-            "sibling".to_owned(),
-            "sibling_dependency".to_owned(),
         ])
     );
     let expected_expansions = BTreeSet::from([ByteRange {
@@ -1109,10 +1190,13 @@ fn inspect_definitions(source: &str) -> DefinitionGraph {
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn assert_generated_sibling_unchanged(source: &str) {
+fn assert_generated_sibling_reduction(source: &str, expected: &str) {
     let first = inspect_reduction(source);
-    assert_eq!(first.rewrite.source, source);
+    assert_eq!(first.rewrite.source, expected);
     assert_piece_map(&first.source, &first.rewrite);
+    assert!(first.rewrite.source.contains("fn sibling"));
+    assert!(!first.rewrite.source.contains("fn dead()"));
+    assert_compiles(&first.rewrite.source);
 
     let second = inspect_reduction(&first.rewrite.source);
     assert_eq!(second.rewrite.source, first.rewrite.source);

@@ -114,6 +114,9 @@ pub enum MonoUseCauseProbe {
     AllocationReference,
     ThreadLocalShim,
     CompilerRequirement,
+    PreOptimizationDirectCall,
+    PreOptimizationFunctionPointer,
+    PreOptimizationInlineAsmSymbol,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -788,17 +791,6 @@ impl<'tcx> MonoQualificationCollector<'tcx> {
         }
         self.validate_stock_endpoints(root, mode, successors)?;
 
-        for proof in successors
-            .proof_uses
-            .iter()
-            .filter(|proof| proof.collection == MonoTraceCollection::Used)
-        {
-            self.record_mono_proof(*proof)?;
-        }
-        for item in successors.used {
-            self.visit_mono_item(item.node, item.span, CollectionMode::UsedItems)?;
-        }
-
         let (owner, instance_and_body) = match root {
             MonoTraceRoot::Fn(instance) => (
                 MonoTraceNode::Item(MonoItem::Fn(instance)),
@@ -815,6 +807,41 @@ impl<'tcx> MonoQualificationCollector<'tcx> {
                 (MonoTraceNode::Item(MonoItem::GlobalAsm(item_id)), None)
             }
         };
+        let is_pre_optimization_cause = |cause| {
+            matches!(
+                cause,
+                MonoUseCause::PreOptimizationDirectCall
+                    | MonoUseCause::PreOptimizationFunctionPointer
+                    | MonoUseCause::PreOptimizationInlineAsmSymbol
+            )
+        };
+        if successors
+            .facts
+            .iter()
+            .any(|fact| is_pre_optimization_cause(fact.cause))
+            || successors
+                .proof_uses
+                .iter()
+                .any(|proof| is_pre_optimization_cause(proof.cause))
+            || successors
+                .pre_optimization_associated_items
+                .iter()
+                .any(|proof| proof.from != owner || !is_pre_optimization_cause(proof.cause))
+        {
+            return Err(ProbeError::MonoObservationIncomplete);
+        }
+
+        for proof in successors
+            .proof_uses
+            .iter()
+            .filter(|proof| proof.collection == MonoTraceCollection::Used)
+        {
+            self.record_mono_proof(*proof)?;
+        }
+        for item in successors.used {
+            self.visit_mono_item(item.node, item.span, CollectionMode::UsedItems)?;
+        }
+
         let collection = probe_collection_for_mode(mode);
         let targets = instance_and_body.map_or(Ok(Vec::new()), |(instance, body)| {
             self.required_const_targets(&format!("{owner:?}"), instance, body, collection)
@@ -829,6 +856,9 @@ impl<'tcx> MonoQualificationCollector<'tcx> {
             .iter()
             .filter(|proof| proof.collection == MonoTraceCollection::Mentioned)
         {
+            self.record_mono_proof(*proof)?;
+        }
+        for proof in successors.pre_optimization_associated_items {
             self.record_mono_proof(*proof)?;
         }
         for item in successors.mentioned {
@@ -1143,6 +1173,19 @@ impl<'tcx> MonoQualificationCollector<'tcx> {
                 if witness.request != request || witness.codegen_instance != codegen_instance {
                     return Err(ProbeError::MonoProofIncomplete);
                 }
+                Ok(())
+            }
+            MonoUseCause::PreOptimizationDirectCall
+            | MonoUseCause::PreOptimizationFunctionPointer
+            | MonoUseCause::PreOptimizationInlineAsmSymbol
+                if proof_use.collection == MonoTraceCollection::Mentioned
+                    && matches!(proof_use.from, MonoTraceNode::Item(MonoItem::Fn(_)))
+                    && matches!(
+                        proof_use.site,
+                        MonoTraceSite::Source(_) | MonoTraceSite::CompilerGenerated
+                    )
+                    && codegen_instance == raw_instance =>
+            {
                 Ok(())
             }
             _ => Err(ProbeError::MonoProofIncomplete),
@@ -1501,6 +1544,13 @@ fn mono_cause(cause: MonoUseCause) -> MonoUseCauseProbe {
         MonoUseCause::AllocationReference => MonoUseCauseProbe::AllocationReference,
         MonoUseCause::ThreadLocalShim => MonoUseCauseProbe::ThreadLocalShim,
         MonoUseCause::CompilerRequirement => MonoUseCauseProbe::CompilerRequirement,
+        MonoUseCause::PreOptimizationDirectCall => MonoUseCauseProbe::PreOptimizationDirectCall,
+        MonoUseCause::PreOptimizationFunctionPointer => {
+            MonoUseCauseProbe::PreOptimizationFunctionPointer
+        }
+        MonoUseCause::PreOptimizationInlineAsmSymbol => {
+            MonoUseCauseProbe::PreOptimizationInlineAsmSymbol
+        }
     }
 }
 

@@ -5,6 +5,8 @@ macro_rules! _dispatch {
     };
     (@emit) => {
         fn value() -> u32 {
+
+
             7
         }
     };

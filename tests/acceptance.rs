@@ -1,7 +1,9 @@
 #![feature(rustc_private)]
 
 #[cfg(rust_item_dependencies_patched)]
-use rust_item_dependencies::dependency_graph::{GraphNode, RootReason};
+use rust_item_dependencies::dependency_graph::{
+    DependencyKind, GraphNode, MonoCollection, MonoDependencyKind, ObservationSite, RootReason,
+};
 #[cfg(rust_item_dependencies_patched)]
 use rust_item_dependencies::{
     AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel,
@@ -55,6 +57,88 @@ const CASES: &[(&str, &str, &str)] = &[
 ];
 
 #[cfg(rust_item_dependencies_patched)]
+const MACRO_COMPONENT_CASES: &[(&str, &str, &str, &str)] = &[
+    (
+        "macro template components",
+        include_str!("fixtures/retention/macro_template_components.input.rs"),
+        include_str!("fixtures/retention/macro_template_components.expected.rs"),
+        "macro_template_components",
+    ),
+    (
+        "macro repetition components",
+        include_str!("fixtures/retention/macro_repetition_components.input.rs"),
+        include_str!("fixtures/retention/macro_repetition_components.expected.rs"),
+        "macro_repetition_components",
+    ),
+    (
+        "nested macro components",
+        include_str!("fixtures/retention/nested_macro_components.input.rs"),
+        include_str!("fixtures/retention/nested_macro_components.expected.rs"),
+        "nested_macro_components",
+    ),
+    (
+        "macro generated members",
+        include_str!("fixtures/retention/macro_generated_members.input.rs"),
+        include_str!("fixtures/retention/macro_generated_members.expected.rs"),
+        "macro_generated_members",
+    ),
+    (
+        "macro repetition member completeness",
+        include_str!("fixtures/retention/macro_repetition_member_completeness.input.rs"),
+        include_str!("fixtures/retention/macro_repetition_member_completeness.expected.rs"),
+        "macro_repetition_member_completeness",
+    ),
+    (
+        "nested generated macro rules",
+        include_str!("fixtures/retention/nested_generated_macro_rules.input.rs"),
+        include_str!("fixtures/retention/nested_generated_macro_rules.expected.rs"),
+        "nested_generated_macro_rules",
+    ),
+    (
+        "macro rule stability",
+        include_str!("fixtures/retention/macro_rule_stability.input.rs"),
+        include_str!("fixtures/retention/macro_rule_stability.expected.rs"),
+        "macro_rule_stability",
+    ),
+    (
+        "macro body definitions",
+        include_str!("fixtures/retention/macro_body_definitions.input.rs"),
+        include_str!("fixtures/retention/macro_body_definitions.expected.rs"),
+        "macro_body_definitions",
+    ),
+    (
+        "macro control chain",
+        include_str!("fixtures/retention/macro_control_chain.input.rs"),
+        include_str!("fixtures/retention/macro_control_chain.expected.rs"),
+        "macro_control_chain",
+    ),
+    (
+        "macro semantic return",
+        include_str!("fixtures/retention/macro_semantic_return.input.rs"),
+        include_str!("fixtures/retention/macro_semantic_return.expected.rs"),
+        "macro_semantic_return",
+    ),
+    (
+        "macro generated return",
+        include_str!("fixtures/retention/macro_generated_return.input.rs"),
+        include_str!("fixtures/retention/macro_generated_return.expected.rs"),
+        "macro_generated_return",
+    ),
+    (
+        "macro semantic side effect",
+        include_str!("fixtures/retention/macro_semantic_side_effect.input.rs"),
+        include_str!("fixtures/retention/macro_semantic_side_effect.expected.rs"),
+        "macro_semantic_side_effect",
+    ),
+    (
+        "macro unrefined child",
+        include_str!("fixtures/retention/macro_unrefined_child.input.rs"),
+        include_str!("fixtures/retention/macro_unrefined_child.expected.rs"),
+        "macro_unrefined_child",
+    ),
+];
+
+#[cfg(rust_item_dependencies_patched)]
 #[test]
 fn complex_reductions_match_handwritten_sources() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
@@ -66,6 +150,140 @@ fn complex_reductions_match_handwritten_sources() {
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
         assert_verified(case, source, expected, &verified);
     }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn macro_component_reductions_preserve_execution_and_reach_a_fixed_point() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let options = CompilationOptions::default();
+
+    for &(case, source, expected, artifact) in MACRO_COMPONENT_CASES {
+        let original_input = input(source, &target);
+        let verified = analyzer
+            .reduce_and_verify(&original_input)
+            .unwrap_or_else(|error| panic!("{case}: {error:?}"));
+        assert_verified(case, source, expected, &verified);
+
+        let reduced_input = input(expected, &target);
+        let fixed = analyzer
+            .reduce_and_verify(&reduced_input)
+            .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
+        assert_eq!(fixed.reduced_source(), expected, "{case} fixed point");
+
+        let original_output =
+            compile_and_run(&original_input, &options, &format!("{artifact}_original"));
+        let reduced_output =
+            compile_and_run(&reduced_input, &options, &format!("{artifact}_reduced"));
+        assert!(
+            original_output.status.success(),
+            "{case} original execution"
+        );
+        assert_eq!(
+            reduced_output.status, original_output.status,
+            "{case} exit status"
+        );
+        assert_eq!(
+            reduced_output.stdout, original_output.stdout,
+            "{case} stdout"
+        );
+        assert_eq!(
+            reduced_output.stderr, original_output.stderr,
+            "{case} stderr"
+        );
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn inlined_associated_selections_preserve_selected_overrides() {
+    let options = CompilationOptions::new().with_optimization_level(OptimizationLevel::O3);
+    let analyzer = Analyzer::new_with_options(options.clone())
+        .expect("the optimized compilation context must be accepted");
+    let target = host_target();
+    let source = include_str!("fixtures/retention/inlined_associated_selection.input.rs");
+    let original_input = input(source, &target);
+    let analysis = analyzer
+        .analyze(&original_input)
+        .expect("the optimized associated selections must be observable");
+    assert!(analysis.graph().edges.iter().any(|edge| {
+        matches!(
+            &edge.kind,
+            DependencyKind::SelectionProof {
+                relation: MonoDependencyKind::SourceAssociatedItem,
+                collection: MonoCollection::Mentioned,
+            }
+        ) && edge.sites.iter().any(|site| {
+            matches!(
+                site,
+                ObservationSite::Source(range)
+                    if &source[range.start as usize..range.end as usize] == "M::transform(value)"
+            )
+        })
+    }));
+
+    let verified = analyzer
+        .reduce_and_verify(&original_input)
+        .expect("the selected associated overrides must survive optimized MIR inlining");
+    let reduced = verified.reduced_source();
+    assert!(!reduced.contains("Unused"));
+    assert!(reduced.contains("impl<M: Transform> Storage for M"));
+    assert!(reduced.contains("fn normalize(value: u32) -> u32"));
+    assert!(reduced.contains("fn transform(value: u32) -> u32"));
+
+    let mut reduced_input = original_input.clone();
+    reduced_input.source = reduced.to_owned();
+    let fixed = analyzer
+        .reduce_and_verify(&reduced_input)
+        .expect("the optimized reduction must reach a fixed point");
+    assert_eq!(fixed.reduced_source(), reduced);
+
+    let original_output = compile_and_run(
+        &original_input,
+        &options,
+        "inlined_associated_selection_original",
+    );
+    let reduced_output = compile_and_run(
+        &reduced_input,
+        &options,
+        "inlined_associated_selection_reduced",
+    );
+    assert!(original_output.status.success());
+    assert_eq!(reduced_output.status, original_output.status);
+    assert_eq!(reduced_output.stdout, original_output.stdout);
+    assert_eq!(reduced_output.stderr, original_output.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn macro_product_identity_preserves_public_keys_across_reduction() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "trait Trait { fn value() -> u8; }\n",
+        "struct Template;\n",
+        "struct Input;\n",
+        "macro_rules! make {\n",
+        "    ($item:item) => {\n",
+        "        impl Trait for Template { fn value() -> u8 { 0 } }\n",
+        "        $item\n",
+        "    };\n",
+        "}\n",
+        "make!(impl Trait for Input { fn value() -> u8 { 1 } });\n",
+        "fn main() { assert_eq!(Input::value(), 1); }\n",
+    );
+
+    let verified = analyzer
+        .reduce_and_verify(&input(source, &target))
+        .expect("removing the first product must preserve the second product's public key");
+    assert!(!verified.reduced_source().contains("for Template"));
+    assert!(verified.reduced_source().contains("for Input"));
+
+    let fixed = analyzer
+        .reduce_and_verify(&input(verified.reduced_source(), &target))
+        .expect("the reduced public identity must remain stable");
+    assert_eq!(fixed.reduced_source(), verified.reduced_source());
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -903,7 +1121,7 @@ fn a_macro_generated_native_link_directive_is_a_compiler_root() {
         "        #[cfg_attr(target_os = \"windows\", link(name = \"kernel32\"))]\n",
         "        #[cfg_attr(not(target_os = \"windows\"), link(name = \"c\"))]\n",
         "        unsafe extern \"C\" {\n",
-        "            fn generated_unused();\n",
+        "            \n",
         "        }\n",
         "    };\n",
         "}\n",

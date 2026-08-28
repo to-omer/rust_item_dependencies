@@ -76,6 +76,7 @@ echo "==> patched compiler observer fixtures"
         tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs \
         tests/ui-fulldeps/typeck-impl-dependencies-structural-pattern.rs \
         tests/ui-fulldeps/typeck-impl-dependencies-union.rs \
+        tests/ui/lint/unused/unused-macro-rules-decl.rs \
         tests/ui/resolve/error-recovery-import-observer.rs
 )
 

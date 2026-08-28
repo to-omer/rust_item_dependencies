@@ -18,7 +18,7 @@ use crate::graph::DefinitionId;
 use crate::input::{
     CompilationContext, InputError, InspectedDependencies, InspectedReduction,
     PreparedCompilationOptions,
-    inspect_source_with_dependencies_at_original_coordinates_in_context,
+    inspect_source_with_dependencies_at_original_coordinates_and_identity_in_context,
     inspect_source_with_reduction_in_context,
 };
 use crate::retention::external_compiler_outcome_difference;
@@ -116,8 +116,20 @@ impl Analyzer {
         .map_err(snapshot_error)?;
 
         let reduced = self.inspect_reduced(&context, &inspected)?;
-        let reduced_snapshot =
-            CompilerDecisionSnapshot::reduced(&reduced.graph).map_err(snapshot_error)?;
+        let reduced_outputless = reduced
+            .complete_source_outputless_macro_expansions
+            .as_ref()
+            .ok_or_else(|| {
+                analysis_error(
+                    InputError::CompilerProtocolFailure,
+                    CompilationPhase::Reduced,
+                )
+            })?;
+        let reduced_snapshot = CompilerDecisionSnapshot::reduced_excluding_outputless_macros(
+            &reduced.graph,
+            reduced_outputless,
+        )
+        .map_err(snapshot_error)?;
         if let Some(difference) = original_snapshot.first_difference(&reduced_snapshot) {
             return Err(AnalysisError::DecisionMismatch(snapshot_difference(
                 difference,
@@ -141,12 +153,14 @@ impl Analyzer {
         context: &CompilationContext<'_>,
         original: &InspectedReduction,
     ) -> Result<InspectedDependencies, AnalysisError> {
-        let reduced = inspect_source_with_dependencies_at_original_coordinates_in_context(
-            &original.rewrite.source,
-            context,
-            &original.rewrite,
-        )
-        .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
+        let reduced =
+            inspect_source_with_dependencies_at_original_coordinates_and_identity_in_context(
+                &original.rewrite.source,
+                context,
+                &original.rewrite,
+                &original.definition_identity_universe,
+            )
+            .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
         if let Some(difference) = external_compiler_outcome_difference(
             &original.external_compiler,
             &reduced.external_compiler,
@@ -829,7 +843,12 @@ mod tests {
         crate::input::reset_inspection_count();
         let analyzer = Analyzer::new().unwrap();
         let input = SourceInput::binary(
-            include_str!("../tests/fixtures/compiler/macro_rule_reduction.rs").to_owned(),
+            concat!(
+                "#[macro_export]\n",
+                "macro_rules! exported { () => { fn main() {} }; }\n",
+                "exported!();\n",
+            )
+            .to_owned(),
             Edition::Rust2024,
             host_target(),
         );
@@ -844,5 +863,33 @@ mod tests {
         assert_eq!(gap.fact, "Source(IncompleteMacroRuleObservation)");
         assert_eq!(gap.range, None);
         assert_eq!(crate::input::inspection_count(), 1);
+    }
+
+    #[test]
+    fn reduced_analysis_rejects_nonempty_macro_output_marked_outputless() {
+        let analyzer = Analyzer::new().unwrap();
+        let input = SourceInput::binary(
+            concat!(
+                "macro_rules! marker { ($($name:ident),*) => { () }; }\n",
+                "fn dead() {}\n",
+                "fn main() { marker!(first, second); }\n",
+            )
+            .to_owned(),
+            Edition::Rust2024,
+            host_target(),
+        );
+        let reduced_source = analyzer.reduce(&input).unwrap().reduced_source().to_owned();
+
+        let result =
+            crate::input::with_one_nonempty_macro_marked_outputless(&reduced_source, || {
+                analyzer.reduce_and_verify(&input)
+            });
+
+        let Err(AnalysisError::IncompleteObservation(gap)) = result else {
+            panic!("inconsistent reduced output coverage must not verify")
+        };
+        assert_eq!(gap.phase, "reduced analysis");
+        assert_eq!(gap.fact, "Dependency(Retention(InvalidConstraint))");
+        assert_eq!(gap.range, None);
     }
 }

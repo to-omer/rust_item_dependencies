@@ -1,0 +1,561 @@
+From 45593a1970a92832b91e597c3b2efec60a0775c6 Mon Sep 17 00:00:00 2001
+From: to-omer <48119218+to-omer@users.noreply.github.com>
+Date: Sat, 29 Aug 2026 02:39:13 +0900
+Subject: [PATCH] Preserve associated selections across MIR inlining
+
+---
+ compiler/rustc_driver_impl/src/lib.rs         |   2 +-
+ compiler/rustc_middle/src/mir/mod.rs          |  31 +++
+ compiler/rustc_middle/src/mono.rs             |   9 +
+ .../rustc_mir_build/src/builder/custom/mod.rs |   1 +
+ compiler/rustc_mir_transform/src/inline.rs    |   5 +
+ .../src/mentioned_items.rs                    |  21 +-
+ compiler/rustc_mir_transform/src/shim.rs      |   1 +
+ compiler/rustc_monomorphize/src/collector.rs  | 115 +++++++---
+ tests/ui-fulldeps/typed-mono-successors.rs    | 204 ++++++++++++++++++
+ 9 files changed, 356 insertions(+), 33 deletions(-)
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index f5b0938be..416094a2e 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 22;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 23;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_middle/src/mir/mod.rs b/compiler/rustc_middle/src/mir/mod.rs
+index 68ccd7b8c..aa67ff552 100644
+--- a/compiler/rustc_middle/src/mir/mod.rs
++++ b/compiler/rustc_middle/src/mir/mod.rs
+@@ -307,6 +307,11 @@ pub struct Body<'tcx> {
+     /// `compiler/rustc_monomorphize/src/collector.rs` for more context.
+     pub mentioned_items: Option<Vec<Spanned<MentionedItem<'tcx>>>>,
+ 
++    /// Trait-associated function mentions captured before MIR optimization.
++    /// Unlike `mentioned_items`, this observer inventory is not rewritten by
++    /// the MIR inliner.
++    pub pre_optimization_associated_items: Option<Vec<Spanned<MentionedItem<'tcx>>>>,
++
+     /// Does this body use generic parameters. This is used for the `ConstEvaluatable` check.
+     ///
+     /// Note that this does not actually mean that this body is not computable right now.
+@@ -389,6 +394,7 @@ pub fn new(
+             span,
+             required_consts: None,
+             mentioned_items: None,
++            pre_optimization_associated_items: None,
+             is_polymorphic: false,
+             injection_phase: None,
+             tainted_by_errors,
+@@ -419,6 +425,7 @@ pub fn new_cfg_only(basic_blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>) ->
+             span: DUMMY_SP,
+             required_consts: None,
+             mentioned_items: None,
++            pre_optimization_associated_items: None,
+             var_debug_info: Vec::new(),
+             is_polymorphic: false,
+             injection_phase: None,
+@@ -770,6 +777,30 @@ pub fn mentioned_items(&self) -> &[Spanned<MentionedItem<'tcx>>] {
+             None => panic!("mentioned_items for {:?} have not yet been set", self.source.def_id()),
+         }
+     }
++
++    #[track_caller]
++    pub fn set_pre_optimization_associated_items(
++        &mut self,
++        items: Vec<Spanned<MentionedItem<'tcx>>>,
++    ) {
++        assert!(
++            self.pre_optimization_associated_items.is_none(),
++            "pre-optimization associated items for {:?} have already been set",
++            self.source.def_id()
++        );
++        self.pre_optimization_associated_items = Some(items);
++    }
++
++    #[track_caller]
++    pub fn pre_optimization_associated_items(&self) -> &[Spanned<MentionedItem<'tcx>>] {
++        match &self.pre_optimization_associated_items {
++            Some(items) => items,
++            None => panic!(
++                "pre-optimization associated items for {:?} have not yet been set",
++                self.source.def_id()
++            ),
++        }
++    }
+ }
+ 
+ impl<'tcx> Index<BasicBlock> for Body<'tcx> {
+diff --git a/compiler/rustc_middle/src/mono.rs b/compiler/rustc_middle/src/mono.rs
+index c62e13362..85d95194f 100644
+--- a/compiler/rustc_middle/src/mono.rs
++++ b/compiler/rustc_middle/src/mono.rs
+@@ -100,6 +100,12 @@ pub enum MonoUseCause {
+     AllocationReference,
+     ThreadLocalShim,
+     CompilerRequirement,
++    /// A direct trait-associated call recorded before MIR optimization.
++    PreOptimizationDirectCall,
++    /// A trait-associated function-pointer conversion recorded before MIR optimization.
++    PreOptimizationFunctionPointer,
++    /// A trait-associated inline-assembly symbol recorded before MIR optimization.
++    PreOptimizationInlineAsmSymbol,
+ }
+ 
+ /// Which stock collection bucket discovered an edge.
+@@ -180,6 +186,9 @@ pub struct MonoSuccessors<'tcx> {
+     /// including uses removed from optimized MIR. Identical owner/key/site repetitions are
+     /// represented once; different source sites remain distinct.
+     pub associated_consts: &'tcx [MonoAssociatedConstUse<'tcx>],
++    /// Associated-item selections captured before MIR optimization. The inliner propagates these
++    /// observations through nested inline expansions without adding them to stock mono endpoints.
++    pub pre_optimization_associated_items: &'tcx [MonoProofUse<'tcx>],
+     /// Compiler proofs from used-item collection followed by mentioned-item collection. Within
+     /// each collection, semantic encounter, predicate, and vtable slot order is retained.
+     pub proof_uses: &'tcx [MonoProofUse<'tcx>],
+diff --git a/compiler/rustc_mir_build/src/builder/custom/mod.rs b/compiler/rustc_mir_build/src/builder/custom/mod.rs
+index 1005dd30d..ec341c778 100644
+--- a/compiler/rustc_mir_build/src/builder/custom/mod.rs
++++ b/compiler/rustc_mir_build/src/builder/custom/mod.rs
+@@ -56,6 +56,7 @@ pub(super) fn build_custom_mir<'tcx>(
+         span,
+         required_consts: None,
+         mentioned_items: None,
++        pre_optimization_associated_items: None,
+         is_polymorphic: false,
+         tainted_by_errors: None,
+         injection_phase: None,
+diff --git a/compiler/rustc_mir_transform/src/inline.rs b/compiler/rustc_mir_transform/src/inline.rs
+index abf181763..6bee4e147 100644
+--- a/compiler/rustc_mir_transform/src/inline.rs
++++ b/compiler/rustc_mir_transform/src/inline.rs
+@@ -1020,6 +1020,11 @@ fn dest_needs_borrow(place: Place<'_>) -> bool {
+     caller_body.required_consts.as_mut().unwrap().extend(
+         callee_body.required_consts().into_iter().filter(|ct| ct.const_.is_required_const()),
+     );
++    caller_body
++        .pre_optimization_associated_items
++        .as_mut()
++        .unwrap()
++        .extend(callee_body.pre_optimization_associated_items().iter().copied());
+     // Now that we incorporated the callee's `required_consts`, we can remove the callee from
+     // `mentioned_items` -- but we have to take their `mentioned_items` in return. This does
+     // some extra work here to save the monomorphization collector work later. It helps a lot,
+diff --git a/compiler/rustc_mir_transform/src/mentioned_items.rs b/compiler/rustc_mir_transform/src/mentioned_items.rs
+index 9e1e08918..3a60fea6f 100644
+--- a/compiler/rustc_mir_transform/src/mentioned_items.rs
++++ b/compiler/rustc_mir_transform/src/mentioned_items.rs
+@@ -25,9 +25,24 @@ fn policy(&self, _sess: &Session) -> PassPolicy {
+     }
+ 
+     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut mir::Body<'tcx>) {
+-        let mut visitor = MentionedItemsVisitor { tcx, body, mentioned_items: Vec::new() };
+-        visitor.visit_body(body);
+-        body.set_mentioned_items(visitor.mentioned_items);
++        let mentioned_items = {
++            let mut visitor = MentionedItemsVisitor { tcx, body, mentioned_items: Vec::new() };
++            visitor.visit_body(body);
++            visitor.mentioned_items
++        };
++        let pre_optimization_associated_items = mentioned_items
++            .iter()
++            .copied()
++            .filter(|item| {
++                matches!(
++                    item.node,
++                    MentionedItem::Fn { ty, .. }
++                        if matches!(*ty.kind(), ty::FnDef(def_id, _) if tcx.trait_of_assoc(def_id).is_some())
++                )
++            })
++            .collect();
++        body.set_pre_optimization_associated_items(pre_optimization_associated_items);
++        body.set_mentioned_items(mentioned_items);
+     }
+ }
+ 
+diff --git a/compiler/rustc_mir_transform/src/shim.rs b/compiler/rustc_mir_transform/src/shim.rs
+index 0561c04bc..629a996d3 100644
+--- a/compiler/rustc_mir_transform/src/shim.rs
++++ b/compiler/rustc_mir_transform/src/shim.rs
+@@ -1065,6 +1065,7 @@ pub(super) fn build_adt_ctor(tcx: TyCtxt<'_>, ctor_id: DefId) -> Body<'_> {
+     // A constructor doesn't mention any other items (and we don't run the usual optimization passes
+     // so this would otherwise not get filled).
+     body.set_mentioned_items(Vec::new());
++    body.set_pre_optimization_associated_items(Vec::new());
+ 
+     // We don't pass any passes here, we just force a phase change to `Optimized`.
+     // Otherwise this bit of MIR will trigger assertions trying to detect MIR with an invalid phase.
+diff --git a/compiler/rustc_monomorphize/src/collector.rs b/compiler/rustc_monomorphize/src/collector.rs
+index aa45b4380..1cf189dbf 100644
+--- a/compiler/rustc_monomorphize/src/collector.rs
++++ b/compiler/rustc_monomorphize/src/collector.rs
+@@ -2066,39 +2066,93 @@ fn collect_associated_const_uses<'tcx>(
+     Ok(uses)
+ }
+ 
+-fn mono_successors<'tcx>(
++fn collect_pre_optimization_associated_items<'tcx>(
+     tcx: TyCtxt<'tcx>,
+-    (root, mode): (MonoTraceRoot<'tcx>, CollectionMode),
+-) -> Result<&'tcx MonoSuccessors<'tcx>, NormalizationErrorInMono> {
+-    let (used_items, mentioned_items, associated_consts) = match root {
+-        MonoTraceRoot::Fn(instance) => {
+-            let items = collect_items_of_instance(tcx, instance, mode, true)?;
+-            let owner = MonoTraceNode::Item(MonoItem::Fn(instance));
+-            let associated_consts = collect_associated_const_uses(
+-                tcx,
+-                owner,
+-                instance,
+-                tcx.instance_mir(instance.def),
+-            )?;
+-            (items.0, items.1, associated_consts)
+-        }
+-        MonoTraceRoot::Static { def_id, trigger_span } => {
+-            let items = collect_items_of_static(tcx, def_id, trigger_span, mode, true);
+-            let instance = Instance::mono(tcx, def_id);
+-            let owner = MonoTraceNode::Item(MonoItem::Static(def_id));
+-            let associated_consts = collect_associated_const_uses(
++    owner: MonoTraceNode<'tcx>,
++    instance: Instance<'tcx>,
++    body: &Body<'tcx>,
++) -> Result<Vec<MonoProofUse<'tcx>>, NormalizationErrorInMono> {
++    let typing_env = ty::TypingEnv::fully_monomorphized();
++    let mut seen_items = FxHashSet::default();
++    let mut associated = Vec::new();
++    for item in body.pre_optimization_associated_items() {
++        let node = instance
++            .try_instantiate_mir_and_normalize_erasing_regions(
+                 tcx,
+-                owner,
+-                instance,
+-                tcx.instance_mir(instance.def),
+-            )?;
+-            (items.0, items.1, associated_consts)
++                typing_env,
++                ty::EarlyBinder::bind(tcx, item.node),
++            )
++            .map_err(|_| NormalizationErrorInMono)?;
++        if !seen_items.insert((node, item.span)) {
++            continue;
+         }
+-        MonoTraceRoot::GlobalAsm { item_id, .. } => {
+-            let items = collect_items_of_global_asm(tcx, item_id, mode, true);
+-            (items.0, items.1, Vec::new())
++        let MentionedItem::Fn { ty, reason } = node else {
++            return Err(NormalizationErrorInMono);
++        };
++        let ty::FnDef(def_id, args) = *ty.kind() else {
++            return Err(NormalizationErrorInMono);
++        };
++        let args = args.no_bound_vars().ok_or(NormalizationErrorInMono)?;
++        let selection =
++            associated_selection_keys(tcx, def_id, args)?.ok_or(NormalizationErrorInMono)?;
++        let codegen_instance = Instance::try_resolve(tcx, typing_env, def_id, args)
++            .map_err(|_| NormalizationErrorInMono)?
++            .ok_or(NormalizationErrorInMono)?;
++        if codegen_instance != selection.raw_instance {
++            return Err(NormalizationErrorInMono);
+         }
+-    };
++        associated.push(MonoProofUse {
++            from: owner,
++            proof: MonoProof::AssociatedItem {
++                selection_key: selection.selection_key,
++                request: selection.request,
++                raw_instance: selection.raw_instance,
++                codegen_instance,
++            },
++            cause: match reason {
++                MentionedFnReason::DirectCall => MonoUseCause::PreOptimizationDirectCall,
++                MentionedFnReason::FunctionPointer => MonoUseCause::PreOptimizationFunctionPointer,
++                MentionedFnReason::InlineAsm => MonoUseCause::PreOptimizationInlineAsmSymbol,
++            },
++            collection: MonoTraceCollection::Mentioned,
++            site: source_trace_site(item.span),
++        });
++    }
++    Ok(associated)
++}
++
++fn mono_successors<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    (root, mode): (MonoTraceRoot<'tcx>, CollectionMode),
++) -> Result<&'tcx MonoSuccessors<'tcx>, NormalizationErrorInMono> {
++    let (used_items, mentioned_items, associated_consts, pre_optimization_associated_items) =
++        match root {
++            MonoTraceRoot::Fn(instance) => {
++                let items = collect_items_of_instance(tcx, instance, mode, true)?;
++                let owner = MonoTraceNode::Item(MonoItem::Fn(instance));
++                let body = tcx.instance_mir(instance.def);
++                let associated_consts = collect_associated_const_uses(tcx, owner, instance, body)?;
++                let pre_optimization_associated_items =
++                    collect_pre_optimization_associated_items(tcx, owner, instance, body)?;
++                (items.0, items.1, associated_consts, pre_optimization_associated_items)
++            }
++            MonoTraceRoot::Static { def_id, trigger_span } => {
++                let items = collect_items_of_static(tcx, def_id, trigger_span, mode, true);
++                let instance = Instance::mono(tcx, def_id);
++                let owner = MonoTraceNode::Item(MonoItem::Static(def_id));
++                let associated_consts = collect_associated_const_uses(
++                    tcx,
++                    owner,
++                    instance,
++                    tcx.instance_mir(instance.def),
++                )?;
++                (items.0, items.1, associated_consts, Vec::new())
++            }
++            MonoTraceRoot::GlobalAsm { item_id, .. } => {
++                let items = collect_items_of_global_asm(tcx, item_id, mode, true);
++                (items.0, items.1, Vec::new(), Vec::new())
++            }
++        };
+ 
+     let (used, mut facts, mut proof_uses) = used_items.into_observation_parts()?;
+     let (mentioned, mentioned_facts, mentioned_proof_uses) =
+@@ -2111,6 +2165,9 @@ fn mono_successors<'tcx>(
+         mentioned: tcx.arena.alloc_from_iter(mentioned),
+         facts: tcx.arena.alloc_from_iter(facts),
+         associated_consts: tcx.arena.alloc_from_iter(associated_consts),
++        pre_optimization_associated_items: tcx
++            .arena
++            .alloc_from_iter(pre_optimization_associated_items),
+         proof_uses: tcx.arena.alloc_from_iter(proof_uses),
+     }))
+ }
+diff --git a/tests/ui-fulldeps/typed-mono-successors.rs b/tests/ui-fulldeps/typed-mono-successors.rs
+index 87778c116..7492b727f 100644
+--- a/tests/ui-fulldeps/typed-mono-successors.rs
++++ b/tests/ui-fulldeps/typed-mono-successors.rs
+@@ -132,6 +132,68 @@ fn main() {
+ }
+ "#;
+ 
++const PRE_OPTIMIZATION_ASSOCIATED_INPUT: &str = r#"
++#![allow(dead_code)]
++
++trait Arithmetic {
++    const OFFSET: u32;
++
++    #[inline(always)]
++    fn reduce(value: u32) -> u32 { value + Self::OFFSET }
++}
++
++trait Storage {
++    fn normalize(value: u32) -> u32 { value }
++}
++
++struct Used;
++
++impl Arithmetic for Used {
++    const OFFSET: u32 = 6;
++}
++
++impl<T: Arithmetic> Storage for T {
++    #[inline(always)]
++    fn normalize(value: u32) -> u32 { T::reduce(value) }
++}
++
++struct Unused;
++
++impl Arithmetic for Unused {
++    const OFFSET: u32 = 10;
++}
++
++struct Defaulted;
++
++impl Storage for Defaulted {}
++
++#[inline(always)]
++fn get<T: Storage>(value: u32) -> u32 {
++    T::normalize(value)
++}
++
++#[inline(always)]
++fn get_pointer<T: Storage>(value: u32) -> u32 {
++    let normalize: fn(u32) -> u32 = T::normalize;
++    normalize(value)
++}
++
++#[inline(always)]
++fn get_asm<T: Storage>() {
++    unsafe {
++        std::arch::asm!("/* {normalize} */", normalize = sym T::normalize);
++    }
++}
++
++fn main() {
++    std::hint::black_box(get::<Used>(1));
++    std::hint::black_box(get::<Used>(2));
++    std::hint::black_box(get::<Defaulted>(3));
++    std::hint::black_box(get_pointer::<Used>(4));
++    get_asm::<Used>();
++}
++"#;
++
+ const ASSOCIATED_CONST_INPUT: &str = r#"
+ #![allow(dead_code)]
+ 
+@@ -321,6 +383,13 @@ fn main() {
+     let sysroot = PathBuf::from(&args[1]);
+     run_input(INPUT, sysroot.clone(), false, false, check_observer);
+     run_input(INLINE_INPUT, sysroot.clone(), true, false, check_inline_reason);
++    run_input(
++        PRE_OPTIMIZATION_ASSOCIATED_INPUT,
++        sysroot.clone(),
++        true,
++        true,
++        check_pre_optimization_associated_items,
++    );
+     run_input(
+         ASSOCIATED_CONST_INPUT,
+         sysroot.clone(),
+@@ -771,6 +840,141 @@ fn check_inline_reason<'tcx>(tcx: TyCtxt<'tcx>) {
+     }));
+ }
+ 
++fn check_pre_optimization_associated_items<'tcx>(tcx: TyCtxt<'tcx>) {
++    let owner = Instance::mono(tcx, tcx.entry_fn(()).unwrap().0);
++    let storage = named_def(tcx, "Storage", DefKind::Trait);
++    let arithmetic = named_def(tcx, "Arithmetic", DefKind::Trait);
++    let normalize = associated_item(tcx, storage, "normalize");
++    let reduce = associated_item(tcx, arithmetic, "reduce");
++    let storage_impl = tcx
++        .iter_local_def_id()
++        .map(|def_id| def_id.to_def_id())
++        .find(|&def_id| {
++            tcx.def_kind(def_id) == DefKind::Impl { of_trait: true }
++                && tcx.impl_trait_id(def_id) == storage
++                && tcx.generics_of(def_id).count() != 0
++        })
++        .unwrap();
++    let normalize_override = tcx.impl_item_implementor_ids(storage_impl)[&normalize];
++    let used = named_def(tcx, "Used", DefKind::Struct);
++    let defaulted = named_def(tcx, "Defaulted", DefKind::Struct);
++    let unused = named_def(tcx, "Unused", DefKind::Struct);
++    let stock_before = tcx.items_of_instance((owner, CollectionMode::UsedItems)).unwrap();
++    let successors = tcx
++        .mono_successors((MonoTraceRoot::Fn(owner), CollectionMode::UsedItems))
++        .unwrap();
++    let warm = tcx
++        .mono_successors((MonoTraceRoot::Fn(owner), CollectionMode::UsedItems))
++        .unwrap();
++    let mentioned_mode = tcx
++        .mono_successors((MonoTraceRoot::Fn(owner), CollectionMode::MentionedItems))
++        .unwrap();
++    assert!(std::ptr::eq(successors, warm));
++    let stock_after = tcx.items_of_instance((owner, CollectionMode::UsedItems)).unwrap();
++    assert_eq!(stock_before, stock_after);
++    assert_eq!(successors.used, stock_after.0);
++    assert_eq!(successors.mentioned, stock_after.1);
++    assert_eq!(
++        successors.pre_optimization_associated_items,
++        mentioned_mode.pre_optimization_associated_items
++    );
++    assert_eq!(successors.pre_optimization_associated_items.len(), 5);
++    let is_pre_optimization_cause = |cause| {
++        matches!(
++            cause,
++            MonoUseCause::PreOptimizationDirectCall
++                | MonoUseCause::PreOptimizationFunctionPointer
++                | MonoUseCause::PreOptimizationInlineAsmSymbol
++        )
++    };
++    assert!(successors
++        .facts
++        .iter()
++        .all(|fact| !is_pre_optimization_cause(fact.cause)));
++    assert!(successors
++        .proof_uses
++        .iter()
++        .all(|proof| !is_pre_optimization_cause(proof.cause)));
++    assert!(successors
++        .pre_optimization_associated_items
++        .iter()
++        .all(|proof| is_pre_optimization_cause(proof.cause)));
++    for (requested, self_type, selected, cause, snippet) in [
++        (
++            normalize,
++            used,
++            normalize_override,
++            MonoUseCause::PreOptimizationDirectCall,
++            "T::normalize(value)",
++        ),
++        (
++            normalize,
++            defaulted,
++            normalize,
++            MonoUseCause::PreOptimizationDirectCall,
++            "T::normalize(value)",
++        ),
++        (
++            reduce,
++            used,
++            reduce,
++            MonoUseCause::PreOptimizationDirectCall,
++            "T::reduce(value)",
++        ),
++        (
++            normalize,
++            used,
++            normalize_override,
++            MonoUseCause::PreOptimizationFunctionPointer,
++            "T::normalize",
++        ),
++        (
++            normalize,
++            used,
++            normalize_override,
++            MonoUseCause::PreOptimizationInlineAsmSymbol,
++            "std::arch::asm!(\"/* {normalize} */\", normalize = sym T::normalize)",
++        ),
++    ] {
++        let observed = successors
++            .pre_optimization_associated_items
++            .iter()
++            .find(|observed| {
++                matches!(
++                    observed.proof,
++                    MonoProof::AssociatedItem { request, .. }
++                        if request.value.0 == requested
++                            && request.value.1.type_at(0).ty_adt_def().is_some_and(|adt| adt.did() == self_type)
++                            && observed.cause == cause
++                )
++            })
++            .unwrap_or_else(|| panic!("missing propagated selection for {self_type:?}"));
++        let MonoProof::AssociatedItem { raw_instance, codegen_instance, .. } = observed.proof else {
++            panic!("expected an associated-item proof: {observed:?}")
++        };
++        assert_eq!(observed.from, MonoTraceNode::Item(MonoItem::Fn(owner)));
++        assert_eq!(observed.cause, cause);
++        assert_eq!(observed.collection, MonoTraceCollection::Mentioned);
++        assert_eq!(raw_instance, codegen_instance);
++        assert_eq!(raw_instance.def_id(), selected);
++        let MonoTraceSite::Source(span) = observed.site else {
++            panic!("pre-optimization selection lacked a source site: {observed:?}")
++        };
++        assert_eq!(tcx.sess.source_map().span_to_snippet(span).unwrap(), snippet);
++    }
++    assert!(successors.pre_optimization_associated_items.iter().all(|observed| {
++        let MonoProof::AssociatedItem { request, .. } = observed.proof else { return false };
++        request.value.1.type_at(0).ty_adt_def().is_none_or(|adt| adt.did() != unused)
++    }));
++    assert!(!successors.proof_uses.iter().any(|proof| {
++        matches!(
++            proof.proof,
++            MonoProof::AssociatedItem { request, .. }
++                if request.value.0 == reduce && proof.cause == MonoUseCause::DirectCall
++        )
++    }));
++}
++
+ fn check_proof_uses<'tcx>(tcx: TyCtxt<'tcx>) {
+     let object_trait = named_def(tcx, "ObjectTrait", DefKind::Trait);
+     let concrete = named_def(tcx, "Concrete", DefKind::Struct);
+-- 
+2.55.0
+

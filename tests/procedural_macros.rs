@@ -247,6 +247,91 @@ mod patched {
     }
 
     #[test]
+    fn empty_function_like_proc_macro_is_removed_and_reaches_a_fixed_point() {
+        let artifacts = ProcMacroArtifacts::build();
+        let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
+        let source = "proc_fixture::empty!();fn main(){println!(\"ok\");}";
+        let expected = "fn main(){println!(\"ok\");}";
+
+        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
+        assert_eq!(verified.reduced_source(), expected);
+        assert_eq!(
+            verified.verification().original_snapshot_hash(),
+            verified.verification().reduced_snapshot_hash()
+        );
+
+        let fixed = analyzer.reduce_and_verify(&input(expected)).unwrap();
+        assert_eq!(fixed.reduced_source(), expected);
+
+        let original_output = compile_and_run(source, &artifacts, "empty_original", false);
+        let reduced_output = compile_and_run(expected, &artifacts, "empty_reduced", false);
+        assert!(original_output.status.success(), "{original_output:?}");
+        assert_eq!(original_output.stdout, b"ok\n");
+        assert_eq!(reduced_output.status, original_output.status);
+        assert_eq!(reduced_output.stdout, original_output.stdout);
+        assert_eq!(reduced_output.stderr, original_output.stderr);
+    }
+
+    #[test]
+    fn empty_attribute_proc_macro_removes_its_item_and_reaches_a_fixed_point() {
+        let artifacts = ProcMacroArtifacts::build();
+        let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
+        let source = concat!(
+            "#[proc_fixture::empty_attribute]fn removed(){panic!(\"removed\");}",
+            "fn main(){println!(\"ok\");}",
+        );
+        let expected = "fn main(){println!(\"ok\");}";
+
+        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
+        assert_eq!(verified.reduced_source(), expected);
+        assert_eq!(
+            verified.verification().original_snapshot_hash(),
+            verified.verification().reduced_snapshot_hash()
+        );
+
+        let fixed = analyzer.reduce_and_verify(&input(expected)).unwrap();
+        assert_eq!(fixed.reduced_source(), expected);
+
+        let original_output =
+            compile_and_run(source, &artifacts, "empty_attribute_original", false);
+        let reduced_output =
+            compile_and_run(expected, &artifacts, "empty_attribute_reduced", false);
+        assert!(original_output.status.success(), "{original_output:?}");
+        assert_eq!(original_output.stdout, b"ok\n");
+        assert_eq!(reduced_output.status, original_output.status);
+        assert_eq!(reduced_output.stdout, original_output.stdout);
+        assert_eq!(reduced_output.stderr, original_output.stderr);
+    }
+
+    #[test]
+    fn input_spanned_proc_output_cannot_refine_local_macro_templates() {
+        let artifacts = ProcMacroArtifacts::build();
+        let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
+        let cases = [
+            concat!(
+                "macro_rules! local { () => { fn generated() -> i32 { 42 } fn dead_generated() {} }; }\n",
+                "proc_fixture::emit_input_spanned_local!(marker);\n",
+                "fn main() { println!(\"{}\", generated()); }\n",
+            ),
+            concat!(
+                "macro_rules! local { () => { fn generated() -> i32 { 42 } fn dead_generated() {} }; }\n",
+                "macro_rules! relay { ($($tokens:tt)*) => { $($tokens)* }; }\n",
+                "proc_fixture::emit_input_spanned_relay!(marker);\n",
+                "fn main() { println!(\"{}\", generated()); }\n",
+            ),
+        ];
+
+        for source in cases {
+            let reduced = analyzer.reduce_and_verify(&input(source)).unwrap();
+            assert_eq!(reduced.reduced_source(), source);
+            let fixed = analyzer
+                .reduce_and_verify(&input(reduced.reduced_source()))
+                .unwrap();
+            assert_eq!(fixed.reduced_source(), source);
+        }
+    }
+
+    #[test]
     fn generated_and_stacked_proc_macros_keep_their_written_outer_input() {
         let artifacts = ProcMacroArtifacts::build();
         let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
@@ -391,6 +476,55 @@ mod patched {
             .reduce_and_verify(&input(verified.reduced_source()))
             .unwrap();
         assert_eq!(fixed.reduced_source(), source);
+    }
+
+    #[test]
+    fn declarative_macro_repetitions_preserve_proc_macro_punctuation_spacing() {
+        let artifacts = ProcMacroArtifacts::build();
+        let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
+        let source = concat!(
+            "macro_rules! observe_tt {",
+            "($( $name:ident => $punct:tt),*) => {",
+            "$(fn $name() -> &'static str { proc_fixture::punct_spacing!($punct) })*",
+            "};",
+            "}",
+            "macro_rules! observe_expr {",
+            "($( $name:ident => $expr:expr),*) => {",
+            "$(fn $name() -> &'static str { proc_fixture::last_punct_spacing!($expr) })*",
+            "};",
+            "}",
+            "macro_rules! observe_prefix {",
+            "($head:tt $($tail:ident)* @) => {",
+            "fn kept_prefix() -> &'static str { proc_fixture::punct_spacing!($head) }",
+            "$(fn $tail() {})*",
+            "};",
+            "}",
+            "observe_tt!(kept_tt => +, dead_tt => -);",
+            "observe_expr!(kept_expr => 1.., dead_expr => 2..);",
+            "observe_prefix!(+dead_prefix@);",
+            "fn main() { println!(\"{} {} {}\", kept_tt(), kept_expr(), kept_prefix()); }",
+        );
+
+        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
+        assert_eq!(verified.reduced_source(), source);
+
+        let fixed = analyzer
+            .reduce_and_verify(&input(verified.reduced_source()))
+            .unwrap();
+        assert_eq!(fixed.reduced_source(), source);
+
+        let original = compile_and_run(source, &artifacts, "spacing_original", false);
+        let reduced = compile_and_run(
+            verified.reduced_source(),
+            &artifacts,
+            "spacing_reduced",
+            false,
+        );
+        assert!(original.status.success(), "{original:?}");
+        assert_eq!(original.stdout, b"Joint Joint Alone\n");
+        assert_eq!(reduced.status, original.status);
+        assert_eq!(reduced.stdout, original.stdout);
+        assert_eq!(reduced.stderr, original.stderr);
     }
 
     #[test]

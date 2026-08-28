@@ -14,6 +14,7 @@ use rustc_middle::metadata::Reexport;
 use rustc_middle::ty::{self, GenericArgKind, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::{ExpnId, Span};
 
+use crate::expansions::{MacroProvenance, collect_macro_provenance};
 use crate::graph::{
     Definition, DefinitionEdge, DefinitionGraph, DefinitionId, DefinitionKey, DefinitionKeyPart,
     DefinitionKind, DefinitionOrigin, DefinitionOriginKey, DefinitionTarget, DependencyKind,
@@ -21,11 +22,12 @@ use crate::graph::{
     InjectedRole,
 };
 use crate::rewrite::{SourceRewrite, SourceRewriteError};
-use crate::source::{
-    ByteRange, CfgState, SourceError, SourceInventory, WrittenUnitKind, original_span_range,
-};
 #[cfg(rust_item_dependencies_patched)]
-use crate::source::{EditableMacroSource, EditableMacroSourceRole, resolve_editable_macro_source};
+use crate::source::EditableMacroSourceRole;
+use crate::source::{
+    ByteRange, CfgState, MacroProductSource, SourceError, SourceInventory, WrittenUnitKind,
+    original_span_range,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DefinitionError {
@@ -81,8 +83,26 @@ struct RawDefinition {
     parent: Option<LocalDefId>,
     kind: DefinitionKind,
     origin: DefinitionOrigin,
+    product_basis: Option<Vec<MacroProductSource>>,
     name: Option<String>,
     structural_ordinal: u32,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DefinitionIdentityPart {
+    kind: DefinitionKind,
+    origin: DefinitionOriginKey,
+    product_basis: Option<Vec<MacroProductSource>>,
+    name: Option<String>,
+    cohort_ordinal: u32,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DefinitionIdentityKey(Vec<DefinitionIdentityPart>);
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DefinitionIdentityUniverse {
+    ordinals: BTreeMap<DefinitionIdentityKey, u32>,
 }
 
 struct RawEdge {
@@ -92,10 +112,20 @@ struct RawEdge {
     site: Option<ByteRange>,
 }
 
+struct DefinitionOriginContext<'a, 'tcx> {
+    compiler: &'a Compiler,
+    tcx: TyCtxt<'tcx>,
+    source: &'a SourceInventory,
+    hir_definitions: &'a BTreeSet<u32>,
+    provenance: &'a MacroProvenance,
+}
+
 pub(crate) struct CollectedDefinitions {
     pub graph: DefinitionGraph,
     compiler_ids: BTreeMap<u32, DefinitionId>,
     identity_keys: Vec<DefinitionKey>,
+    product_bases: Vec<Option<Vec<MacroProductSource>>>,
+    identity_universe: DefinitionIdentityUniverse,
     hir_definitions: BTreeSet<u32>,
 }
 
@@ -115,6 +145,23 @@ impl CollectedDefinitions {
 
     pub(crate) fn has_hir_definition(&self, definition: LocalDefId) -> bool {
         self.hir_definitions.contains(&raw_local_id(definition))
+    }
+
+    pub(crate) fn product_basis(
+        &self,
+        definition: DefinitionId,
+    ) -> Option<Option<&[MacroProductSource]>> {
+        self.product_bases
+            .get(definition.0 as usize)
+            .map(|basis| basis.as_deref())
+    }
+
+    pub(crate) fn product_bases(&self) -> &[Option<Vec<MacroProductSource>>] {
+        &self.product_bases
+    }
+
+    pub(crate) fn identity_universe(&self) -> &DefinitionIdentityUniverse {
+        &self.identity_universe
     }
 
     /// Switches compiler-term identity to the coordinates of the original
@@ -189,29 +236,43 @@ pub(crate) fn collect_definition_graph(
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
 ) -> Result<DefinitionGraph, DefinitionError> {
-    collect_definitions(compiler, tcx, source).map(|definitions| definitions.graph)
+    let provenance = collect_macro_provenance(compiler, tcx, source)
+        .map_err(|_| DefinitionError::IncompleteDefinition)?;
+    collect_definitions(compiler, tcx, source, &provenance).map(|definitions| definitions.graph)
 }
 
 pub(crate) fn collect_definitions(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
+    provenance: &MacroProvenance,
+) -> Result<CollectedDefinitions, DefinitionError> {
+    collect_definitions_with_identity(compiler, tcx, source, provenance, None, None)
+}
+
+pub(crate) fn collect_definitions_with_identity(
+    compiler: &Compiler,
+    tcx: TyCtxt<'_>,
+    source: &SourceInventory,
+    provenance: &MacroProvenance,
+    coordinates: Option<&SourceRewrite>,
+    expected_identity: Option<&DefinitionIdentityUniverse>,
 ) -> Result<CollectedDefinitions, DefinitionError> {
     let hir_definitions = collect_hir_definitions(tcx);
+    let origin_context = DefinitionOriginContext {
+        compiler,
+        tcx,
+        source,
+        hir_definitions: &hir_definitions,
+        provenance,
+    };
     let mut raw_definitions = tcx
         .iter_local_def_id()
         .map(|definition| {
             let kind = definition_kind(tcx, definition, &hir_definitions)?;
             let parent = tcx.opt_local_parent(definition);
-            let origin = definition_origin(
-                compiler,
-                tcx,
-                source,
-                definition,
-                kind,
-                parent,
-                &hir_definitions,
-            )?;
+            let (origin, product_basis) =
+                definition_origin(&origin_context, definition, kind, parent)?;
             let def_key = tcx.def_key(definition);
             let name = match def_key.disambiguated_data.data {
                 DefPathData::AnonAssocTy(method) => Some(method.to_string()),
@@ -222,22 +283,31 @@ pub(crate) fn collect_definitions(
                 parent,
                 kind,
                 origin,
+                product_basis,
                 name,
                 structural_ordinal: def_key.disambiguated_data.disambiguator,
             })
         })
         .collect::<Result<Vec<_>, DefinitionError>>()?;
 
-    assign_structural_ordinals(&mut raw_definitions)?;
+    let identity_universe =
+        assign_structural_ordinals(&mut raw_definitions, coordinates, expected_identity)?;
     let source_owners = source_definition_owners(source, &raw_definitions);
-    let (definitions, local_ids) = canonicalize_definitions(raw_definitions)?;
+    let (definitions, local_ids, product_bases) = canonicalize_definitions(raw_definitions)?;
 
     let mut raw_edges = collect_hir_edges(compiler, tcx, source, &hir_definitions)
         .map_err(DefinitionError::at_hir)?;
     collect_typeck_edges(compiler, tcx, source, &mut raw_edges)
         .map_err(DefinitionError::at_typeck)?;
-    collect_import_edges(compiler, tcx, source, &source_owners, &mut raw_edges)
-        .map_err(DefinitionError::at_import)?;
+    collect_import_edges(
+        compiler,
+        tcx,
+        source,
+        &source_owners,
+        provenance,
+        &mut raw_edges,
+    )
+    .map_err(DefinitionError::at_import)?;
     for compiler_id in tcx.iter_local_def_id() {
         let definition_id = *local_ids
             .get(&raw_local_id(compiler_id))
@@ -315,6 +385,8 @@ pub(crate) fn collect_definitions(
         graph,
         compiler_ids: local_ids,
         identity_keys,
+        product_bases,
+        identity_universe,
         hir_definitions,
     })
 }
@@ -536,74 +608,65 @@ fn definition_kind(
 }
 
 fn definition_origin(
-    compiler: &Compiler,
-    tcx: TyCtxt<'_>,
-    source: &SourceInventory,
+    context: &DefinitionOriginContext<'_, '_>,
     definition: LocalDefId,
     kind: DefinitionKind,
     parent: Option<LocalDefId>,
-    hir_definitions: &BTreeSet<u32>,
-) -> Result<DefinitionOrigin, DefinitionError> {
+) -> Result<(DefinitionOrigin, Option<Vec<MacroProductSource>>), DefinitionError> {
     if definition == CRATE_DEF_ID {
-        let root = source
+        let root = context
+            .source
             .units
             .iter()
             .find(|unit| unit.kind == WrittenUnitKind::CrateRoot)
             .ok_or(DefinitionError::InvalidSource)?;
-        return Ok(written_origin(root, root.full_range));
+        return Ok((written_origin(root, root.full_range), None));
     }
     if parent == Some(definition) {
         return Err(DefinitionError::IncompleteDefinition);
     }
 
-    let expansion = tcx.expn_that_defined(definition.to_def_id());
+    let expansion = context.tcx.expn_that_defined(definition.to_def_id());
     if expansion != ExpnId::root() {
         #[cfg(rust_item_dependencies_patched)]
         if let Some(origin) = written_target_definition_origin(
-            compiler,
-            tcx,
-            source,
+            context.compiler,
+            context.tcx,
+            context.source,
             definition,
             kind,
             expansion,
-            hir_definitions,
+            context.hir_definitions,
+            context.provenance,
         )? {
-            return Ok(origin);
+            return Ok((origin, None));
         }
-        return definition_origin_from_expansion(
-            compiler,
-            tcx,
-            source,
-            definition,
-            kind,
-            expansion,
-            hir_definitions,
-        );
+        return definition_origin_from_expansion(context, definition, kind, expansion);
     }
 
-    if is_injected(tcx, definition, kind, hir_definitions) {
-        return Ok(DefinitionOrigin::Injected {
-            role: match kind {
-                DefinitionKind::ExternCrate => InjectedRole::ExternCrate,
-                DefinitionKind::Use => InjectedRole::PreludeImport,
-                _ => return Err(DefinitionError::IncompleteDefinition),
+    if is_injected(context.tcx, definition, kind, context.hir_definitions) {
+        return Ok((
+            DefinitionOrigin::Injected {
+                role: match kind {
+                    DefinitionKind::ExternCrate => InjectedRole::ExternCrate,
+                    DefinitionKind::Use => InjectedRole::PreludeImport,
+                    _ => return Err(DefinitionError::IncompleteDefinition),
+                },
+                ordinal: 0,
             },
-            ordinal: 0,
-        });
+            None,
+        ));
     }
 
-    if is_compiler_generated(tcx, definition, kind, hir_definitions)? {
-        let role = generated_role(tcx, definition, kind, hir_definitions)?;
+    if is_compiler_generated(context.tcx, definition, kind, context.hir_definitions)? {
+        let role = generated_role(context.tcx, definition, kind, context.hir_definitions)?;
         if let Some(parent) = parent {
-            let parent_kind = definition_kind(tcx, parent, hir_definitions)?;
-            let parent_origin = definition_origin(
-                compiler,
-                tcx,
-                source,
+            let parent_kind = definition_kind(context.tcx, parent, context.hir_definitions)?;
+            let (parent_origin, product_basis) = definition_origin(
+                context,
                 parent,
                 parent_kind,
-                tcx.opt_local_parent(parent),
-                hir_definitions,
+                context.tcx.opt_local_parent(parent),
             )?;
             if let DefinitionOrigin::Expanded {
                 invocation,
@@ -611,25 +674,37 @@ fn definition_origin(
                 ..
             } = parent_origin
             {
-                return Ok(DefinitionOrigin::Expanded {
-                    invocation,
-                    invocation_range,
-                    generated_role: Some(role),
-                    ordinal: 0,
-                });
+                return Ok((
+                    DefinitionOrigin::Expanded {
+                        invocation,
+                        invocation_range,
+                        generated_role: Some(role),
+                        ordinal: 0,
+                    },
+                    product_basis,
+                ));
             }
         }
-        return Ok(DefinitionOrigin::CompilerGenerated { role, ordinal: 0 });
+        return Ok((
+            DefinitionOrigin::CompilerGenerated { role, ordinal: 0 },
+            None,
+        ));
     }
 
-    if !hir_definitions.contains(&raw_local_id(definition)) {
+    if !context.hir_definitions.contains(&raw_local_id(definition)) {
         return Err(DefinitionError::IncompleteDefinition);
     }
-    let span = tcx.hir_span(tcx.local_def_id_to_hir_id(definition));
-    let range = original_span_range(compiler, &source.offsets, span.source_callsite())?;
-    let unit = source_unit_for_definition(source, range, kind)
+    let span = context
+        .tcx
+        .hir_span(context.tcx.local_def_id_to_hir_id(definition));
+    let range = original_span_range(
+        context.compiler,
+        &context.source.offsets,
+        span.source_callsite(),
+    )?;
+    let unit = source_unit_for_definition(context.source, range, kind)
         .ok_or(DefinitionError::IncompleteDefinition)?;
-    Ok(written_origin(unit, range))
+    Ok((written_origin(unit, range), None))
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -641,26 +716,25 @@ fn written_target_definition_origin(
     kind: DefinitionKind,
     expansion: ExpnId,
     hir_definitions: &BTreeSet<u32>,
+    provenance: &MacroProvenance,
 ) -> Result<Option<DefinitionOrigin>, DefinitionError> {
-    let Some(expansion) = recorded_macro_expansion(tcx, expansion) else {
+    let Some(origin) = provenance
+        .recorded_editable_macro_origin(expansion)
+        .map_err(|_| DefinitionError::IncompleteDefinition)?
+    else {
         return Ok(None);
     };
-    let origins = &tcx.resolutions(()).macro_invocation_origins;
-    let Some(origin) = origins.get(&expansion) else {
-        return Ok(None);
-    };
-    let editable = resolve_editable_macro_source(compiler, source, origins, expansion)
-        .map_err(|_| DefinitionError::IncompleteDefinition)?;
-    if editable
-        .is_none_or(|editable| editable.role != EditableMacroSourceRole::TransparentAttribute)
+    if origin.source.role != EditableMacroSourceRole::TransparentAttribute
         || !hir_definitions.contains(&raw_local_id(definition))
     {
         return Ok(None);
     }
-    let Some(target_span) = origin.target_span else {
+    if !origin.target_span_is_present {
         return Err(DefinitionError::IncompleteDefinition);
-    };
-    let target_range = original_span_range(compiler, &source.offsets, target_span)?;
+    }
+    let target_range = origin
+        .target_range
+        .ok_or(DefinitionError::IncompleteDefinition)?;
     let span = tcx.hir_span(tcx.local_def_id_to_hir_id(definition));
     let range = original_span_range(compiler, &source.offsets, span.source_callsite())?;
     if !target_range.contains(range) {
@@ -674,41 +748,51 @@ fn written_target_definition_origin(
 
 #[cfg(not(rust_item_dependencies_patched))]
 fn definition_origin_from_expansion(
-    _compiler: &Compiler,
-    _tcx: TyCtxt<'_>,
-    _source: &SourceInventory,
+    _context: &DefinitionOriginContext<'_, '_>,
     _definition: LocalDefId,
     _kind: DefinitionKind,
     _expansion: ExpnId,
-    _hir_definitions: &BTreeSet<u32>,
-) -> Result<DefinitionOrigin, DefinitionError> {
+) -> Result<(DefinitionOrigin, Option<Vec<MacroProductSource>>), DefinitionError> {
     Err(DefinitionError::IncompleteDefinition)
 }
 
 #[cfg(rust_item_dependencies_patched)]
 fn definition_origin_from_expansion(
-    compiler: &Compiler,
-    tcx: TyCtxt<'_>,
-    source: &SourceInventory,
+    context: &DefinitionOriginContext<'_, '_>,
     definition: LocalDefId,
     kind: DefinitionKind,
     expansion: ExpnId,
-    hir_definitions: &BTreeSet<u32>,
-) -> Result<DefinitionOrigin, DefinitionError> {
-    if recorded_macro_expansion(tcx, expansion).is_some() {
+) -> Result<(DefinitionOrigin, Option<Vec<MacroProductSource>>), DefinitionError> {
+    if context
+        .provenance
+        .recorded_macro_expansion(expansion)
+        .map_err(|_| DefinitionError::IncompleteDefinition)?
+        .is_some()
+    {
         let role = generated_role_for_expanded_definition(
-            tcx,
+            context.tcx,
             definition,
             kind,
             expansion,
-            hir_definitions,
+            context.hir_definitions,
         )?;
-        return expanded_origin(compiler, tcx, source, expansion, role);
+        return expanded_origin(
+            context.compiler,
+            context.tcx,
+            context.source,
+            definition,
+            expansion,
+            role,
+            context.provenance,
+        );
     }
-    Ok(DefinitionOrigin::CompilerGenerated {
-        role: generated_role(tcx, definition, kind, hir_definitions)?,
-        ordinal: 0,
-    })
+    Ok((
+        DefinitionOrigin::CompilerGenerated {
+            role: generated_role(context.tcx, definition, kind, context.hir_definitions)?,
+            ordinal: 0,
+        },
+        None,
+    ))
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -801,70 +885,27 @@ fn written_origin(unit: &crate::source::WrittenUnit, anchor: ByteRange) -> Defin
 
 #[cfg(rust_item_dependencies_patched)]
 fn expanded_origin(
-    compiler: &Compiler,
-    tcx: TyCtxt<'_>,
-    source: &SourceInventory,
+    _compiler: &Compiler,
+    _tcx: TyCtxt<'_>,
+    _source: &SourceInventory,
+    definition: LocalDefId,
     expansion: ExpnId,
     generated_role: Option<GeneratedRole>,
-) -> Result<DefinitionOrigin, DefinitionError> {
-    let (_, invocation) = nearest_editable_macro_source(compiler, tcx, source, expansion)
-        .map_err(|_| DefinitionError::IncompleteDefinition)?;
-    Ok(DefinitionOrigin::Expanded {
-        invocation: invocation.unit,
-        invocation_range: invocation.call_range,
-        generated_role,
-        ordinal: 0,
-    })
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn nearest_editable_macro_source(
-    compiler: &Compiler,
-    tcx: TyCtxt<'_>,
-    source: &SourceInventory,
-    expansion: ExpnId,
-) -> Result<(ExpnId, EditableMacroSource), DefinitionError> {
-    let origins = &tcx.resolutions(()).macro_invocation_origins;
-    let mut current =
-        recorded_macro_expansion(tcx, expansion).ok_or(DefinitionError::IncompleteDependency)?;
-    let mut visited = Vec::new();
-    loop {
-        if current == ExpnId::root() || visited.contains(&current) {
-            return Err(DefinitionError::IncompleteDependency);
-        }
-        visited.push(current);
-        if let Some(editable) = resolve_editable_macro_source(compiler, source, origins, current)
-            .map_err(|_| DefinitionError::IncompleteDependency)?
-        {
-            return Ok((current, editable));
-        }
-        let origin = origins
-            .get(&current)
-            .ok_or(DefinitionError::IncompleteDependency)?;
-        if origin.discovered_in_expansion == ExpnId::root() {
-            return Err(DefinitionError::IncompleteDependency);
-        }
-        current = recorded_macro_expansion(tcx, origin.discovered_in_expansion)
-            .ok_or(DefinitionError::IncompleteDependency)?;
-    }
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn recorded_macro_expansion(tcx: TyCtxt<'_>, mut expansion: ExpnId) -> Option<ExpnId> {
-    let origins = &tcx.resolutions(()).macro_invocation_origins;
-    let mut visited = Vec::new();
-    while expansion != ExpnId::root() && !visited.contains(&expansion) {
-        visited.push(expansion);
-        if origins.contains_key(&expansion) {
-            return Some(expansion);
-        }
-        let parent = expansion.expn_data().call_site.ctxt().outer_expn();
-        if parent == expansion {
-            return None;
-        }
-        expansion = parent;
-    }
-    None
+    provenance: &MacroProvenance,
+) -> Result<(DefinitionOrigin, Option<Vec<MacroProductSource>>), DefinitionError> {
+    let invocation = provenance
+        .nearest_editable_macro_origin(expansion)
+        .map_err(|_| DefinitionError::IncompleteDefinition)?
+        .source;
+    Ok((
+        DefinitionOrigin::Expanded {
+            invocation: invocation.unit,
+            invocation_range: invocation.call_range,
+            generated_role,
+            ordinal: 0,
+        },
+        provenance.definition_basis(definition).map(<[_]>::to_vec),
+    ))
 }
 
 fn is_injected(
@@ -995,49 +1036,256 @@ fn source_unit_for_definition(
         .min_by_key(|unit| (unit.full_range.len(), unit.kind.rank(), unit.id))
 }
 
-fn assign_structural_ordinals(definitions: &mut [RawDefinition]) -> Result<(), DefinitionError> {
-    type Group = (
+fn assign_structural_ordinals(
+    definitions: &mut [RawDefinition],
+    coordinates: Option<&SourceRewrite>,
+    expected: Option<&DefinitionIdentityUniverse>,
+) -> Result<DefinitionIdentityUniverse, DefinitionError> {
+    type Cohort = (
         Option<u32>,
         DefinitionOriginKey,
+        Option<Vec<MacroProductSource>>,
         DefinitionKind,
         Option<String>,
     );
 
-    let mut groups = BTreeMap::<Group, Vec<(u32, usize)>>::new();
+    let identity_origins = definitions
+        .iter()
+        .map(|definition| {
+            let mut origin = definition.origin.key();
+            if let Some(coordinates) = coordinates {
+                normalize_identity_origin(&mut origin, definition.kind, coordinates)?;
+            }
+            let mut product_basis = definition.product_basis.clone();
+            if let Some(coordinates) = coordinates {
+                for source in product_basis.iter_mut().flatten() {
+                    source.range = coordinates
+                        .original_range(source.range)
+                        .map_err(|_| DefinitionError::InvalidSource)?;
+                }
+            }
+            if product_basis.as_ref().is_some_and(|basis| {
+                basis.iter().any(|source| source.range.is_empty())
+                    || basis.windows(2).any(|pair| pair[0] >= pair[1])
+            }) {
+                return Err(DefinitionError::IncompleteDefinition);
+            }
+            Ok((origin, product_basis))
+        })
+        .collect::<Result<Vec<_>, DefinitionError>>()?;
+
+    let compiler_ordinals = definitions
+        .iter()
+        .map(|definition| definition.structural_ordinal)
+        .collect::<Vec<_>>();
+
+    // Assign a private ordinal inside each exact product cohort. Retention
+    // keeps such a cohort atomically, so this identity component cannot
+    // compact independently after rewriting. It must not replace the public
+    // structural ordinal, whose initial numbering remains the established
+    // rustc structural order.
+    let mut private_cohort_ordinals = vec![0; definitions.len()];
+    let mut cohorts = BTreeMap::<Cohort, Vec<(u32, usize)>>::new();
     for (index, definition) in definitions.iter().enumerate() {
-        groups
+        let (origin, basis) = &identity_origins[index];
+        cohorts
             .entry((
                 definition.parent.map(raw_local_id),
-                definition.origin.key(),
+                origin.clone(),
+                basis.clone(),
                 definition.kind,
                 definition.name.clone(),
             ))
             .or_default()
-            .push((definition.structural_ordinal, index));
+            .push((compiler_ordinals[index], index));
     }
-    for members in groups.values_mut() {
+    for members in cohorts.values_mut() {
         members.sort_unstable();
         if members.windows(2).any(|pair| pair[0].0 == pair[1].0) {
             return Err(DefinitionError::IncompleteDefinition);
         }
         for (rank, &(_, index)) in members.iter().enumerate() {
-            let rank = u32::try_from(rank).map_err(|_| DefinitionError::IncompleteDefinition)?;
+            private_cohort_ordinals[index] =
+                u32::try_from(rank).map_err(|_| DefinitionError::IncompleteDefinition)?;
+        }
+    }
+
+    let by_compiler_id = definitions
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| (raw_local_id(definition.compiler_id), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut identities = vec![None; definitions.len()];
+    let mut active = BTreeSet::new();
+    fn identity(
+        index: usize,
+        definitions: &[RawDefinition],
+        identity_origins: &[(DefinitionOriginKey, Option<Vec<MacroProductSource>>)],
+        private_cohort_ordinals: &[u32],
+        by_compiler_id: &BTreeMap<u32, usize>,
+        identities: &mut [Option<DefinitionIdentityKey>],
+        active: &mut BTreeSet<usize>,
+    ) -> Result<DefinitionIdentityKey, DefinitionError> {
+        if let Some(identity) = &identities[index] {
+            return Ok(identity.clone());
+        }
+        if !active.insert(index) {
+            return Err(DefinitionError::IncompleteDefinition);
+        }
+        let definition = &definitions[index];
+        let mut parts = if let Some(parent) = definition.parent {
+            let parent = *by_compiler_id
+                .get(&raw_local_id(parent))
+                .ok_or(DefinitionError::IncompleteDefinition)?;
+            identity(
+                parent,
+                definitions,
+                identity_origins,
+                private_cohort_ordinals,
+                by_compiler_id,
+                identities,
+                active,
+            )?
+            .0
+        } else {
+            Vec::new()
+        };
+        let (origin, product_basis) = &identity_origins[index];
+        parts.push(DefinitionIdentityPart {
+            kind: definition.kind,
+            origin: origin.clone(),
+            product_basis: product_basis.clone(),
+            name: definition.name.clone(),
+            cohort_ordinal: private_cohort_ordinals[index],
+        });
+        let key = DefinitionIdentityKey(parts);
+        active.remove(&index);
+        identities[index] = Some(key.clone());
+        Ok(key)
+    }
+    for index in 0..definitions.len() {
+        identity(
+            index,
+            definitions,
+            &identity_origins,
+            &private_cohort_ordinals,
+            &by_compiler_id,
+            &mut identities,
+            &mut active,
+        )?;
+    }
+    let identities = identities
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or(DefinitionError::IncompleteDefinition)?;
+
+    type PublicCohort = (
+        Option<DefinitionIdentityKey>,
+        DefinitionOriginKey,
+        DefinitionKind,
+        Option<String>,
+    );
+    let mut public_cohorts = BTreeMap::<PublicCohort, Vec<usize>>::new();
+    for (index, definition) in definitions.iter().enumerate() {
+        let parent = definition
+            .parent
+            .map(|parent| {
+                by_compiler_id
+                    .get(&raw_local_id(parent))
+                    .and_then(|index| identities.get(*index))
+                    .cloned()
+                    .ok_or(DefinitionError::IncompleteDefinition)
+            })
+            .transpose()?;
+        public_cohorts
+            .entry((
+                parent,
+                identity_origins[index].0.clone(),
+                definition.kind,
+                definition.name.clone(),
+            ))
+            .or_default()
+            .push(index);
+    }
+
+    let mut universe = DefinitionIdentityUniverse::default();
+    for members in public_cohorts.values_mut() {
+        if expected.is_none() {
+            members.sort_by_key(|&index| compiler_ordinals[index]);
+            if members
+                .windows(2)
+                .any(|pair| compiler_ordinals[pair[0]] == compiler_ordinals[pair[1]])
+            {
+                return Err(DefinitionError::IncompleteDefinition);
+            }
+        } else {
+            members.sort_by_key(|&index| identities[index].clone());
+        }
+        let mut assigned = BTreeSet::new();
+        for (rank, &index) in members.iter().enumerate() {
+            let assigned_ordinal = match expected {
+                Some(expected) => *expected
+                    .ordinals
+                    .get(&identities[index])
+                    .ok_or(DefinitionError::IncompleteDefinition)?,
+                None => u32::try_from(rank).map_err(|_| DefinitionError::IncompleteDefinition)?,
+            };
+            if !assigned.insert(assigned_ordinal)
+                || universe
+                    .ordinals
+                    .insert(identities[index].clone(), assigned_ordinal)
+                    .is_some()
+            {
+                return Err(DefinitionError::IncompleteDefinition);
+            }
             let definition = &mut definitions[index];
-            definition.structural_ordinal = rank;
+            definition.structural_ordinal = assigned_ordinal;
             match &mut definition.origin {
                 DefinitionOrigin::Expanded { ordinal, .. }
                 | DefinitionOrigin::CompilerGenerated { ordinal, .. }
-                | DefinitionOrigin::Injected { ordinal, .. } => *ordinal = rank,
+                | DefinitionOrigin::Injected { ordinal, .. } => *ordinal = assigned_ordinal,
                 DefinitionOrigin::Written { .. } => {}
             }
         }
     }
+    Ok(universe)
+}
+
+fn normalize_identity_origin(
+    origin: &mut DefinitionOriginKey,
+    kind: DefinitionKind,
+    coordinates: &SourceRewrite,
+) -> Result<(), DefinitionError> {
+    match origin {
+        DefinitionOriginKey::Written { anchor, .. } => {
+            *anchor = if kind == DefinitionKind::Crate {
+                coordinates.original_crate_range(*anchor)
+            } else {
+                coordinates.original_range(*anchor)
+            }
+            .map_err(|_| DefinitionError::InvalidSource)?;
+        }
+        DefinitionOriginKey::Expanded {
+            invocation_range, ..
+        } => {
+            *invocation_range = coordinates
+                .original_range(*invocation_range)
+                .map_err(|_| DefinitionError::InvalidSource)?;
+        }
+        DefinitionOriginKey::CompilerGenerated { .. } | DefinitionOriginKey::Injected { .. } => {}
+    }
     Ok(())
 }
 
+type CanonicalDefinitions = (
+    Vec<Definition>,
+    BTreeMap<u32, DefinitionId>,
+    Vec<Option<Vec<MacroProductSource>>>,
+);
+
 fn canonicalize_definitions(
     definitions: Vec<RawDefinition>,
-) -> Result<(Vec<Definition>, BTreeMap<u32, DefinitionId>), DefinitionError> {
+) -> Result<CanonicalDefinitions, DefinitionError> {
     let by_compiler_id = definitions
         .iter()
         .enumerate()
@@ -1086,6 +1334,7 @@ fn canonicalize_definitions(
         children: &BTreeMap<u32, Vec<usize>>,
         local_ids: &mut BTreeMap<u32, DefinitionId>,
         output: &mut Vec<Definition>,
+        product_bases: &mut Vec<Option<Vec<MacroProductSource>>>,
     ) {
         let raw = &definitions[index];
         let id = DefinitionId(output.len() as u32);
@@ -1109,20 +1358,36 @@ fn canonicalize_definitions(
             parent,
             origin: raw.origin.clone(),
         });
+        product_bases.push(raw.product_basis.clone());
         if let Some(indices) = children.get(&raw_local_id(raw.compiler_id)) {
             for &child in indices {
-                append(child, definitions, children, local_ids, output);
+                append(
+                    child,
+                    definitions,
+                    children,
+                    local_ids,
+                    output,
+                    product_bases,
+                );
             }
         }
     }
 
     let mut local_ids = BTreeMap::new();
     let mut output = Vec::with_capacity(definitions.len());
-    append(root, &definitions, &children, &mut local_ids, &mut output);
+    let mut product_bases = Vec::with_capacity(definitions.len());
+    append(
+        root,
+        &definitions,
+        &children,
+        &mut local_ids,
+        &mut output,
+        &mut product_bases,
+    );
     if output.len() != definitions.len() {
         return Err(DefinitionError::IncompleteDefinition);
     }
-    Ok((output, local_ids))
+    Ok((output, local_ids, product_bases))
 }
 
 fn definition_site(definition: &Definition) -> Option<ByteRange> {
@@ -2181,6 +2446,7 @@ fn collect_import_edges(
     _tcx: TyCtxt<'_>,
     _source: &SourceInventory,
     _source_owners: &BTreeMap<crate::source::SourceUnitId, LocalDefId>,
+    _provenance: &MacroProvenance,
     _edges: &mut Vec<RawEdge>,
 ) -> Result<(), DefinitionError> {
     Err(DefinitionError::IncompleteDependency)
@@ -2192,6 +2458,7 @@ fn collect_import_edges(
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
     source_owners: &BTreeMap<crate::source::SourceUnitId, LocalDefId>,
+    provenance: &MacroProvenance,
     edges: &mut Vec<RawEdge>,
 ) -> Result<(), DefinitionError> {
     for record in &tcx.resolutions(()).resolved_import_uses {
@@ -2241,36 +2508,28 @@ fn collect_import_edges(
         }
     }
 
-    let macro_origins = tcx
-        .resolutions(())
-        .macro_invocation_origins
-        .items()
-        .map(|(&expansion, origin)| {
-            (
-                expansion.expn_hash().local_hash().as_u64(),
-                expansion,
-                origin,
-            )
-        })
-        .into_sorted_stable_ord_by_key(|record| &record.0);
-    for (_, expansion, origin) in macro_origins {
-        let macro_definition = expansion.expn_data().macro_def_id;
+    for expansion in provenance.observed_expansion_ids() {
+        let origin = tcx
+            .resolutions(())
+            .macro_invocation_origins
+            .get(&expansion)
+            .ok_or(DefinitionError::IncompleteDependency)?;
+        let macro_definition = provenance
+            .macro_definition(expansion)
+            .map_err(|_| DefinitionError::IncompleteDependency)?;
         if macro_definition.is_none() && origin.resolved_import_uses.is_empty() {
             continue;
         }
-        let (source_expansion, invocation) =
-            nearest_editable_macro_source(compiler, tcx, source, expansion)?;
-        let source_origin = tcx
-            .resolutions(())
-            .macro_invocation_origins
-            .get(&source_expansion)
-            .ok_or(DefinitionError::IncompleteDependency)?;
+        let source_origin = provenance
+            .nearest_editable_macro_origin(expansion)
+            .map_err(|_| DefinitionError::IncompleteDependency)?;
+        let invocation = source_origin.source;
         let source_unit = source
             .units
             .get(invocation.unit.0 as usize)
             .filter(|unit| unit.id == invocation.unit)
             .ok_or(DefinitionError::IncompleteDependency)?;
-        let from = if source_origin.target_span.is_some() {
+        let from = if source_origin.target_span_is_present {
             source_owner(source, source_owners, source_unit.id)?
         } else {
             source_origin.parent_definition
@@ -3193,6 +3452,59 @@ mod exact_tests {
                 ),
             ])
         );
+    }
+
+    #[test]
+    fn macro_product_identity_does_not_reorder_public_definition_keys() {
+        let source = concat!(
+            "trait Trait { fn value() -> u8; }\n",
+            "struct Template;\n",
+            "struct Input;\n",
+            "macro_rules! make {\n",
+            "    ($item:item) => {\n",
+            "        impl Trait for Template { fn value() -> u8 { 0 } }\n",
+            "        $item\n",
+            "    };\n",
+            "}\n",
+            "make!(impl Trait for Input { fn value() -> u8 { 1 } });\n",
+            "fn main() { assert_eq!(Input::value(), 1); }\n",
+        );
+        let graph = inspect(source);
+        let definition_named = |name: &str| {
+            graph
+                .definitions
+                .iter()
+                .find(|definition| {
+                    definition
+                        .key
+                        .0
+                        .last()
+                        .and_then(|part| part.name.as_deref())
+                        == Some(name)
+                })
+                .map(|definition| definition.id)
+                .unwrap_or_else(|| panic!("missing definition {name}"))
+        };
+        let impl_ordinal = |self_type: DefinitionId| {
+            let implementation = graph
+                .edges
+                .iter()
+                .find(|edge| {
+                    edge.kind == DependencyKind::ImplSelfType
+                        && edge.to == DefinitionTarget::Local(self_type)
+                })
+                .map(|edge| edge.from)
+                .expect("the generated impl must retain its self-type edge");
+            graph.definitions[implementation.0 as usize]
+                .key
+                .0
+                .last()
+                .expect("the impl key must have a leaf")
+                .same_role_ordinal
+        };
+
+        assert_eq!(impl_ordinal(definition_named("Template")), 0);
+        assert_eq!(impl_ordinal(definition_named("Input")), 1);
     }
 
     #[test]

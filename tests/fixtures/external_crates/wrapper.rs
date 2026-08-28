@@ -11,6 +11,17 @@ where
     external_leaf::double(value)
 }
 
+pub trait ExternalStorage {
+    fn normalize(value: u32) -> u32 {
+        value
+    }
+}
+
+#[inline(always)]
+pub fn external_get<T: ExternalStorage>(value: u32) -> u32 {
+    T::normalize(value)
+}
+
 #[doc(hidden)]
 pub fn macro_value(value: i32) -> i32 {
     value + 1
@@ -36,6 +47,11 @@ macro_rules! external_passthrough {
     ($item:item) => {
         $item
     };
+}
+
+#[macro_export]
+macro_rules! external_empty {
+    () => {};
 }
 
 #[macro_export]

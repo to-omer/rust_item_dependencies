@@ -346,6 +346,7 @@ pub enum MonoDependencyKind {
     AllocationReference,
     ThreadLocalShim,
     CompilerRequirement,
+    SourceAssociatedItem,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -974,7 +975,43 @@ fn valid_associated_item_selection_joins(
         let GraphNode::Proof(proof) = proof_edge.to else {
             return false;
         };
-        let Some(ProofNode {
+        let Some(proof_node) = proofs.get(proof.0 as usize) else {
+            return false;
+        };
+        let GraphNode::Mono(from) = proof_edge.from else {
+            return false;
+        };
+        if relation == MonoDependencyKind::SourceAssociatedItem {
+            if collection != MonoCollection::Mentioned
+                || proof_edge.sites.is_empty()
+                || !proof_edge.sites.iter().all(|site| {
+                    matches!(
+                        site,
+                        ObservationSite::Source(_)
+                            | ObservationSite::ExternalSource
+                            | ObservationSite::CompilerGenerated
+                    )
+                })
+                || !matches!(
+                    mono_nodes.get(from.0 as usize).map(|node| &node.key),
+                    Some(MonoKey::Instance {
+                        role: MonoInstanceRole::Callable,
+                        ..
+                    })
+                )
+            {
+                return false;
+            }
+            return match &proof_node.kind {
+                ProofNodeKind::AssociatedItem {
+                    raw_instance,
+                    codegen_instance,
+                    ..
+                } => raw_instance == codegen_instance,
+                _ => true,
+            };
+        }
+        let ProofNode {
             kind:
                 ProofNodeKind::AssociatedItem {
                     codegen_instance,
@@ -983,12 +1020,9 @@ fn valid_associated_item_selection_joins(
                     ..
                 },
             ..
-        }) = proofs.get(proof.0 as usize)
+        } = proof_node
         else {
             return true;
-        };
-        let GraphNode::Mono(from) = proof_edge.from else {
-            return false;
         };
         if relation == MonoDependencyKind::ConstAllocation {
             return matches!(
@@ -1950,8 +1984,10 @@ fn valid_edge_shape(from: GraphNode, to: GraphNode, kind: &DependencyKind) -> bo
         DependencyKind::MaterializesDefinition => {
             matches!(from, GraphNode::Mono(_)) && definition(to)
         }
-        DependencyKind::Mono { .. } => {
-            matches!(from, GraphNode::Mono(_)) && matches!(to, GraphNode::Mono(_))
+        DependencyKind::Mono { relation, .. } => {
+            *relation != MonoDependencyKind::SourceAssociatedItem
+                && matches!(from, GraphNode::Mono(_))
+                && matches!(to, GraphNode::Mono(_))
         }
     }
 }
@@ -2072,6 +2108,118 @@ mod tests {
         ExternalDefinition,
     };
     use crate::source::WrittenUnitKind;
+
+    #[test]
+    fn source_associated_items_are_proof_only_edges() {
+        let relation = MonoDependencyKind::SourceAssociatedItem;
+        assert!(!valid_edge_shape(
+            GraphNode::Mono(MonoId(0)),
+            GraphNode::Mono(MonoId(1)),
+            &DependencyKind::Mono {
+                relation,
+                collection: MonoCollection::Mentioned,
+            },
+        ));
+        assert!(valid_edge_shape(
+            GraphNode::Mono(MonoId(0)),
+            GraphNode::Proof(ProofId(0)),
+            &DependencyKind::SelectionProof {
+                relation,
+                collection: MonoCollection::Mentioned,
+            },
+        ));
+    }
+
+    #[test]
+    fn source_associated_item_proofs_validate_the_shared_edge_shape() {
+        let instance = |tag| MonoInstanceKey {
+            definition: DefinitionReferenceKey::Local(DefinitionKey(Vec::new())),
+            arguments: term(tag),
+            kind: term(tag + 1),
+        };
+        let callable = MonoNode {
+            id: MonoId(0),
+            key: MonoKey::Instance {
+                instance: instance(1),
+                role: MonoInstanceRole::Callable,
+            },
+            materialized_definition: None,
+            allocation_observation: None,
+        };
+        let edge = DependencyEdge {
+            from: GraphNode::Mono(MonoId(0)),
+            to: GraphNode::Proof(ProofId(0)),
+            kind: DependencyKind::SelectionProof {
+                relation: MonoDependencyKind::SourceAssociatedItem,
+                collection: MonoCollection::Mentioned,
+            },
+            sites: vec![ObservationSite::Source(ByteRange { start: 0, end: 1 })],
+            evidence: EvidenceOrigin::PatchedObserver,
+        };
+        let obligation = obligation(0, None);
+        assert!(valid_associated_item_selection_joins(
+            std::slice::from_ref(&obligation),
+            std::slice::from_ref(&callable),
+            std::slice::from_ref(&edge),
+        ));
+
+        let mut invalid_collection = edge.clone();
+        invalid_collection.kind = DependencyKind::SelectionProof {
+            relation: MonoDependencyKind::SourceAssociatedItem,
+            collection: MonoCollection::Used,
+        };
+        assert!(!valid_associated_item_selection_joins(
+            std::slice::from_ref(&obligation),
+            std::slice::from_ref(&callable),
+            std::slice::from_ref(&invalid_collection),
+        ));
+
+        let mut invalid_site = edge.clone();
+        invalid_site.sites = vec![ObservationSite::VTableSlot(0)];
+        assert!(!valid_associated_item_selection_joins(
+            std::slice::from_ref(&obligation),
+            std::slice::from_ref(&callable),
+            std::slice::from_ref(&invalid_site),
+        ));
+
+        let mut static_owner = callable.clone();
+        static_owner.key = MonoKey::Static {
+            definition: DefinitionKey(Vec::new()),
+        };
+        assert!(!valid_associated_item_selection_joins(
+            std::slice::from_ref(&obligation),
+            std::slice::from_ref(&static_owner),
+            std::slice::from_ref(&edge),
+        ));
+
+        let request = term(10);
+        let raw_instance = instance(11);
+        let codegen_instance = instance(13);
+        let associated = ProofNode {
+            id: ProofId(0),
+            key: ProofKey::AssociatedItem {
+                request: request.clone(),
+                raw_instance: raw_instance.clone(),
+                codegen_instance: codegen_instance.clone(),
+            },
+            kind: ProofNodeKind::AssociatedItem {
+                request,
+                raw_instance,
+                codegen_instance,
+                selection: ProofId(0),
+                source_kind: SelectionSourceKind::Parameter,
+                leaf: None,
+                defining_node: None,
+                finalizing_node: None,
+                ancestor_path: Vec::new(),
+            },
+        };
+        assert!(!valid_associated_item_selection_joins(
+            std::slice::from_ref(&associated),
+            std::slice::from_ref(&callable),
+            std::slice::from_ref(&edge),
+        ));
+    }
 
     fn term(tag: u8) -> CanonicalCompilerTerm {
         CanonicalCompilerTerm {

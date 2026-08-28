@@ -209,6 +209,7 @@ encoded_rustflags="${encoded_rustflags}${unit_separator}-L${unit_separator}depen
 
 PATH="$compiler_library${PATH:+:$PATH}" \
 RUSTC="$stage2_rustc" \
+CARGO_INCREMENTAL=0 \
 CARGO_ENCODED_RUSTFLAGS="$encoded_rustflags" \
 CARGO_TARGET_DIR="$cargo_target_directory" \
 cargo test \
