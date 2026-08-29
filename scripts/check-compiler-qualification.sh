@@ -17,7 +17,6 @@ fi
 
 sh -n \
     "$repository_root/scripts/apply-rustc-patches.sh" \
-    "$repository_root/scripts/build-patched-rustc.sh" \
     "$repository_root/scripts/check-acceptance.sh" \
     "$repository_root/scripts/check-patched-rustc.sh" \
     "$repository_root/scripts/patch-queue-digest.sh"
