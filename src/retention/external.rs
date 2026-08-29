@@ -18,9 +18,9 @@ use crate::graph::{DefinitionId, DefinitionKind};
 use crate::source::original_span_range;
 use crate::source::{CfgState, SourceInventory, SourceUnitId};
 
-#[cfg(rust_item_dependencies_patched)]
-use super::source_site_owner;
 use super::{Retention, RetentionError, SourceConstraints};
+#[cfg(rust_item_dependencies_patched)]
+use super::{SourceSiteOwnerIndex, source_site_owner};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ExternalDependencyKind {
@@ -223,10 +223,16 @@ pub(super) struct ExternalCrateFacts {
     pub(super) local_requirements: Vec<LocalMetadataRequirement>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum CompilerCrateLoadCarrier {
+    Definition(DefinitionId),
+    Source(SourceUnitId),
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(super) struct CompilerSourceDisjunction {
+pub(super) struct CompilerCrateLoadDisjunction {
     pub(super) trigger: Option<GraphNode>,
-    pub(super) choices: Vec<SourceUnitId>,
+    pub(super) choices: Vec<CompilerCrateLoadCarrier>,
 }
 #[cfg(rust_item_dependencies_patched)]
 pub(super) fn collect_external_crate_facts(
@@ -243,6 +249,8 @@ pub(super) fn collect_external_crate_facts(
     use rustc_middle::ty::{CompilerMetadataProvider, CompilerMetadataRequirement};
     use rustc_session::cstore::CrateDepKind;
     use rustc_span::kw;
+
+    let source_sites = SourceSiteOwnerIndex::new(source)?;
 
     fn dependency_kind(kind: CrateDepKind) -> ExternalDependencyKind {
         match kind {
@@ -405,7 +413,7 @@ pub(super) fn collect_external_crate_facts(
         )
         .map_err(|_| RetentionError::IncompleteExternalCrateConstraints)?;
         activations.insert(ExternalCrateActivation {
-            source: Some(source_site_owner(source, range)?),
+            source: Some(source_site_owner(&source_sites, range)?),
             load: load(tcx, activation.load, &loaded, &mut loads)?,
         });
     }
@@ -788,7 +796,7 @@ pub(super) fn validate_external_crate_facts(
     graph: &DependencyGraph,
     definition_units: &[SourceUnitId],
     facts: &ExternalCrateFacts,
-) -> Result<Vec<CompilerSourceDisjunction>, RetentionError> {
+) -> Result<Vec<CompilerCrateLoadDisjunction>, RetentionError> {
     let incomplete = RetentionError::IncompleteExternalCrateConstraints;
     let loaded = facts
         .loaded_crates
@@ -849,14 +857,17 @@ pub(super) fn validate_external_crate_facts(
 
     let mut source_loads = BTreeSet::new();
     for binding in &facts.bindings {
-        let unit = *definition_units
+        definition_units
             .get(binding.definition.0 as usize)
             .ok_or(incomplete)?;
         match &binding.target {
             ExternalCrateBindingTarget::SelfCrate => {}
             ExternalCrateBindingTarget::External(load) => {
                 validate_load(load)?;
-                source_loads.insert((unit, load.clone()));
+                source_loads.insert((
+                    CompilerCrateLoadCarrier::Definition(binding.definition),
+                    load.clone(),
+                ));
             }
         }
     }
@@ -876,7 +887,10 @@ pub(super) fn validate_external_crate_facts(
             {
                 return Err(incomplete);
             }
-            source_loads.insert((unit, activation.load.clone()));
+            source_loads.insert((
+                CompilerCrateLoadCarrier::Source(unit),
+                activation.load.clone(),
+            ));
         } else {
             source_free_loads.insert(activation.load.clone());
         }
@@ -946,15 +960,15 @@ pub(super) fn validate_external_crate_facts(
             }
             let triggering_sources = source_loads
                 .iter()
-                .filter_map(|(source, load)| {
+                .filter_map(|(carrier, load)| {
                     load.closure
                         .iter()
                         .any(|dependency| dependency.crate_identity == condition)
-                        .then_some(*source)
+                        .then_some(*carrier)
                 })
                 .collect::<Vec<_>>();
-            for source in triggering_sources {
-                source_loads.insert((source, activation.load.clone()));
+            for carrier in triggering_sources {
+                source_loads.insert((carrier, activation.load.clone()));
             }
         }
         if source_loads.len() == source_count && source_free_loads.len() == source_free_count {
@@ -997,8 +1011,10 @@ pub(super) fn validate_external_crate_facts(
             crate_identity: provider.crate_identity,
             kind: *loaded.get(&provider.crate_identity).ok_or(incomplete)?,
         };
-        let fixed_source_load = source_loads.iter().any(|(unit, load)| {
-            source.units[unit.0 as usize].kind == crate::source::WrittenUnitKind::CrateRoot
+        let fixed_source_load = source_loads.iter().any(|(carrier, load)| {
+            matches!(carrier, CompilerCrateLoadCarrier::Source(unit)
+                if source.units[unit.0 as usize].kind
+                    == crate::source::WrittenUnitKind::CrateRoot)
                 && satisfies(load, required)
         });
         if !fixed_source_load
@@ -1063,12 +1079,12 @@ pub(super) fn validate_external_crate_facts(
         }
         let choices = source_loads
             .iter()
-            .filter_map(|(unit, load)| satisfies(load, required).then_some(*unit))
+            .filter_map(|(carrier, load)| satisfies(load, required).then_some(*carrier))
             .collect::<BTreeSet<_>>();
         if choices.is_empty() {
             return Err(incomplete);
         }
-        disjunctions.insert(CompilerSourceDisjunction {
+        disjunctions.insert(CompilerCrateLoadDisjunction {
             trigger,
             choices: choices.into_iter().collect(),
         });
@@ -1107,18 +1123,19 @@ pub(super) fn validate_external_crate_facts(
                 (requirement.kind == kind)
                     .then_some(requirement.source)
                     .flatten()
+                    .map(CompilerCrateLoadCarrier::Source)
             })
             .collect::<BTreeSet<_>>();
-        choices.extend(source_loads.iter().filter_map(|(unit, load)| {
+        choices.extend(source_loads.iter().filter_map(|(carrier, load)| {
             load.closure
                 .iter()
                 .any(|dependency| carriers.contains(&dependency.crate_identity))
-                .then_some(*unit)
+                .then_some(*carrier)
         }));
         if choices.is_empty() {
             return Err(incomplete);
         }
-        disjunctions.insert(CompilerSourceDisjunction {
+        disjunctions.insert(CompilerCrateLoadDisjunction {
             trigger: None,
             choices: choices.into_iter().collect(),
         });

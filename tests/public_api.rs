@@ -197,7 +197,7 @@ fn compiler_recipe_identifies_normalized_compilation_options_but_not_source_text
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
-fn unselected_macro_rules_are_physically_removed_and_idempotent() {
+fn binary_exported_macros_remove_unselected_rules_and_dead_selected_components() {
     use rust_item_dependencies::source::WrittenUnitKind;
 
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
@@ -207,7 +207,7 @@ fn unselected_macro_rules_are_physically_removed_and_idempotent() {
 
     let verified = analyzer
         .reduce_and_verify(&input)
-        .expect("unused macro rules must preserve compiler decisions");
+        .expect("binary-local exported macros must be reducible");
     assert_eq!(verified.reduced_source(), expected);
     assert!(verified.reduced_source().len() < source.len());
     assert_eq!(
@@ -230,7 +230,11 @@ fn unselected_macro_rules_are_physically_removed_and_idempotent() {
         .iter()
         .filter(|unit| unit.kind == WrittenUnitKind::MacroRule)
         .collect::<Vec<_>>();
-    assert_eq!(rules.len(), 6);
+    assert_eq!(
+        rules.len(),
+        6,
+        "binary-local exported and private macro definitions must both be refined"
+    );
     assert!(rules.iter().all(|rule| {
         rule.parent.is_some_and(|parent| {
             analysis.source_units()[parent.0 as usize].kind == WrittenUnitKind::MacroDefinition
@@ -246,7 +250,7 @@ fn unselected_macro_rules_are_physically_removed_and_idempotent() {
         std::collections::BTreeSet::from([
             concat!(
                 "(@unused) => {\n",
-                "        compile_error!(\"an unselected rule must be removable\");\n",
+                "        compile_error!(\"an exported rule must remain available\");\n",
                 "    };"
             ),
             concat!(
@@ -263,6 +267,9 @@ fn unselected_macro_rules_are_physically_removed_and_idempotent() {
             .count(),
         4
     );
+    assert!(!verified.reduced_source().contains("selected_dead_local"));
+    assert!(!verified.reduced_source().contains("selected_dead_item"));
+    assert!(verified.reduced_source().contains("fn value"));
     assert_eq!(
         verified
             .pieces()
@@ -491,7 +498,7 @@ fn compiler_decision_changes_caused_by_line_are_rejected() {
             "fn dead() {\n",
             "    let _ = 0;\n",
             "}\n",
-            "fn main() { let _ = <Line<{ line!() }> as Pick>::value(); }\n",
+            "fn main() { let _ = (<Line<6> as Pick>::value, <Line<8> as Pick>::value); let _ = <Line<{ line!() }> as Pick>::value(); }\n",
         )
         .to_owned(), Edition::Rust2024, host_target());
 

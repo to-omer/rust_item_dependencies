@@ -5,11 +5,19 @@ macro_rules! _dispatch {
     };
     (@emit) => {
         fn value() -> u32 {
+macro_rules! selected_dead_local {
+    () => {
+        99
+    };
+}
+fn selected_dead_item() -> u32 {
+    99
+}
             7
         }
     };
     (@unused) => {
-        compile_error!("an unselected rule must be removable");
+        compile_error!("an exported rule must remain available");
     };
 }
 

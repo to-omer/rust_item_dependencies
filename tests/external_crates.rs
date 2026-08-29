@@ -9,8 +9,9 @@ mod patched {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rust_item_dependencies::{
-        AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, SourceInput,
-        UnsupportedReason, VerifiedReduction, error::DiagnosticLevel, source::ByteRange,
+        AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel,
+        SourceInput, UnsupportedReason, VerifiedReduction, error::DiagnosticLevel,
+        source::ByteRange,
     };
 
     const LEAF_SOURCE: &str = include_str!("fixtures/external_crates/leaf.rs");
@@ -186,6 +187,91 @@ mod patched {
                 "{}",
                 case.name
             );
+        }
+    }
+
+    #[test]
+    fn cross_crate_inlining_preserves_selected_associated_overrides() {
+        let artifacts = ExternalArtifacts::build();
+        let options = artifacts
+            .options()
+            .with_optimization_level(OptimizationLevel::O3);
+        let analyzer = Analyzer::new_with_options(options)
+            .expect("the optimized external-crate context must be accepted");
+        let target = host_target();
+        let source = concat!(
+            "struct Local;\n",
+            "impl external_wrapper::ExternalStorage for Local {\n",
+            "    #[inline(always)]\n",
+            "    fn normalize(value: u32) -> u32 { value + 6 }\n",
+            "}\n",
+            "fn unused() {}\n",
+            "fn main() {\n",
+            "    assert_eq!(external_wrapper::external_get::<Local>(1), 7);\n",
+            "}\n",
+        );
+        let original = input(source, Edition::Rust2021, &target);
+
+        let verified = analyzer
+            .reduce_and_verify(&original)
+            .expect("the external associated selection must survive inlining");
+        assert!(!verified.reduced_source().contains("fn unused"));
+        assert!(verified.reduced_source().contains("fn normalize"));
+
+        let reduced = input(verified.reduced_source(), Edition::Rust2021, &target);
+        let fixed = analyzer
+            .reduce_and_verify(&reduced)
+            .expect("the external associated selection must reach a fixed point");
+        assert_eq!(fixed.reduced_source(), verified.reduced_source());
+
+        let original_output = compile_and_run(&original, &artifacts, "external_inline_original");
+        let reduced_output = compile_and_run(&reduced, &artifacts, "external_inline_reduced");
+        assert!(original_output.status.success());
+        assert_eq!(reduced_output.status, original_output.status);
+        assert_eq!(reduced_output.stdout, original_output.stdout);
+        assert_eq!(reduced_output.stderr, original_output.stderr);
+    }
+
+    #[test]
+    fn empty_external_declarative_macro_is_removed_and_reaches_a_fixed_point() {
+        let artifacts = ExternalArtifacts::build();
+        let analyzer = Analyzer::new_with_options(artifacts.options()).unwrap();
+        let target = host_target();
+        let expected = "fn main(){println!(\"ok\");}";
+        for (name, edition, source) in [
+            (
+                "2018",
+                Edition::Rust2018,
+                "external_wrapper::external_empty!();fn main(){println!(\"ok\");}",
+            ),
+            (
+                "2015",
+                Edition::Rust2015,
+                "#[macro_use]extern crate external_wrapper;external_empty!();fn main(){println!(\"ok\");}",
+            ),
+        ] {
+            let original = input(source, edition, &target);
+            let verified = analyzer.reduce_and_verify(&original).unwrap();
+            assert_eq!(verified.reduced_source(), expected, "{name}");
+            assert_eq!(
+                verified.verification().original_snapshot_hash(),
+                verified.verification().reduced_snapshot_hash(),
+                "{name}"
+            );
+
+            let reduced = input(expected, edition, &target);
+            let fixed = analyzer.reduce_and_verify(&reduced).unwrap();
+            assert_eq!(fixed.reduced_source(), expected, "{name}");
+
+            let original_output =
+                compile_and_run(&original, &artifacts, &format!("empty_{name}_original"));
+            let reduced_output =
+                compile_and_run(&reduced, &artifacts, &format!("empty_{name}_reduced"));
+            assert!(original_output.status.success(), "{name}");
+            assert_eq!(original_output.stdout, b"ok\n", "{name}");
+            assert_eq!(reduced_output.status, original_output.status, "{name}");
+            assert_eq!(reduced_output.stdout, original_output.stdout, "{name}");
+            assert_eq!(reduced_output.stderr, original_output.stderr, "{name}");
         }
     }
 
@@ -915,6 +1001,8 @@ mod patched {
         match edition {
             Edition::Rust2015 => "2015",
             Edition::Rust2018 => "2018",
+            Edition::Rust2021 => "2021",
+            Edition::Rust2024 => "2024",
             unsupported => panic!("unsupported external-crate test edition: {unsupported:?}"),
         }
     }

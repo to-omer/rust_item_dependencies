@@ -12,21 +12,26 @@ use crate::compiler_terms::CanonicalCompilerTerm;
 use crate::dependency_graph::{
     AllocationPathSite, AllocationRootKey, BuiltinTraitTarget, DefinitionReferenceKey,
     DependencyGraph, DependencyKind, ExpansionId, ExpansionKey, ExpansionKeyPart, ExpansionKind,
-    GraphNode, MacroImplementationKind, MonoId, MonoInstanceKey, MonoInstanceRole, MonoKey,
-    ObservationSite, ProjectionOutcome, ProjectionSourceKind, ProofId, ProofKey, ProofNodeKind,
-    ProofRelationKind, RootReason, SelectionSource, SelectionSourceKind, SolverTracePayload,
-    SpecializationNode, SpecializationNodeKind,
+    GraphNode, MacroImplementationKind, MonoCollection, MonoId, MonoInstanceKey, MonoInstanceRole,
+    MonoKey, ObservationSite, ProjectionOutcome, ProjectionSourceKind, ProofId, ProofKey,
+    ProofNodeKind, ProofRelationKind, RootReason, SelectionSource, SelectionSourceKind,
+    SolverTracePayload, SpecializationNode, SpecializationNodeKind,
 };
 use crate::digest::sha256;
 use crate::graph::{
     DefinitionId, DefinitionKey, DefinitionOriginKey, DefinitionTarget, ExternalDefinitionId,
     ExternalDefinitionKey,
 };
-use crate::retention::{Retention, source_site_is_retained};
+use crate::retention::{Retention, SourceSiteOwnerIndex, source_site_is_retained};
 use crate::rewrite::SourceRewrite;
 use crate::source::{ByteRange, SourceInventory};
 
-const SNAPSHOT_SCHEMA: u8 = 5;
+const SNAPSHOT_SCHEMA: u8 = 7;
+
+type SourceFilter<'a> = (
+    &'a SourceSiteOwnerIndex,
+    &'a BTreeSet<crate::source::SourceUnitId>,
+);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum SnapshotNodeKey {
@@ -143,11 +148,31 @@ pub(crate) enum SnapshotObservationSite {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum SnapshotEdgeFrom {
+    Node(SnapshotNodeKey),
+    SourceAssociatedItem,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SnapshotEdge {
-    pub from: SnapshotNodeKey,
+    pub from: SnapshotEdgeFrom,
     pub to: SnapshotNodeKey,
     pub kind: DependencyKind,
     pub sites: Vec<SnapshotObservationSite>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SnapshotCollectionEdgeKey {
+    from: SnapshotEdgeFrom,
+    to: SnapshotNodeKey,
+    used_kind: DependencyKind,
+}
+
+#[derive(Default)]
+struct SnapshotCollectionObservations {
+    source_free: bool,
+    sites: BTreeSet<SnapshotObservationSite>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -206,6 +231,12 @@ impl CompilerDecisionSnapshot {
             .iter()
             .copied()
             .map(|node| {
+                if matches!(node, GraphNode::Expansion(expansion) if retention
+                    .outputless_macro_expansions
+                    .contains(&expansion))
+                {
+                    return Ok(None);
+                }
                 selected_node_survives_rewrite(graph, &rewrite.pieces, &surviving_expansions, node)
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -222,7 +253,9 @@ impl CompilerDecisionSnapshot {
             return Err(SnapshotError::InvalidRoot);
         }
 
-        let source_filter = Some((source, &retention.retained_units));
+        let source_sites =
+            SourceSiteOwnerIndex::new(source).map_err(|_| SnapshotError::InvalidSourceSite)?;
+        let source_filter = Some((&source_sites, &retention.retained_units));
         let mut work = selected.iter().copied().collect::<Vec<_>>();
         while let Some(from) = work.pop() {
             for edge in graph
@@ -237,13 +270,36 @@ impl CompilerDecisionSnapshot {
                 }
             }
         }
-        Self::build(graph, &selected, source_filter)
+        Self::build(
+            graph,
+            &selected,
+            source_filter,
+            &retention.outputless_macro_expansions,
+        )
     }
 
     /// Builds the observed decision set from the reduced analysis.  Every
     /// local definition is a root so a newly introduced retained definition
     /// cannot hide merely because it is not reachable from an entry root.
     pub(crate) fn reduced(graph: &DependencyGraph) -> Result<Self, SnapshotError> {
+        Self::reduced_excluding(graph, &BTreeSet::new())
+    }
+
+    /// Builds a reduced snapshot after excluding macro expansions whose
+    /// validated surviving output has no semantic product. This includes
+    /// directly empty expansions and transparent control-only parents whose
+    /// children are all outputless.
+    pub(crate) fn reduced_excluding_outputless_macros(
+        graph: &DependencyGraph,
+        outputless_macro_expansions: &BTreeSet<ExpansionId>,
+    ) -> Result<Self, SnapshotError> {
+        Self::reduced_excluding(graph, outputless_macro_expansions)
+    }
+
+    fn reduced_excluding(
+        graph: &DependencyGraph,
+        outputless_macro_expansions: &BTreeSet<ExpansionId>,
+    ) -> Result<Self, SnapshotError> {
         let mut selected = graph
             .definitions
             .definitions
@@ -255,12 +311,17 @@ impl CompilerDecisionSnapshot {
         let mut work = selected.iter().copied().collect::<Vec<_>>();
         while let Some(from) = work.pop() {
             for edge in graph.edges.iter().filter(|edge| edge.from == from) {
+                if matches!(edge.to, GraphNode::Expansion(expansion) if outputless_macro_expansions
+                    .contains(&expansion))
+                {
+                    continue;
+                }
                 if selected.insert(edge.to) {
                     work.push(edge.to);
                 }
             }
         }
-        Self::build(graph, &selected, None)
+        Self::build(graph, &selected, None, outputless_macro_expansions)
     }
 
     pub(crate) fn hash(&self) -> [u8; 32] {
@@ -302,9 +363,11 @@ impl CompilerDecisionSnapshot {
     fn build(
         graph: &DependencyGraph,
         selected: &BTreeSet<GraphNode>,
-        source_filter: Option<(&SourceInventory, &BTreeSet<crate::source::SourceUnitId>)>,
+        source_filter: Option<SourceFilter<'_>>,
+        outputless_macro_expansions: &BTreeSet<ExpansionId>,
     ) -> Result<Self, SnapshotError> {
-        let expansion_keys = snapshot_expansion_keys(graph, selected, source_filter)?;
+        let expansion_keys =
+            snapshot_expansion_keys(graph, selected, source_filter, outputless_macro_expansions)?;
         let mut roots = BTreeSet::new();
         for root in &graph.roots {
             if !selected.contains(&root.node)
@@ -334,26 +397,148 @@ impl CompilerDecisionSnapshot {
             let Some(sites) = snapshot_observation_sites(&edge.sites, source_filter)? else {
                 continue;
             };
-            edges.insert(SnapshotEdge {
-                from: node_key(graph, &expansion_keys, edge.from)?,
+            let snapshot = SnapshotEdge {
+                from: SnapshotEdgeFrom::Node(node_key(graph, &expansion_keys, edge.from)?),
                 to: node_key(graph, &expansion_keys, edge.to)?,
                 kind: snapshot_dependency_kind(&edge.kind),
                 sites,
-            });
+            };
+            edges.extend(project_source_associated_item(snapshot));
         }
 
         Ok(Self {
             roots,
             nodes,
-            edges,
+            edges: canonicalize_collection_edges(edges),
         })
     }
+}
+
+/// Projects a trait-associated item selected from pre-optimization source onto
+/// its source site. The observer propagates this proof through MIR inlining, so
+/// the optimized owner is placement rather than part of the selection itself.
+fn project_source_associated_item(mut edge: SnapshotEdge) -> Vec<SnapshotEdge> {
+    if !matches!(
+        edge.kind,
+        DependencyKind::SelectionProof {
+            relation: crate::dependency_graph::MonoDependencyKind::SourceAssociatedItem,
+            collection: MonoCollection::Mentioned,
+        }
+    ) {
+        return vec![edge];
+    }
+
+    let mut source_sites = Vec::new();
+    edge.sites.retain(|site| {
+        if matches!(
+            site,
+            SnapshotObservationSite::Source(_) | SnapshotObservationSite::ExternalSource
+        ) {
+            source_sites.push(*site);
+            false
+        } else {
+            true
+        }
+    });
+    if source_sites.is_empty() {
+        return vec![edge];
+    }
+
+    let mut projected =
+        Vec::with_capacity(source_sites.len() + usize::from(!edge.sites.is_empty()));
+    let target = edge.to.clone();
+    let kind = edge.kind.clone();
+    if !edge.sites.is_empty() {
+        projected.push(edge);
+    }
+    projected.extend(source_sites.into_iter().map(|site| SnapshotEdge {
+        from: SnapshotEdgeFrom::SourceAssociatedItem,
+        to: target.clone(),
+        kind: kind.clone(),
+        sites: vec![site],
+    }));
+    projected
+}
+
+/// Projects raw monomorphization observations onto compiler obligations.
+///
+/// `Mentioned` keeps an optimization-independent item available for compiler
+/// checks. An otherwise identical `Used` observation already requires that
+/// item for code generation and subsumes the same check. Distinct sites,
+/// relations, endpoints, and edge categories remain separate decisions.
+fn canonicalize_collection_edges(edges: BTreeSet<SnapshotEdge>) -> BTreeSet<SnapshotEdge> {
+    let mut used = BTreeMap::<SnapshotCollectionEdgeKey, SnapshotCollectionObservations>::new();
+    for edge in &edges {
+        let Some((MonoCollection::Used, key)) = snapshot_collection_edge_key(edge) else {
+            continue;
+        };
+        let observations = used.entry(key).or_default();
+        if edge.sites.is_empty() {
+            observations.source_free = true;
+        } else {
+            observations.sites.extend(edge.sites.iter().copied());
+        }
+    }
+
+    edges
+        .into_iter()
+        .filter_map(|mut edge| {
+            let Some((MonoCollection::Mentioned, key)) = snapshot_collection_edge_key(&edge) else {
+                return Some(edge);
+            };
+            let Some(used) = used.get(&key) else {
+                return Some(edge);
+            };
+            if edge.sites.is_empty() {
+                return (!used.source_free).then_some(edge);
+            }
+            edge.sites.retain(|site| !used.sites.contains(site));
+            (!edge.sites.is_empty()).then_some(edge)
+        })
+        .collect()
+}
+
+fn snapshot_collection_edge_key(
+    edge: &SnapshotEdge,
+) -> Option<(MonoCollection, SnapshotCollectionEdgeKey)> {
+    let (collection, used_kind) = match &edge.kind {
+        DependencyKind::Mono {
+            relation,
+            collection,
+        } => (
+            *collection,
+            DependencyKind::Mono {
+                relation: *relation,
+                collection: MonoCollection::Used,
+            },
+        ),
+        DependencyKind::SelectionProof {
+            relation,
+            collection,
+        } => (
+            *collection,
+            DependencyKind::SelectionProof {
+                relation: *relation,
+                collection: MonoCollection::Used,
+            },
+        ),
+        _ => return None,
+    };
+    Some((
+        collection,
+        SnapshotCollectionEdgeKey {
+            from: edge.from.clone(),
+            to: edge.to.clone(),
+            used_kind,
+        },
+    ))
 }
 
 fn snapshot_expansion_keys(
     graph: &DependencyGraph,
     selected: &BTreeSet<GraphNode>,
-    source_filter: Option<(&SourceInventory, &BTreeSet<crate::source::SourceUnitId>)>,
+    source_filter: Option<SourceFilter<'_>>,
+    outputless_macro_expansions: &BTreeSet<ExpansionId>,
 ) -> Result<Vec<ExpansionKey>, SnapshotError> {
     let mut keys = graph
         .expansions
@@ -373,6 +558,11 @@ fn snapshot_expansion_keys(
     if raw_ids.len() != graph.expansions.len() {
         return Err(SnapshotError::InvalidNode);
     }
+    let filtered_raw_ordinals = if outputless_macro_expansions.is_empty() {
+        None
+    } else {
+        Some(outputless_filtered_expansion_ordinals(graph, outputless_macro_expansions)?.0)
+    };
 
     let mut by_depth = graph
         .expansions
@@ -489,6 +679,12 @@ fn snapshot_expansion_keys(
                 if witnesses_are_canonical || subtree_is_canonical {
                     leaf.same_role_ordinal =
                         u32::try_from(ordinal).map_err(|_| SnapshotError::InvalidNode)?;
+                } else if let Some(filtered_raw_ordinals) = &filtered_raw_ordinals {
+                    leaf.same_role_ordinal = filtered_raw_ordinals
+                        .get(id.0 as usize)
+                        .copied()
+                        .flatten()
+                        .ok_or(SnapshotError::InvalidNode)?;
                 }
                 let mut parts = parent.as_ref().map_or_else(Vec::new, |key| key.0.clone());
                 parts.push(leaf);
@@ -506,6 +702,128 @@ fn snapshot_expansion_keys(
         return Err(SnapshotError::InvalidNode);
     }
     Ok(keys)
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct OutputlessOrdinalWork {
+    #[cfg(test)]
+    expansion_visits: usize,
+    #[cfg(test)]
+    grouped_expansions: usize,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct ExpansionSiblingRole<'a> {
+    parent: Option<ExpansionId>,
+    kind: &'a ExpansionKind,
+    fragment: Option<crate::dependency_graph::ExpansionFragmentKind>,
+    implementation: Option<MacroImplementationKind>,
+    invocation_range: Option<ByteRange>,
+    node_range: Option<ByteRange>,
+    target_range: Option<ByteRange>,
+    macro_definition: Option<&'a DefinitionReferenceKey>,
+    selected_macro_rule: Option<ByteRange>,
+}
+
+fn expansion_sibling_role(
+    node: &crate::dependency_graph::ExpansionNode,
+) -> Result<ExpansionSiblingRole<'_>, SnapshotError> {
+    let leaf = node.key.0.last().ok_or(SnapshotError::InvalidNode)?;
+    Ok(ExpansionSiblingRole {
+        // This is the same identity-parent precedence validated by
+        // DependencyGraph::new when it checks the stored key prefix.
+        parent: node
+            .discovered_in
+            .or(node.source_call_parent)
+            .or(node.semantic_parent),
+        kind: &leaf.kind,
+        fragment: leaf.fragment,
+        implementation: leaf.implementation,
+        invocation_range: leaf.invocation_range,
+        node_range: leaf.node_range,
+        target_range: leaf.target_range,
+        macro_definition: leaf.macro_definition.as_ref(),
+        selected_macro_rule: leaf.selected_macro_rule,
+    })
+}
+
+fn outputless_filtered_expansion_ordinals(
+    graph: &DependencyGraph,
+    outputless_macro_expansions: &BTreeSet<ExpansionId>,
+) -> Result<(Vec<Option<u32>>, OutputlessOrdinalWork), SnapshotError> {
+    debug_assert!(!outputless_macro_expansions.is_empty());
+    let mut affected_roles = BTreeSet::new();
+    for id in outputless_macro_expansions {
+        let expansion = graph
+            .expansions
+            .get(id.0 as usize)
+            .filter(|expansion| expansion.id == *id)
+            .ok_or(SnapshotError::InvalidNode)?;
+        affected_roles.insert(expansion_sibling_role(expansion)?);
+    }
+
+    #[cfg(test)]
+    let mut work = OutputlessOrdinalWork::default();
+    #[cfg(not(test))]
+    let work = OutputlessOrdinalWork::default();
+    let mut ordinals = vec![None; graph.expansions.len()];
+    let mut groups = BTreeMap::<ExpansionSiblingRole<'_>, Vec<(u32, ExpansionId)>>::new();
+    for expansion in &graph.expansions {
+        #[cfg(test)]
+        {
+            work.expansion_visits += 1;
+        }
+        let leaf = expansion.key.0.last().ok_or(SnapshotError::InvalidNode)?;
+        let raw_ordinal = leaf.same_role_ordinal;
+        *ordinals
+            .get_mut(expansion.id.0 as usize)
+            .ok_or(SnapshotError::InvalidNode)? = Some(raw_ordinal);
+        let role = expansion_sibling_role(expansion)?;
+        if affected_roles.contains(&role) {
+            #[cfg(test)]
+            {
+                work.grouped_expansions += 1;
+            }
+            groups
+                .entry(role)
+                .or_default()
+                .push((raw_ordinal, expansion.id));
+        }
+    }
+
+    for members in groups.values_mut() {
+        members.sort_unstable();
+        let mut excluded_before = 0_u32;
+        let mut previous = None;
+        for &(raw_ordinal, id) in members.iter() {
+            if previous == Some(raw_ordinal)
+                || graph
+                    .expansions
+                    .get(id.0 as usize)
+                    .is_none_or(|candidate| candidate.id != id)
+            {
+                return Err(SnapshotError::InvalidNode);
+            }
+            previous = Some(raw_ordinal);
+            if outputless_macro_expansions.contains(&id) {
+                *ordinals
+                    .get_mut(id.0 as usize)
+                    .ok_or(SnapshotError::InvalidNode)? = None;
+                excluded_before = excluded_before
+                    .checked_add(1)
+                    .ok_or(SnapshotError::InvalidNode)?;
+                continue;
+            }
+            *ordinals
+                .get_mut(id.0 as usize)
+                .ok_or(SnapshotError::InvalidNode)? = Some(
+                raw_ordinal
+                    .checked_sub(excluded_before)
+                    .ok_or(SnapshotError::InvalidNode)?,
+            );
+        }
+    }
+    Ok((ordinals, work))
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -632,7 +950,7 @@ fn expansion_use_witness(
     graph: &DependencyGraph,
     selected: &BTreeSet<GraphNode>,
     expansion: ExpansionId,
-    source_filter: Option<(&SourceInventory, &BTreeSet<crate::source::SourceUnitId>)>,
+    source_filter: Option<SourceFilter<'_>>,
 ) -> Result<BTreeSet<DefinitionKey>, SnapshotError> {
     let mut witness = BTreeSet::new();
     for edge in graph.edges.iter().filter(|edge| {
@@ -653,13 +971,13 @@ fn expansion_use_witness(
 
 fn snapshot_observation_sites(
     observations: &[ObservationSite],
-    source_filter: Option<(&SourceInventory, &BTreeSet<crate::source::SourceUnitId>)>,
+    source_filter: Option<SourceFilter<'_>>,
 ) -> Result<Option<Vec<SnapshotObservationSite>>, SnapshotError> {
     let mut sites = BTreeSet::new();
     for site in observations {
         if let ObservationSite::Source(range) = site
-            && let Some((source, retained_units)) = source_filter
-            && !source_site_is_retained(source, retained_units, *range)
+            && let Some((source_sites, retained_units)) = source_filter
+            && !source_site_is_retained(source_sites, retained_units, *range)
                 .map_err(|_| SnapshotError::InvalidSourceSite)?
         {
             continue;
@@ -1384,7 +1702,13 @@ fn put_specialization_node(bytes: &mut Vec<u8>, node: &SnapshotSpecializationNod
 }
 
 fn put_snapshot_edge(bytes: &mut Vec<u8>, edge: &SnapshotEdge) {
-    put_snapshot_node_key(bytes, &edge.from);
+    match &edge.from {
+        SnapshotEdgeFrom::Node(node) => {
+            put_u8(bytes, 0);
+            put_snapshot_node_key(bytes, node);
+        }
+        SnapshotEdgeFrom::SourceAssociatedItem => put_u8(bytes, 1),
+    }
     put_snapshot_node_key(bytes, &edge.to);
     put_dependency_kind(bytes, &edge.kind);
     put_len(bytes, edge.sites.len());
@@ -2077,7 +2401,7 @@ mod tests {
     }
 
     fn two_item_inventory() -> SourceInventory {
-        let source = Arc::<str>::from("ab");
+        let source = Arc::<str>::from(";;");
         let (normalized, offsets) = OriginalOffsetMap::from_source(&source).unwrap();
         SourceInventory {
             original: source,
@@ -2126,6 +2450,8 @@ mod tests {
             ],
             derive_targets: Vec::new(),
             macro_rules: Vec::new(),
+            macro_templates: Vec::new(),
+            macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         }
     }
@@ -2135,6 +2461,67 @@ mod tests {
         inventory.units[1].kind = WrittenUnitKind::MacroInvocation;
         inventory.units[2].kind = WrittenUnitKind::MacroInvocation;
         inventory
+    }
+
+    fn four_unit_inventory() -> SourceInventory {
+        SourceInventory {
+            original: Arc::from("abcd"),
+            normalized: Arc::from("abcd"),
+            offsets: OriginalOffsetMap::from_source("abcd").unwrap().1,
+            units: vec![
+                WrittenUnit {
+                    id: SourceUnitId(0),
+                    kind: WrittenUnitKind::CrateRoot,
+                    full_range: ByteRange { start: 0, end: 4 },
+                    parent: None,
+                    cfg_state: CfgState::Active,
+                    atomic_group: AtomicGroupId(0),
+                    same_role_ordinal: 0,
+                },
+                WrittenUnit {
+                    id: SourceUnitId(1),
+                    kind: WrittenUnitKind::Item,
+                    full_range: ByteRange { start: 1, end: 2 },
+                    parent: Some(SourceUnitId(0)),
+                    cfg_state: CfgState::Active,
+                    atomic_group: AtomicGroupId(1),
+                    same_role_ordinal: 0,
+                },
+                WrittenUnit {
+                    id: SourceUnitId(2),
+                    kind: WrittenUnitKind::Item,
+                    full_range: ByteRange { start: 2, end: 3 },
+                    parent: Some(SourceUnitId(0)),
+                    cfg_state: CfgState::Active,
+                    atomic_group: AtomicGroupId(2),
+                    same_role_ordinal: 1,
+                },
+                WrittenUnit {
+                    id: SourceUnitId(3),
+                    kind: WrittenUnitKind::Item,
+                    full_range: ByteRange { start: 3, end: 4 },
+                    parent: Some(SourceUnitId(0)),
+                    cfg_state: CfgState::Active,
+                    atomic_group: AtomicGroupId(3),
+                    same_role_ordinal: 2,
+                },
+            ],
+            pieces: (0..4)
+                .map(|start| OwnedPiece {
+                    range: ByteRange {
+                        start,
+                        end: start + 1,
+                    },
+                    owner: SourceUnitId(start),
+                    kind: PieceKind::Token,
+                })
+                .collect(),
+            derive_targets: Vec::new(),
+            macro_rules: Vec::new(),
+            macro_templates: Vec::new(),
+            macro_repetitions: Vec::new(),
+            ownerless_attribute_invocations: Vec::new(),
+        }
     }
 
     fn external_definition(id: u32) -> ExternalDefinition {
@@ -2665,6 +3052,250 @@ mod tests {
     }
 
     #[test]
+    fn used_collection_subsumes_only_the_same_mentioned_observation() {
+        let fixture = snapshot();
+        let from = SnapshotEdgeFrom::Node(SnapshotNodeKey::Mono(
+            snapshot_entry_instance(&fixture).clone(),
+        ));
+        let mono_to = SnapshotNodeKey::Mono(MonoKey::Static {
+            definition: definition_key("required", 10),
+        });
+        let proof_to = SnapshotNodeKey::Proof(ProofKey::Obligation {
+            environment: term(10),
+            predicate: term(11),
+        });
+        let first = SnapshotObservationSite::Source(ByteRange { start: 1, end: 2 });
+        let second = SnapshotObservationSite::Source(ByteRange { start: 3, end: 4 });
+        let edge = |to: &SnapshotNodeKey, kind, sites| SnapshotEdge {
+            from: from.clone(),
+            to: to.clone(),
+            kind,
+            sites,
+        };
+        let used = edge(
+            &mono_to,
+            DependencyKind::Mono {
+                relation: crate::dependency_graph::MonoDependencyKind::ConstAllocation,
+                collection: MonoCollection::Used,
+            },
+            vec![first],
+        );
+        let mentioned = edge(
+            &mono_to,
+            DependencyKind::Mono {
+                relation: crate::dependency_graph::MonoDependencyKind::ConstAllocation,
+                collection: MonoCollection::Mentioned,
+            },
+            vec![first, second],
+        );
+        let selection_used = edge(
+            &proof_to,
+            DependencyKind::SelectionProof {
+                relation: crate::dependency_graph::MonoDependencyKind::VTableConstruction,
+                collection: MonoCollection::Used,
+            },
+            vec![SnapshotObservationSite::CompilerGenerated],
+        );
+        let selection_mentioned = edge(
+            &proof_to,
+            DependencyKind::SelectionProof {
+                relation: crate::dependency_graph::MonoDependencyKind::VTableConstruction,
+                collection: MonoCollection::Mentioned,
+            },
+            vec![SnapshotObservationSite::CompilerGenerated],
+        );
+
+        assert_eq!(
+            canonicalize_collection_edges(BTreeSet::from([
+                used.clone(),
+                mentioned.clone(),
+                selection_used.clone(),
+                selection_mentioned,
+            ])),
+            BTreeSet::from([
+                used.clone(),
+                edge(
+                    &mono_to,
+                    DependencyKind::Mono {
+                        relation: crate::dependency_graph::MonoDependencyKind::ConstAllocation,
+                        collection: MonoCollection::Mentioned,
+                    },
+                    vec![second],
+                ),
+                selection_used,
+            ]),
+        );
+        let used_only = canonicalize_collection_edges(BTreeSet::from([used]));
+        let mentioned_only = canonicalize_collection_edges(BTreeSet::from([mentioned]));
+        assert_ne!(used_only, mentioned_only);
+
+        let mut original = fixture.clone();
+        original.edges = mentioned_only;
+        let mut reduced = fixture;
+        reduced.edges = used_only;
+        assert!(matches!(
+            original.first_difference(&reduced),
+            Some(SnapshotDiff::Edge { .. })
+        ));
+        assert!(matches!(
+            reduced.first_difference(&original),
+            Some(SnapshotDiff::Edge { .. })
+        ));
+    }
+
+    #[test]
+    fn source_associated_item_is_independent_of_inlined_mir_owner() {
+        let caller_a = SnapshotNodeKey::Mono(MonoKey::Static {
+            definition: definition_key("caller_a", 10),
+        });
+        let caller_b = SnapshotNodeKey::Mono(MonoKey::Static {
+            definition: definition_key("caller_b", 20),
+        });
+        let target = SnapshotNodeKey::Proof(ProofKey::Obligation {
+            environment: term(12),
+            predicate: term(13),
+        });
+        let other_target = SnapshotNodeKey::Proof(ProofKey::Obligation {
+            environment: term(12),
+            predicate: term(14),
+        });
+        let source = SnapshotObservationSite::Source(ByteRange { start: 40, end: 41 });
+        let second_source = SnapshotObservationSite::Source(ByteRange { start: 42, end: 43 });
+        let kind = DependencyKind::SelectionProof {
+            relation: crate::dependency_graph::MonoDependencyKind::SourceAssociatedItem,
+            collection: MonoCollection::Mentioned,
+        };
+        let make_edge =
+            |from: &SnapshotNodeKey,
+             to: &SnapshotNodeKey,
+             kind: DependencyKind,
+             sites: Vec<SnapshotObservationSite>| SnapshotEdge {
+                from: SnapshotEdgeFrom::Node(from.clone()),
+                to: to.clone(),
+                kind,
+                sites,
+            };
+        let project = |edges: Vec<SnapshotEdge>| {
+            canonicalize_collection_edges(
+                edges
+                    .into_iter()
+                    .flat_map(project_source_associated_item)
+                    .collect(),
+            )
+        };
+
+        let original_edges = project(vec![
+            make_edge(
+                &caller_a,
+                &target,
+                kind.clone(),
+                vec![source, second_source],
+            ),
+            make_edge(&caller_b, &target, kind.clone(), vec![source]),
+        ]);
+        let reduced_edges = project(vec![make_edge(
+            &caller_b,
+            &target,
+            kind.clone(),
+            vec![source, second_source],
+        )]);
+        assert_eq!(original_edges, reduced_edges);
+        assert!(
+            original_edges
+                .iter()
+                .all(|edge| edge.from == SnapshotEdgeFrom::SourceAssociatedItem)
+        );
+
+        let mixed = project_source_associated_item(make_edge(
+            &caller_a,
+            &target,
+            kind.clone(),
+            vec![
+                source,
+                SnapshotObservationSite::ExternalSource,
+                SnapshotObservationSite::CompilerGenerated,
+            ],
+        ));
+        assert_eq!(mixed.len(), 3);
+        assert!(mixed.iter().any(|edge| {
+            edge.from == SnapshotEdgeFrom::SourceAssociatedItem && edge.sites == vec![source]
+        }));
+        assert!(mixed.iter().any(|edge| {
+            edge.from == SnapshotEdgeFrom::SourceAssociatedItem
+                && edge.sites == vec![SnapshotObservationSite::ExternalSource]
+        }));
+        assert!(mixed.iter().any(|edge| {
+            edge.from == SnapshotEdgeFrom::Node(caller_a.clone())
+                && edge.sites == vec![SnapshotObservationSite::CompilerGenerated]
+        }));
+
+        assert_eq!(
+            project_source_associated_item(make_edge(
+                &caller_a,
+                &target,
+                kind.clone(),
+                vec![SnapshotObservationSite::ExternalSource],
+            )),
+            project_source_associated_item(make_edge(
+                &caller_b,
+                &target,
+                kind.clone(),
+                vec![SnapshotObservationSite::ExternalSource],
+            ))
+        );
+
+        assert_ne!(
+            project_source_associated_item(make_edge(
+                &caller_a,
+                &target,
+                kind.clone(),
+                vec![SnapshotObservationSite::CompilerGenerated],
+            )),
+            project_source_associated_item(make_edge(
+                &caller_b,
+                &target,
+                kind.clone(),
+                vec![SnapshotObservationSite::CompilerGenerated],
+            ))
+        );
+        assert_ne!(
+            original_edges,
+            project(vec![make_edge(
+                &caller_a,
+                &other_target,
+                kind.clone(),
+                vec![source, second_source],
+            )])
+        );
+        assert_ne!(
+            original_edges,
+            project(vec![make_edge(
+                &caller_a,
+                &target,
+                kind,
+                vec![
+                    source,
+                    SnapshotObservationSite::Source(ByteRange { start: 43, end: 44 })
+                ],
+            )])
+        );
+
+        let ordinary = DependencyKind::SelectionProof {
+            relation: crate::dependency_graph::MonoDependencyKind::DirectCall,
+            collection: MonoCollection::Mentioned,
+        };
+        assert_ne!(
+            project_source_associated_item(make_edge(
+                &caller_a,
+                &target,
+                ordinary.clone(),
+                vec![source],
+            )),
+            project_source_associated_item(make_edge(&caller_b, &target, ordinary, vec![source],))
+        );
+    }
+
+    #[test]
     fn only_top_level_trace_relation_ordinals_are_query_local() {
         for relation in [
             ProofRelationKind::TraceObligation,
@@ -2728,6 +3359,7 @@ mod tests {
                 GraphNode::Mono(MonoId(0)),
             ]),
             retained_units: BTreeSet::from([SourceUnitId(0), SourceUnitId(1)]),
+            outputless_macro_expansions: BTreeSet::new(),
         };
 
         let inventory = two_item_inventory();
@@ -2790,6 +3422,7 @@ mod tests {
                 GraphNode::Definition(DefinitionId(1)),
             ]),
             retained_units,
+            outputless_macro_expansions: BTreeSet::new(),
         };
         let rewrite =
             crate::rewrite::rewrite_source(&inventory, &retention.retained_units).unwrap();
@@ -2955,6 +3588,7 @@ mod tests {
             semantic_required: BTreeSet::new(),
             compile_required,
             retained_units: BTreeSet::from([SourceUnitId(0), SourceUnitId(1)]),
+            outputless_macro_expansions: BTreeSet::new(),
         };
         let inventory = two_macro_inventory();
         let rewrite =
@@ -3018,6 +3652,137 @@ mod tests {
                     .contains_key(&SnapshotNodeKey::Expansion(expansion.key.clone()))
             );
         }
+        assert_eq!(original, reduced);
+        assert_eq!(original.hash(), reduced.hash());
+        assert_eq!(original.first_difference(&reduced), None);
+    }
+
+    #[test]
+    fn snapshots_exclude_only_validated_outputless_macro_expansions() {
+        let graph = graph_with_expansion_sibling_order(
+            [DefinitionId(1), DefinitionId(2), DefinitionId(3)],
+            SiblingWitness::UniqueExpansionUse,
+        );
+        let outputless = ExpansionId(2);
+        let retained_key = SnapshotNodeKey::Expansion(graph.expansions[1].key.clone());
+        let all_nodes = BTreeSet::from_iter(
+            graph
+                .definitions
+                .definitions
+                .iter()
+                .map(|definition| GraphNode::Definition(definition.id))
+                .chain(
+                    graph
+                        .expansions
+                        .iter()
+                        .map(|expansion| GraphNode::Expansion(expansion.id)),
+                )
+                .chain(graph.roots.iter().map(|root| root.node)),
+        );
+        let inventory = four_unit_inventory();
+        let retention = Retention {
+            semantic_required: BTreeSet::new(),
+            compile_required: all_nodes,
+            retained_units: inventory.units.iter().map(|unit| unit.id).collect(),
+            outputless_macro_expansions: BTreeSet::from([outputless]),
+        };
+        let rewrite =
+            crate::rewrite::rewrite_source(&inventory, &retention.retained_units).unwrap();
+
+        let original =
+            CompilerDecisionSnapshot::original(&graph, &inventory, &retention, &rewrite).unwrap();
+        let reduced = CompilerDecisionSnapshot::reduced_excluding_outputless_macros(
+            &graph,
+            &retention.outputless_macro_expansions,
+        )
+        .unwrap();
+        let unfiltered = CompilerDecisionSnapshot::reduced(&graph).unwrap();
+
+        let expansion_count = |snapshot: &CompilerDecisionSnapshot| {
+            snapshot
+                .nodes
+                .keys()
+                .filter(|key| matches!(key, SnapshotNodeKey::Expansion(_)))
+                .count()
+        };
+        assert_eq!(expansion_count(&original), 3);
+        assert_eq!(expansion_count(&reduced), 3);
+        assert_eq!(expansion_count(&unfiltered), 4);
+        assert!(original.nodes.contains_key(&retained_key));
+        assert!(reduced.nodes.contains_key(&retained_key));
+        assert_eq!(original, reduced);
+        assert!(unfiltered.first_difference(&reduced).is_some());
+
+        assert_eq!(
+            CompilerDecisionSnapshot::reduced_excluding_outputless_macros(
+                &graph,
+                &BTreeSet::from([ExpansionId(99)]),
+            ),
+            Err(SnapshotError::InvalidNode)
+        );
+    }
+
+    #[test]
+    fn outputless_sibling_removal_compacts_ambiguous_expansion_ordinals() {
+        let original_graph = graph_with_expansion_sibling_order(
+            [DefinitionId(1), DefinitionId(2), DefinitionId(3)],
+            SiblingWitness::Duplicate,
+        );
+        let outputless = ExpansionId(2);
+        let all_nodes = BTreeSet::from_iter(
+            original_graph
+                .definitions
+                .definitions
+                .iter()
+                .map(|definition| GraphNode::Definition(definition.id))
+                .chain(
+                    original_graph
+                        .expansions
+                        .iter()
+                        .map(|expansion| GraphNode::Expansion(expansion.id)),
+                )
+                .chain(original_graph.roots.iter().map(|root| root.node)),
+        );
+        let inventory = four_unit_inventory();
+        let retention = Retention {
+            semantic_required: BTreeSet::new(),
+            compile_required: all_nodes,
+            retained_units: inventory.units.iter().map(|unit| unit.id).collect(),
+            outputless_macro_expansions: BTreeSet::from([outputless]),
+        };
+        let rewrite =
+            crate::rewrite::rewrite_source(&inventory, &retention.retained_units).unwrap();
+        let original =
+            CompilerDecisionSnapshot::original(&original_graph, &inventory, &retention, &rewrite)
+                .unwrap();
+
+        let mut reduced_graph = original_graph.clone();
+        reduced_graph.expansions.remove(outputless.0 as usize);
+        let shifted = reduced_graph
+            .expansions
+            .get_mut(outputless.0 as usize)
+            .expect("the trailing sibling must shift into the removed slot");
+        shifted.id = outputless;
+        shifted
+            .key
+            .0
+            .last_mut()
+            .expect("the sibling key must have a leaf")
+            .same_role_ordinal = 1;
+        let remap = |node: &mut GraphNode| match node {
+            GraphNode::Expansion(id) if *id == ExpansionId(3) => *id = outputless,
+            _ => {}
+        };
+        reduced_graph.edges.retain(|edge| {
+            edge.from != GraphNode::Expansion(outputless)
+                && edge.to != GraphNode::Expansion(outputless)
+        });
+        for edge in &mut reduced_graph.edges {
+            remap(&mut edge.from);
+            remap(&mut edge.to);
+        }
+        let reduced = CompilerDecisionSnapshot::reduced(&reduced_graph).unwrap();
+
         assert_eq!(original, reduced);
         assert_eq!(original.hash(), reduced.hash());
         assert_eq!(original.first_difference(&reduced), None);
@@ -3236,6 +4001,7 @@ mod tests {
         );
         let inventory = two_item_inventory();
         let retained_units = BTreeSet::from([SourceUnitId(0), SourceUnitId(1)]);
+        let source_sites = SourceSiteOwnerIndex::new(&inventory).unwrap();
 
         for id in 1..4 {
             assert_eq!(
@@ -3243,7 +4009,7 @@ mod tests {
                     &graph,
                     &selected,
                     ExpansionId(id),
-                    Some((&inventory, &retained_units)),
+                    Some((&source_sites, &retained_units)),
                 ),
                 Ok(BTreeSet::new())
             );
@@ -3288,7 +4054,7 @@ mod tests {
         ]);
 
         assert_eq!(graph.expansions[3].key.0[1].same_role_ordinal, 2);
-        let keys = snapshot_expansion_keys(&graph, &selected, None).unwrap();
+        let keys = snapshot_expansion_keys(&graph, &selected, None, &BTreeSet::new()).unwrap();
         assert_eq!(keys[3].0[1].same_role_ordinal, 0);
     }
 
@@ -3300,7 +4066,7 @@ mod tests {
         );
         let selected = BTreeSet::from_iter((0..4).map(|id| GraphNode::Expansion(ExpansionId(id))));
 
-        let keys = snapshot_expansion_keys(&graph, &selected, None).unwrap();
+        let keys = snapshot_expansion_keys(&graph, &selected, None, &BTreeSet::new()).unwrap();
 
         assert_eq!(
             keys[1..]
@@ -3309,6 +4075,86 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
+    }
+
+    #[test]
+    fn only_validated_outputless_siblings_are_removed_from_ambiguous_ordinals() {
+        let graph = graph_with_expansion_sibling_order(
+            [DefinitionId(1), DefinitionId(2), DefinitionId(3)],
+            SiblingWitness::Duplicate,
+        );
+        let selected = BTreeSet::from([
+            GraphNode::Expansion(ExpansionId(0)),
+            GraphNode::Expansion(ExpansionId(1)),
+            GraphNode::Expansion(ExpansionId(3)),
+        ]);
+
+        let ordinary = snapshot_expansion_keys(&graph, &selected, None, &BTreeSet::new()).unwrap();
+        let filtered =
+            snapshot_expansion_keys(&graph, &selected, None, &BTreeSet::from([ExpansionId(2)]))
+                .unwrap();
+
+        assert_eq!(ordinary[3].0[1].same_role_ordinal, 2);
+        assert_eq!(filtered[3].0[1].same_role_ordinal, 1);
+    }
+
+    #[test]
+    fn outputless_ordinal_filter_only_groups_the_affected_deep_sibling_role() {
+        const DEPTH: usize = 1_024;
+        let kind = ExpansionKind::Macro {
+            style: MacroStyle::Bang,
+            name: "recursive".into(),
+        };
+        let part = ExpansionKeyPart {
+            kind: kind.clone(),
+            fragment: Some(ExpansionFragmentKind::Items),
+            implementation: Some(MacroImplementationKind::Declarative),
+            invocation_range: None,
+            node_range: None,
+            target_range: None,
+            macro_definition: None,
+            selected_macro_rule: None,
+            same_role_ordinal: 0,
+        };
+        let mut key = Vec::new();
+        let mut expansions = Vec::with_capacity(DEPTH);
+        for index in 0..DEPTH {
+            key.push(part.clone());
+            let id = ExpansionId(index as u32);
+            expansions.push(ExpansionNode {
+                id,
+                key: ExpansionKey(key.clone()),
+                kind: kind.clone(),
+                fragment: part.fragment,
+                implementation: part.implementation,
+                discovered_in: (index != 0).then(|| ExpansionId(index as u32 - 1)),
+                semantic_parent: None,
+                source_call_parent: None,
+                written_invocation: None,
+                source_owner: None,
+                macro_definition: None,
+            });
+        }
+        let graph = DependencyGraph {
+            definitions: DefinitionGraph {
+                definitions: Vec::new(),
+                external_definitions: Vec::new(),
+                edges: Vec::new(),
+            },
+            expansions,
+            proofs: Vec::new(),
+            mono_nodes: Vec::new(),
+            edges: Vec::new(),
+            roots: Vec::new(),
+        };
+
+        let outputless = ExpansionId(DEPTH as u32 - 1);
+        let (filtered, filtered_work) =
+            outputless_filtered_expansion_ordinals(&graph, &BTreeSet::from([outputless])).unwrap();
+        assert_eq!(filtered[DEPTH - 2], Some(0));
+        assert_eq!(filtered[DEPTH - 1], None);
+        assert_eq!(filtered_work.expansion_visits, DEPTH);
+        assert_eq!(filtered_work.grouped_expansions, 1);
     }
 
     #[test]
@@ -3413,13 +4259,13 @@ mod tests {
             end: 8,
         })];
         let original_edge = SnapshotEdge {
-            from: mono.clone(),
+            from: SnapshotEdgeFrom::Node(mono.clone()),
             to: definition.clone(),
             kind: DependencyKind::Definition(crate::graph::DependencyKind::ValuePath),
             sites: source.clone(),
         };
         let reduced_edge = SnapshotEdge {
-            from: mono,
+            from: SnapshotEdgeFrom::Node(mono),
             to: definition,
             kind: DependencyKind::Definition(crate::graph::DependencyKind::TypePath),
             sites: source,

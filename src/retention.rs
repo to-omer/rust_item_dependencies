@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -10,19 +11,57 @@ use rustc_middle::ty::{self, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisi
 
 use crate::definitions::CollectedDefinitions;
 use crate::dependency_graph::{
-    DependencyGraph, DependencyKind, ExpansionNode, GraphNode, MacroImplementationKind,
-    expansion_source_survival, valid_roots,
+    DependencyGraph, DependencyKind, ExpansionId, ExpansionNode, GraphNode,
+    MacroImplementationKind, valid_roots,
+};
+#[cfg(test)]
+use crate::expansions::{
+    MacroCompleteOutputMeaning, MacroContributorDag, MacroContributorSetId,
+    MacroOutputMaterializationGroup, MacroOutputRange, MacroOwnerEffect, MacroProducerCoverage,
+};
+use crate::expansions::{
+    MacroCompleteOutputMeaningInventory, MacroProducerCoverageInventory,
+    validated_outputless_macro_expansions,
 };
 use crate::graph::{
     DefinitionGraph, DefinitionId, DefinitionKind, DefinitionOrigin, DefinitionTarget,
 };
 use crate::source::{
-    CfgState, DeriveTargetSourceFacts, MacroRuleSourceFacts, SourceInventory, SourceUnitId,
-    WrittenUnit, WrittenUnitKind, validate_derive_target_facts, validate_macro_rule_facts,
+    CfgState, DeclarativeSourceUnitKind, DeriveTargetSourceFacts, MacroRuleSelectionIndex,
+    MacroRuleSourceFacts, SourceInventory, SourceUnitId, WrittenUnit, WrittenUnitKind,
+    validate_declarative_macro_source_facts, validate_derive_target_facts,
     validate_ownerless_attribute_invocations,
 };
 
+mod disjunctions;
 mod external;
+mod macro_products;
+mod reachability;
+mod source_closure;
+mod source_sites;
+
+use disjunctions::{DisjunctionClosure, DisjunctionDemandLanes};
+use macro_products::{
+    DefinitionMacroProducerIndex, MacroProducerClassification, RetentionClosure,
+    ValidatedMacroProducts, outputless_complete_macro_outputs,
+    outputless_macro_expansions_after_rewrite, validate_complete_macro_output_meaning,
+    validate_macro_product_constraints, validate_macro_source_refinement_coverage,
+    validate_refined_macro_producers,
+};
+use reachability::{CompilerReachabilityClosure, CompilerReachabilityIndex};
+use source_closure::{SourceRequirementClosure, SourceRequirementIndex, SourceRequirementMode};
+pub(crate) use source_sites::SourceSiteOwnerIndex;
+
+#[cfg(test)]
+use macro_products::{
+    MacroContributorProvenanceNode, MacroDefinitionParent, MacroMaterialization,
+    MacroOwnerRequirement, MacroSourceContributorIndex, PendingMacroMaterializationGroup,
+    immediate_macro_parent, lower_macro_materialization_groups,
+    macro_contributor_provenance_parent, outputless_complete_macro_outputs_with_stats,
+    outputless_macro_expansions_after_rewrite_with_stats, resolve_macro_contributor_provenance,
+    validate_macro_contributor_provenance_with_stats, validate_macro_definition_product_class,
+    validate_macro_owner_effect_members,
+};
 
 pub(crate) use external::{
     ExternalCompilerExpectation, ExternalCompilerObservation, external_compiler_expectation,
@@ -43,8 +82,8 @@ pub(crate) fn with_one_omitted_external_compiler_metadata_fact<T>(f: impl FnOnce
     external::with_one_omitted_external_compiler_metadata_fact(f)
 }
 use external::{
-    CompilerSourceDisjunction, ExternalCrateFacts, collect_external_crate_facts,
-    validate_external_crate_facts,
+    CompilerCrateLoadCarrier, CompilerCrateLoadDisjunction, ExternalCrateFacts,
+    collect_external_crate_facts, validate_external_crate_facts,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -54,22 +93,9 @@ pub(crate) struct SourceRequirement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct CompilerSourceRequirement {
-    trigger: GraphNode,
-    required: SourceUnitId,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct MacroRuleSelectionRequirement {
     pub expansion: crate::dependency_graph::ExpansionId,
     pub rule: SourceUnitId,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ConditionalSourceRequirement {
-    pub left: SourceUnitId,
-    pub right: SourceUnitId,
-    pub required: SourceUnitId,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -78,28 +104,57 @@ pub(crate) struct SourceDisjunction {
     pub choices: Vec<SourceUnitId>,
 }
 
-fn source_macro_rule_requirements(
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DefinitionRequirement {
+    trigger: DefinitionId,
+    required: DefinitionId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ConditionalDefinitionRequirement {
+    left: DefinitionId,
+    right: DefinitionId,
+    required: DefinitionId,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DefinitionDisjunction {
+    trigger: DefinitionId,
+    choices: Vec<DefinitionId>,
+}
+
+/// Compiler-owned semantic relations between trait and implementation
+/// definitions.  These facts deliberately stay in the definition domain:
+/// multiple expanded products may share one written macro invocation unit.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct CompilerMemberConstraints {
+    classified_members: Vec<DefinitionId>,
+    classified_implementations: Vec<DefinitionId>,
+    requirements: Vec<DefinitionRequirement>,
+    conditional_requirements: Vec<ConditionalDefinitionRequirement>,
+    disjunctions: Vec<DefinitionDisjunction>,
+}
+
+#[derive(Clone)]
+struct ValidatedCompilerMemberConstraints {
+    requirements_by_trigger: BTreeMap<DefinitionId, Vec<DefinitionId>>,
+    conditional_requirements: Vec<ConditionalDefinitionRequirement>,
+    conditional_by_trigger: BTreeMap<DefinitionId, Vec<(usize, u8)>>,
+    disjunctions: Vec<DefinitionDisjunction>,
+}
+
+fn source_macro_rule_disjunctions(
     source: &SourceInventory,
-) -> impl Iterator<Item = SourceRequirement> + '_ {
-    source
-        .macro_rules
-        .iter()
-        .filter_map(|facts| match facts {
-            MacroRuleSourceFacts::Whole { .. } => None,
-            MacroRuleSourceFacts::Refined {
-                definition,
-                rules,
-                observed_selections,
-                ..
-            } if observed_selections.is_empty() => Some((*definition, rules.as_slice())),
-            MacroRuleSourceFacts::Refined { .. } => None,
-        })
-        .flat_map(|(trigger, rules)| {
-            rules
-                .iter()
-                .copied()
-                .map(move |required| SourceRequirement { trigger, required })
-        })
+) -> impl Iterator<Item = SourceDisjunction> + '_ {
+    source.macro_rules.iter().filter_map(|facts| match facts {
+        MacroRuleSourceFacts::Whole { .. } => None,
+        MacroRuleSourceFacts::Refined {
+            definition, rules, ..
+        } => Some(SourceDisjunction {
+            trigger: *definition,
+            choices: rules.clone(),
+        }),
+    })
 }
 
 fn source_derive_requirements(
@@ -135,6 +190,23 @@ fn source_derive_requirements(
     })
 }
 
+fn source_macro_repetition_disjunctions(
+    source: &SourceInventory,
+) -> impl Iterator<Item = SourceDisjunction> + '_ {
+    source
+        .macro_repetitions
+        .iter()
+        .filter(|repetition| repetition.minimum == 1)
+        .map(|repetition| SourceDisjunction {
+            trigger: repetition.parent,
+            choices: repetition
+                .elements
+                .iter()
+                .map(|element| element.unit)
+                .collect(),
+        })
+}
+
 /// Owned source-domain constraints collected before leaving the compiler
 /// session.
 ///
@@ -144,17 +216,27 @@ fn source_derive_requirements(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceConstraints {
     pub atomic_groups: Vec<Vec<SourceUnitId>>,
-    pub macro_rule_selection_requirements: Vec<MacroRuleSelectionRequirement>,
+    declarative_macros: Option<DeclarativeMacroConstraints>,
     pub ancestor_requirements: Vec<SourceRequirement>,
     pub shell_requirements: Vec<SourceRequirement>,
     pub derive_requirements: Vec<SourceRequirement>,
     pub macro_rule_requirements: Vec<SourceRequirement>,
-    pub member_requirements: Vec<SourceRequirement>,
-    pub conditional_member_requirements: Vec<ConditionalSourceRequirement>,
     pub disjunctions: Vec<SourceDisjunction>,
     pub member_containers: Vec<SourceUnitId>,
     pub classified_members: Vec<SourceUnitId>,
+    compiler_members: CompilerMemberConstraints,
     external_crates: ExternalCrateFacts,
+}
+
+/// One exhaustive declarative-macro observer snapshot. Rule selections,
+/// output materializations, and outputless producers come from one compiler
+/// observation and therefore enter `SourceConstraints` atomically.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeclarativeMacroConstraints {
+    rule_selections: Vec<MacroRuleSelectionRequirement>,
+    producer_coverage: MacroProducerCoverageInventory,
+    complete_output_meaning: MacroCompleteOutputMeaningInventory,
+    outputless_expansions: Vec<ExpansionId>,
 }
 
 impl SourceConstraints {
@@ -171,7 +253,7 @@ impl SourceConstraints {
         }
         Self {
             atomic_groups: groups.into_values().collect(),
-            macro_rule_selection_requirements: Vec::new(),
+            declarative_macros: None,
             ancestor_requirements: source
                 .units
                 .iter()
@@ -184,19 +266,44 @@ impl SourceConstraints {
                 .collect(),
             shell_requirements: Vec::new(),
             derive_requirements: source_derive_requirements(source).collect(),
-            macro_rule_requirements: source_macro_rule_requirements(source).collect(),
-            member_requirements: Vec::new(),
-            conditional_member_requirements: Vec::new(),
-            disjunctions: Vec::new(),
+            macro_rule_requirements: Vec::new(),
+            disjunctions: source_macro_rule_disjunctions(source)
+                .chain(source_macro_repetition_disjunctions(source))
+                .collect(),
             member_containers: Vec::new(),
             classified_members: Vec::new(),
+            compiler_members: CompilerMemberConstraints::default(),
             external_crates: ExternalCrateFacts::default(),
         }
     }
+
+    pub(crate) fn set_declarative_macro_constraints(
+        &mut self,
+        constraints: DeclarativeMacroConstraints,
+    ) -> Result<(), RetentionError> {
+        if self.declarative_macros.is_some() {
+            return Err(RetentionError::InvalidConstraint);
+        }
+        self.declarative_macros = Some(constraints);
+        Ok(())
+    }
+
+    fn declarative_macros(&self) -> Result<&DeclarativeMacroConstraints, RetentionError> {
+        self.declarative_macros
+            .as_ref()
+            .ok_or(RetentionError::IncompleteMacroProductConstraints)
+    }
+
+    pub(crate) fn macro_rule_selections(
+        &self,
+    ) -> Result<&[MacroRuleSelectionRequirement], RetentionError> {
+        Ok(&self.declarative_macros()?.rule_selections)
+    }
 }
 
-/// Converts rustc's trait/impl completeness rules into an owned source model.
-/// No compiler-lifetime value crosses this boundary.
+/// Converts rustc's trait/impl completeness rules into owned definition-domain
+/// semantics plus written-source structural shells. No compiler-lifetime value
+/// crosses this boundary.
 pub(crate) fn collect_source_constraints(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
@@ -249,7 +356,6 @@ pub(crate) fn collect_source_constraints(
     }
     constraints.member_containers = containers.keys().copied().collect();
 
-    let mut member_requirements = BTreeSet::new();
     for member in source.units.iter().filter(|unit| {
         unit.cfg_state == CfgState::Active
             && matches!(
@@ -311,15 +417,16 @@ pub(crate) fn collect_source_constraints(
         collect_semantic_member_requirements(
             tcx,
             definitions,
-            &definition_units,
             local_definitions[definition.id.0 as usize],
-            definition_units[definition.id.0 as usize],
-            &mut member_requirements,
+            definition.id,
+            &mut constraints.compiler_members.requirements,
         )?;
+        constraints
+            .compiler_members
+            .classified_members
+            .push(definition.id);
     }
 
-    let mut conditional_requirements = BTreeSet::new();
-    let mut disjunctions = BTreeSet::new();
     for definition in definitions
         .graph
         .definitions
@@ -328,25 +435,39 @@ pub(crate) fn collect_source_constraints(
     {
         collect_impl_constraints(
             tcx,
-            source,
             definitions,
             &local_definitions,
-            &definition_units,
             definition.id,
-            &mut member_requirements,
-            &mut conditional_requirements,
-            &mut disjunctions,
+            &mut constraints.compiler_members.requirements,
+            &mut constraints.compiler_members.conditional_requirements,
+            &mut constraints.compiler_members.disjunctions,
         )?;
+        constraints
+            .compiler_members
+            .classified_implementations
+            .push(definition.id);
     }
     collect_body_impl_requirements(
         tcx,
         definitions,
-        &definition_units,
-        &mut member_requirements,
+        &mut constraints.compiler_members.requirements,
     )?;
-    constraints.member_requirements = member_requirements.into_iter().collect();
-    constraints.conditional_member_requirements = conditional_requirements.into_iter().collect();
-    constraints.disjunctions = disjunctions.into_iter().collect();
+    constraints.compiler_members.classified_members.sort();
+    constraints
+        .compiler_members
+        .classified_implementations
+        .sort();
+    constraints.compiler_members.requirements.sort();
+    constraints.compiler_members.requirements.dedup();
+    constraints.compiler_members.conditional_requirements.sort();
+    constraints
+        .compiler_members
+        .conditional_requirements
+        .dedup();
+    constraints.compiler_members.disjunctions.sort();
+    constraints.compiler_members.disjunctions.dedup();
+    constraints.disjunctions.sort();
+    constraints.disjunctions.dedup();
     constraints.shell_requirements.sort();
     constraints.shell_requirements.dedup();
     constraints.member_containers.sort();
@@ -358,8 +479,7 @@ pub(crate) fn collect_source_constraints(
 fn collect_body_impl_requirements(
     tcx: TyCtxt<'_>,
     definitions: &CollectedDefinitions,
-    definition_units: &[SourceUnitId],
-    requirements: &mut BTreeSet<SourceRequirement>,
+    requirements: &mut Vec<DefinitionRequirement>,
 ) -> Result<(), RetentionError> {
     let cold = tcx.typeck_impl_dependencies(());
     let warm = tcx.typeck_impl_dependencies(());
@@ -371,30 +491,22 @@ fn collect_body_impl_requirements(
     }
 
     for dependency in cold {
-        let trigger = compiler_definition_unit(
-            definitions,
-            definition_units,
-            dependency.source_owner.to_def_id(),
-        )?;
-        let impl_unit = compiler_definition_unit(
-            definitions,
-            definition_units,
-            dependency.impl_def_id.to_def_id(),
-        )?;
-        if trigger != impl_unit {
-            requirements.insert(SourceRequirement {
+        let trigger = compiler_definition_id(definitions, dependency.source_owner.to_def_id())?;
+        let implementation =
+            compiler_definition_id(definitions, dependency.impl_def_id.to_def_id())?;
+        if trigger != implementation {
+            requirements.push(DefinitionRequirement {
                 trigger,
-                required: impl_unit,
+                required: implementation,
             });
         }
         if let Some(item) = dependency.associated_item
-            && let Some(item_unit) =
-                optional_compiler_definition_unit(definitions, definition_units, item)?
-            && trigger != item_unit
+            && let Some(item) = optional_compiler_definition_id(definitions, item)?
+            && trigger != item
         {
-            requirements.insert(SourceRequirement {
+            requirements.push(DefinitionRequirement {
                 trigger,
-                required: item_unit,
+                required: item,
             });
         }
     }
@@ -405,8 +517,7 @@ fn collect_body_impl_requirements(
 fn collect_body_impl_requirements(
     _tcx: TyCtxt<'_>,
     _definitions: &CollectedDefinitions,
-    _definition_units: &[SourceUnitId],
-    _requirements: &mut BTreeSet<SourceRequirement>,
+    _requirements: &mut Vec<DefinitionRequirement>,
 ) -> Result<(), RetentionError> {
     Ok(())
 }
@@ -414,10 +525,9 @@ fn collect_body_impl_requirements(
 fn collect_semantic_member_requirements(
     tcx: TyCtxt<'_>,
     definitions: &CollectedDefinitions,
-    definition_units: &[SourceUnitId],
     member: LocalDefId,
-    member_unit: SourceUnitId,
-    requirements: &mut BTreeSet<SourceRequirement>,
+    member_definition: DefinitionId,
+    requirements: &mut Vec<DefinitionRequirement>,
 ) -> Result<(), RetentionError> {
     let mut aliases = LocalMemberAliasCollector::default();
     match tcx.def_kind(member) {
@@ -447,13 +557,12 @@ fn collect_semantic_member_requirements(
         .sort_by_key(|target| tcx.def_path_hash(*target));
     aliases.targets.dedup();
     for target in aliases.targets {
-        if let Some(target_unit) =
-            optional_compiler_definition_unit(definitions, definition_units, target)?
-            && target_unit != member_unit
+        if let Some(target_definition) = optional_compiler_definition_id(definitions, target)?
+            && target_definition != member_definition
         {
-            requirements.insert(SourceRequirement {
-                trigger: member_unit,
-                required: target_unit,
+            requirements.push(DefinitionRequirement {
+                trigger: member_definition,
+                required: target_definition,
             });
         }
     }
@@ -507,21 +616,18 @@ fn reverse_local_definitions(
 #[allow(clippy::too_many_arguments)]
 fn collect_impl_constraints(
     tcx: TyCtxt<'_>,
-    source: &SourceInventory,
     definitions: &CollectedDefinitions,
     local_definitions: &[LocalDefId],
-    definition_units: &[SourceUnitId],
     impl_definition: DefinitionId,
-    member_requirements: &mut BTreeSet<SourceRequirement>,
-    conditional_requirements: &mut BTreeSet<ConditionalSourceRequirement>,
-    disjunctions: &mut BTreeSet<SourceDisjunction>,
+    member_requirements: &mut Vec<DefinitionRequirement>,
+    conditional_requirements: &mut Vec<ConditionalDefinitionRequirement>,
+    disjunctions: &mut Vec<DefinitionDisjunction>,
 ) -> Result<(), RetentionError> {
     let impl_local = local_definitions[impl_definition.0 as usize];
     if !matches!(tcx.def_kind(impl_local), DefKind::Impl { .. }) {
         return Err(RetentionError::IncompleteMemberConstraints);
     }
     let impl_id = impl_local.to_def_id();
-    let impl_unit = definition_units[impl_definition.0 as usize];
     let Some(trait_ref) = tcx.impl_opt_trait_ref(impl_id) else {
         return Ok(());
     };
@@ -552,18 +658,17 @@ fn collect_impl_constraints(
     let implementors = tcx.impl_item_implementor_ids(impl_id);
 
     for impl_item in associated_items.in_definition_order() {
-        let impl_item_unit =
-            compiler_definition_unit(definitions, definition_units, impl_item.def_id)?;
+        let impl_item_definition = compiler_definition_id(definitions, impl_item.def_id)?;
         let trait_item = impl_item
             .trait_item_def_id()
             .ok_or(RetentionError::IncompleteMemberConstraints)?;
-        if let Some(trait_item_unit) =
-            optional_compiler_definition_unit(definitions, definition_units, trait_item)?
-            && impl_item_unit != trait_item_unit
+        if let Some(trait_item_definition) =
+            optional_compiler_definition_id(definitions, trait_item)?
+            && impl_item_definition != trait_item_definition
         {
-            member_requirements.insert(SourceRequirement {
-                trigger: impl_item_unit,
-                required: trait_item_unit,
+            member_requirements.push(DefinitionRequirement {
+                trigger: impl_item_definition,
+                required: trait_item_definition,
             });
         }
     }
@@ -579,24 +684,30 @@ fn collect_impl_constraints(
             }
             return Err(RetentionError::IncompleteMemberConstraints);
         };
-        let impl_item_unit = compiler_definition_unit(definitions, definition_units, impl_item)?;
-        if impl_item_unit == impl_unit {
+        let impl_item_definition = compiler_definition_id(definitions, impl_item)?;
+        if impl_item_definition == impl_definition {
             continue;
         }
-        if let Some(trait_item_unit) =
-            optional_compiler_definition_unit(definitions, definition_units, trait_item.def_id)?
+        if let Some(trait_item_definition) =
+            optional_compiler_definition_id(definitions, trait_item.def_id)?
         {
-            if trait_item_unit != impl_unit && trait_item_unit != impl_item_unit {
-                conditional_requirements.insert(ConditionalSourceRequirement {
-                    left: impl_unit,
-                    right: trait_item_unit,
-                    required: impl_item_unit,
+            // Completeness requires an implementation only when the trait has
+            // no default. A used override is reached independently through
+            // the compiler dependency graph.
+            if !trait_item.defaultness(tcx).has_value()
+                && trait_item_definition != impl_definition
+                && trait_item_definition != impl_item_definition
+            {
+                conditional_requirements.push(ConditionalDefinitionRequirement {
+                    left: impl_definition,
+                    right: trait_item_definition,
+                    required: impl_item_definition,
                 });
             }
         } else if !trait_item.defaultness(tcx).has_value() {
-            member_requirements.insert(SourceRequirement {
-                trigger: impl_unit,
-                required: impl_item_unit,
+            member_requirements.push(DefinitionRequirement {
+                trigger: impl_definition,
+                required: impl_item_definition,
             });
         }
     }
@@ -619,8 +730,8 @@ fn collect_impl_constraints(
             let Some(&impl_item) = implementors.get(&trait_item.def_id) else {
                 continue;
             };
-            let choice = compiler_definition_unit(definitions, definition_units, impl_item)?;
-            if choice == impl_unit {
+            let choice = compiler_definition_id(definitions, impl_item)?;
+            if choice == impl_definition {
                 fulfilled_by_impl_unit = true;
             } else {
                 choices.insert(choice);
@@ -630,46 +741,32 @@ fn collect_impl_constraints(
             if choices.is_empty() {
                 return Err(RetentionError::IncompleteMemberConstraints);
             }
-            disjunctions.insert(SourceDisjunction {
-                trigger: impl_unit,
+            disjunctions.push(DefinitionDisjunction {
+                trigger: impl_definition,
                 choices: choices.into_iter().collect(),
             });
         }
     }
-
-    if source
-        .units
-        .get(impl_unit.0 as usize)
-        .is_none_or(|unit| unit.cfg_state != CfgState::Active)
-    {
-        return Err(RetentionError::IncompleteMemberConstraints);
-    }
     Ok(())
 }
 
-fn compiler_definition_unit(
+fn compiler_definition_id(
     definitions: &CollectedDefinitions,
-    definition_units: &[SourceUnitId],
     definition: DefId,
-) -> Result<SourceUnitId, RetentionError> {
-    optional_compiler_definition_unit(definitions, definition_units, definition)?
+) -> Result<DefinitionId, RetentionError> {
+    optional_compiler_definition_id(definitions, definition)?
         .ok_or(RetentionError::IncompleteMemberConstraints)
 }
 
-fn optional_compiler_definition_unit(
+fn optional_compiler_definition_id(
     definitions: &CollectedDefinitions,
-    definition_units: &[SourceUnitId],
     definition: DefId,
-) -> Result<Option<SourceUnitId>, RetentionError> {
+) -> Result<Option<DefinitionId>, RetentionError> {
     let Some(local) = definition.as_local() else {
         return Ok(None);
     };
-    let id = definitions
+    definitions
         .definition_id(local)
-        .ok_or(RetentionError::IncompleteMemberConstraints)?;
-    definition_units
-        .get(id.0 as usize)
-        .copied()
         .map(Some)
         .ok_or(RetentionError::IncompleteMemberConstraints)
 }
@@ -679,6 +776,7 @@ pub(crate) struct Retention {
     pub semantic_required: BTreeSet<GraphNode>,
     pub compile_required: BTreeSet<GraphNode>,
     pub retained_units: BTreeSet<SourceUnitId>,
+    pub outputless_macro_expansions: BTreeSet<ExpansionId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -689,6 +787,7 @@ pub(crate) enum RetentionError {
     IncompleteMemberConstraints,
     IncompleteExternalCrateConstraints,
     IncompleteOpaqueSourceConstraints,
+    IncompleteMacroProductConstraints,
     UnsupportedExternalNativeLink,
 }
 
@@ -701,15 +800,35 @@ pub(crate) fn compute_retention(
     validate_graph(graph)?;
     let definition_units = definition_source_units(source, graph)?;
     let validated = validate_constraints(source, graph, &definition_units, constraints)?;
-
+    let source_requirements = SourceRequirementIndex::new(
+        source.units.len(),
+        &validated.atomic_groups,
+        &validated.ancestor_requirements,
+        &validated.shell_requirements,
+        &validated.derive_requirements,
+        &validated.macro_rule_requirements,
+    )?;
+    let source_sites = SourceSiteOwnerIndex::new(source)?;
+    let compiler_reachability = CompilerReachabilityIndex::new(
+        source,
+        &source_sites,
+        graph,
+        &validated.macro_products.delegated_macro_expansions,
+    )?;
+    let mut macro_repetition_tokens = crate::rewrite::MacroRepetitionTokenRequirements::new(source)
+        .map_err(|_| RetentionError::InvalidConstraint)?;
     let semantic_roots = graph
         .roots
         .iter()
         .filter(|root| root.reason.is_semantic())
         .map(|root| root.node)
         .collect();
-    let semantic_required =
-        semantic_closure_for_source(graph, source, &definition_units, &validated, semantic_roots)?;
+    let semantic_required = semantic_closure_for_source(
+        &validated,
+        &source_requirements,
+        &compiler_reachability,
+        semantic_roots,
+    )?;
 
     let compile_roots = graph
         .roots
@@ -717,55 +836,78 @@ pub(crate) fn compute_retention(
         .map(|root| root.node)
         .collect::<BTreeSet<_>>();
     let mut compile_required = compile_roots;
+    let mut actual_required = compile_required.clone();
     let mut retained_units = BTreeSet::new();
+    let mut token_retained_deltas = Vec::new();
+    let mut pending_compile = compile_required.iter().copied().collect::<Vec<_>>();
+    let mut pending_actual = actual_required.iter().copied().collect::<Vec<_>>();
+    let mut pending_source = Vec::new();
+    let mut macro_closure =
+        RetentionClosure::new(&validated.macro_products, Some(&validated.compiler_members));
+    macro_closure.seed(&compile_required, &actual_required, &retained_units)?;
+    let mut reachability_closure = CompilerReachabilityClosure::new(&compiler_reachability);
+    reachability_closure.seed(&compile_required, &retained_units)?;
+    let mut actual_reachability_closure = CompilerReachabilityClosure::new(&compiler_reachability);
+    actual_reachability_closure.seed(&actual_required, &retained_units)?;
+    let mut source_closure =
+        SourceRequirementClosure::new(&source_requirements, SourceRequirementMode::Compile);
+    source_closure.seed(&retained_units)?;
+    let mut disjunction_closure = DisjunctionClosure::new(
+        source,
+        graph,
+        &validated.singleton_definition_units,
+        &validated.macro_products,
+        &validated.disjunctions,
+        &validated.compiler_disjunctions,
+        &validated.compiler_members.disjunctions,
+    )?;
+    disjunction_closure.seed(&compile_required, &actual_required, &retained_units)?;
+    let mut preserve_active_source_opened = false;
 
     loop {
         close_deterministic_constraints(
-            source,
-            graph,
-            &definition_units,
             &validated,
-            &mut compile_required,
-            &mut retained_units,
+            DeterministicRetentionState {
+                compile_required: &mut compile_required,
+                actual_required: &mut actual_required,
+                retained_units: &mut retained_units,
+                pending_compile: &mut pending_compile,
+                pending_actual: &mut pending_actual,
+                pending_source: &mut pending_source,
+                token_retained_deltas: &mut token_retained_deltas,
+            },
+            DeterministicClosures {
+                macro_products: &mut macro_closure,
+                reachability: &mut reachability_closure,
+                actual_reachability: &mut actual_reachability_closure,
+                source_requirements: &mut source_closure,
+                disjunctions: &mut disjunction_closure,
+                preserve_active_source_opened: &mut preserve_active_source_opened,
+            },
         )?;
 
-        let mut selected = false;
-        for disjunction in &validated.disjunctions {
-            if retained_units.contains(&disjunction.trigger)
-                && !disjunction
-                    .choices
-                    .iter()
-                    .any(|choice| retained_units.contains(choice))
-            {
-                let choice = disjunction
-                    .choices
-                    .iter()
-                    .min_by_key(|choice| {
-                        let unit = &source.units[choice.0 as usize];
-                        (unit.full_range.len(), unit.full_range, unit.id)
-                    })
-                    .expect("validated disjunctions have a choice");
-                selected |= retained_units.insert(*choice);
-            }
-        }
-        for disjunction in &validated.compiler_disjunctions {
-            if disjunction
-                .trigger
-                .is_none_or(|trigger| compile_required.contains(&trigger))
-                && !disjunction
-                    .choices
-                    .iter()
-                    .any(|choice| retained_units.contains(choice))
-            {
-                let choice = disjunction
-                    .choices
-                    .iter()
-                    .min_by_key(|choice| {
-                        let unit = &source.units[choice.0 as usize];
-                        (unit.full_range.len(), unit.full_range, unit.id)
-                    })
-                    .expect("validated compiler disjunctions have a choice");
-                selected |= retained_units.insert(*choice);
+        let mut selected = disjunction_closure.select(
+            DisjunctionDemandLanes {
+                compile: &mut compile_required,
+                actual: &mut actual_required,
+                newly_compile: &mut pending_compile,
+                newly_actual: &mut pending_actual,
+            },
+            &mut retained_units,
+            &mut pending_source,
+            &mut token_retained_deltas,
+        )?;
+        if !selected {
+            selected = macro_repetition_tokens
+                .close(
+                    &mut retained_units,
+                    &std::mem::take(&mut token_retained_deltas),
+                )
+                .map_err(|_| RetentionError::InvalidConstraint)?;
+            if selected {
+                let forced = macro_repetition_tokens.take_newly_forced_units();
+                pending_source.extend_from_slice(&forced);
+                token_retained_deltas.extend(forced);
             }
         }
         if !selected {
@@ -781,222 +923,571 @@ pub(crate) fn compute_retention(
     if !retained_units.contains(&root.id) {
         return Err(RetentionError::InvalidGraph);
     }
-    validate_retained_macro_definitions(source, &validated, &compile_required, &retained_units)?;
-
+    validate_retained_macro_definitions(source, &retained_units)?;
+    let mut outputless_macro_expansions = validated.outputless_macro_expansions;
+    outputless_macro_expansions.extend(outputless_macro_expansions_after_rewrite(
+        &validated.macro_products,
+        &retained_units,
+    )?);
     Ok(Retention {
         semantic_required,
         compile_required,
         retained_units,
+        outputless_macro_expansions,
     })
 }
 
-fn close_deterministic_constraints(
-    source: &SourceInventory,
+/// Computes the outputless declarative expansions represented by an already
+/// rewritten source without selecting another reduction.
+///
+/// Every source unit in this inventory exists in the rewritten text. Running
+/// the same macro-output least fixed point over that complete set gives the
+/// exclusions used to canonicalize the reduced compiler snapshot, including
+/// control-only parents of directly empty expansions.
+pub(crate) fn outputless_macro_expansions_in_complete_source(
     graph: &DependencyGraph,
-    definition_units: &[SourceUnitId],
+    constraints: &SourceConstraints,
+) -> Result<BTreeSet<ExpansionId>, RetentionError> {
+    let declarative_macros = constraints.declarative_macros()?;
+    let directly_outputless = validate_outputless_macro_expansions(graph, declarative_macros)?;
+    let complete_output_meaning = validate_complete_macro_output_meaning(
+        graph,
+        &declarative_macros.complete_output_meaning,
+        &directly_outputless,
+    )?;
+    outputless_complete_macro_outputs(&complete_output_meaning)
+}
+
+struct DeterministicClosures<'state, 'constraints> {
+    macro_products: &'state mut RetentionClosure<'constraints>,
+    reachability: &'state mut CompilerReachabilityClosure<'constraints>,
+    actual_reachability: &'state mut CompilerReachabilityClosure<'constraints>,
+    source_requirements: &'state mut SourceRequirementClosure<'constraints>,
+    disjunctions: &'state mut DisjunctionClosure,
+    preserve_active_source_opened: &'state mut bool,
+}
+
+struct DeterministicRetentionState<'state> {
+    compile_required: &'state mut BTreeSet<GraphNode>,
+    actual_required: &'state mut BTreeSet<GraphNode>,
+    retained_units: &'state mut BTreeSet<SourceUnitId>,
+    pending_compile: &'state mut Vec<GraphNode>,
+    pending_actual: &'state mut Vec<GraphNode>,
+    pending_source: &'state mut Vec<SourceUnitId>,
+    token_retained_deltas: &'state mut Vec<SourceUnitId>,
+}
+
+fn close_deterministic_constraints(
     constraints: &ValidatedConstraints,
-    compile_required: &mut BTreeSet<GraphNode>,
-    retained_units: &mut BTreeSet<SourceUnitId>,
+    state: DeterministicRetentionState<'_>,
+    closures: DeterministicClosures<'_, '_>,
 ) -> Result<(), RetentionError> {
+    let DeterministicRetentionState {
+        compile_required,
+        actual_required,
+        retained_units,
+        pending_compile,
+        pending_actual,
+        pending_source,
+        token_retained_deltas,
+    } = state;
+    let DeterministicClosures {
+        macro_products: macro_closure,
+        reachability: reachability_closure,
+        actual_reachability: actual_reachability_closure,
+        source_requirements: source_closure,
+        disjunctions: disjunction_closure,
+        preserve_active_source_opened,
+    } = closures;
+    let token_notification_start = pending_source.len();
+    let mut macro_presence_cursor = 0;
+    let mut macro_actual_cursor = 0;
+    let mut macro_source_cursor = 0;
+    let mut side_effect_compile_cursor = 0;
+    let mut source_definition_cursor = 0;
+    let mut source_closure_cursor = 0;
+    let mut disjunction_actual_cursor = 0;
+    let mut disjunction_compile_cursor = 0;
+    let mut disjunction_source_cursor = 0;
+    let mut reachability_compile_cursor = 0;
+    let mut reachability_source_cursor = 0;
+    let mut actual_reachability_cursor = 0;
+    let mut actual_reachability_source_cursor = 0;
+    let mut actual_to_compile_cursor = 0;
+
     loop {
-        let compile_before = compile_required.len();
-        let source_before = retained_units.len();
-
-        *compile_required = compiler_closure_for_source(
-            graph,
-            source,
-            retained_units,
-            std::mem::take(compile_required),
-        )?;
-        for node in compile_required.iter().copied().collect::<Vec<_>>() {
-            if let GraphNode::Definition(definition) = node {
-                retained_units.insert(definition_units[definition.0 as usize]);
-            }
-        }
-        for requirement in constraints.compiler_source_requirements() {
-            if compile_required.contains(&requirement.trigger) {
-                retained_units.insert(requirement.required);
-            }
-        }
-        if constraints
-            .preserve_active_source_triggers
-            .iter()
-            .any(|trigger| compile_required.contains(trigger))
+        while macro_presence_cursor < pending_compile.len()
+            || macro_actual_cursor < pending_actual.len()
+            || macro_source_cursor < pending_source.len()
+            || side_effect_compile_cursor < pending_compile.len()
+            || source_definition_cursor < pending_source.len()
+            || source_closure_cursor < pending_source.len()
+            || disjunction_actual_cursor < pending_actual.len()
+            || disjunction_compile_cursor < pending_compile.len()
+            || disjunction_source_cursor < pending_source.len()
         {
-            retained_units.extend(constraints.active_source_units.iter().copied());
-        }
-        close_source_requirements(constraints, retained_units);
-
-        for (index, unit) in definition_units.iter().enumerate() {
-            if retained_units.contains(unit) {
-                compile_required.insert(GraphNode::Definition(DefinitionId(index as u32)));
+            if macro_presence_cursor < pending_compile.len() {
+                let deltas = pending_compile[macro_presence_cursor..].to_vec();
+                macro_presence_cursor = pending_compile.len();
+                macro_closure.add_presence(deltas);
             }
+            if macro_actual_cursor < pending_actual.len() {
+                let deltas = pending_actual[macro_actual_cursor..].to_vec();
+                macro_actual_cursor = pending_actual.len();
+                macro_closure.add_actual(deltas);
+            }
+            if macro_source_cursor < pending_source.len() {
+                let deltas = pending_source[macro_source_cursor..].to_vec();
+                macro_source_cursor = pending_source.len();
+                macro_closure.add_source(deltas);
+            }
+            if disjunction_compile_cursor < pending_compile.len() {
+                let deltas = pending_compile[disjunction_compile_cursor..].to_vec();
+                disjunction_compile_cursor = pending_compile.len();
+                disjunction_closure.add_compile(deltas);
+            }
+            if disjunction_actual_cursor < pending_actual.len() {
+                let deltas = pending_actual[disjunction_actual_cursor..].to_vec();
+                disjunction_actual_cursor = pending_actual.len();
+                disjunction_closure.add_actual(deltas);
+            }
+            if disjunction_source_cursor < pending_source.len() {
+                let deltas = pending_source[disjunction_source_cursor..].to_vec();
+                disjunction_source_cursor = pending_source.len();
+                disjunction_closure.add_source(deltas)?;
+            }
+
+            let compile_deltas = pending_compile[side_effect_compile_cursor..].to_vec();
+            side_effect_compile_cursor = pending_compile.len();
+            for node in compile_deltas {
+                if let GraphNode::Definition(definition) = node
+                    && let Some(unit) =
+                        constraints.singleton_definition_units[definition.0 as usize]
+                {
+                    retain_source_unit(retained_units, pending_source, unit);
+                }
+                if let Some(required) = constraints.compiler_sources_by_trigger.get(&node) {
+                    retain_source_units(retained_units, pending_source, required.iter().copied());
+                }
+                if !*preserve_active_source_opened
+                    && constraints.preserve_active_source_triggers.contains(&node)
+                {
+                    *preserve_active_source_opened = true;
+                    retain_source_units(
+                        retained_units,
+                        pending_source,
+                        constraints.active_source_units.iter().copied(),
+                    );
+                }
+            }
+
+            if source_closure_cursor < pending_source.len() {
+                let deltas = pending_source[source_closure_cursor..].to_vec();
+                source_closure_cursor = pending_source.len();
+                source_closure.add(deltas)?;
+                source_closure.close(retained_units, pending_source)?;
+            }
+
+            let source_deltas = pending_source[source_definition_cursor..].to_vec();
+            source_definition_cursor = pending_source.len();
+            for unit in source_deltas {
+                let Some(definitions) = constraints
+                    .singleton_definitions_by_source
+                    .get(unit.0 as usize)
+                else {
+                    return Err(RetentionError::InvalidConstraint);
+                };
+                for &definition in definitions {
+                    require_compiler_node(
+                        compile_required,
+                        pending_compile,
+                        GraphNode::Definition(definition),
+                    );
+                }
+            }
+
+            macro_closure.close(
+                compile_required,
+                pending_compile,
+                actual_required,
+                pending_actual,
+                retained_units,
+                pending_source,
+            );
         }
-        if compile_required.len() == compile_before && retained_units.len() == source_before {
+
+        if reachability_compile_cursor < pending_compile.len() {
+            let deltas = pending_compile[reachability_compile_cursor..].to_vec();
+            reachability_compile_cursor = pending_compile.len();
+            reachability_closure.add_reachable(deltas);
+        }
+        if reachability_source_cursor < pending_source.len() {
+            let deltas = pending_source[reachability_source_cursor..].to_vec();
+            reachability_source_cursor = pending_source.len();
+            reachability_closure.add_sources(deltas)?;
+        }
+        let compile_before = pending_compile.len();
+        reachability_closure.close(compile_required, pending_compile)?;
+
+        if actual_reachability_cursor < pending_actual.len() {
+            let deltas = pending_actual[actual_reachability_cursor..].to_vec();
+            actual_reachability_cursor = pending_actual.len();
+            actual_reachability_closure.add_reachable(deltas);
+        }
+        if actual_reachability_source_cursor < pending_source.len() {
+            let deltas = pending_source[actual_reachability_source_cursor..].to_vec();
+            actual_reachability_source_cursor = pending_source.len();
+            actual_reachability_closure.add_sources(deltas)?;
+        }
+        let actual_before = pending_actual.len();
+        actual_reachability_closure.close(actual_required, pending_actual)?;
+        if actual_to_compile_cursor < pending_actual.len() {
+            mirror_actual_nodes_into_compile(
+                &pending_actual[actual_to_compile_cursor..],
+                compile_required,
+                pending_compile,
+            );
+            actual_to_compile_cursor = pending_actual.len();
+        }
+        if pending_compile.len() == compile_before && pending_actual.len() == actual_before {
             break;
         }
     }
+
+    token_retained_deltas.extend_from_slice(&pending_source[token_notification_start..]);
+    pending_compile.clear();
+    pending_actual.clear();
+    pending_source.clear();
     Ok(())
 }
 
-fn close_source_requirements(
-    constraints: &ValidatedConstraints,
-    retained: &mut BTreeSet<SourceUnitId>,
+#[derive(Default)]
+struct MacroProductRankCache {
+    contributor_classes: Vec<Option<MacroProductGroupRank>>,
+    #[cfg(test)]
+    rank_queries: usize,
+    #[cfg(test)]
+    contributor_class_misses: usize,
+    #[cfg(test)]
+    dag_node_visits: usize,
+}
+
+struct MacroProductGroupRank {
+    size: u64,
+    ranges: Arc<[crate::source::ByteRange]>,
+}
+
+type DefinitionChoiceRank = (
+    u64,
+    Arc<[crate::source::ByteRange]>,
+    crate::graph::DefinitionKey,
+);
+
+type CompilerCrateLoadCarrierRank = (
+    u64,
+    Arc<[crate::source::ByteRange]>,
+    Option<crate::graph::DefinitionKey>,
+    CompilerCrateLoadCarrier,
+);
+
+fn definition_choice_rank(
+    source: &SourceInventory,
+    graph: &DependencyGraph,
+    singleton_definition_units: &[Option<SourceUnitId>],
+    macro_products: &ValidatedMacroProducts,
+    macro_rank_cache: &mut MacroProductRankCache,
+    choice: DefinitionId,
+) -> Result<DefinitionChoiceRank, RetentionError> {
+    let definition = graph
+        .definitions
+        .definitions
+        .get(choice.0 as usize)
+        .filter(|definition| definition.id == choice)
+        .ok_or(RetentionError::InvalidConstraint)?;
+    #[cfg(test)]
+    {
+        macro_rank_cache.rank_queries += 1;
+    }
+    let group = macro_products.group_for_product(GraphNode::Definition(choice));
+    let singleton = singleton_definition_units
+        .get(choice.0 as usize)
+        .copied()
+        .flatten();
+    let (size, ranges) = match (group, singleton) {
+        (Some(group), None) => {
+            let contributor_class = macro_products
+                .contributor_class_for_group(group)
+                .ok_or(RetentionError::InvalidConstraint)?;
+            let (size, ranges) = if let Some(rank) = macro_rank_cache
+                .contributor_classes
+                .get(contributor_class)
+                .and_then(Option::as_ref)
+            {
+                (rank.size, Arc::clone(&rank.ranges))
+            } else {
+                let (contributor_sources, _dag_node_visits) =
+                    macro_products.contributor_sources_for_class_with_visits(contributor_class)?;
+                #[cfg(test)]
+                {
+                    macro_rank_cache.contributor_class_misses += 1;
+                    macro_rank_cache.dag_node_visits += _dag_node_visits;
+                }
+                let mut ranges = contributor_sources
+                    .into_iter()
+                    .map(|unit| {
+                        source
+                            .units
+                            .get(unit.0 as usize)
+                            .filter(|source_unit| source_unit.id == unit)
+                            .map(|source_unit| source_unit.full_range)
+                            .ok_or(RetentionError::InvalidConstraint)
+                    })
+                    .collect::<Result<Vec<_>, RetentionError>>()?;
+                ranges.sort();
+                let size = ranges.iter().try_fold(0u64, |size, range| {
+                    size.checked_add(u64::from(range.len()))
+                        .ok_or(RetentionError::InvalidConstraint)
+                })?;
+                let ranges = Arc::from(ranges);
+                if macro_rank_cache.contributor_classes.len() <= contributor_class {
+                    macro_rank_cache
+                        .contributor_classes
+                        .resize_with(contributor_class + 1, || None);
+                }
+                macro_rank_cache.contributor_classes[contributor_class] =
+                    Some(MacroProductGroupRank {
+                        size,
+                        ranges: Arc::clone(&ranges),
+                    });
+                (size, ranges)
+            };
+            (size, ranges)
+        }
+        (None, Some(unit)) => {
+            let range = source
+                .units
+                .get(unit.0 as usize)
+                .filter(|source_unit| source_unit.id == unit)
+                .map(|source_unit| source_unit.full_range)
+                .ok_or(RetentionError::InvalidConstraint)?;
+            (u64::from(range.len()), Arc::from(vec![range]))
+        }
+        (Some(_), Some(_)) | (None, None) => return Err(RetentionError::InvalidConstraint),
+    };
+    Ok((size, ranges, definition.key.clone()))
+}
+
+fn require_compiler_node(
+    required: &mut BTreeSet<GraphNode>,
+    newly_required: &mut Vec<GraphNode>,
+    node: GraphNode,
+) -> bool {
+    let inserted = required.insert(node);
+    if inserted {
+        newly_required.push(node);
+    }
+    inserted
+}
+
+fn mirror_actual_nodes_into_compile(
+    actual_deltas: &[GraphNode],
+    compile_required: &mut BTreeSet<GraphNode>,
+    newly_compile_required: &mut Vec<GraphNode>,
 ) {
-    loop {
-        let before = retained.len();
-        close_atomic_groups(&constraints.atomic_groups, retained);
-        for requirement in constraints
-            .ancestor_requirements
-            .iter()
-            .chain(&constraints.shell_requirements)
-            .chain(&constraints.derive_requirements)
-            .chain(&constraints.macro_rule_requirements)
-            .chain(&constraints.member_requirements)
-        {
-            if retained.contains(&requirement.trigger) {
-                retained.insert(requirement.required);
-            }
-        }
-        for requirement in &constraints.conditional_member_requirements {
-            if retained.contains(&requirement.left) && retained.contains(&requirement.right) {
-                retained.insert(requirement.required);
-            }
-        }
-        if retained.len() == before {
-            break;
-        }
+    for &node in actual_deltas {
+        require_compiler_node(compile_required, newly_compile_required, node);
     }
 }
 
-fn close_atomic_groups(groups: &[Vec<SourceUnitId>], retained: &mut BTreeSet<SourceUnitId>) {
-    for group in groups {
-        if group.iter().any(|unit| retained.contains(unit)) {
-            retained.extend(group.iter().copied());
-        }
+fn retain_source_unit(
+    retained: &mut BTreeSet<SourceUnitId>,
+    newly_retained: &mut Vec<SourceUnitId>,
+    unit: SourceUnitId,
+) -> bool {
+    let inserted = retained.insert(unit);
+    if inserted {
+        newly_retained.push(unit);
+    }
+    inserted
+}
+
+fn retain_source_units(
+    retained: &mut BTreeSet<SourceUnitId>,
+    newly_retained: &mut Vec<SourceUnitId>,
+    units: impl IntoIterator<Item = SourceUnitId>,
+) {
+    for unit in units {
+        retain_source_unit(retained, newly_retained, unit);
     }
 }
 
-fn close_source_survival_requirements(
-    constraints: &ValidatedConstraints,
-    retained: &mut BTreeSet<SourceUnitId>,
-) {
-    loop {
-        let before = retained.len();
-        close_atomic_groups(&constraints.atomic_groups, retained);
-        for requirement in constraints
-            .ancestor_requirements
-            .iter()
-            .chain(&constraints.derive_requirements)
-        {
-            if retained.contains(&requirement.trigger) {
-                retained.insert(requirement.required);
-            }
+fn compiler_crate_load_carrier_rank(
+    source: &SourceInventory,
+    graph: &DependencyGraph,
+    singleton_definition_units: &[Option<SourceUnitId>],
+    macro_products: &ValidatedMacroProducts,
+    macro_rank_cache: &mut MacroProductRankCache,
+    carrier: CompilerCrateLoadCarrier,
+) -> Result<CompilerCrateLoadCarrierRank, RetentionError> {
+    match carrier {
+        CompilerCrateLoadCarrier::Definition(definition) => {
+            let (size, ranges, key) = definition_choice_rank(
+                source,
+                graph,
+                singleton_definition_units,
+                macro_products,
+                macro_rank_cache,
+                definition,
+            )?;
+            Ok((size, ranges, Some(key), carrier))
         }
-        if retained.len() == before {
-            break;
+        CompilerCrateLoadCarrier::Source(unit) => {
+            let unit = source
+                .units
+                .get(unit.0 as usize)
+                .filter(|source_unit| source_unit.id == unit)
+                .ok_or(RetentionError::InvalidConstraint)?;
+            Ok((
+                u64::from(unit.full_range.len()),
+                Arc::from(vec![unit.full_range]),
+                None,
+                carrier,
+            ))
         }
     }
 }
 
 fn semantic_closure_for_source(
-    graph: &DependencyGraph,
-    source: &SourceInventory,
-    definition_units: &[SourceUnitId],
     constraints: &ValidatedConstraints,
+    source_requirements: &SourceRequirementIndex,
+    compiler_reachability: &CompilerReachabilityIndex,
     roots: BTreeSet<GraphNode>,
 ) -> Result<BTreeSet<GraphNode>, RetentionError> {
     let mut reachable = roots;
+    let mut actual_required = reachable.clone();
     let mut source_units = BTreeSet::new();
+    let mut pending_compile = reachable.iter().copied().collect::<Vec<_>>();
+    let mut pending_actual = actual_required.iter().copied().collect::<Vec<_>>();
+    let mut pending_source = Vec::new();
+    let mut macro_closure = RetentionClosure::new(&constraints.macro_products, None);
+    macro_closure.seed(&reachable, &actual_required, &source_units)?;
+    let mut reachability_closure = CompilerReachabilityClosure::new(compiler_reachability);
+    reachability_closure.seed(&reachable, &source_units)?;
+    let mut actual_reachability_closure = CompilerReachabilityClosure::new(compiler_reachability);
+    actual_reachability_closure.seed(&actual_required, &source_units)?;
+    let mut source_closure =
+        SourceRequirementClosure::new(source_requirements, SourceRequirementMode::Semantic);
+    source_closure.seed(&source_units)?;
+    let mut macro_presence_cursor = 0;
+    let mut macro_actual_cursor = 0;
+    let mut macro_source_cursor = 0;
+    let mut definition_source_cursor = 0;
+    let mut source_closure_cursor = 0;
+    let mut reachability_compile_cursor = 0;
+    let mut reachability_source_cursor = 0;
+    let mut actual_reachability_cursor = 0;
+    let mut actual_reachability_source_cursor = 0;
+    let mut actual_to_compile_cursor = 0;
+
     loop {
-        let node_count = reachable.len();
-        let unit_count = source_units.len();
-        for node in reachable.iter().copied() {
-            if let GraphNode::Definition(definition) = node {
-                source_units.insert(definition_units[definition.0 as usize]);
+        while macro_presence_cursor < pending_compile.len()
+            || macro_actual_cursor < pending_actual.len()
+            || macro_source_cursor < pending_source.len()
+            || definition_source_cursor < pending_compile.len()
+            || source_closure_cursor < pending_source.len()
+        {
+            if macro_presence_cursor < pending_compile.len() {
+                let deltas = pending_compile[macro_presence_cursor..].to_vec();
+                macro_presence_cursor = pending_compile.len();
+                macro_closure.add_presence(deltas);
             }
+            if macro_actual_cursor < pending_actual.len() {
+                let deltas = pending_actual[macro_actual_cursor..].to_vec();
+                macro_actual_cursor = pending_actual.len();
+                macro_closure.add_actual(deltas);
+            }
+            if macro_source_cursor < pending_source.len() {
+                let deltas = pending_source[macro_source_cursor..].to_vec();
+                macro_source_cursor = pending_source.len();
+                macro_closure.add_source(deltas);
+            }
+
+            let compile_deltas = pending_compile[definition_source_cursor..].to_vec();
+            definition_source_cursor = pending_compile.len();
+            for node in compile_deltas {
+                if let GraphNode::Definition(definition) = node
+                    && let Some(unit) =
+                        constraints.singleton_definition_units[definition.0 as usize]
+                {
+                    retain_source_unit(&mut source_units, &mut pending_source, unit);
+                }
+            }
+
+            if source_closure_cursor < pending_source.len() {
+                let deltas = pending_source[source_closure_cursor..].to_vec();
+                source_closure_cursor = pending_source.len();
+                source_closure.add(deltas)?;
+                source_closure.close(&mut source_units, &mut pending_source)?;
+            }
+
+            macro_closure.close(
+                &mut reachable,
+                &mut pending_compile,
+                &mut actual_required,
+                &mut pending_actual,
+                &mut source_units,
+                &mut pending_source,
+            );
         }
-        close_source_survival_requirements(constraints, &mut source_units);
-        reachable = compiler_closure_for_source(graph, source, &source_units, reachable)?;
-        if reachable.len() == node_count && source_units.len() == unit_count {
+
+        if reachability_compile_cursor < pending_compile.len() {
+            let deltas = pending_compile[reachability_compile_cursor..].to_vec();
+            reachability_compile_cursor = pending_compile.len();
+            reachability_closure.add_reachable(deltas);
+        }
+        if reachability_source_cursor < pending_source.len() {
+            let deltas = pending_source[reachability_source_cursor..].to_vec();
+            reachability_source_cursor = pending_source.len();
+            reachability_closure.add_sources(deltas)?;
+        }
+        let compile_before = pending_compile.len();
+        reachability_closure.close(&mut reachable, &mut pending_compile)?;
+
+        if actual_reachability_cursor < pending_actual.len() {
+            let deltas = pending_actual[actual_reachability_cursor..].to_vec();
+            actual_reachability_cursor = pending_actual.len();
+            actual_reachability_closure.add_reachable(deltas);
+        }
+        if actual_reachability_source_cursor < pending_source.len() {
+            let deltas = pending_source[actual_reachability_source_cursor..].to_vec();
+            actual_reachability_source_cursor = pending_source.len();
+            actual_reachability_closure.add_sources(deltas)?;
+        }
+        let actual_before = pending_actual.len();
+        actual_reachability_closure.close(&mut actual_required, &mut pending_actual)?;
+        if actual_to_compile_cursor < pending_actual.len() {
+            mirror_actual_nodes_into_compile(
+                &pending_actual[actual_to_compile_cursor..],
+                &mut reachable,
+                &mut pending_compile,
+            );
+            actual_to_compile_cursor = pending_actual.len();
+        }
+        if pending_compile.len() == compile_before && pending_actual.len() == actual_before {
             return Ok(reachable);
         }
     }
 }
 
-fn compiler_closure_for_source(
-    graph: &DependencyGraph,
-    source: &SourceInventory,
-    retained_units: &BTreeSet<SourceUnitId>,
-    reachable: BTreeSet<GraphNode>,
-) -> Result<BTreeSet<GraphNode>, RetentionError> {
-    let surviving_expansions = expansion_source_survival(&graph.expansions, |unit| {
-        source
-            .units
-            .get(unit.0 as usize)
-            .filter(|written| {
-                written.id == unit
-                    && written.kind == WrittenUnitKind::MacroInvocation
-                    && written.cfg_state == CfgState::Active
-            })
-            .map(|written| retained_units.contains(&written.id))
-    })
-    .ok_or(RetentionError::InvalidGraph)?;
-    let mut reachable = reachable;
-    let mut work = reachable.iter().copied().collect::<Vec<_>>();
-    while let Some(from) = work.pop() {
-        for edge in graph
-            .edges
-            .iter()
-            .filter(|edge| edge.from == from && is_compiler_dependency(&edge.kind))
-        {
-            let active = if edge.sites.is_empty() {
-                true
-            } else {
-                match from {
-                    GraphNode::Definition(_) => {
-                        edge.sites.iter().try_fold(false, |active, site| {
-                            if active {
-                                Ok(true)
-                            } else if let crate::dependency_graph::ObservationSite::Source(range) =
-                                site
-                            {
-                                source_site_is_retained(source, retained_units, *range)
-                            } else {
-                                Ok(true)
-                            }
-                        })?
-                    }
-                    _ => true,
-                }
-            };
-            let active = active
-                && match (&edge.kind, edge.to) {
-                    (
-                        DependencyKind::ExpansionUse | DependencyKind::GeneratedBy,
-                        GraphNode::Expansion(expansion),
-                    ) => surviving_expansions
-                        .get(expansion.0 as usize)
-                        .copied()
-                        .ok_or(RetentionError::InvalidGraph)?,
-                    _ => true,
-                };
-            if active && reachable.insert(edge.to) {
-                work.push(edge.to);
-            }
-        }
-    }
-    Ok(reachable)
-}
-
 pub(crate) fn source_site_is_retained(
-    source: &SourceInventory,
+    source_sites: &SourceSiteOwnerIndex,
     retained_units: &BTreeSet<SourceUnitId>,
     site: crate::source::ByteRange,
 ) -> Result<bool, RetentionError> {
-    let owner_states = source_site_owners(source, site)?
+    let owner_states = source_sites
+        .owners(site)?
         .into_iter()
-        .map(|unit| retained_units.contains(&unit.id))
+        .map(|unit| retained_units.contains(&unit))
         .collect::<BTreeSet<_>>();
     if owner_states.len() != 1 {
         return Err(RetentionError::InvalidGraph);
@@ -1005,62 +1496,14 @@ pub(crate) fn source_site_is_retained(
 }
 
 fn source_site_owner(
-    source: &SourceInventory,
+    source_sites: &SourceSiteOwnerIndex,
     site: crate::source::ByteRange,
 ) -> Result<SourceUnitId, RetentionError> {
-    let owners = source_site_owners(source, site)?;
+    let owners = source_sites.owners(site)?;
     let [owner] = owners.as_slice() else {
         return Err(RetentionError::IncompleteMemberConstraints);
     };
-    Ok(owner.id)
-}
-
-fn source_site_owners(
-    source: &SourceInventory,
-    site: crate::source::ByteRange,
-) -> Result<Vec<&WrittenUnit>, RetentionError> {
-    let candidates = source
-        .units
-        .iter()
-        .filter(|unit| unit.cfg_state == CfgState::Active && unit.full_range.contains(site))
-        .collect::<Vec<_>>();
-    let smallest = candidates
-        .iter()
-        .map(|unit| unit.full_range.len())
-        .min()
-        .ok_or(RetentionError::InvalidGraph)?;
-    let candidates = candidates
-        .iter()
-        .filter(|unit| unit.full_range.len() == smallest)
-        .map(|unit| Ok((*unit, source_unit_depth(source, unit.id)?)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let deepest = candidates
-        .iter()
-        .map(|(_, depth)| *depth)
-        .max()
-        .ok_or(RetentionError::InvalidGraph)?;
-    Ok(candidates
-        .into_iter()
-        .filter(|(_, depth)| *depth == deepest)
-        .map(|(unit, _)| unit)
-        .collect())
-}
-
-fn source_unit_depth(
-    source: &SourceInventory,
-    mut unit: SourceUnitId,
-) -> Result<usize, RetentionError> {
-    let mut depth = 0;
-    while let Some(parent) = source
-        .units
-        .get(unit.0 as usize)
-        .ok_or(RetentionError::InvalidGraph)?
-        .parent
-    {
-        depth += 1;
-        unit = parent;
-    }
-    Ok(depth)
+    Ok(*owner)
 }
 
 fn is_compiler_dependency(kind: &DependencyKind) -> bool {
@@ -1081,29 +1524,110 @@ fn is_compiler_dependency(kind: &DependencyKind) -> bool {
 
 #[derive(Clone)]
 struct ValidatedConstraints {
+    singleton_definition_units: Vec<Option<SourceUnitId>>,
+    singleton_definitions_by_source: Vec<Vec<DefinitionId>>,
     atomic_groups: Vec<Vec<SourceUnitId>>,
     macro_rule_selection_requirements: Vec<MacroRuleSelectionRequirement>,
+    macro_products: ValidatedMacroProducts,
+    outputless_macro_expansions: BTreeSet<ExpansionId>,
     ancestor_requirements: Vec<SourceRequirement>,
     shell_requirements: Vec<SourceRequirement>,
     derive_requirements: Vec<SourceRequirement>,
     macro_rule_requirements: Vec<SourceRequirement>,
-    member_requirements: Vec<SourceRequirement>,
-    conditional_member_requirements: Vec<ConditionalSourceRequirement>,
+    compiler_members: ValidatedCompilerMemberConstraints,
     disjunctions: Vec<SourceDisjunction>,
-    compiler_disjunctions: Vec<CompilerSourceDisjunction>,
-    preserve_active_source_triggers: Vec<GraphNode>,
+    compiler_disjunctions: Vec<CompilerCrateLoadDisjunction>,
+    compiler_sources_by_trigger: BTreeMap<GraphNode, Vec<SourceUnitId>>,
+    preserve_active_source_triggers: BTreeSet<GraphNode>,
     active_source_units: Vec<SourceUnitId>,
 }
 
-impl ValidatedConstraints {
-    fn compiler_source_requirements(&self) -> impl Iterator<Item = CompilerSourceRequirement> + '_ {
-        self.macro_rule_selection_requirements
-            .iter()
-            .map(|requirement| CompilerSourceRequirement {
-                trigger: GraphNode::Expansion(requirement.expansion),
-                required: requirement.rule,
-            })
+fn validate_outputless_macro_expansions(
+    graph: &DependencyGraph,
+    declarative_macros: &DeclarativeMacroConstraints,
+) -> Result<BTreeSet<ExpansionId>, RetentionError> {
+    let outputless = validated_outputless_macro_expansions(
+        &graph.expansions,
+        &graph.edges,
+        &declarative_macros.outputless_expansions,
+    )
+    .ok_or(RetentionError::InvalidConstraint)?;
+    if declarative_macros
+        .producer_coverage
+        .producers()
+        .iter()
+        .any(|coverage| {
+            coverage.output_token_count() == 0 || outputless.contains(&coverage.producer())
+        })
+    {
+        return Err(RetentionError::InvalidConstraint);
     }
+    Ok(outputless)
+}
+
+struct ValidatedDeclarativeMacroConstraints {
+    singleton_definition_units: Vec<Option<SourceUnitId>>,
+    macro_rule_selection_requirements: Vec<MacroRuleSelectionRequirement>,
+    macro_products: ValidatedMacroProducts,
+    outputless_macro_expansions: BTreeSet<ExpansionId>,
+}
+
+fn validate_declarative_macro_constraints(
+    source: &SourceInventory,
+    graph: &DependencyGraph,
+    definition_units: &[SourceUnitId],
+    declarative_macros: &DeclarativeMacroConstraints,
+) -> Result<ValidatedDeclarativeMacroConstraints, RetentionError> {
+    let refined_macro_definitions = refined_macro_definition_units(source);
+    let macro_rule_selection_requirements = validate_macro_rule_selection_requirements(
+        source,
+        graph,
+        &refined_macro_definitions,
+        &declarative_macros.rule_selections,
+    )?;
+    let outputless_macro_expansions =
+        validate_outputless_macro_expansions(graph, declarative_macros)?;
+    let refined_macro_producers = validate_refined_macro_producers(
+        source,
+        graph,
+        &refined_macro_definitions,
+        &macro_rule_selection_requirements,
+        declarative_macros.producer_coverage.producers(),
+    )?;
+    validate_macro_source_refinement_coverage(
+        source,
+        graph,
+        &macro_rule_selection_requirements,
+        &refined_macro_producers,
+        &outputless_macro_expansions,
+    )?;
+    let complete_output_meaning = validate_complete_macro_output_meaning(
+        graph,
+        &declarative_macros.complete_output_meaning,
+        &outputless_macro_expansions,
+    )?;
+    let macro_producers = DefinitionMacroProducerIndex::new(graph);
+    let singleton_definition_units = definition_singleton_source_units(
+        &graph.definitions,
+        &macro_producers,
+        definition_units,
+        &refined_macro_producers,
+    )?;
+    let macro_products = validate_macro_product_constraints(
+        source,
+        graph,
+        &macro_producers,
+        &singleton_definition_units,
+        &MacroProducerClassification::new(&refined_macro_producers, &complete_output_meaning),
+        &macro_rule_selection_requirements,
+        &declarative_macros.producer_coverage,
+    )?;
+    Ok(ValidatedDeclarativeMacroConstraints {
+        singleton_definition_units,
+        macro_rule_selection_requirements,
+        macro_products,
+        outputless_macro_expansions,
+    })
 }
 
 fn validate_constraints(
@@ -1112,8 +1636,13 @@ fn validate_constraints(
     definition_units: &[SourceUnitId],
     constraints: &SourceConstraints,
 ) -> Result<ValidatedConstraints, RetentionError> {
+    let declarative_macros = constraints.declarative_macros()?;
+    let macro_graph = graph;
     let unit_count = source.units.len();
     let valid_unit = |id: SourceUnitId| (id.0 as usize) < unit_count;
+    let declarative_unit_kinds = source
+        .declarative_unit_kinds()
+        .map_err(|_| RetentionError::InvalidConstraint)?;
 
     let expected_groups = source
         .units
@@ -1181,22 +1710,28 @@ fn validate_constraints(
         &constraints.macro_rule_requirements,
         RequirementClass::Semantic,
     )?;
-    let expected_macro_rules = source_macro_rule_requirements(source).collect::<BTreeSet<_>>();
-    if macro_rules.iter().copied().collect::<BTreeSet<_>>() != expected_macro_rules {
+    if !macro_rules.is_empty() {
         return Err(RetentionError::InvalidConstraint);
     }
-    let macro_rule_selection_requirements = validate_macro_rule_selection_requirements(
+    let ValidatedDeclarativeMacroConstraints {
+        singleton_definition_units,
+        macro_rule_selection_requirements,
+        macro_products,
+        outputless_macro_expansions,
+    } = validate_declarative_macro_constraints(
         source,
-        graph,
-        &constraints.macro_rule_selection_requirements,
+        macro_graph,
+        definition_units,
+        declarative_macros,
     )?;
-    let members = validate_requirements(
-        source,
-        &constraints.member_requirements,
-        RequirementClass::Semantic,
-    )?;
-    let conditional_members =
-        validate_conditional_requirements(source, &constraints.conditional_member_requirements)?;
+    let mut singleton_definitions_by_source = vec![Vec::new(); unit_count];
+    for (index, unit) in singleton_definition_units.iter().copied().enumerate() {
+        if let Some(unit) = unit {
+            singleton_definitions_by_source[unit.0 as usize].push(DefinitionId(index as u32));
+        }
+    }
+    let compiler_members =
+        validate_compiler_member_constraints(graph, &constraints.compiler_members)?;
 
     let member_containers = unique_active_units(source, &constraints.member_containers)?;
     let expected_containers = graph
@@ -1247,6 +1782,24 @@ fn validate_constraints(
 
     let mut disjunction_keys = BTreeSet::new();
     let mut disjunctions = Vec::new();
+    let expected_macro_rule_disjunctions = source_macro_rule_disjunctions(source)
+        .map(|disjunction| {
+            (
+                disjunction.trigger,
+                disjunction.choices.into_iter().collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let expected_macro_repetition_disjunctions = source_macro_repetition_disjunctions(source)
+        .map(|disjunction| {
+            (
+                disjunction.trigger,
+                disjunction.choices.into_iter().collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut actual_macro_rule_disjunctions = BTreeSet::new();
+    let mut actual_macro_repetition_disjunctions = BTreeSet::new();
     for disjunction in &constraints.disjunctions {
         if !valid_unit(disjunction.trigger)
             || source.units[disjunction.trigger.0 as usize].cfg_state != CfgState::Active
@@ -1263,17 +1816,49 @@ fn validate_constraints(
                     || source.units[choice.0 as usize].parent != Some(disjunction.trigger)
                     || !matches!(
                         source.units[choice.0 as usize].kind,
-                        WrittenUnitKind::ImplMember | WrittenUnitKind::MacroInvocation
-                    )
+                        WrittenUnitKind::ImplMember
+                            | WrittenUnitKind::MacroInvocation
+                            | WrittenUnitKind::MacroRule
+                    ) && declarative_unit_kinds[choice.0 as usize]
+                        != Some(DeclarativeSourceUnitKind::MatcherElement)
             })
             || !disjunction_keys.insert((disjunction.trigger, choices.clone()))
         {
             return Err(RetentionError::InvalidConstraint);
         }
+        let contains_macro_rules = choices
+            .iter()
+            .any(|choice| source.units[choice.0 as usize].kind == WrittenUnitKind::MacroRule);
+        let contains_macro_repetition_elements = choices.iter().any(|choice| {
+            declarative_unit_kinds[choice.0 as usize]
+                == Some(DeclarativeSourceUnitKind::MatcherElement)
+        });
+        if contains_macro_rules {
+            if choices
+                .iter()
+                .any(|choice| source.units[choice.0 as usize].kind != WrittenUnitKind::MacroRule)
+            {
+                return Err(RetentionError::InvalidConstraint);
+            }
+            actual_macro_rule_disjunctions.insert((disjunction.trigger, choices.clone()));
+        } else if contains_macro_repetition_elements {
+            if choices.iter().any(|choice| {
+                declarative_unit_kinds[choice.0 as usize]
+                    != Some(DeclarativeSourceUnitKind::MatcherElement)
+            }) {
+                return Err(RetentionError::InvalidConstraint);
+            }
+            actual_macro_repetition_disjunctions.insert((disjunction.trigger, choices.clone()));
+        }
         disjunctions.push(SourceDisjunction {
             trigger: disjunction.trigger,
             choices: choices.into_iter().collect(),
         });
+    }
+    if actual_macro_rule_disjunctions != expected_macro_rule_disjunctions
+        || actual_macro_repetition_disjunctions != expected_macro_repetition_disjunctions
+    {
+        return Err(RetentionError::InvalidConstraint);
     }
     disjunctions.sort();
     let compiler_disjunctions = validate_external_crate_facts(
@@ -1283,7 +1868,16 @@ fn validate_constraints(
         &constraints.external_crates,
     )?;
     let preserve_active_source_triggers =
-        validate_preserve_active_source_requirements(source, graph, definition_units)?;
+        validate_preserve_active_source_requirements(source, graph, definition_units)?
+            .into_iter()
+            .collect();
+    let mut compiler_sources_by_trigger = BTreeMap::<GraphNode, Vec<SourceUnitId>>::new();
+    for requirement in &macro_rule_selection_requirements {
+        compiler_sources_by_trigger
+            .entry(GraphNode::Expansion(requirement.expansion))
+            .or_default()
+            .push(requirement.rule);
+    }
     let active_source_units = source
         .units
         .iter()
@@ -1292,19 +1886,23 @@ fn validate_constraints(
         .collect();
 
     Ok(ValidatedConstraints {
+        singleton_definition_units,
+        singleton_definitions_by_source,
         atomic_groups: actual_groups
             .into_iter()
             .map(|group| group.into_iter().collect())
             .collect(),
         macro_rule_selection_requirements,
+        macro_products,
+        outputless_macro_expansions,
         ancestor_requirements: ancestors,
         shell_requirements: shells,
         derive_requirements: derives,
         macro_rule_requirements: macro_rules,
-        member_requirements: members,
-        conditional_member_requirements: conditional_members,
+        compiler_members,
         disjunctions,
         compiler_disjunctions,
+        compiler_sources_by_trigger,
         preserve_active_source_triggers,
         active_source_units,
     })
@@ -1353,15 +1951,15 @@ fn validate_preserve_active_source_requirements(
     Ok(triggers.into_iter().map(GraphNode::Definition).collect())
 }
 
-pub(crate) fn collect_macro_rule_expansion_constraints(
+fn collect_macro_rule_selection_requirements(
     source: &SourceInventory,
     definitions: &DefinitionGraph,
     expansions: &[ExpansionNode],
-    constraints: &mut SourceConstraints,
-) -> Result<(), RetentionError> {
-    if !constraints.macro_rule_selection_requirements.is_empty() {
-        return Err(RetentionError::InvalidConstraint);
-    }
+) -> Result<Vec<MacroRuleSelectionRequirement>, RetentionError> {
+    let rule_index = source
+        .macro_rule_selection_index()
+        .map_err(|_| RetentionError::InvalidConstraint)?;
+    let refined_macro_definitions = refined_macro_definition_units(source);
     let mut requirements = BTreeSet::new();
     for expansion in expansions {
         let Some(selected_range) = expansion
@@ -1372,15 +1970,20 @@ pub(crate) fn collect_macro_rule_expansion_constraints(
         else {
             continue;
         };
-        let Some(rule) = selected_macro_rule_unit(source, selected_range)? else {
+        let Some(rule) = selected_macro_rule_unit(source, &rule_index, selected_range)? else {
             continue;
         };
         let requirement = MacroRuleSelectionRequirement {
             expansion: expansion.id,
             rule: rule.id,
         };
-        if !macro_rule_requirement_matches(source, definitions, expansion, requirement.rule)
-            || !requirements.insert(requirement)
+        if !macro_rule_requirement_matches(
+            source,
+            definitions,
+            &refined_macro_definitions,
+            expansion,
+            requirement.rule,
+        ) || !requirements.insert(requirement)
         {
             return Err(RetentionError::InvalidConstraint);
         }
@@ -1391,50 +1994,68 @@ pub(crate) fn collect_macro_rule_expansion_constraints(
     {
         return Err(RetentionError::InvalidConstraint);
     }
-    constraints
-        .macro_rule_selection_requirements
-        .extend(requirements);
-    Ok(())
+    Ok(requirements.into_iter().collect())
 }
 
-fn selected_macro_rule_unit(
+pub(crate) fn collect_declarative_macro_constraints(
     source: &SourceInventory,
+    definitions: &DefinitionGraph,
+    expansions: &[ExpansionNode],
+    producer_coverage: MacroProducerCoverageInventory,
+    complete_output_meaning: MacroCompleteOutputMeaningInventory,
+    outputless_expansions: Vec<ExpansionId>,
+) -> Result<DeclarativeMacroConstraints, RetentionError> {
+    Ok(DeclarativeMacroConstraints {
+        rule_selections: collect_macro_rule_selection_requirements(
+            source,
+            definitions,
+            expansions,
+        )?,
+        producer_coverage,
+        complete_output_meaning,
+        outputless_expansions,
+    })
+}
+
+fn selected_macro_rule_unit<'a>(
+    source: &'a SourceInventory,
+    rule_index: &MacroRuleSelectionIndex,
     selected_range: crate::source::ByteRange,
-) -> Result<Option<&WrittenUnit>, RetentionError> {
-    let matching_rules = source
+) -> Result<Option<&'a WrittenUnit>, RetentionError> {
+    let Some(rule) = rule_index
+        .selected_rule(selected_range)
+        .map_err(|_| RetentionError::InvalidConstraint)?
+    else {
+        return Ok(None);
+    };
+    source
         .units
-        .iter()
+        .get(rule.0 as usize)
         .filter(|unit| {
-            unit.kind == WrittenUnitKind::MacroRule
+            unit.id == rule
+                && unit.kind == WrittenUnitKind::MacroRule
                 && unit.cfg_state == CfgState::Active
                 && unit.full_range == selected_range
         })
-        .collect::<Vec<_>>();
-    if let [rule] = matching_rules.as_slice() {
-        return Ok(Some(rule));
-    }
-    if !matching_rules.is_empty() {
-        return Err(RetentionError::InvalidConstraint);
-    }
+        .map(Some)
+        .ok_or(RetentionError::InvalidConstraint)
+}
 
-    let enclosing_whole_definitions = source
+fn refined_macro_definition_units(source: &SourceInventory) -> BTreeSet<SourceUnitId> {
+    source
         .macro_rules
         .iter()
         .filter_map(|facts| match facts {
-            MacroRuleSourceFacts::Whole { definition } => source.units.get(definition.0 as usize),
-            MacroRuleSourceFacts::Refined { .. } => None,
+            MacroRuleSourceFacts::Whole { .. } => None,
+            MacroRuleSourceFacts::Refined { definition, .. } => Some(*definition),
         })
-        .filter(|definition| definition.full_range.contains(selected_range))
-        .count();
-    match enclosing_whole_definitions {
-        1 => Ok(None),
-        _ => Err(RetentionError::InvalidConstraint),
-    }
+        .collect()
 }
 
 fn validate_macro_rule_selection_requirements(
     source: &SourceInventory,
     graph: &DependencyGraph,
+    refined_macro_definitions: &BTreeSet<SourceUnitId>,
     requirements: &[MacroRuleSelectionRequirement],
 ) -> Result<Vec<MacroRuleSelectionRequirement>, RetentionError> {
     let requirement_count = requirements.len();
@@ -1455,6 +2076,7 @@ fn validate_macro_rule_selection_requirements(
                     !macro_rule_requirement_matches(
                         source,
                         &graph.definitions,
+                        refined_macro_definitions,
                         expansion,
                         requirement.rule,
                     )
@@ -1472,8 +2094,8 @@ fn validate_macro_rule_selection_requirements(
 }
 
 fn macro_rule_selection_definition(
-    source: &SourceInventory,
     definitions: &DefinitionGraph,
+    refined_macro_definitions: &BTreeSet<SourceUnitId>,
     expansion: &ExpansionNode,
 ) -> Option<SourceUnitId> {
     if expansion.implementation != Some(MacroImplementationKind::Declarative) {
@@ -1486,16 +2108,14 @@ fn macro_rule_selection_definition(
     let DefinitionOrigin::Written { unit, .. } = &definition.origin else {
         return None;
     };
-    (definition.kind == DefinitionKind::Macro
-        && source.macro_rules.iter().any(|facts| {
-            matches!(facts, MacroRuleSourceFacts::Refined { definition, .. } if definition == unit)
-        }))
-    .then_some(*unit)
+    (definition.kind == DefinitionKind::Macro && refined_macro_definitions.contains(unit))
+        .then_some(*unit)
 }
 
 fn macro_rule_requirement_matches(
     source: &SourceInventory,
     definitions: &DefinitionGraph,
+    refined_macro_definitions: &BTreeSet<SourceUnitId>,
     expansion: &ExpansionNode,
     required: SourceUnitId,
 ) -> bool {
@@ -1506,7 +2126,7 @@ fn macro_rule_requirement_matches(
     }) else {
         return false;
     };
-    macro_rule_selection_definition(source, definitions, expansion)
+    macro_rule_selection_definition(definitions, refined_macro_definitions, expansion)
         .is_some_and(|definition_unit| rule.parent == Some(definition_unit))
 }
 
@@ -1538,28 +2158,15 @@ fn observed_macro_rule_selection_counts(source: &SourceInventory) -> BTreeMap<So
 
 fn validate_retained_macro_definitions(
     source: &SourceInventory,
-    constraints: &ValidatedConstraints,
-    compile_required: &BTreeSet<GraphNode>,
     retained_units: &BTreeSet<SourceUnitId>,
 ) -> Result<(), RetentionError> {
-    let definitions_with_reachable_selection = constraints
-        .macro_rule_selection_requirements
-        .iter()
-        .filter(|requirement| {
-            compile_required.contains(&GraphNode::Expansion(requirement.expansion))
-        })
-        .filter_map(|requirement| source.units[requirement.rule.0 as usize].parent)
-        .collect::<BTreeSet<_>>();
     if source.macro_rules.iter().any(|facts| match facts {
         MacroRuleSourceFacts::Whole { .. } => false,
         MacroRuleSourceFacts::Refined {
-            definition,
-            observed_selections,
-            ..
+            definition, rules, ..
         } => {
-            !observed_selections.is_empty()
-                && retained_units.contains(definition)
-                && !definitions_with_reachable_selection.contains(definition)
+            retained_units.contains(definition)
+                && rules.iter().all(|rule| !retained_units.contains(rule))
         }
     }) {
         return Err(RetentionError::InvalidConstraint);
@@ -1567,26 +2174,163 @@ fn validate_retained_macro_definitions(
     Ok(())
 }
 
-fn validate_conditional_requirements(
-    source: &SourceInventory,
-    requirements: &[ConditionalSourceRequirement],
-) -> Result<Vec<ConditionalSourceRequirement>, RetentionError> {
-    let mut unique = BTreeSet::new();
-    for requirement in requirements {
-        let units = [requirement.left, requirement.right, requirement.required]
-            .map(|id| source.units.get(id.0 as usize));
-        if units
-            .iter()
-            .any(|unit| unit.is_none_or(|unit| unit.cfg_state != CfgState::Active))
-            || requirement.left == requirement.right
-            || requirement.required == requirement.left
-            || requirement.required == requirement.right
-            || !unique.insert(*requirement)
+fn validate_compiler_member_constraints(
+    graph: &DependencyGraph,
+    constraints: &CompilerMemberConstraints,
+) -> Result<ValidatedCompilerMemberConstraints, RetentionError> {
+    let definition = |id: DefinitionId| {
+        graph
+            .definitions
+            .definitions
+            .get(id.0 as usize)
+            .filter(|definition| definition.id == id)
+    };
+    let is_member = |kind: DefinitionKind| {
+        matches!(
+            kind,
+            DefinitionKind::AssociatedType
+                | DefinitionKind::AssociatedFunction
+                | DefinitionKind::AssociatedConst
+        )
+    };
+
+    let expected_members = graph
+        .definitions
+        .definitions
+        .iter()
+        .filter(|definition| {
+            is_member(definition.kind)
+                && matches!(
+                    definition.origin,
+                    DefinitionOrigin::Written { .. } | DefinitionOrigin::Expanded { .. }
+                )
+        })
+        .map(|definition| definition.id)
+        .collect::<BTreeSet<_>>();
+    let actual_members = constraints
+        .classified_members
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let expected_implementations = graph
+        .definitions
+        .definitions
+        .iter()
+        .filter(|definition| definition.kind == DefinitionKind::Impl)
+        .map(|definition| definition.id)
+        .collect::<BTreeSet<_>>();
+    let actual_implementations = constraints
+        .classified_implementations
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual_members != expected_members
+        || actual_members.len() != constraints.classified_members.len()
+        || actual_implementations != expected_implementations
+        || actual_implementations.len() != constraints.classified_implementations.len()
+    {
+        return Err(RetentionError::IncompleteMemberConstraints);
+    }
+
+    let mut requirements = BTreeSet::new();
+    for requirement in &constraints.requirements {
+        let Some(trigger) = definition(requirement.trigger) else {
+            return Err(RetentionError::InvalidConstraint);
+        };
+        let Some(required) = definition(requirement.required) else {
+            return Err(RetentionError::InvalidConstraint);
+        };
+        if trigger.id == required.id
+            || !matches!(
+                required.kind,
+                DefinitionKind::Impl
+                    | DefinitionKind::AssociatedType
+                    | DefinitionKind::AssociatedFunction
+                    | DefinitionKind::AssociatedConst
+            )
+            || !requirements.insert(*requirement)
         {
             return Err(RetentionError::InvalidConstraint);
         }
     }
-    Ok(unique.into_iter().collect())
+
+    let mut conditional_requirements = BTreeSet::new();
+    for requirement in &constraints.conditional_requirements {
+        let Some(left) = definition(requirement.left) else {
+            return Err(RetentionError::InvalidConstraint);
+        };
+        let Some(right) = definition(requirement.right) else {
+            return Err(RetentionError::InvalidConstraint);
+        };
+        let Some(required) = definition(requirement.required) else {
+            return Err(RetentionError::InvalidConstraint);
+        };
+        let right_parent = right.parent.and_then(definition);
+        if left.kind != DefinitionKind::Impl
+            || !is_member(right.kind)
+            || right_parent.is_none_or(|parent| parent.kind != DefinitionKind::Trait)
+            || !is_member(required.kind)
+            || required.parent != Some(left.id)
+            || requirement.left == requirement.right
+            || requirement.required == requirement.left
+            || requirement.required == requirement.right
+            || !conditional_requirements.insert(*requirement)
+        {
+            return Err(RetentionError::InvalidConstraint);
+        }
+    }
+
+    let mut disjunctions = BTreeSet::new();
+    let mut triggers = BTreeSet::new();
+    for disjunction in &constraints.disjunctions {
+        let Some(trigger) = definition(disjunction.trigger) else {
+            return Err(RetentionError::InvalidConstraint);
+        };
+        let choices = disjunction.choices.iter().copied().collect::<BTreeSet<_>>();
+        if trigger.kind != DefinitionKind::Impl
+            || choices.is_empty()
+            || choices.len() != disjunction.choices.len()
+            || !triggers.insert(disjunction.trigger)
+            || choices.iter().any(|choice| {
+                definition(*choice).is_none_or(|choice| {
+                    !is_member(choice.kind) || choice.parent != Some(disjunction.trigger)
+                })
+            })
+        {
+            return Err(RetentionError::InvalidConstraint);
+        }
+        disjunctions.insert(DefinitionDisjunction {
+            trigger: disjunction.trigger,
+            choices: choices.into_iter().collect(),
+        });
+    }
+
+    let requirements = requirements.into_iter().collect::<Vec<_>>();
+    let conditional_requirements = conditional_requirements.into_iter().collect::<Vec<_>>();
+    let mut requirements_by_trigger = BTreeMap::<DefinitionId, Vec<DefinitionId>>::new();
+    for requirement in &requirements {
+        requirements_by_trigger
+            .entry(requirement.trigger)
+            .or_default()
+            .push(requirement.required);
+    }
+    let mut conditional_by_trigger = BTreeMap::<DefinitionId, Vec<(usize, u8)>>::new();
+    for (index, requirement) in conditional_requirements.iter().enumerate() {
+        conditional_by_trigger
+            .entry(requirement.left)
+            .or_default()
+            .push((index, 1));
+        conditional_by_trigger
+            .entry(requirement.right)
+            .or_default()
+            .push((index, 2));
+    }
+    Ok(ValidatedCompilerMemberConstraints {
+        requirements_by_trigger,
+        conditional_requirements,
+        conditional_by_trigger,
+        disjunctions: disjunctions.into_iter().collect(),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1657,6 +2401,57 @@ fn definition_source_units_from_graph(
         .into_iter()
         .map(|unit| unit.ok_or(RetentionError::InvalidGraph))
         .collect()
+}
+
+/// Returns the source units which materialize definitions without a macro
+/// product conjunction.  Expanded definitions, and compiler definitions
+/// nested below them, deliberately have no singleton binding.
+fn definition_singleton_source_units(
+    graph: &DefinitionGraph,
+    macro_producers: &DefinitionMacroProducerIndex,
+    definition_units: &[SourceUnitId],
+    refined_macro_producers: &BTreeSet<ExpansionId>,
+) -> Result<Vec<Option<SourceUnitId>>, RetentionError> {
+    if graph.definitions.len() != definition_units.len() {
+        return Err(RetentionError::InvalidGraph);
+    }
+    let mut states = vec![0_u8; graph.definitions.len()];
+    let mut bindings = vec![None; graph.definitions.len()];
+    for start in 0..graph.definitions.len() {
+        if states[start] == 2 {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut current = start;
+        let binding = loop {
+            match states.get(current).copied() {
+                Some(2) => break bindings[current],
+                Some(1) | None => return Err(RetentionError::InvalidGraph),
+                Some(0) => {}
+                _ => unreachable!(),
+            }
+            states[current] = 1;
+            path.push(current);
+            let definition = &graph.definitions[current];
+            match definition.origin {
+                DefinitionOrigin::Written { .. } => break Some(definition_units[current]),
+                DefinitionOrigin::Expanded { .. } => {
+                    let refined = macro_producers
+                        .producer(definition.id)
+                        .is_ok_and(|producer| refined_macro_producers.contains(&producer));
+                    break (!refined).then_some(definition_units[current]);
+                }
+                DefinitionOrigin::CompilerGenerated { .. } | DefinitionOrigin::Injected { .. } => {
+                    current = definition.parent.ok_or(RetentionError::InvalidGraph)?.0 as usize;
+                }
+            }
+        };
+        for index in path.into_iter().rev() {
+            states[index] = 2;
+            bindings[index] = binding;
+        }
+    }
+    Ok(bindings)
 }
 
 fn resolve_definition_unit(
@@ -1782,8 +2577,14 @@ fn validate_source(source: &SourceInventory) -> Result<(), RetentionError> {
             }
         }
     }
-    validate_macro_rule_facts(&source.units, &source.macro_rules)
-        .map_err(|_| RetentionError::InvalidSource)?;
+    validate_declarative_macro_source_facts(
+        &source.original,
+        &source.units,
+        &source.macro_rules,
+        &source.macro_templates,
+        &source.macro_repetitions,
+    )
+    .map_err(|_| RetentionError::InvalidSource)?;
     validate_derive_target_facts(&source.units, &source.derive_targets)
         .map_err(|_| RetentionError::InvalidSource)?;
     validate_ownerless_attribute_invocations(
@@ -1851,1857 +2652,4 @@ fn valid_graph_node(graph: &DependencyGraph, node: GraphNode) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use crate::compiler_terms::CanonicalCompilerTerm;
-    use crate::dependency_graph::{
-        DefinitionReferenceKey, DependencyEdge, EvidenceOrigin, ExpansionFragmentKind, ExpansionId,
-        ExpansionKey, ExpansionKeyPart, ExpansionKind, ExpansionNode, MacroStyle, MonoInstanceKey,
-        MonoInstanceRole, MonoKey, MonoNode, ObservationSite, RootReason, RootRecord,
-    };
-    use crate::graph::{
-        Definition, DefinitionEdge, DefinitionGraph, DefinitionKey, DefinitionKeyPart,
-        DependencyKind as DefinitionDependencyKind, ExternalDefinition, ExternalDefinitionId,
-        ExternalDefinitionKey, GeneratedRole, InjectedRole,
-    };
-    use crate::source::{
-        AtomicGroupId, ByteRange, DeriveAttributeSourceFacts, DeriveHelperSourceFacts,
-        DeriveSourceRequirement, DeriveTargetSourceFacts, MacroRuleSourceFacts, OriginalOffsetMap,
-        SourceInventory, WrittenUnit,
-    };
-
-    use super::*;
-    use crate::dependency_graph::MonoId;
-
-    fn unit(
-        id: u32,
-        kind: WrittenUnitKind,
-        range: (u32, u32),
-        parent: Option<u32>,
-        group: u32,
-    ) -> WrittenUnit {
-        WrittenUnit {
-            id: SourceUnitId(id),
-            kind,
-            full_range: ByteRange {
-                start: range.0,
-                end: range.1,
-            },
-            parent: parent.map(SourceUnitId),
-            cfg_state: CfgState::Active,
-            atomic_group: AtomicGroupId(group),
-            same_role_ordinal: id.saturating_sub(1),
-        }
-    }
-
-    fn inventory(source: &str, units: Vec<WrittenUnit>) -> SourceInventory {
-        let (normalized, offsets) = OriginalOffsetMap::from_source(source).unwrap();
-        SourceInventory {
-            original: Arc::from(source),
-            normalized: Arc::from(normalized),
-            offsets,
-            units,
-            pieces: Vec::new(),
-            derive_targets: Vec::new(),
-            macro_rules: Vec::new(),
-            ownerless_attribute_invocations: Vec::new(),
-        }
-    }
-
-    fn written_definition(
-        id: u32,
-        kind: DefinitionKind,
-        unit: &WrittenUnit,
-        parent: Option<u32>,
-        name: &str,
-    ) -> Definition {
-        let origin = DefinitionOrigin::Written {
-            unit: unit.id,
-            unit_range: unit.full_range,
-            anchor: ByteRange {
-                start: unit.full_range.start,
-                end: unit.full_range.start,
-            },
-            unit_kind: unit.kind,
-            unit_ordinal: unit.same_role_ordinal,
-        };
-        Definition {
-            id: DefinitionId(id),
-            key: DefinitionKey(vec![DefinitionKeyPart {
-                kind,
-                origin: origin.key(),
-                name: Some(name.to_owned()),
-                same_role_ordinal: 0,
-            }]),
-            kind,
-            parent: parent.map(DefinitionId),
-            origin,
-        }
-    }
-
-    fn expanded_definition(
-        id: u32,
-        kind: DefinitionKind,
-        invocation: &WrittenUnit,
-        parent: Option<u32>,
-        name: &str,
-    ) -> Definition {
-        let origin = DefinitionOrigin::Expanded {
-            invocation: invocation.id,
-            invocation_range: invocation.full_range,
-            generated_role: None,
-            ordinal: id,
-        };
-        Definition {
-            id: DefinitionId(id),
-            key: DefinitionKey(vec![DefinitionKeyPart {
-                kind,
-                origin: origin.key(),
-                name: Some(name.to_owned()),
-                same_role_ordinal: id,
-            }]),
-            kind,
-            parent: parent.map(DefinitionId),
-            origin,
-        }
-    }
-
-    fn compiler_generated_definition(id: u32, parent: u32) -> Definition {
-        let origin = DefinitionOrigin::CompilerGenerated {
-            role: GeneratedRole::OpaqueType,
-            ordinal: id,
-        };
-        Definition {
-            id: DefinitionId(id),
-            key: DefinitionKey(vec![DefinitionKeyPart {
-                kind: DefinitionKind::OpaqueType,
-                origin: origin.key(),
-                name: None,
-                same_role_ordinal: id,
-            }]),
-            kind: DefinitionKind::OpaqueType,
-            parent: Some(DefinitionId(parent)),
-            origin,
-        }
-    }
-
-    fn injected_definition(id: u32, parent: u32) -> Definition {
-        let origin = DefinitionOrigin::Injected {
-            role: InjectedRole::PreludeImport,
-            ordinal: 0,
-        };
-        Definition {
-            id: DefinitionId(id),
-            key: DefinitionKey(vec![DefinitionKeyPart {
-                kind: DefinitionKind::Use,
-                origin: origin.key(),
-                name: None,
-                same_role_ordinal: 0,
-            }]),
-            kind: DefinitionKind::Use,
-            parent: Some(DefinitionId(parent)),
-            origin,
-        }
-    }
-
-    fn edge(from: GraphNode, to: GraphNode) -> DependencyEdge {
-        let materialization = matches!(from, GraphNode::Mono(_))
-            && matches!(
-                to,
-                GraphNode::Definition(_) | GraphNode::ExternalDefinition(_)
-            );
-        DependencyEdge {
-            from,
-            to,
-            kind: if materialization {
-                DependencyKind::MaterializesDefinition
-            } else {
-                DependencyKind::Definition(DefinitionDependencyKind::ValuePath)
-            },
-            sites: (!materialization)
-                .then_some(ObservationSite::CompilerGenerated)
-                .into_iter()
-                .collect(),
-            evidence: EvidenceOrigin::Compiler,
-        }
-    }
-
-    fn opaque_source_edge(
-        from: u32,
-        to: u32,
-        sites: impl IntoIterator<Item = ByteRange>,
-    ) -> DefinitionEdge {
-        DefinitionEdge {
-            from: DefinitionId(from),
-            to: DefinitionTarget::Local(DefinitionId(to)),
-            kind: DefinitionDependencyKind::OpaqueSource,
-            sites: sites.into_iter().collect(),
-        }
-    }
-
-    fn graph(definitions: Vec<Definition>, mut edges: Vec<DependencyEdge>) -> DependencyGraph {
-        let main = definitions
-            .iter()
-            .find(|definition| {
-                definition
-                    .key
-                    .0
-                    .last()
-                    .and_then(|part| part.name.as_deref())
-                    == Some("main")
-            })
-            .unwrap();
-        let main_id = main.id;
-        let main_key = main.key.clone();
-        let term = CanonicalCompilerTerm {
-            schema_version: 1,
-            bytes: vec![1],
-        };
-        let main_instance = MonoInstanceKey {
-            definition: DefinitionReferenceKey::Local(main_key),
-            arguments: term.clone(),
-            kind: term.clone(),
-        };
-        let start_instance = MonoInstanceKey {
-            definition: DefinitionReferenceKey::Local(definitions[0].key.clone()),
-            arguments: term.clone(),
-            kind: term,
-        };
-        let mono_nodes = vec![
-            MonoNode {
-                id: MonoId(0),
-                key: MonoKey::Instance {
-                    instance: main_instance,
-                    role: MonoInstanceRole::Callable,
-                },
-                materialized_definition: Some(crate::graph::DefinitionTarget::Local(main_id)),
-                allocation_observation: None,
-            },
-            MonoNode {
-                id: MonoId(1),
-                key: MonoKey::Instance {
-                    instance: start_instance,
-                    role: MonoInstanceRole::Callable,
-                },
-                materialized_definition: None,
-                allocation_observation: None,
-            },
-        ];
-        edges.push(edge(
-            GraphNode::Mono(MonoId(0)),
-            GraphNode::Definition(main_id),
-        ));
-        DependencyGraph {
-            definitions: DefinitionGraph {
-                definitions,
-                external_definitions: Vec::new(),
-                edges: Vec::new(),
-            },
-            expansions: Vec::new(),
-            proofs: Vec::new(),
-            mono_nodes,
-            edges,
-            roots: vec![
-                RootRecord {
-                    node: GraphNode::Mono(MonoId(0)),
-                    reason: RootReason::Main,
-                },
-                RootRecord {
-                    node: GraphNode::Mono(MonoId(1)),
-                    reason: RootReason::StartInstance,
-                },
-            ],
-        }
-    }
-
-    fn complete_constraints(
-        source: &SourceInventory,
-        graph: &DependencyGraph,
-    ) -> SourceConstraints {
-        let mut constraints = SourceConstraints::from_source(source);
-        constraints.member_containers = graph
-            .definitions
-            .definitions
-            .iter()
-            .filter_map(|definition| {
-                matches!(
-                    definition.kind,
-                    DefinitionKind::Trait | DefinitionKind::Impl
-                )
-                .then(|| match &definition.origin {
-                    DefinitionOrigin::Written { unit, .. } => Some(*unit),
-                    _ => None,
-                })
-                .flatten()
-            })
-            .collect();
-        constraints.classified_members = source
-            .units
-            .iter()
-            .filter(|unit| {
-                matches!(
-                    unit.kind,
-                    WrittenUnitKind::TraitMember | WrittenUnitKind::ImplMember
-                ) && unit.cfg_state == CfgState::Active
-            })
-            .map(|unit| unit.id)
-            .collect();
-        constraints.external_crates.loaded_crates = graph
-            .definitions
-            .external_definitions
-            .iter()
-            .map(|definition| definition.key.crate_identity)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|crate_identity| ExternalCrateDependency {
-                crate_identity,
-                kind: ExternalDependencyKind::Unconditional,
-            })
-            .collect();
-        constraints.external_crates.bindings = graph
-            .definitions
-            .definitions
-            .iter()
-            .filter(|definition| definition.kind == DefinitionKind::ExternCrate)
-            .map(|definition| ExternalCrateBinding {
-                definition: definition.id,
-                target: ExternalCrateBindingTarget::SelfCrate,
-            })
-            .collect();
-        collect_macro_rule_expansion_constraints(
-            source,
-            &graph.definitions,
-            &graph.expansions,
-            &mut constraints,
-        )
-        .unwrap();
-        constraints
-    }
-
-    fn external_dependency(
-        crate_identity: u64,
-        kind: ExternalDependencyKind,
-    ) -> ExternalCrateDependency {
-        ExternalCrateDependency {
-            crate_identity,
-            kind,
-        }
-    }
-
-    fn external_load(
-        direct: ExternalCrateDependency,
-        closure: impl IntoIterator<Item = ExternalCrateDependency>,
-    ) -> ExternalCrateLoad {
-        ExternalCrateLoad {
-            direct,
-            closure: closure.into_iter().collect(),
-        }
-    }
-
-    #[test]
-    fn opaque_source_preservation_depends_on_owner_reachability() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let mut inactive = unit(4, WrittenUnitKind::Item, (31, 40), Some(0), 4);
-        inactive.cfg_state = CfgState::Inactive;
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
-            unit(3, WrittenUnitKind::Item, (21, 30), Some(0), 3),
-            inactive,
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            written_definition(2, DefinitionKind::Function, &units[2], Some(0), "unused_a"),
-            written_definition(3, DefinitionKind::Function, &units[3], Some(0), "unused_b"),
-        ];
-        for (trigger, site, expected) in [
-            (
-                1,
-                ByteRange { start: 3, end: 8 },
-                BTreeSet::from([
-                    SourceUnitId(0),
-                    SourceUnitId(1),
-                    SourceUnitId(2),
-                    SourceUnitId(3),
-                ]),
-            ),
-            (
-                2,
-                ByteRange { start: 13, end: 18 },
-                BTreeSet::from([SourceUnitId(0), SourceUnitId(1)]),
-            ),
-        ] {
-            let mut graph = graph(
-                definitions.clone(),
-                vec![edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                )],
-            );
-            graph.definitions.edges = vec![opaque_source_edge(trigger, 0, [site])];
-
-            let retention = compute_retention(
-                &inventory,
-                &graph,
-                &complete_constraints(&inventory, &graph),
-            )
-            .unwrap();
-
-            assert_eq!(retention.retained_units, expected, "trigger {trigger}");
-        }
-    }
-
-    #[test]
-    fn opaque_source_edges_require_the_crate_target_and_source_evidence() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-        ];
-
-        for opaque_edge in [
-            opaque_source_edge(1, 1, [ByteRange { start: 3, end: 8 }]),
-            opaque_source_edge(1, 0, []),
-            opaque_source_edge(1, 0, [ByteRange { start: 20, end: 21 }]),
-            opaque_source_edge(1, 0, [ByteRange { start: 33, end: 34 }]),
-        ] {
-            let mut graph = graph(
-                definitions.clone(),
-                vec![edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                )],
-            );
-            graph.definitions.edges = vec![opaque_edge];
-
-            assert_eq!(
-                compute_retention(
-                    &inventory,
-                    &graph,
-                    &complete_constraints(&inventory, &graph),
-                ),
-                Err(RetentionError::IncompleteOpaqueSourceConstraints)
-            );
-        }
-    }
-
-    #[test]
-    fn retained_macro_products_reenter_the_compiler_closure() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
-            unit(2, WrittenUnitKind::MacroInvocation, (11, 20), Some(0), 2),
-            unit(3, WrittenUnitKind::Item, (21, 30), Some(0), 3),
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            expanded_definition(2, DefinitionKind::Function, &units[2], Some(0), "first"),
-            expanded_definition(3, DefinitionKind::Function, &units[2], Some(0), "sibling"),
-            written_definition(4, DefinitionKind::Struct, &units[3], Some(0), "dependency"),
-            compiler_generated_definition(5, 4),
-        ];
-        let graph = graph(
-            definitions,
-            vec![
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(2)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(3)),
-                    GraphNode::Definition(DefinitionId(5)),
-                ),
-            ],
-        );
-        let retention = compute_retention(
-            &inventory,
-            &graph,
-            &complete_constraints(&inventory, &graph),
-        )
-        .unwrap();
-
-        assert_eq!(
-            retention.retained_units,
-            BTreeSet::from([
-                SourceUnitId(0),
-                SourceUnitId(1),
-                SourceUnitId(2),
-                SourceUnitId(3),
-            ])
-        );
-        assert_eq!(
-            retention.compile_required,
-            BTreeSet::from([
-                GraphNode::Definition(DefinitionId(0)),
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(2)),
-                GraphNode::Definition(DefinitionId(3)),
-                GraphNode::Definition(DefinitionId(4)),
-                GraphNode::Definition(DefinitionId(5)),
-                GraphNode::Mono(MonoId(0)),
-                GraphNode::Mono(MonoId(1)),
-            ])
-        );
-    }
-
-    #[test]
-    fn source_site_uses_the_deepest_equal_range_owner() {
-        let source = "fn main(){}";
-        let inventory = inventory(
-            source,
-            vec![
-                unit(0, WrittenUnitKind::CrateRoot, (0, 11), None, 0),
-                unit(1, WrittenUnitKind::Item, (0, 11), Some(0), 1),
-            ],
-        );
-        let site = crate::source::ByteRange { start: 3, end: 7 };
-
-        assert_eq!(
-            source_site_is_retained(&inventory, &BTreeSet::from([SourceUnitId(1)]), site),
-            Ok(true)
-        );
-        assert_eq!(
-            source_site_is_retained(&inventory, &BTreeSet::from([SourceUnitId(0)]), site),
-            Ok(false)
-        );
-    }
-
-    #[test]
-    fn compiler_roots_do_not_pollute_semantic_requirements() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
-            unit(3, WrittenUnitKind::Item, (21, 30), Some(0), 3),
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            written_definition(
-                2,
-                DefinitionKind::Static,
-                &units[2],
-                Some(0),
-                "compiler_root",
-            ),
-            written_definition(3, DefinitionKind::Function, &units[3], Some(0), "entry"),
-        ];
-        let mut graph = graph(
-            definitions,
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        let compiler_root = MonoId(graph.mono_nodes.len() as u32);
-        graph.mono_nodes.push(MonoNode {
-            id: compiler_root,
-            key: MonoKey::Static {
-                definition: graph.definitions.definitions[2].key.clone(),
-            },
-            materialized_definition: Some(crate::graph::DefinitionTarget::Local(DefinitionId(2))),
-            allocation_observation: None,
-        });
-        graph.roots.push(RootRecord {
-            node: GraphNode::Mono(compiler_root),
-            reason: RootReason::UsedAttribute,
-        });
-        graph.roots.push(RootRecord {
-            node: GraphNode::Definition(DefinitionId(3)),
-            reason: RootReason::ExplicitEntry,
-        });
-        graph.edges.push(edge(
-            GraphNode::Mono(compiler_root),
-            GraphNode::Definition(DefinitionId(2)),
-        ));
-        let retention = compute_retention(
-            &inventory,
-            &graph,
-            &complete_constraints(&inventory, &graph),
-        )
-        .unwrap();
-
-        assert_eq!(
-            retention.semantic_required,
-            BTreeSet::from([
-                GraphNode::Definition(DefinitionId(0)),
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(3)),
-                GraphNode::Mono(MonoId(0)),
-            ])
-        );
-        assert!(
-            retention
-                .compile_required
-                .contains(&GraphNode::Definition(DefinitionId(2)))
-        );
-    }
-
-    #[test]
-    fn a_reexport_definition_root_retains_a_generic_function_without_a_mono_node() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 40), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
-            unit(3, WrittenUnitKind::Item, (21, 30), Some(0), 3),
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "generic"),
-            written_definition(2, DefinitionKind::Use, &units[2], Some(0), "export"),
-            written_definition(3, DefinitionKind::Function, &units[3], Some(0), "unused"),
-        ];
-        let graph = DependencyGraph::new(
-            DefinitionGraph {
-                definitions,
-                external_definitions: Vec::new(),
-                edges: Vec::new(),
-            },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            vec![
-                edge(
-                    GraphNode::Definition(DefinitionId(2)),
-                    GraphNode::Definition(DefinitionId(1)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(2)),
-                    GraphNode::Definition(DefinitionId(0)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                ),
-            ],
-            vec![RootRecord {
-                node: GraphNode::Definition(DefinitionId(2)),
-                reason: RootReason::ExplicitEntry,
-            }],
-        )
-        .unwrap();
-        let retention = compute_retention(
-            &inventory,
-            &graph,
-            &complete_constraints(&inventory, &graph),
-        )
-        .unwrap();
-
-        assert!(graph.mono_nodes.is_empty());
-        assert_eq!(
-            retention.semantic_required,
-            BTreeSet::from([
-                GraphNode::Definition(DefinitionId(0)),
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(2)),
-            ])
-        );
-        assert_eq!(
-            retention.retained_units,
-            BTreeSet::from([SourceUnitId(0), SourceUnitId(1), SourceUnitId(2)])
-        );
-    }
-
-    #[test]
-    fn native_link_definition_roots_are_compile_only() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            written_definition(
-                2,
-                DefinitionKind::ForeignModule,
-                &units[2],
-                Some(0),
-                "linked",
-            ),
-        ];
-        let mut graph = graph(
-            definitions,
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        graph.roots.push(RootRecord {
-            node: GraphNode::Definition(DefinitionId(2)),
-            reason: RootReason::NativeLink,
-        });
-
-        let retention = compute_retention(
-            &inventory,
-            &graph,
-            &complete_constraints(&inventory, &graph),
-        )
-        .unwrap();
-
-        assert_eq!(
-            retention.semantic_required,
-            BTreeSet::from([
-                GraphNode::Definition(DefinitionId(0)),
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Mono(MonoId(0)),
-            ])
-        );
-        assert!(
-            retention
-                .compile_required
-                .contains(&GraphNode::Definition(DefinitionId(2)))
-        );
-        assert!(retention.retained_units.contains(&SourceUnitId(2)));
-    }
-
-    #[test]
-    fn disjunction_uses_shortest_member_then_source_order() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 5), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (6, 60), Some(0), 2),
-            unit(3, WrittenUnitKind::ImplMember, (10, 20), Some(2), 3),
-            unit(4, WrittenUnitKind::ImplMember, (21, 26), Some(2), 4),
-            unit(5, WrittenUnitKind::ImplMember, (30, 35), Some(2), 5),
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            written_definition(2, DefinitionKind::Impl, &units[2], Some(0), "impl"),
-            written_definition(
-                3,
-                DefinitionKind::AssociatedFunction,
-                &units[3],
-                Some(2),
-                "long",
-            ),
-            written_definition(
-                4,
-                DefinitionKind::AssociatedFunction,
-                &units[4],
-                Some(2),
-                "first_short",
-            ),
-            written_definition(
-                5,
-                DefinitionKind::AssociatedFunction,
-                &units[5],
-                Some(2),
-                "second_short",
-            ),
-        ];
-        let graph = graph(
-            definitions,
-            vec![
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(2)),
-                ),
-            ],
-        );
-        let mut constraints = complete_constraints(&inventory, &graph);
-        constraints.disjunctions.push(SourceDisjunction {
-            trigger: SourceUnitId(2),
-            choices: vec![SourceUnitId(5), SourceUnitId(3), SourceUnitId(4)],
-        });
-        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-
-        assert_eq!(
-            retention.retained_units,
-            BTreeSet::from([
-                SourceUnitId(0),
-                SourceUnitId(1),
-                SourceUnitId(2),
-                SourceUnitId(4),
-            ])
-        );
-    }
-
-    #[test]
-    fn conditional_member_requirement_needs_both_inputs() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 5), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (6, 30), Some(0), 2),
-            unit(3, WrittenUnitKind::TraitMember, (10, 15), Some(2), 3),
-            unit(4, WrittenUnitKind::Item, (31, 60), Some(0), 4),
-            unit(5, WrittenUnitKind::ImplMember, (40, 50), Some(4), 5),
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            written_definition(2, DefinitionKind::Trait, &units[2], Some(0), "trait"),
-            written_definition(
-                3,
-                DefinitionKind::AssociatedType,
-                &units[3],
-                Some(2),
-                "required",
-            ),
-            written_definition(4, DefinitionKind::Impl, &units[4], Some(0), "impl"),
-            written_definition(
-                5,
-                DefinitionKind::AssociatedType,
-                &units[5],
-                Some(4),
-                "implementation",
-            ),
-        ];
-        let conditional = ConditionalSourceRequirement {
-            left: SourceUnitId(4),
-            right: SourceUnitId(3),
-            required: SourceUnitId(5),
-        };
-
-        for (edges, expected_member) in [
-            (
-                vec![edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(4)),
-                )],
-                false,
-            ),
-            (
-                vec![edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(3)),
-                )],
-                false,
-            ),
-            (
-                vec![
-                    edge(
-                        GraphNode::Definition(DefinitionId(1)),
-                        GraphNode::Definition(DefinitionId(3)),
-                    ),
-                    edge(
-                        GraphNode::Definition(DefinitionId(1)),
-                        GraphNode::Definition(DefinitionId(4)),
-                    ),
-                ],
-                true,
-            ),
-        ] {
-            let graph = graph(definitions.clone(), edges);
-            let mut constraints = complete_constraints(&inventory, &graph);
-            constraints
-                .conditional_member_requirements
-                .push(conditional);
-            let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-            assert_eq!(
-                retention.retained_units.contains(&SourceUnitId(5)),
-                expected_member
-            );
-        }
-    }
-
-    #[test]
-    fn atomicity_and_an_empty_impl_shell_are_retained() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
-            unit(2, WrittenUnitKind::MacroInvocation, (2, 4), Some(1), 1),
-            unit(3, WrittenUnitKind::Item, (11, 20), Some(0), 2),
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            written_definition(2, DefinitionKind::Impl, &units[3], Some(0), "empty_impl"),
-        ];
-        let graph = graph(
-            definitions,
-            vec![
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(2)),
-                ),
-            ],
-        );
-        let retention = compute_retention(
-            &inventory,
-            &graph,
-            &complete_constraints(&inventory, &graph),
-        )
-        .unwrap();
-
-        assert_eq!(
-            retention.retained_units,
-            BTreeSet::from([
-                SourceUnitId(0),
-                SourceUnitId(1),
-                SourceUnitId(2),
-                SourceUnitId(3),
-            ])
-        );
-    }
-
-    #[test]
-    fn invalid_constraints_and_missing_member_coverage_fail_closed() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (11, 30), Some(0), 2),
-            unit(3, WrittenUnitKind::TraitMember, (15, 20), Some(2), 3),
-        ];
-        let inventory = inventory(source, units.clone());
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                written_definition(2, DefinitionKind::Trait, &units[2], Some(0), "trait"),
-                written_definition(
-                    3,
-                    DefinitionKind::AssociatedFunction,
-                    &units[3],
-                    Some(2),
-                    "member",
-                ),
-            ],
-            vec![
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(2)),
-                ),
-            ],
-        );
-
-        let missing = SourceConstraints::from_source(&inventory);
-        assert_eq!(
-            compute_retention(&inventory, &graph, &missing),
-            Err(RetentionError::IncompleteMemberConstraints)
-        );
-
-        let mut invalid = complete_constraints(&inventory, &graph);
-        invalid.member_requirements.push(SourceRequirement {
-            trigger: SourceUnitId(3),
-            required: SourceUnitId(99),
-        });
-        assert_eq!(
-            compute_retention(&inventory, &graph, &invalid),
-            Err(RetentionError::InvalidConstraint)
-        );
-    }
-
-    #[test]
-    fn retained_derive_outputs_close_over_influences_and_helper_attributes() {
-        let source = "x".repeat(128);
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 128), None, 0),
-            unit(1, WrittenUnitKind::Item, (100, 120), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (0, 90), Some(0), 2),
-            unit(3, WrittenUnitKind::MacroInvocation, (0, 30), Some(2), 3),
-            unit(4, WrittenUnitKind::MacroInvocation, (9, 14), Some(3), 4),
-            unit(5, WrittenUnitKind::MacroInvocation, (16, 23), Some(3), 5),
-            unit(6, WrittenUnitKind::MacroInvocation, (40, 50), Some(2), 6),
-        ];
-        let mut inventory = inventory(&source, units.clone());
-        inventory.derive_targets = vec![DeriveTargetSourceFacts::Complete {
-            target: SourceUnitId(2),
-            attributes: vec![DeriveAttributeSourceFacts {
-                attribute: SourceUnitId(3),
-                elements: vec![SourceUnitId(4), SourceUnitId(5)],
-                directly_written: true,
-            }],
-            helper_candidates: vec![units[6].full_range],
-            influences: vec![DeriveSourceRequirement {
-                trigger: SourceUnitId(4),
-                required: SourceUnitId(5),
-            }],
-            helpers: vec![DeriveHelperSourceFacts {
-                attribute: SourceUnitId(6),
-                provider: SourceUnitId(5),
-            }],
-        }];
-
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                expanded_definition(
-                    2,
-                    DefinitionKind::Function,
-                    &units[4],
-                    Some(0),
-                    "derived_output",
-                ),
-            ],
-            vec![
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(2)),
-                ),
-            ],
-        );
-        let constraints = complete_constraints(&inventory, &graph);
-
-        assert_eq!(
-            constraints
-                .derive_requirements
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from([
-                SourceRequirement {
-                    trigger: SourceUnitId(4),
-                    required: SourceUnitId(5),
-                },
-                SourceRequirement {
-                    trigger: SourceUnitId(5),
-                    required: SourceUnitId(6),
-                },
-                SourceRequirement {
-                    trigger: SourceUnitId(6),
-                    required: SourceUnitId(5),
-                },
-            ])
-        );
-        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-        assert!(retention.retained_units.contains(&SourceUnitId(4)));
-        assert!(retention.retained_units.contains(&SourceUnitId(5)));
-        assert!(retention.retained_units.contains(&SourceUnitId(6)));
-
-        let mut incomplete = constraints.clone();
-        incomplete.derive_requirements.pop();
-        assert_eq!(
-            compute_retention(&inventory, &graph, &incomplete),
-            Err(RetentionError::InvalidConstraint)
-        );
-    }
-
-    #[test]
-    fn reachable_macro_expansion_requires_only_its_selected_rule() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
-            unit(1, WrittenUnitKind::Item, (24, 32), Some(0), 1),
-            unit(2, WrittenUnitKind::MacroDefinition, (0, 23), Some(0), 2),
-            unit(3, WrittenUnitKind::MacroRule, (5, 12), Some(2), 3),
-            unit(4, WrittenUnitKind::MacroRule, (13, 22), Some(2), 4),
-        ];
-        let mut inventory = inventory(source, units.clone());
-        inventory.macro_rules = vec![MacroRuleSourceFacts::Refined {
-            definition: SourceUnitId(2),
-            rules: vec![SourceUnitId(3), SourceUnitId(4)],
-            observed_selections: vec![SourceUnitId(3), SourceUnitId(3)],
-        }];
-        let mut graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                written_definition(2, DefinitionKind::Macro, &units[2], Some(0), "m"),
-            ],
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        let expansion_kind = ExpansionKind::Macro {
-            style: MacroStyle::Bang,
-            name: "m".into(),
-        };
-        graph.expansions.push(ExpansionNode {
-            id: ExpansionId(0),
-            key: ExpansionKey(vec![ExpansionKeyPart {
-                kind: expansion_kind.clone(),
-                fragment: Some(ExpansionFragmentKind::Expression),
-                implementation: Some(MacroImplementationKind::Declarative),
-                invocation_range: Some(ByteRange { start: 24, end: 25 }),
-                node_range: Some(ByteRange { start: 24, end: 25 }),
-                target_range: None,
-                macro_definition: Some(DefinitionReferenceKey::Local(
-                    graph.definitions.definitions[2].key.clone(),
-                )),
-                selected_macro_rule: Some(units[3].full_range),
-                same_role_ordinal: 0,
-            }]),
-            kind: expansion_kind,
-            fragment: Some(ExpansionFragmentKind::Expression),
-            implementation: Some(MacroImplementationKind::Declarative),
-            discovered_in: None,
-            semantic_parent: None,
-            source_call_parent: None,
-            written_invocation: None,
-            source_owner: Some(DefinitionId(1)),
-            macro_definition: Some(DefinitionTarget::Local(DefinitionId(2))),
-        });
-        let mut repeated_expansion = graph.expansions[0].clone();
-        repeated_expansion.id = ExpansionId(1);
-        repeated_expansion.key.0[0].invocation_range = Some(ByteRange { start: 25, end: 26 });
-        repeated_expansion.key.0[0].node_range = Some(ByteRange { start: 25, end: 26 });
-        repeated_expansion.key.0[0].same_role_ordinal = 1;
-        graph.expansions.push(repeated_expansion);
-        graph.edges.extend([
-            DependencyEdge {
-                from: GraphNode::Definition(DefinitionId(1)),
-                to: GraphNode::Expansion(ExpansionId(0)),
-                kind: DependencyKind::ExpansionUse,
-                sites: vec![ObservationSite::CompilerGenerated],
-                evidence: EvidenceOrigin::Compiler,
-            },
-            DependencyEdge {
-                from: GraphNode::Expansion(ExpansionId(0)),
-                to: GraphNode::Definition(DefinitionId(2)),
-                kind: DependencyKind::MacroDefinition,
-                sites: Vec::new(),
-                evidence: EvidenceOrigin::Compiler,
-            },
-            DependencyEdge {
-                from: GraphNode::Definition(DefinitionId(1)),
-                to: GraphNode::Expansion(ExpansionId(1)),
-                kind: DependencyKind::ExpansionUse,
-                sites: vec![ObservationSite::CompilerGenerated],
-                evidence: EvidenceOrigin::Compiler,
-            },
-            DependencyEdge {
-                from: GraphNode::Expansion(ExpansionId(1)),
-                to: GraphNode::Definition(DefinitionId(2)),
-                kind: DependencyKind::MacroDefinition,
-                sites: Vec::new(),
-                evidence: EvidenceOrigin::Compiler,
-            },
-        ]);
-
-        let mut missing_selection_graph = graph.clone();
-        missing_selection_graph.expansions[0].key.0[0].selected_macro_rule = None;
-        let mut incomplete_constraints = SourceConstraints::from_source(&inventory);
-        assert_eq!(
-            collect_macro_rule_expansion_constraints(
-                &inventory,
-                &missing_selection_graph.definitions,
-                &missing_selection_graph.expansions,
-                &mut incomplete_constraints,
-            ),
-            Err(RetentionError::InvalidConstraint),
-            "every in-scope expansion needs a collected rule selection"
-        );
-
-        let mut missing_definition_graph = graph.clone();
-        missing_definition_graph.expansions[1].macro_definition = None;
-        missing_definition_graph.expansions[1].key.0[0].macro_definition = None;
-        let mut incomplete_constraints = SourceConstraints::from_source(&inventory);
-        assert_eq!(
-            collect_macro_rule_expansion_constraints(
-                &inventory,
-                &missing_definition_graph.definitions,
-                &missing_definition_graph.expansions,
-                &mut incomplete_constraints,
-            ),
-            Err(RetentionError::InvalidConstraint),
-            "coverage must not depend on the macro-definition relation being present"
-        );
-
-        let constraints = complete_constraints(&inventory, &graph);
-        assert_eq!(
-            constraints.macro_rule_selection_requirements,
-            vec![
-                MacroRuleSelectionRequirement {
-                    expansion: ExpansionId(0),
-                    rule: SourceUnitId(3),
-                },
-                MacroRuleSelectionRequirement {
-                    expansion: ExpansionId(1),
-                    rule: SourceUnitId(3),
-                },
-            ]
-        );
-        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-        assert!(retention.retained_units.contains(&SourceUnitId(2)));
-        assert!(retention.retained_units.contains(&SourceUnitId(3)));
-        assert!(!retention.retained_units.contains(&SourceUnitId(4)));
-
-        let mut missing_repeated_selection = constraints.clone();
-        missing_repeated_selection
-            .macro_rule_selection_requirements
-            .pop();
-        assert_eq!(
-            compute_retention(&inventory, &graph, &missing_repeated_selection),
-            Err(RetentionError::InvalidConstraint),
-            "every expansion must keep its own selection even when the rule is shared"
-        );
-
-        let mut normalized_graph = graph.clone();
-        for expansion in &mut normalized_graph.expansions {
-            expansion.key.0[0].selected_macro_rule = Some(ByteRange { start: 6, end: 13 });
-        }
-        let normalized_retention =
-            compute_retention(&inventory, &normalized_graph, &constraints).unwrap();
-        assert_eq!(normalized_retention, retention);
-
-        let mut orphaned_graph = graph.clone();
-        orphaned_graph.edges.retain(|edge| {
-            !(edge.from == GraphNode::Definition(DefinitionId(1))
-                && matches!(edge.to, GraphNode::Expansion(_)))
-        });
-        orphaned_graph.edges.push(edge(
-            GraphNode::Definition(DefinitionId(1)),
-            GraphNode::Definition(DefinitionId(2)),
-        ));
-        assert_eq!(
-            compute_retention(&inventory, &orphaned_graph, &constraints),
-            Err(RetentionError::InvalidConstraint),
-            "an observed definition cannot survive without a reachable selecting expansion"
-        );
-    }
-
-    #[test]
-    fn retained_unobserved_macro_definition_keeps_every_rule() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
-            unit(1, WrittenUnitKind::Item, (24, 32), Some(0), 1),
-            unit(2, WrittenUnitKind::MacroDefinition, (0, 23), Some(0), 2),
-            unit(3, WrittenUnitKind::MacroRule, (5, 12), Some(2), 3),
-            unit(4, WrittenUnitKind::MacroRule, (13, 22), Some(2), 4),
-        ];
-        let mut inventory = inventory(source, units.clone());
-        inventory.macro_rules = vec![MacroRuleSourceFacts::Refined {
-            definition: SourceUnitId(2),
-            rules: vec![SourceUnitId(3), SourceUnitId(4)],
-            observed_selections: Vec::new(),
-        }];
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                written_definition(2, DefinitionKind::Macro, &units[2], Some(0), "m"),
-            ],
-            vec![
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(2)),
-                ),
-            ],
-        );
-
-        let retention = compute_retention(
-            &inventory,
-            &graph,
-            &complete_constraints(&inventory, &graph),
-        )
-        .unwrap();
-        assert!(retention.retained_units.contains(&SourceUnitId(2)));
-        assert!(retention.retained_units.contains(&SourceUnitId(3)));
-        assert!(retention.retained_units.contains(&SourceUnitId(4)));
-
-        let mut missing = complete_constraints(&inventory, &graph);
-        missing.macro_rule_requirements.pop();
-        assert_eq!(
-            compute_retention(&inventory, &graph, &missing),
-            Err(RetentionError::InvalidConstraint)
-        );
-    }
-
-    #[test]
-    fn compiler_generated_load_keeps_the_source_of_its_external_condition() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
-            unit(1, WrittenUnitKind::Item, (48, 64), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (0, 32), Some(0), 2),
-        ];
-        let inventory = inventory(source, units.clone());
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                written_definition(
-                    2,
-                    DefinitionKind::Function,
-                    &units[2],
-                    Some(0),
-                    "loads_need",
-                ),
-            ],
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        let needs = external_dependency(10, ExternalDependencyKind::MacrosOnly);
-        let runtime = external_dependency(20, ExternalDependencyKind::Conditional);
-        let needs_load = external_load(needs, [needs]);
-        let runtime_load = external_load(runtime, [runtime]);
-        let mut constraints = complete_constraints(&inventory, &graph);
-        constraints.external_crates.loaded_crates = vec![needs, runtime];
-        constraints.external_crates.activations = vec![ExternalCrateActivation {
-            source: Some(SourceUnitId(2)),
-            load: needs_load.clone(),
-        }];
-        constraints.external_crates.compiler_generated_activations =
-            vec![CompilerGeneratedCrateActivation {
-                load: runtime_load,
-                condition: Some(needs.crate_identity),
-            }];
-        constraints.external_crates.providers = vec![ExternalMetadataProvider {
-            crate_identity: runtime.crate_identity,
-            kind: ExternalMetadataProviderKind::PanicRuntime,
-        }];
-
-        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-        assert!(retention.retained_units.contains(&SourceUnitId(2)));
-
-        constraints
-            .external_crates
-            .activations
-            .push(ExternalCrateActivation {
-                source: None,
-                load: needs_load,
-            });
-        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-        assert!(!retention.retained_units.contains(&SourceUnitId(2)));
-    }
-
-    #[test]
-    fn compiler_metadata_requirements_keep_their_external_source() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
-            unit(1, WrittenUnitKind::Item, (48, 64), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (0, 32), Some(0), 2),
-        ];
-        let inventory = inventory(source, units.clone());
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                written_definition(
-                    2,
-                    DefinitionKind::Function,
-                    &units[2],
-                    Some(0),
-                    "loads_need",
-                ),
-            ],
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        let dependency = external_dependency(10, ExternalDependencyKind::Unconditional);
-        let load = external_load(dependency, [dependency]);
-
-        for kind in [
-            ExternalMetadataRequirementKind::Allocator,
-            ExternalMetadataRequirementKind::PanicRuntime,
-        ] {
-            let mut constraints = complete_constraints(&inventory, &graph);
-            constraints.external_crates.loaded_crates = vec![dependency];
-            constraints.external_crates.activations = vec![ExternalCrateActivation {
-                source: Some(SourceUnitId(2)),
-                load: load.clone(),
-            }];
-            constraints.external_crates.requirements = vec![ExternalMetadataRequirement {
-                crate_identity: dependency.crate_identity,
-                kind,
-            }];
-
-            let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-            assert!(retention.retained_units.contains(&SourceUnitId(2)));
-
-            constraints
-                .external_crates
-                .activations
-                .push(ExternalCrateActivation {
-                    source: None,
-                    load: load.clone(),
-                });
-            let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-            assert!(!retention.retained_units.contains(&SourceUnitId(2)));
-        }
-    }
-
-    #[test]
-    fn compiler_metadata_requirement_uses_one_smallest_carrier() {
-        let source = "x".repeat(80);
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 80), None, 0),
-            unit(1, WrittenUnitKind::Item, (60, 80), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (0, 40), Some(0), 2),
-            unit(3, WrittenUnitKind::Item, (41, 55), Some(0), 3),
-        ];
-        let inventory = inventory(&source, units.clone());
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                written_definition(2, DefinitionKind::Function, &units[2], Some(0), "large"),
-                written_definition(3, DefinitionKind::Function, &units[3], Some(0), "small"),
-            ],
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        let large = external_dependency(10, ExternalDependencyKind::Unconditional);
-        let small = external_dependency(20, ExternalDependencyKind::MacrosOnly);
-        let mut constraints = complete_constraints(&inventory, &graph);
-        constraints.external_crates.loaded_crates = vec![large, small];
-        constraints.external_crates.activations = vec![
-            ExternalCrateActivation {
-                source: Some(SourceUnitId(2)),
-                load: external_load(large, [large]),
-            },
-            ExternalCrateActivation {
-                source: Some(SourceUnitId(3)),
-                load: external_load(small, [small]),
-            },
-        ];
-        constraints.external_crates.requirements = vec![
-            ExternalMetadataRequirement {
-                crate_identity: large.crate_identity,
-                kind: ExternalMetadataRequirementKind::Allocator,
-            },
-            ExternalMetadataRequirement {
-                crate_identity: small.crate_identity,
-                kind: ExternalMetadataRequirementKind::Allocator,
-            },
-        ];
-
-        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-        assert!(!retention.retained_units.contains(&SourceUnitId(2)));
-        assert!(retention.retained_units.contains(&SourceUnitId(3)));
-
-        constraints.external_crates.local_requirements = vec![LocalMetadataRequirement {
-            source: None,
-            kind: ExternalMetadataRequirementKind::Allocator,
-        }];
-        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-        assert!(!retention.retained_units.contains(&SourceUnitId(2)));
-        assert!(!retention.retained_units.contains(&SourceUnitId(3)));
-    }
-
-    #[test]
-    fn provider_choice_preserves_the_required_dependency_kind() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
-            unit(1, WrittenUnitKind::Item, (48, 64), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (0, 20), Some(0), 2),
-            unit(3, WrittenUnitKind::Item, (21, 40), Some(0), 3),
-        ];
-        let inventory = inventory(source, units.clone());
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                written_definition(2, DefinitionKind::Function, &units[2], Some(0), "weak"),
-                written_definition(3, DefinitionKind::Function, &units[3], Some(0), "strong"),
-            ],
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        let provider = external_dependency(10, ExternalDependencyKind::Unconditional);
-        let weak = external_dependency(20, ExternalDependencyKind::MacrosOnly);
-        let strong = external_dependency(30, ExternalDependencyKind::Unconditional);
-        let mut constraints = complete_constraints(&inventory, &graph);
-        constraints.external_crates.loaded_crates = vec![provider, weak, strong];
-        constraints.external_crates.activations = vec![
-            ExternalCrateActivation {
-                source: Some(SourceUnitId(2)),
-                load: external_load(
-                    weak,
-                    [
-                        weak,
-                        external_dependency(10, ExternalDependencyKind::MacrosOnly),
-                    ],
-                ),
-            },
-            ExternalCrateActivation {
-                source: Some(SourceUnitId(3)),
-                load: external_load(strong, [strong, provider]),
-            },
-        ];
-        constraints.external_crates.providers = vec![ExternalMetadataProvider {
-            crate_identity: provider.crate_identity,
-            kind: ExternalMetadataProviderKind::GlobalAllocator,
-        }];
-
-        let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
-        assert!(!retention.retained_units.contains(&SourceUnitId(2)));
-        assert!(retention.retained_units.contains(&SourceUnitId(3)));
-    }
-
-    #[test]
-    fn external_compiler_root_selects_a_source_only_when_reached() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 64), None, 0),
-            unit(1, WrittenUnitKind::Item, (48, 64), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (0, 32), Some(0), 2),
-        ];
-        let inventory = inventory(source, units.clone());
-        let definitions = vec![
-            written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-            written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            written_definition(2, DefinitionKind::Function, &units[2], Some(0), "load"),
-        ];
-        let external = ExternalDefinition {
-            id: ExternalDefinitionId(0),
-            key: ExternalDefinitionKey {
-                crate_identity: 10,
-                crate_name: "external".to_owned(),
-                def_path_hash: [1; 16],
-            },
-            path: "external::entry".to_owned(),
-        };
-        let mut live_graph = graph(
-            definitions.clone(),
-            vec![
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::Definition(DefinitionId(0)),
-                ),
-                edge(
-                    GraphNode::Definition(DefinitionId(1)),
-                    GraphNode::ExternalDefinition(ExternalDefinitionId(0)),
-                ),
-            ],
-        );
-        live_graph.definitions.external_definitions = vec![external.clone()];
-        let load = external_dependency(10, ExternalDependencyKind::Unconditional);
-        let mut constraints = complete_constraints(&inventory, &live_graph);
-        constraints.external_crates.activations = vec![ExternalCrateActivation {
-            source: Some(SourceUnitId(2)),
-            load: external_load(load, [load]),
-        }];
-
-        let retention = compute_retention(&inventory, &live_graph, &constraints).unwrap();
-        assert!(retention.retained_units.contains(&SourceUnitId(2)));
-
-        let mut dead_graph = graph(
-            definitions,
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        dead_graph.definitions.external_definitions = vec![external];
-        let dead_retention = compute_retention(&inventory, &dead_graph, &constraints).unwrap();
-        assert!(!dead_retention.retained_units.contains(&SourceUnitId(2)));
-    }
-
-    #[test]
-    fn missing_external_activation_is_an_observation_gap() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
-            unit(1, WrittenUnitKind::Item, (16, 32), Some(0), 1),
-        ];
-        let inventory = inventory(source, units.clone());
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            ],
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        let mut constraints = complete_constraints(&inventory, &graph);
-        constraints.external_crates.loaded_crates = vec![external_dependency(
-            10,
-            ExternalDependencyKind::Unconditional,
-        )];
-        constraints.external_crates.providers = vec![ExternalMetadataProvider {
-            crate_identity: 10,
-            kind: ExternalMetadataProviderKind::CompilerBuiltins,
-        }];
-        assert_eq!(
-            compute_retention(&inventory, &graph, &constraints),
-            Err(RetentionError::IncompleteExternalCrateConstraints)
-        );
-    }
-
-    #[test]
-    fn removable_user_external_native_link_metadata_is_rejected() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 48), None, 0),
-            unit(1, WrittenUnitKind::Item, (32, 48), Some(0), 1),
-            unit(2, WrittenUnitKind::Item, (0, 24), Some(0), 2),
-        ];
-        let inventory = inventory(source, units.clone());
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                written_definition(2, DefinitionKind::Function, &units[2], Some(0), "load"),
-            ],
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        let dependency = external_dependency(10, ExternalDependencyKind::Unconditional);
-        let load = external_load(dependency, [dependency]);
-        let mut constraints = complete_constraints(&inventory, &graph);
-        constraints.external_crates.loaded_crates = vec![dependency];
-        constraints.external_crates.activations = vec![ExternalCrateActivation {
-            source: Some(SourceUnitId(2)),
-            load: load.clone(),
-        }];
-        constraints.external_crates.providers = vec![ExternalMetadataProvider {
-            crate_identity: dependency.crate_identity,
-            kind: ExternalMetadataProviderKind::ExternalNativeLink,
-        }];
-
-        assert!(compute_retention(&inventory, &graph, &constraints).is_ok());
-
-        constraints.external_crates.user_artifact_crates = vec![dependency.crate_identity];
-        assert_eq!(
-            compute_retention(&inventory, &graph, &constraints),
-            Err(RetentionError::UnsupportedExternalNativeLink)
-        );
-
-        constraints.external_crates.activations[0].source = Some(SourceUnitId(0));
-        assert!(compute_retention(&inventory, &graph, &constraints).is_ok());
-
-        constraints.external_crates.activations[0].source = None;
-        assert!(compute_retention(&inventory, &graph, &constraints).is_ok());
-    }
-
-    #[test]
-    fn order_sensitive_providers_require_one_crate_identity() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
-            unit(1, WrittenUnitKind::Item, (16, 32), Some(0), 1),
-        ];
-        let inventory = inventory(source, units.clone());
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-            ],
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-
-        for provider_kind in [
-            ExternalMetadataProviderKind::CompilerBuiltins,
-            ExternalMetadataProviderKind::ProfilerRuntime,
-            ExternalMetadataProviderKind::DefaultLibAllocator,
-        ] {
-            let first = external_dependency(10, ExternalDependencyKind::Conditional);
-            let second = external_dependency(20, ExternalDependencyKind::Conditional);
-            let mut constraints = complete_constraints(&inventory, &graph);
-            constraints.external_crates.loaded_crates = vec![first, second];
-            constraints.external_crates.activations = vec![
-                ExternalCrateActivation {
-                    source: None,
-                    load: external_load(first, [first]),
-                },
-                ExternalCrateActivation {
-                    source: None,
-                    load: external_load(second, [second]),
-                },
-            ];
-            constraints.external_crates.providers = vec![
-                ExternalMetadataProvider {
-                    crate_identity: first.crate_identity,
-                    kind: provider_kind,
-                },
-                ExternalMetadataProvider {
-                    crate_identity: second.crate_identity,
-                    kind: provider_kind,
-                },
-            ];
-
-            assert_eq!(
-                compute_retention(&inventory, &graph, &constraints),
-                Err(RetentionError::IncompleteExternalCrateConstraints)
-            );
-            assert_eq!(
-                external_compiler_observation(&constraints),
-                Err(RetentionError::IncompleteExternalCrateConstraints)
-            );
-        }
-    }
-
-    #[test]
-    fn external_compiler_outcome_detects_provider_and_kind_changes() {
-        let provider = ExternalCompilerMetadataFact::Provider {
-            crate_identity: 10,
-            provider: ExternalMetadataProviderKind::GlobalAllocator,
-            dependency_kind: ExternalDependencyKind::Unconditional,
-        };
-        let requirement = ExternalCompilerMetadataFact::Requirement(
-            ExternalMetadataRequirementKind::PanicRuntime,
-        );
-        let original = ExternalCompilerExpectation {
-            metadata: BTreeSet::from([provider, requirement]),
-            external_crates: BTreeSet::from([external_dependency(
-                20,
-                ExternalDependencyKind::Conditional,
-            )]),
-        };
-        let matching = ExternalCompilerObservation {
-            metadata: BTreeSet::from([provider, requirement]),
-            loaded_crates: BTreeSet::from([external_dependency(
-                20,
-                ExternalDependencyKind::Conditional,
-            )]),
-        };
-        assert_eq!(
-            external_compiler_outcome_difference(&original, &matching),
-            None
-        );
-
-        let mut missing_provider = matching.clone();
-        missing_provider.metadata.remove(&provider);
-        assert!(matches!(
-            external_compiler_outcome_difference(&original, &missing_provider),
-            Some(ExternalCompilerOutcomeDifference::Metadata { .. })
-        ));
-
-        let mut weaker_provider = matching.clone();
-        weaker_provider.metadata.remove(&provider);
-        weaker_provider
-            .metadata
-            .insert(ExternalCompilerMetadataFact::Provider {
-                crate_identity: 10,
-                provider: ExternalMetadataProviderKind::GlobalAllocator,
-                dependency_kind: ExternalDependencyKind::Conditional,
-            });
-        assert!(matches!(
-            external_compiler_outcome_difference(&original, &weaker_provider),
-            Some(ExternalCompilerOutcomeDifference::Metadata { .. })
-        ));
-
-        let mut additional_provider = matching.clone();
-        additional_provider
-            .metadata
-            .insert(ExternalCompilerMetadataFact::Provider {
-                crate_identity: 30,
-                provider: ExternalMetadataProviderKind::PanicRuntime,
-                dependency_kind: ExternalDependencyKind::Conditional,
-            });
-        assert!(matches!(
-            external_compiler_outcome_difference(&original, &additional_provider),
-            Some(ExternalCompilerOutcomeDifference::Metadata { .. })
-        ));
-
-        let mut missing_requirement = matching.clone();
-        missing_requirement.metadata.remove(&requirement);
-        assert!(matches!(
-            external_compiler_outcome_difference(&original, &missing_requirement),
-            Some(ExternalCompilerOutcomeDifference::Metadata { .. })
-        ));
-
-        let mut weaker_external = matching;
-        weaker_external.loaded_crates =
-            BTreeSet::from([external_dependency(20, ExternalDependencyKind::MacrosOnly)]);
-        assert_eq!(
-            external_compiler_outcome_difference(&original, &weaker_external),
-            Some(ExternalCompilerOutcomeDifference::ExternalCrate {
-                crate_identity: 20,
-                original: ExternalDependencyKind::Conditional,
-                reduced: Some(ExternalDependencyKind::MacrosOnly),
-            })
-        );
-
-        let stronger_external = ExternalCompilerObservation {
-            metadata: BTreeSet::from([provider, requirement]),
-            loaded_crates: BTreeSet::from([external_dependency(
-                20,
-                ExternalDependencyKind::Unconditional,
-            )]),
-        };
-        assert_eq!(
-            external_compiler_outcome_difference(&original, &stronger_external),
-            Some(ExternalCompilerOutcomeDifference::ExternalCrate {
-                crate_identity: 20,
-                original: ExternalDependencyKind::Conditional,
-                reduced: Some(ExternalDependencyKind::Unconditional),
-            })
-        );
-    }
-
-    #[test]
-    fn source_free_definitions_inherit_their_parent_unit() {
-        let source = "xxxxxxxxxxxxxxxxxxxxxxxx";
-        let units = vec![
-            unit(0, WrittenUnitKind::CrateRoot, (0, 24), None, 0),
-            unit(1, WrittenUnitKind::Item, (0, 12), Some(0), 1),
-        ];
-        let inventory = inventory(source, units.clone());
-        let graph = graph(
-            vec![
-                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
-                written_definition(1, DefinitionKind::Function, &units[1], Some(0), "main"),
-                injected_definition(2, 1),
-            ],
-            vec![edge(
-                GraphNode::Definition(DefinitionId(1)),
-                GraphNode::Definition(DefinitionId(0)),
-            )],
-        );
-        let retention = compute_retention(
-            &inventory,
-            &graph,
-            &complete_constraints(&inventory, &graph),
-        )
-        .unwrap();
-
-        assert!(
-            retention
-                .compile_required
-                .contains(&GraphNode::Definition(DefinitionId(2)))
-        );
-    }
-}
+mod tests;

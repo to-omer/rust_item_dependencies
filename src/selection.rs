@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_hir::def::DefKind;
 use rustc_middle::mono::{
-    MonoProof, MonoProofUse, MonoTraceCollection, MonoTraceNode, MonoTraceSite, MonoUseCause,
+    MonoItem, MonoProof, MonoProofUse, MonoTraceCollection, MonoTraceNode, MonoTraceSite,
+    MonoUseCause,
 };
 use rustc_middle::traits::{
     BuiltinImplSource, CodegenAssociatedItemProof, CodegenAssociatedItemProofError,
@@ -330,6 +331,24 @@ impl<'a, 'tcx> SelectionCollector<'a, 'tcx> {
                     MonoTraceCollection::Mentioned => raw_instance,
                 };
                 if codegen_instance == expected {
+                    Ok(())
+                } else {
+                    Err(SelectionCollectionError::StockResultMismatch)
+                }
+            }
+            MonoUseCause::PreOptimizationDirectCall
+            | MonoUseCause::PreOptimizationFunctionPointer
+            | MonoUseCause::PreOptimizationInlineAsmSymbol => {
+                if proof_use.collection != MonoTraceCollection::Mentioned
+                    || !matches!(proof_use.from, MonoTraceNode::Item(MonoItem::Fn(_)))
+                    || !matches!(
+                        proof_use.site,
+                        MonoTraceSite::Source(_) | MonoTraceSite::CompilerGenerated
+                    )
+                {
+                    return Err(SelectionCollectionError::InvalidInput);
+                }
+                if codegen_instance == raw_instance {
                     Ok(())
                 } else {
                     Err(SelectionCollectionError::StockResultMismatch)

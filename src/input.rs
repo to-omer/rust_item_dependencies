@@ -31,17 +31,20 @@ use rustc_span::{FileName, RealFileName, Span, Symbol, sym};
 use rustc_target::spec::TARGETS;
 
 use crate::definitions::{
-    DefinitionError, collect_definition_graph, collect_definitions, normalize_definition_key,
+    DefinitionError, DefinitionIdentityUniverse, collect_definition_graph,
+    collect_definitions_with_identity, normalize_definition_key,
 };
 use crate::dependency_graph::{
-    AllocationPathSite, DependencyEdge, DependencyGraph, DependencyGraphError, ExpansionNode,
-    GraphNode, MonoKey, MonoNode, ObservationSite, RootReason, RootRecord,
+    AllocationPathSite, DependencyEdge, DependencyGraph, DependencyGraphError, ExpansionId,
+    ExpansionNode, GraphNode, MonoKey, MonoNode, ObservationSite, RootReason, RootRecord,
     is_downstream_selection_candidate,
 };
 #[cfg(all(test, rust_item_dependencies_patched))]
 use crate::dependency_graph::{DependencyKind, EvidenceOrigin, ProofRelationKind};
 use crate::error::{AnalysisError, EntryPointError, UnsupportedReason};
-use crate::expansions::{CollectedExpansions, ExpansionError, collect_expansions};
+#[cfg(all(test, rust_item_dependencies_patched))]
+use crate::expansions::validated_outputless_macro_expansions;
+use crate::expansions::{ExpansionError, collect_expansions, collect_macro_provenance};
 use crate::external::{ExternalCrate, PreparedExternalCrates, prepare_external_crates};
 use crate::graph::{DefinitionGraph, DefinitionKind, DefinitionOrigin};
 use crate::monomorphization::{
@@ -49,8 +52,9 @@ use crate::monomorphization::{
 };
 use crate::retention::{
     ExternalCompilerExpectation, ExternalCompilerObservation, Retention, RetentionError,
-    SourceConstraints, collect_macro_rule_expansion_constraints, collect_source_constraints,
+    SourceConstraints, collect_declarative_macro_constraints, collect_source_constraints,
     compute_retention, external_compiler_expectation, external_compiler_observation,
+    outputless_macro_expansions_in_complete_source,
 };
 use crate::rewrite::{SourceRewrite, SourceRewriteError, rewrite_source};
 use crate::source::{
@@ -529,8 +533,10 @@ pub(crate) struct InspectedDependencies {
     pub source: SourceInventory,
     pub graph: DependencyGraph,
     pub constraints: SourceConstraints,
+    pub complete_source_outputless_macro_expansions: Option<BTreeSet<ExpansionId>>,
     pub external_compiler: ExternalCompilerObservation,
     pub tags: DefinitionTags,
+    pub(crate) definition_identity_universe: DefinitionIdentityUniverse,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -542,6 +548,7 @@ pub(crate) struct InspectedReduction {
     pub rewrite: SourceRewrite,
     pub external_compiler: ExternalCompilerExpectation,
     pub tags: DefinitionTags,
+    pub(crate) definition_identity_universe: DefinitionIdentityUniverse,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -561,6 +568,9 @@ static OMIT_ONE_SELECTED_IMPL_FACT_FROM: Mutex<Option<String>> = Mutex::new(None
 
 #[cfg(all(test, rust_item_dependencies_patched))]
 static OMIT_ONE_MACRO_RULE_SELECTION_FROM: Mutex<Option<String>> = Mutex::new(None);
+
+#[cfg(all(test, rust_item_dependencies_patched))]
+static MARK_ONE_NONEMPTY_MACRO_OUTPUTLESS_FROM: Mutex<Option<(String, bool)>> = Mutex::new(None);
 
 #[cfg(test)]
 pub(crate) fn reset_inspection_count() {
@@ -614,6 +624,40 @@ pub(crate) fn with_one_missing_macro_rule_selection<T>(source: &str, f: impl FnO
     f()
 }
 
+#[cfg(all(test, rust_item_dependencies_patched))]
+pub(crate) fn with_one_nonempty_macro_marked_outputless<T>(
+    source: &str,
+    f: impl FnOnce() -> T,
+) -> T {
+    let mut request = MARK_ONE_NONEMPTY_MACRO_OUTPUTLESS_FROM
+        .lock()
+        .expect("outputless mutation mutex is poisoned");
+    assert!(request.is_none(), "outputless mutation must not be nested");
+    *request = Some((source.to_owned(), false));
+    drop(request);
+
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *MARK_ONE_NONEMPTY_MACRO_OUTPUTLESS_FROM
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+    let _reset = Reset;
+    let result = f();
+    let applied = MARK_ONE_NONEMPTY_MACRO_OUTPUTLESS_FROM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .is_some_and(|(configured, applied)| configured == source && applied);
+    assert!(
+        applied,
+        "the mutation fixture must observe eligible nonempty macro output"
+    );
+    result
+}
+
 #[cfg(test)]
 pub(crate) fn inspect_source(
     input: &SourceInput,
@@ -628,7 +672,7 @@ pub(crate) fn inspect_source_in_context(
     source: &str,
     context: &CompilationContext<'_>,
 ) -> Result<SourceInventory, InputError> {
-    run_inspection(source, context, CollectionMode::Source, None)
+    run_inspection(source, context, CollectionMode::Source, None, None)
         .map(|inspection| inspection.source)
 }
 
@@ -647,7 +691,7 @@ fn inspect_source_with_definitions_in_context(
     source: &str,
     context: &CompilationContext<'_>,
 ) -> Result<InspectedSource, InputError> {
-    let inspection = run_inspection(source, context, CollectionMode::Definitions, None)?;
+    let inspection = run_inspection(source, context, CollectionMode::Definitions, None, None)?;
     Ok(InspectedSource {
         source: inspection.source,
         definitions: inspection
@@ -663,7 +707,7 @@ pub(crate) fn inspect_source_with_dependencies(
 ) -> Result<InspectedDependencies, InputError> {
     let compilation = PreparedCompilationOptions::empty();
     let context = CompilationContext::new(input, &compilation, sysroot);
-    inspect_source_with_dependencies_inner(&input.source, &context, None)
+    inspect_source_with_dependencies_inner(&input.source, &context, None, None)
 }
 
 /// Inspects a rewritten source while expressing every compiler-decision
@@ -689,13 +733,28 @@ pub(crate) fn inspect_source_with_dependencies_at_original_coordinates_in_contex
     context: &CompilationContext<'_>,
     coordinates: &SourceRewrite,
 ) -> Result<InspectedDependencies, InputError> {
-    inspect_source_with_dependencies_inner(source, context, Some(coordinates))
+    inspect_source_with_dependencies_inner(source, context, Some(coordinates), None)
+}
+
+pub(crate) fn inspect_source_with_dependencies_at_original_coordinates_and_identity_in_context(
+    source: &str,
+    context: &CompilationContext<'_>,
+    coordinates: &SourceRewrite,
+    expected_identity: &DefinitionIdentityUniverse,
+) -> Result<InspectedDependencies, InputError> {
+    inspect_source_with_dependencies_inner(
+        source,
+        context,
+        Some(coordinates),
+        Some(expected_identity),
+    )
 }
 
 fn inspect_source_with_dependencies_inner(
     source: &str,
     context: &CompilationContext<'_>,
     coordinates: Option<&SourceRewrite>,
+    expected_identity: Option<&DefinitionIdentityUniverse>,
 ) -> Result<InspectedDependencies, InputError> {
     if let Some(coordinates) = coordinates {
         if coordinates.source != source {
@@ -707,7 +766,13 @@ fn inspect_source_with_dependencies_inner(
                 .map_err(|_| InputError::Rewrite(SourceRewriteError::InvalidInventory))?,
         })?;
     }
-    let inspection = run_inspection(source, context, CollectionMode::Dependencies, coordinates)?;
+    let inspection = run_inspection(
+        source,
+        context,
+        CollectionMode::Dependencies,
+        coordinates,
+        expected_identity,
+    )?;
     let dependencies = inspection
         .dependencies
         .ok_or(InputError::CompilerProtocolFailure)?;
@@ -716,8 +781,11 @@ fn inspect_source_with_dependencies_inner(
         source: inspection.source,
         graph: dependencies.graph,
         constraints: dependencies.constraints,
+        complete_source_outputless_macro_expansions: dependencies
+            .complete_source_outputless_macro_expansions,
         external_compiler,
         tags: dependencies.tags,
+        definition_identity_universe: dependencies.definition_identity_universe,
     })
 }
 
@@ -735,7 +803,7 @@ pub(crate) fn inspect_source_with_reduction_in_context(
     source: &str,
     context: &CompilationContext<'_>,
 ) -> Result<InspectedReduction, InputError> {
-    let inspected = inspect_source_with_dependencies_inner(source, context, None)?;
+    let inspected = inspect_source_with_dependencies_inner(source, context, None, None)?;
     let retention = compute_retention(&inspected.source, &inspected.graph, &inspected.constraints)?;
     let external_compiler =
         external_compiler_expectation(&inspected.graph, &inspected.constraints, &retention)?;
@@ -748,6 +816,7 @@ pub(crate) fn inspect_source_with_reduction_in_context(
         rewrite,
         external_compiler,
         tags: inspected.tags,
+        definition_identity_universe: inspected.definition_identity_universe,
     })
 }
 
@@ -755,7 +824,9 @@ pub(crate) fn inspect_source_with_reduction_in_context(
 struct CollectedDependencies {
     graph: DependencyGraph,
     constraints: SourceConstraints,
+    complete_source_outputless_macro_expansions: Option<BTreeSet<ExpansionId>>,
     tags: DefinitionTags,
+    definition_identity_universe: DefinitionIdentityUniverse,
 }
 
 struct CompilerInspection {
@@ -769,6 +840,7 @@ fn run_inspection(
     context: &CompilationContext<'_>,
     collection_mode: CollectionMode,
     coordinates: Option<&SourceRewrite>,
+    expected_identity: Option<&DefinitionIdentityUniverse>,
 ) -> Result<CompilerInspection, InputError> {
     #[cfg(test)]
     INSPECTION_COUNT.set(INSPECTION_COUNT.get() + 1);
@@ -807,6 +879,7 @@ fn run_inspection(
         inventory: None,
         collection_mode,
         coordinates: coordinates.cloned(),
+        expected_definition_identity: expected_identity.cloned(),
         direct_external_crates: context
             .external_crates()
             .direct()
@@ -1089,6 +1162,7 @@ struct InputCallbacks {
     inventory: Option<SourceInventory>,
     collection_mode: CollectionMode,
     coordinates: Option<SourceRewrite>,
+    expected_definition_identity: Option<DefinitionIdentityUniverse>,
     direct_external_crates: BTreeSet<String>,
     external_artifact_directory: Option<PathBuf>,
     crate_type: CrateType,
@@ -1277,6 +1351,7 @@ impl Callbacks for InputCallbacks {
 
         #[cfg(rust_item_dependencies_patched)]
         {
+            config.observe_declarative_macro_expansions = true;
             let denied_resources = Arc::clone(&self.denied_resources);
             config.external_resource_guard =
                 Some(rustc_driver::ExternalResourceGuard::new(move |resource| {
@@ -1461,7 +1536,10 @@ impl Callbacks for InputCallbacks {
                     compiler,
                     tcx,
                     inventory,
-                    self.coordinates.as_ref(),
+                    (
+                        self.coordinates.as_ref(),
+                        self.expected_definition_identity.as_ref(),
+                    ),
                     self.external_artifact_directory.as_deref(),
                     self.crate_type,
                     &entry_points,
@@ -1535,12 +1613,22 @@ fn collect_dependency_graph(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
-    coordinates: Option<&SourceRewrite>,
+    definition_identity: (Option<&SourceRewrite>, Option<&DefinitionIdentityUniverse>),
     external_artifact_directory: Option<&Path>,
     crate_type: CrateType,
     entry_points: &[ResolvedEntryPoint],
 ) -> Result<CollectedDependencies, DependencyError> {
-    let mut definitions = collect_definitions(compiler, tcx, source)?;
+    let (coordinates, expected_identity) = definition_identity;
+    let provenance = collect_macro_provenance(compiler, tcx, source)?;
+    let mut definitions = collect_definitions_with_identity(
+        compiler,
+        tcx,
+        source,
+        &provenance,
+        coordinates,
+        expected_identity,
+    )?;
+    let definition_identity_universe = definitions.identity_universe().clone();
     let tags = collect_definition_tags(compiler, tcx, source, &definitions)?;
     // Source constraints join HIR definitions to the rewritten inventory, so
     // they must be collected before any identity is moved to original-source
@@ -1560,10 +1648,44 @@ fn collect_dependency_graph(
     if let Some(coordinates) = coordinates {
         definitions.normalize_identity_keys(coordinates)?;
     }
-    let CollectedExpansions {
-        nodes: mut expansions,
+    let (
+        mut expansions,
         mut edges,
-    } = collect_expansions(compiler, tcx, source, &mut definitions)?;
+        macro_producer_coverage,
+        macro_complete_output_meaning,
+        outputless_macro_expansions,
+    ) = collect_expansions(compiler, tcx, source, &mut definitions, &provenance)?.into_parts();
+    #[cfg(all(test, rust_item_dependencies_patched))]
+    let mut outputless_macro_expansions = outputless_macro_expansions;
+    #[cfg(all(test, rust_item_dependencies_patched))]
+    {
+        let mut request = MARK_ONE_NONEMPTY_MACRO_OUTPUTLESS_FROM
+            .lock()
+            .expect("outputless mutation mutex is poisoned");
+        if request
+            .as_ref()
+            .is_some_and(|(configured, _)| configured == source.original.as_ref())
+        {
+            let producer = macro_producer_coverage
+                .producers()
+                .iter()
+                .find(|coverage| {
+                    let producer = coverage.producer();
+                    coverage.output_token_count() != 0
+                        && !outputless_macro_expansions.contains(&producer)
+                        && validated_outputless_macro_expansions(&expansions, &edges, &[producer])
+                            .is_some()
+                })
+                .map(|coverage| coverage.producer());
+            if let Some(producer) = producer {
+                outputless_macro_expansions.push(producer);
+                outputless_macro_expansions.sort_unstable();
+                if let Some((_, applied)) = request.as_mut() {
+                    *applied = true;
+                }
+            }
+        }
+    }
     let needs_downstream_selection = if crate_type == CrateType::Library {
         entry_points.iter().try_fold(false, |needed, entry| {
             if needed {
@@ -1598,12 +1720,15 @@ fn collect_dependency_graph(
         },
         Ok,
     )?;
-    collect_macro_rule_expansion_constraints(
+    let declarative_macros = collect_declarative_macro_constraints(
         source,
         &definitions.graph,
         &expansions,
-        &mut constraints,
+        macro_producer_coverage,
+        macro_complete_output_meaning,
+        outputless_macro_expansions,
     )?;
+    constraints.set_declarative_macro_constraints(declarative_macros)?;
     edges.extend(mono_edges);
     #[cfg(all(test, rust_item_dependencies_patched))]
     let omit_selected_impl = {
@@ -1648,10 +1773,15 @@ fn collect_dependency_graph(
         edges,
         roots,
     )?;
+    let complete_source_outputless_macro_expansions = coordinates
+        .map(|_| outputless_macro_expansions_in_complete_source(&graph, &constraints))
+        .transpose()?;
     Ok(CollectedDependencies {
         graph,
         constraints,
+        complete_source_outputless_macro_expansions,
         tags,
+        definition_identity_universe,
     })
 }
 
@@ -2556,6 +2686,10 @@ mod tests {
                 ),
                 #[cfg(rust_item_dependencies_patched)]
                 (MacroRule, range(178, 208), Some(range(158, 210)), Active),
+                #[cfg(rust_item_dependencies_patched)]
+                (NestedItem, range(186, 195), Some(range(178, 208)), Active),
+                #[cfg(rust_item_dependencies_patched)]
+                (NestedItem, range(196, 205), Some(range(178, 208)), Active),
                 (
                     MacroInvocation,
                     range(216, 224),

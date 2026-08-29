@@ -178,6 +178,66 @@ pub fn entry(value: u8) -> u8 { value.saturating_add(helper()) }
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn exported_library_macros_remain_whole_for_downstream_rule_selection() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let source = concat!(
+        "#[macro_export]\n",
+        "macro_rules! exported {\n",
+        "    () => {\n",
+        "        macro_rules! dead_local { () => { 99 }; }\n",
+        "        pub fn entry() -> u32 { 7 }\n",
+        "        fn dead_item() -> u32 { dead_local!() }\n",
+        "    };\n",
+        "    ($name:ident) => { pub fn $name() -> u32 { 11 } };\n",
+        "}\n",
+        "exported!();\n",
+    );
+    let input = SourceInput::library(
+        source,
+        Edition::Rust2024,
+        target.clone(),
+        "exported_macro_library",
+    )
+    .with_entry_point(EntryPoint::new("exported_macro_library::entry"));
+
+    let verified = analyzer
+        .reduce_and_verify(&input)
+        .expect("a downstream-visible exported macro must remain whole");
+    assert_eq!(verified.reduced_source(), source);
+    assert_fixed_point(&analyzer, &input, source);
+
+    let downstream = concat!(
+        "exported_macro_library::exported!(downstream_value);\n",
+        "fn main() { println!(\"{}\", downstream_value()); }\n",
+    );
+    let directory = TestDirectory::new("exported-macro-library");
+    let original = compile_library_and_run_downstream(
+        directory.path(),
+        "original",
+        "exported_macro_library",
+        source,
+        downstream,
+        &target,
+    );
+    let reduced = compile_library_and_run_downstream(
+        directory.path(),
+        "reduced",
+        "exported_macro_library",
+        verified.reduced_source(),
+        downstream,
+        &target,
+    );
+    assert!(original.status.success(), "original run: {original:?}");
+    assert_eq!(original.stdout, b"11\n");
+    assert!(original.stderr.is_empty(), "original run: {original:?}");
+    assert_eq!(reduced.status, original.status);
+    assert_eq!(reduced.stdout, original.stdout);
+    assert_eq!(reduced.stderr, original.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn an_unused_alloc_import_preserves_the_downstream_allocator_requirement() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();

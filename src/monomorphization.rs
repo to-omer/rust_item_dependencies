@@ -338,13 +338,46 @@ impl<'a, 'tcx> MonoCollector<'a, 'tcx> {
                 continue;
             }
             let successors = self.successors(root, mode)?;
+            let owner = trace_root(root);
+            let is_pre_optimization_cause = |cause| {
+                matches!(
+                    cause,
+                    MonoUseCause::PreOptimizationDirectCall
+                        | MonoUseCause::PreOptimizationFunctionPointer
+                        | MonoUseCause::PreOptimizationInlineAsmSymbol
+                )
+            };
+            if successors
+                .facts
+                .iter()
+                .any(|fact| is_pre_optimization_cause(fact.cause))
+                || successors
+                    .proof_uses
+                    .iter()
+                    .any(|proof| is_pre_optimization_cause(proof.cause))
+                || successors
+                    .pre_optimization_associated_items
+                    .iter()
+                    .any(|proof| proof.from != owner || !is_pre_optimization_cause(proof.cause))
+            {
+                return Err(MonomorphizationError::IncompleteObservation);
+            }
             self.facts.extend(successors.facts.iter().copied());
             self.proofs
                 .extend(successors.proof_uses.iter().copied().map(|proof| RawProof {
                     from: proof.from,
                     proof,
                 }));
-            let owner = trace_root(root);
+            self.proofs.extend(
+                successors
+                    .pre_optimization_associated_items
+                    .iter()
+                    .copied()
+                    .map(|proof| RawProof {
+                        from: proof.from,
+                        proof,
+                    }),
+            );
             let instance_and_body = match root {
                 MonoTraceRoot::Fn(instance) => {
                     Some((instance, self.tcx.instance_mir(instance.def)))
@@ -1440,6 +1473,9 @@ fn dependency_kind(value: MonoUseCause) -> MonoDependencyKind {
         MonoUseCause::AllocationReference => MonoDependencyKind::AllocationReference,
         MonoUseCause::ThreadLocalShim => MonoDependencyKind::ThreadLocalShim,
         MonoUseCause::CompilerRequirement => MonoDependencyKind::CompilerRequirement,
+        MonoUseCause::PreOptimizationDirectCall
+        | MonoUseCause::PreOptimizationFunctionPointer
+        | MonoUseCause::PreOptimizationInlineAsmSymbol => MonoDependencyKind::SourceAssociatedItem,
     }
 }
 

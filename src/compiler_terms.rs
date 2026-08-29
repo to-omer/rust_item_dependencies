@@ -14,7 +14,7 @@ use crate::graph::{
     DefinitionKey, DefinitionOriginKey, ExternalDefinitionKey, GeneratedRole, InjectedRole,
 };
 
-const TERM_ENCODING_SCHEMA: u32 = 1;
+const TERM_ENCODING_SCHEMA: u32 = 2;
 
 /// A compiler term whose identity is independent of interned pointers and
 /// compiler-session identifiers.

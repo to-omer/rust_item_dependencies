@@ -1,6 +1,43 @@
 extern crate proc_macro;
 
-use proc_macro::{Spacing, TokenStream, TokenTree};
+use proc_macro::{Delimiter, Group, Spacing, Span, TokenStream, TokenTree};
+
+fn with_span(input: TokenStream, span: Span) -> TokenStream {
+    input
+        .into_iter()
+        .map(|token| match token {
+            TokenTree::Group(group) => {
+                let mut output = Group::new(group.delimiter(), with_span(group.stream(), span));
+                output.set_span(span);
+                TokenTree::Group(output)
+            }
+            TokenTree::Ident(mut identifier) => {
+                identifier.set_span(span);
+                TokenTree::Ident(identifier)
+            }
+            TokenTree::Punct(mut punctuation) => {
+                punctuation.set_span(span);
+                TokenTree::Punct(punctuation)
+            }
+            TokenTree::Literal(mut literal) => {
+                literal.set_span(span);
+                TokenTree::Literal(literal)
+            }
+        })
+        .collect()
+}
+
+fn with_first_input_span(input: TokenStream, output: &str) -> TokenStream {
+    let span = input
+        .into_iter()
+        .next()
+        .expect("the marker token must be present")
+        .span();
+    with_span(
+        output.parse().expect("the generated tokens must parse"),
+        span,
+    )
+}
 
 fn contains_identifier(input: TokenStream, expected: &str) -> bool {
     input.into_iter().any(|token| match token {
@@ -49,10 +86,25 @@ pub fn make_unused(_input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+pub fn empty(_input: TokenStream) -> TokenStream {
+    TokenStream::new()
+}
+
+#[proc_macro]
 pub fn make_assembly(_input: TokenStream) -> TokenStream {
     "fn generated_assembly() { unsafe { core::arch::asm!(\"\"); } }"
         .parse()
         .expect("the generated assembly function must parse")
+}
+
+#[proc_macro]
+pub fn emit_input_spanned_local(input: TokenStream) -> TokenStream {
+    with_first_input_span(input, "local!();")
+}
+
+#[proc_macro]
+pub fn emit_input_spanned_relay(input: TokenStream) -> TokenStream {
+    with_first_input_span(input, "relay!(local!(););")
 }
 
 #[proc_macro]
@@ -63,9 +115,60 @@ pub fn configured_bang(input: TokenStream) -> TokenStream {
         .expect("the generated item must parse")
 }
 
+#[proc_macro]
+pub fn punct_spacing(input: TokenStream) -> TokenStream {
+    let mut tokens = input.into_iter();
+    let punctuation = match (tokens.next(), tokens.next()) {
+        (Some(TokenTree::Punct(punctuation)), None) => punctuation,
+        _ => panic!("punct_spacing expects exactly one punctuation token"),
+    };
+    let result = match punctuation.spacing() {
+        Spacing::Joint => "\"Joint\"",
+        Spacing::Alone => "\"Alone\"",
+    };
+    result
+        .parse()
+        .expect("the generated string literal must parse")
+}
+
+#[proc_macro]
+pub fn last_punct_spacing(input: TokenStream) -> TokenStream {
+    fn tail_punctuation(input: TokenStream) -> Option<Option<Spacing>> {
+        let mut last = None;
+        for token in input {
+            let current = match token {
+                TokenTree::Group(group) if group.delimiter() == Delimiter::None => {
+                    let Some(tail) = tail_punctuation(group.stream()) else {
+                        continue;
+                    };
+                    tail
+                }
+                TokenTree::Punct(punctuation) => Some(punctuation.spacing()),
+                TokenTree::Group(_) | TokenTree::Ident(_) | TokenTree::Literal(_) => None,
+            };
+            last = Some(current);
+        }
+        last
+    }
+
+    let result = match tail_punctuation(input) {
+        Some(Some(Spacing::Joint)) => "\"Joint\"",
+        Some(Some(Spacing::Alone)) => "\"Alone\"",
+        None | Some(None) => panic!("last_punct_spacing expects a trailing punctuation token"),
+    };
+    result
+        .parse()
+        .expect("the generated string literal must parse")
+}
+
 #[proc_macro_attribute]
 pub fn passthrough(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     item
+}
+
+#[proc_macro_attribute]
+pub fn empty_attribute(_attribute: TokenStream, _item: TokenStream) -> TokenStream {
+    TokenStream::new()
 }
 
 #[proc_macro_attribute]
