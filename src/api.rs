@@ -57,22 +57,7 @@ pub struct Analysis {
 pub struct Reduction {
     original: Analysis,
     reduced_source: String,
-    reduced_source_digest: [u8; 32],
     pieces: Vec<SourcePiece>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[doc(hidden)]
-pub struct VerifiedReduction {
-    reduction: Reduction,
-    verification: VerificationSummary,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[doc(hidden)]
-pub struct VerificationSummary {
-    original_snapshot_hash: [u8; 32],
-    reduced_snapshot_hash: [u8; 32],
 }
 
 impl Analyzer {
@@ -92,18 +77,6 @@ impl Analyzer {
     }
 
     pub fn reduce(&self, input: &SourceInput) -> Result<Reduction, AnalysisError> {
-        let context = self.compilation_context(input);
-        let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
-            .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
-        self.inspect_reduced(&context, &inspected)?;
-        Ok(self.reduction(input, &context, &inspected))
-    }
-
-    #[doc(hidden)]
-    pub fn reduce_and_verify(
-        &self,
-        input: &SourceInput,
-    ) -> Result<VerifiedReduction, AnalysisError> {
         let context = self.compilation_context(input);
         let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
@@ -135,16 +108,10 @@ impl Analyzer {
                 difference,
             )));
         }
-
-        let original_snapshot_hash = original_snapshot.hash();
-        let reduced_snapshot_hash = reduced_snapshot.hash();
-        debug_assert_eq!(original_snapshot_hash, reduced_snapshot_hash);
-        Ok(VerifiedReduction {
-            reduction: self.reduction(input, &context, &inspected),
-            verification: VerificationSummary {
-                original_snapshot_hash,
-                reduced_snapshot_hash,
-            },
+        Ok(Reduction {
+            original: self.analysis(input, &context, &inspected),
+            reduced_source: inspected.rewrite.source.clone(),
+            pieces: inspected.rewrite.pieces.clone(),
         })
     }
 
@@ -179,20 +146,6 @@ impl Analyzer {
 
     fn compilation_context<'a>(&'a self, input: &'a SourceInput) -> CompilationContext<'a> {
         CompilationContext::new(input, &self.compilation, &self.sysroot)
-    }
-
-    fn reduction(
-        &self,
-        input: &SourceInput,
-        context: &CompilationContext<'_>,
-        inspected: &InspectedReduction,
-    ) -> Reduction {
-        Reduction {
-            original: self.analysis(input, context, inspected),
-            reduced_source_digest: sha256(inspected.rewrite.source.as_bytes()),
-            reduced_source: inspected.rewrite.source.clone(),
-            pieces: inspected.rewrite.pieces.clone(),
-        }
     }
 
     fn analysis(
@@ -286,44 +239,8 @@ impl Reduction {
         &self.reduced_source
     }
 
-    pub fn reduced_source_digest(&self) -> [u8; 32] {
-        self.reduced_source_digest
-    }
-
     pub fn pieces(&self) -> &[SourcePiece] {
         &self.pieces
-    }
-}
-
-impl VerifiedReduction {
-    pub fn original_analysis(&self) -> &Analysis {
-        self.reduction.original_analysis()
-    }
-
-    pub fn reduced_source(&self) -> &str {
-        self.reduction.reduced_source()
-    }
-
-    pub fn reduced_source_digest(&self) -> [u8; 32] {
-        self.reduction.reduced_source_digest()
-    }
-
-    pub fn pieces(&self) -> &[SourcePiece] {
-        self.reduction.pieces()
-    }
-
-    pub fn verification(&self) -> &VerificationSummary {
-        &self.verification
-    }
-}
-
-impl VerificationSummary {
-    pub fn original_snapshot_hash(&self) -> [u8; 32] {
-        self.original_snapshot_hash
-    }
-
-    pub fn reduced_snapshot_hash(&self) -> [u8; 32] {
-        self.reduced_snapshot_hash
     }
 }
 
@@ -707,20 +624,6 @@ mod tests {
     }
 
     #[test]
-    fn verified_reduction_runs_original_and_reduced_compilers_once_each() {
-        crate::input::reset_inspection_count();
-        let analyzer = Analyzer::new().unwrap();
-        let input = SourceInput::binary(
-            "fn dead() {}\nfn main() {}\n".to_owned(),
-            Edition::Rust2024,
-            host_target(),
-        );
-
-        analyzer.reduce_and_verify(&input).unwrap();
-        assert_eq!(crate::input::inspection_count(), 2);
-    }
-
-    #[test]
     fn reduction_compiles_the_original_and_reduced_sources_once_each() {
         crate::input::reset_inspection_count();
         let analyzer = Analyzer::new().unwrap();
@@ -854,10 +757,10 @@ mod tests {
         );
 
         let result = crate::input::with_one_missing_macro_rule_selection(&input.source, || {
-            analyzer.reduce_and_verify(&input)
+            analyzer.reduce(&input)
         });
         let Err(AnalysisError::IncompleteObservation(gap)) = result else {
-            panic!("a missing macro rule selection must not produce a verified reduction")
+            panic!("a missing macro rule selection must not produce a reduction")
         };
         assert_eq!(gap.phase, "original analysis");
         assert_eq!(gap.fact, "Source(IncompleteMacroRuleObservation)");
@@ -882,11 +785,11 @@ mod tests {
 
         let result =
             crate::input::with_one_nonempty_macro_marked_outputless(&reduced_source, || {
-                analyzer.reduce_and_verify(&input)
+                analyzer.reduce(&input)
             });
 
         let Err(AnalysisError::IncompleteObservation(gap)) = result else {
-            panic!("inconsistent reduced output coverage must not verify")
+            panic!("inconsistent reduced output coverage must not produce a reduction")
         };
         assert_eq!(gap.phase, "reduced analysis");
         assert_eq!(gap.fact, "Dependency(Retention(InvalidConstraint))");

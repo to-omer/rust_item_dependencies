@@ -103,18 +103,18 @@ fn multiple_function_and_static_entries_remove_unrelated_items() {
         .with_entry_point(EntryPoint::new("multiple_roots::rid_static"))
         .with_entry_point(EntryPoint::new("multiple_roots::rid_function"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("multiple explicit roots must be reducible");
     assert_eq!(
-        rid_lines(verified.reduced_source()),
+        rid_lines(reduction.reduced_source()),
         BTreeSet::from([
             "fn rid_helper() -> u32 { 7 }",
             "pub fn rid_function() -> u32 { rid_helper() }",
             "pub static rid_static: u32 = 9;",
         ])
     );
-    assert_fixed_point(&analyzer, &input, verified.reduced_source());
+    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -141,10 +141,10 @@ pub fn entry(value: u8) -> u8 { value.saturating_add(helper()) }
     let input = SourceInput::library(source, Edition::Rust2024, target.clone(), "no_std_library")
         .with_entry_point(EntryPoint::new("no_std_library::entry"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("the no_std library must preserve its explicit entry and core dependencies");
-    assert_eq!(verified.reduced_source(), expected);
+    assert_eq!(reduction.reduced_source(), expected);
     assert_fixed_point(&analyzer, &input, expected);
 
     let downstream = concat!(
@@ -201,10 +201,10 @@ fn exported_library_macros_remain_whole_for_downstream_rule_selection() {
     )
     .with_entry_point(EntryPoint::new("exported_macro_library::entry"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("a downstream-visible exported macro must remain whole");
-    assert_eq!(verified.reduced_source(), source);
+    assert_eq!(reduction.reduced_source(), source);
     assert_fixed_point(&analyzer, &input, source);
 
     let downstream = concat!(
@@ -224,7 +224,7 @@ fn exported_library_macros_remain_whole_for_downstream_rule_selection() {
         directory.path(),
         "reduced",
         "exported_macro_library",
-        verified.reduced_source(),
+        reduction.reduced_source(),
         downstream,
         &target,
     );
@@ -349,12 +349,12 @@ pub fn entry() -> u8 { 7 }
     )
     .with_entry_point(EntryPoint::new("panic_handler_library::entry"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("the generated panic handler must be retained as a compiler root");
-    assert_eq!(verified.reduced_source(), expected);
+    assert_eq!(reduction.reduced_source(), expected);
     assert_eq!(
-        verified
+        reduction
             .original_analysis()
             .roots()
             .iter()
@@ -428,11 +428,11 @@ fn explicit_reexport_paths_keep_their_complete_alias_chains_only() {
         ))
         .with_entry_point(EntryPoint::new("reexports::rid_glob_target"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("all supported reexport shapes must be reducible");
     assert_eq!(
-        rid_lines(verified.reduced_source()),
+        rid_lines(reduction.reduced_source()),
         BTreeSet::from([
             "mod rid_chain_middle {",
             "mod rid_chain_source {",
@@ -452,7 +452,7 @@ fn explicit_reexport_paths_keep_their_complete_alias_chains_only() {
             "pub use super::rid_chain_source::rid_chain_target as rid_chain_step;",
         ])
     );
-    assert_fixed_point(&analyzer, &input, verified.reduced_source());
+    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -489,11 +489,11 @@ fn a_generic_definition_entry_preserves_downstream_trait_selection() {
     .with_entry_point(EntryPoint::new("generic_definition::entry"))
     .with_entry_point(EntryPoint::new("generic_definition::const_entry"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("a generic definition root must be reducible without a concrete instance");
     assert_eq!(
-        generic_contract_lines(verified.reduced_source()),
+        generic_contract_lines(reduction.reduced_source()),
         BTreeSet::from([
             "const VALUE: u8 = 7;",
             "const VALUE: u8;",
@@ -512,7 +512,7 @@ fn a_generic_definition_entry_preserves_downstream_trait_selection() {
             "type Output;",
         ])
     );
-    assert_fixed_point(&analyzer, &input, verified.reduced_source());
+    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
 
     let downstream = concat!(
         "use generic_definition::{const_entry, entry, Local, Marker};\n",
@@ -535,7 +535,7 @@ fn a_generic_definition_entry_preserves_downstream_trait_selection() {
         directory.path(),
         "reduced",
         "generic_definition",
-        verified.reduced_source(),
+        reduction.reduced_source(),
         downstream,
         &target,
     );
@@ -593,10 +593,10 @@ fn downstream_codegen_assembly_preserves_the_active_library_source() {
     for (crate_name, source, downstream) in cases {
         let input = library_input(source, crate_name)
             .with_entry_point(EntryPoint::new(format!("{crate_name}::entry")));
-        let verified = analyzer
-            .reduce_and_verify(&input)
+        let reduction = analyzer
+            .reduce(&input)
             .unwrap_or_else(|error| panic!("{crate_name}: {error:?}"));
-        assert_eq!(verified.reduced_source(), source, "{crate_name}");
+        assert_eq!(reduction.reduced_source(), source, "{crate_name}");
         assert_fixed_point(&analyzer, &input, source);
 
         let directory = TestDirectory::new(crate_name);
@@ -612,7 +612,7 @@ fn downstream_codegen_assembly_preserves_the_active_library_source() {
             directory.path(),
             "reduced",
             crate_name,
-            verified.reduced_source(),
+            reduction.reduced_source(),
             downstream,
             &target,
         );
@@ -641,11 +641,11 @@ fn a_local_type_in_an_entry_signature_preserves_its_downstream_value_semantics()
     let input = SourceInput::library(source, Edition::Rust2024, target.clone(), "exposed_value")
         .with_entry_point(EntryPoint::new("exposed_value::entry"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("an exposed local type must retain downstream-selected implementations");
     assert_eq!(
-        exposed_value_contract_lines(verified.reduced_source()),
+        exposed_value_contract_lines(reduction.reduced_source()),
         BTreeSet::from([
             "impl Clone for Value { fn clone(&self) -> Self { *self } }",
             "impl Copy for Value {}",
@@ -654,7 +654,7 @@ fn a_local_type_in_an_entry_signature_preserves_its_downstream_value_semantics()
             "unsafe impl Send for Value {}",
         ])
     );
-    assert_fixed_point(&analyzer, &input, verified.reduced_source());
+    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
 
     let downstream = concat!(
         "use exposed_value::entry;\n",
@@ -679,7 +679,7 @@ fn a_local_type_in_an_entry_signature_preserves_its_downstream_value_semantics()
         directory.path(),
         "reduced",
         "exposed_value",
-        verified.reduced_source(),
+        reduction.reduced_source(),
         downstream,
         &target,
     );
@@ -705,21 +705,21 @@ fn derived_impls_follow_the_same_downstream_selection_contract() {
     let input = SourceInput::library(source, Edition::Rust2024, target.clone(), "derived_value")
         .with_entry_point(EntryPoint::new("derived_value::entry"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("derive-generated impls on an exposed type must remain available downstream");
     assert!(
-        verified
+        reduction
             .reduced_source()
             .contains("#[derive(Clone, Debug)]")
     );
     assert!(
-        verified
+        reduction
             .reduced_source()
             .contains("pub struct DerivedValue(pub u8);")
     );
-    assert!(!verified.reduced_source().contains("unrelated"));
-    assert_fixed_point(&analyzer, &input, verified.reduced_source());
+    assert!(!reduction.reduced_source().contains("unrelated"));
+    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
 
     let private_source = concat!(
         "#[derive(Clone)]\n",
@@ -733,16 +733,20 @@ fn derived_impls_follow_the_same_downstream_selection_contract() {
         "private_derive",
     )
     .with_entry_point(EntryPoint::new("private_derive::entry"));
-    let private_verified = analyzer
-        .reduce_and_verify(&private_input)
+    let private_reduction = analyzer
+        .reduce(&private_input)
         .expect("an unused derive on a private entry dependency must be removable");
-    assert!(!private_verified.reduced_source().contains("derive"));
+    assert!(!private_reduction.reduced_source().contains("derive"));
     assert!(
-        private_verified
+        private_reduction
             .reduced_source()
             .contains("struct Private;")
     );
-    assert_fixed_point(&analyzer, &private_input, private_verified.reduced_source());
+    assert_fixed_point(
+        &analyzer,
+        &private_input,
+        private_reduction.reduced_source(),
+    );
 
     let downstream = concat!(
         "use derived_value::entry;\n",
@@ -764,7 +768,7 @@ fn derived_impls_follow_the_same_downstream_selection_contract() {
         directory.path(),
         "reduced",
         "derived_value",
-        verified.reduced_source(),
+        reduction.reduced_source(),
         downstream,
         &target,
     );
@@ -860,17 +864,17 @@ fn entry_type_surfaces_and_bounds_preserve_downstream_trait_semantics() {
     for (crate_name, source, entry_name, entry_expression, retained_fragment) in cases {
         let input = SourceInput::library(source, Edition::Rust2024, target.clone(), crate_name)
             .with_entry_point(EntryPoint::new(format!("{crate_name}::{entry_name}")));
-        let verified = analyzer
-            .reduce_and_verify(&input)
+        let reduction = analyzer
+            .reduce(&input)
             .expect("the exposed type must retain downstream-selected implementations");
         assert!(
-            verified.reduced_source().contains(retained_fragment),
+            reduction.reduced_source().contains(retained_fragment),
             "{crate_name}: {}",
-            verified.reduced_source()
+            reduction.reduced_source()
         );
-        assert!(!verified.reduced_source().contains("pub fn unrelated"));
-        assert!(!verified.reduced_source().contains("IrrelevantTrait"));
-        assert_fixed_point(&analyzer, &input, verified.reduced_source());
+        assert!(!reduction.reduced_source().contains("pub fn unrelated"));
+        assert!(!reduction.reduced_source().contains("IrrelevantTrait"));
+        assert_fixed_point(&analyzer, &input, reduction.reduced_source());
 
         let downstream = format!(
             "use {crate_name}::{entry_name};\nfn require_send<T: Send>(_: T) {{}}\nfn main() {{ require_send({entry_expression}); println!(\"ok\"); }}\n"
@@ -888,7 +892,7 @@ fn entry_type_surfaces_and_bounds_preserve_downstream_trait_semantics() {
             directory.path(),
             "reduced",
             crate_name,
-            verified.reduced_source(),
+            reduction.reduced_source(),
             &downstream,
             &target,
         );
@@ -914,15 +918,15 @@ fn a_binary_can_add_an_explicit_entry_without_losing_main() {
         .with_crate_name("binary_entries")
         .with_entry_point(EntryPoint::new("binary_entries::rid_exported"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("main and the additional entry must share the root model");
     assert_eq!(
-        rid_lines(verified.reduced_source()),
+        rid_lines(reduction.reduced_source()),
         BTreeSet::from(["pub fn rid_exported() -> u8 { 7 }"])
     );
-    assert!(verified.reduced_source().contains("fn main()"));
-    assert_fixed_point(&analyzer, &input, verified.reduced_source());
+    assert!(reduction.reduced_source().contains("fn main()"));
+    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -942,18 +946,18 @@ fn external_only_entry_types_do_not_retain_unrelated_trait_implementations() {
         .with_entry_point(EntryPoint::new("lifetime_definition::array_entry"))
         .with_entry_point(EntryPoint::new("lifetime_definition::outlives_entry"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("external-only types must use ordinary mono roots");
     assert_eq!(
-        external_type_contract_lines(verified.reduced_source()),
+        external_type_contract_lines(reduction.reduced_source()),
         BTreeSet::from([
             "pub fn array_entry() -> [u8; 1 + 1] { [0; 1 + 1] }",
             "pub fn lifetime_entry<'a>(value: &'a u8) -> &'a u8 { value }",
             "pub fn outlives_entry() where LocalType: 'static {}",
         ])
     );
-    assert_fixed_point(&analyzer, &input, verified.reduced_source());
+    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -1024,7 +1028,7 @@ fn assert_fixed_point(analyzer: &Analyzer, input: &SourceInput, reduced_source: 
     let mut reduced_input = input.clone();
     reduced_input.source = reduced_source.to_owned();
     let fixed = analyzer
-        .reduce_and_verify(&reduced_input)
+        .reduce(&reduced_input)
         .expect("an already reduced library must remain reducible");
     assert_eq!(fixed.reduced_source(), reduced_source);
 }
