@@ -21,6 +21,7 @@ use crate::graph::{
     Definition, DefinitionEdge, DefinitionGraph, DefinitionKey, DefinitionKeyPart, DefinitionKind,
     DefinitionOrigin, DefinitionTarget, DependencyKind as DefinitionDependencyKind,
 };
+use crate::macro_output::ValidatedDeclarativeOutputs;
 use crate::source::{
     SourceInventory, SourceUnitIdentityKind, WrittenUnitKind, collect_source,
     refine_attribute_macros_from_compiler, refine_derive_targets_from_compiler,
@@ -837,6 +838,7 @@ fn collect(source: &str) -> TestCollection {
         source: Arc::from(source),
         result: Arc::clone(&result),
         inventory: None,
+        declarative_outputs: None,
     };
     let arguments = vec![
         "rust-item-dependencies-expansions".to_owned(),
@@ -864,6 +866,7 @@ struct ExpansionCallbacks {
     source: Arc<str>,
     result: Arc<Mutex<Option<Result<TestCollection, ExpansionError>>>>,
     inventory: Option<SourceInventory>,
+    declarative_outputs: Option<ValidatedDeclarativeOutputs>,
 }
 
 struct TestCollection {
@@ -911,25 +914,30 @@ impl Callbacks for ExpansionCallbacks {
             .inventory
             .as_ref()
             .expect("source inventory must survive through analysis");
-        let value = collect_macro_provenance(compiler, tcx, inventory).and_then(|provenance| {
-            collect_definitions(compiler, tcx, inventory, &provenance)
-                .map_err(ExpansionError::from)
-                .and_then(|mut definitions| {
-                    let expansions = collect_expansions(
-                        compiler,
-                        tcx,
-                        inventory,
-                        &mut definitions,
-                        &provenance,
-                    )?;
-                    Ok(TestCollection {
-                        product_bases: definitions.product_bases().to_vec(),
-                        definitions: definitions.graph,
-                        expansions,
-                        source_units: inventory.units.clone(),
+        let outputs = self
+            .declarative_outputs
+            .as_ref()
+            .expect("declarative outputs must survive through analysis");
+        let value =
+            collect_macro_provenance(compiler, tcx, inventory, outputs).and_then(|provenance| {
+                collect_definitions(compiler, tcx, inventory, &provenance)
+                    .map_err(ExpansionError::from)
+                    .and_then(|mut definitions| {
+                        let expansions = collect_expansions(
+                            compiler,
+                            tcx,
+                            inventory,
+                            &mut definitions,
+                            &provenance,
+                        )?;
+                        Ok(TestCollection {
+                            product_bases: definitions.product_bases().to_vec(),
+                            definitions: definitions.graph,
+                            expansions,
+                            source_units: inventory.units.clone(),
+                        })
                     })
-                })
-        });
+            });
         *self
             .result
             .lock()
@@ -938,6 +946,7 @@ impl Callbacks for ExpansionCallbacks {
     }
 
     fn after_expansion<'tcx>(&mut self, compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        let declarative_outputs = ValidatedDeclarativeOutputs::collect(tcx);
         {
             let (_, krate) = tcx.resolver_for_lowering();
             let krate = krate.borrow();
@@ -965,9 +974,11 @@ impl Callbacks for ExpansionCallbacks {
             self.inventory
                 .as_mut()
                 .expect("source inventory must survive through expansion"),
+            &declarative_outputs,
             false,
         )
         .expect("macro rule inventory must be complete");
+        self.declarative_outputs = Some(declarative_outputs);
         Compilation::Continue
     }
 }

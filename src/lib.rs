@@ -37,6 +37,8 @@ pub mod graph;
 #[allow(dead_code)]
 pub(crate) mod input;
 #[allow(dead_code)]
+pub(crate) mod macro_output;
+#[allow(dead_code)]
 pub(crate) mod monomorphization;
 pub mod qualification;
 #[allow(dead_code)]

@@ -43,14 +43,15 @@ impl From<DefinitionError> for ExpansionError {
 mod output;
 mod provenance;
 
+pub(crate) use crate::macro_output::MacroOutputRange;
 #[cfg(test)]
 pub(crate) use output::{
     MacroCompleteOutputMeaning, MacroOutputMaterializationGroup, MacroOutputSlice,
 };
 pub(crate) use output::{
-    MacroCompleteOutputMeaningInventory, MacroDefinitionProductRole, MacroOutputRange,
-    MacroOwnerEffect, MacroProducerCoverage, MacroProducerCoverageInventory,
-    macro_definition_product_role, validated_outputless_macro_expansions,
+    MacroCompleteOutputMeaningInventory, MacroDefinitionProductRole, MacroOwnerEffect,
+    MacroProducerCoverage, MacroProducerCoverageInventory, macro_definition_product_role,
+    validated_outputless_macro_expansions,
 };
 pub(crate) use provenance::{
     MacroContributorDag, MacroContributorSetId, MacroProvenance, collect_macro_provenance,

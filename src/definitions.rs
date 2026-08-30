@@ -21,6 +21,7 @@ use crate::graph::{
     ExternalDefinition, ExternalDefinitionId, ExternalDefinitionKey, GeneratedRole, GraphError,
     InjectedRole,
 };
+use crate::macro_output::ValidatedDeclarativeOutputs;
 use crate::rewrite::{SourceRewrite, SourceRewriteError};
 #[cfg(rust_item_dependencies_patched)]
 use crate::source::EditableMacroSourceRole;
@@ -235,8 +236,9 @@ pub(crate) fn collect_definition_graph(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
+    outputs: &ValidatedDeclarativeOutputs,
 ) -> Result<DefinitionGraph, DefinitionError> {
-    let provenance = collect_macro_provenance(compiler, tcx, source)
+    let provenance = collect_macro_provenance(compiler, tcx, source, outputs)
         .map_err(|_| DefinitionError::IncompleteDefinition)?;
     collect_definitions(compiler, tcx, source, &provenance).map(|definitions| definitions.graph)
 }

@@ -6,8 +6,6 @@ use std::sync::Arc;
 #[cfg(rust_item_dependencies_patched)]
 use rustc_data_structures::fx::FxHashMap;
 #[cfg(rust_item_dependencies_patched)]
-use rustc_middle::ty::MacroOutputTokenRange;
-#[cfg(rust_item_dependencies_patched)]
 use rustc_span::ExpnId;
 
 #[cfg(rust_item_dependencies_patched)]
@@ -16,6 +14,13 @@ use crate::dependency_graph::{
     DependencyEdge, DependencyKind, ExpansionId, ExpansionKind, ExpansionNode, GraphNode,
 };
 use crate::graph::{Definition, DefinitionId, DefinitionOrigin};
+use crate::macro_output::MacroOutputRange;
+#[cfg(rust_item_dependencies_patched)]
+use crate::macro_output::ValidatedMacroOwnerOutput;
+#[cfg(test)]
+use crate::macro_output::normalize_discarded_output_ranges;
+#[cfg(any(rust_item_dependencies_patched, test))]
+use crate::macro_output::{ValidatedMacroOutputLedger, laminar_output_ranges};
 #[cfg(test)]
 use crate::source::SourceUnitId;
 #[cfg(rust_item_dependencies_patched)]
@@ -35,51 +40,7 @@ use super::provenance::{
 use super::provenance::{IndexedInterval, IntervalStartIndex};
 use super::provenance::{MacroContributorDag, MacroContributorSetId};
 #[cfg(rust_item_dependencies_patched)]
-use super::provenance::{MacroProvenance, PreparedMacroOwnerOutput, PreparedProducer};
-
-/// One half-open range in a producer's output-token ordinal space.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct MacroOutputRange {
-    pub(super) start: u32,
-    pub(super) end: u32,
-}
-
-impl MacroOutputRange {
-    fn len(self) -> u32 {
-        self.end - self.start
-    }
-
-    fn is_empty(self) -> bool {
-        self.start == self.end
-    }
-
-    fn contains(self, other: Self) -> bool {
-        self.start <= other.start && other.end <= self.end
-    }
-
-    pub(crate) fn start(self) -> u32 {
-        self.start
-    }
-
-    pub(crate) fn end(self) -> u32 {
-        self.end
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_new(start: u32, end: u32) -> Self {
-        Self { start, end }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_set_start(&mut self, start: u32) {
-        self.start = start;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_set_end(&mut self, end: u32) {
-        self.end = end;
-    }
-}
+use super::provenance::{MacroProvenance, PreparedProducer};
 
 /// All producer-local output ledgers and the one contributor DAG their root
 /// identifiers belong to.
@@ -1050,6 +1011,54 @@ mod product_classification_tests {
         MacroOutputRange { start, end }
     }
 
+    fn output_classes(
+        products: &[ObservedProduct],
+        discarded: &[MacroOutputRange],
+        output_token_count: u32,
+        source_owner: Option<DefinitionId>,
+    ) -> Result<PendingOutputClasses, ExpansionError> {
+        let ledger = ValidatedMacroOutputLedger::new(
+            output_token_count,
+            products.iter().map(|product| product.output).collect(),
+            discarded.to_vec(),
+        )
+        .ok_or(ExpansionError::IncompleteOrigin)?;
+        super::output_classes(products, &ledger, source_owner)
+    }
+
+    fn output_classes_with_work(
+        products: &[ObservedProduct],
+        discarded: &[MacroOutputRange],
+        output_token_count: u32,
+        source_owner: Option<DefinitionId>,
+    ) -> Result<(PendingOutputClasses, OutputClassWork), ExpansionError> {
+        let ledger = ValidatedMacroOutputLedger::new(
+            output_token_count,
+            products.iter().map(|product| product.output).collect(),
+            discarded.to_vec(),
+        )
+        .ok_or(ExpansionError::IncompleteOrigin)?;
+        super::output_classes_with_work(products, &ledger, source_owner)
+    }
+
+    fn validate_owner_member_classes(
+        members: &[ObservedProduct],
+        products: &[ObservedProduct],
+        discarded: &[MacroOutputRange],
+        output_token_count: u32,
+        classes: &[(MacroOutputRange, PendingOutputClass)],
+    ) -> Result<Vec<GraphNode>, ExpansionError> {
+        let live_outputs = products
+            .iter()
+            .chain(members)
+            .map(|product| product.output)
+            .collect();
+        let ledger =
+            ValidatedMacroOutputLedger::new(output_token_count, live_outputs, discarded.to_vec())
+                .ok_or(ExpansionError::IncompleteOrigin)?;
+        super::validate_owner_member_classes(members, products, &ledger, classes)
+    }
+
     #[test]
     fn product_identity_range_uses_the_token_piece_envelope() {
         let (source, index) = identity_index(&[
@@ -1437,9 +1446,9 @@ mod product_classification_tests {
         };
         assert_eq!(
             normalize_discarded_output_ranges(vec![range(3, 5), range(1, 2), range(2, 3)], 10,),
-            Ok(vec![range(1, 2), range(2, 3), range(3, 5)]),
+            Some(vec![range(1, 2), range(2, 3), range(3, 5)]),
         );
-        assert!(normalize_discarded_output_ranges(vec![range(1, 4), range(3, 5)], 10).is_err());
+        assert!(normalize_discarded_output_ranges(vec![range(1, 4), range(3, 5)], 10).is_none());
         assert!(output_classes(&[], &[range(1, 4), range(3, 5)], 10, None).is_err());
         assert!(output_classes(&[], &[range(0, 3), range(3, 5)], 5, None).is_ok());
         assert!(output_classes(&[], &[range(9, 11)], 10, None).is_err());
@@ -2384,7 +2393,7 @@ impl<'a> CoverageLowerer<'a> {
     ) -> Result<MacroCompleteOutputMeaningInventory, ExpansionError> {
         let mut meanings = Vec::with_capacity(self.provenance.producers.len());
         for (&compiler_id, prepared) in &self.provenance.producers {
-            if prepared.output_token_count == 0 {
+            if prepared.ledger.output_token_count() == 0 {
                 return Err(ExpansionError::IncompleteOrigin);
             }
             let producer = self
@@ -2517,7 +2526,7 @@ impl<'a> CoverageLowerer<'a> {
             owner_effect,
             dependent_expansions,
             output_demands,
-            residual_intrinsic: prepared.owner_output.intrinsic,
+            residual_intrinsic: prepared.owner_output.intrinsic(),
         })
     }
 
@@ -2543,7 +2552,7 @@ impl<'a> CoverageLowerer<'a> {
             .token_contributors
             .get(&compiler_id)
             .ok_or(ExpansionError::IncompleteOrigin)?;
-        if token_contributors.output_token_count()? != prepared.output_token_count {
+        if token_contributors.output_token_count()? != prepared.ledger.output_token_count() {
             return Err(ExpansionError::IncompleteOrigin);
         }
 
@@ -2563,17 +2572,11 @@ impl<'a> CoverageLowerer<'a> {
             return Err(ExpansionError::IncompleteOrigin);
         }
 
-        let interval_classes = output_classes(
-            &products,
-            &prepared.discarded_outputs,
-            prepared.output_token_count,
-            raw.source_owner,
-        )?;
+        let interval_classes = output_classes(&products, &prepared.ledger, raw.source_owner)?;
         let owner_members = validate_owner_member_classes(
             &owner_members,
             &products,
-            &prepared.discarded_outputs,
-            prepared.output_token_count,
+            &prepared.ledger,
             interval_classes.intervals(),
         )?;
         let (interval_classes, mut product_classes) = interval_classes.into_parts();
@@ -2636,8 +2639,8 @@ impl<'a> CoverageLowerer<'a> {
         }
         Ok(MacroProducerCoverage {
             producer,
-            output_token_count: prepared.output_token_count,
-            discarded_outputs: prepared.discarded_outputs.clone(),
+            output_token_count: prepared.ledger.output_token_count(),
+            discarded_outputs: prepared.ledger.discarded_outputs().to_vec(),
             materialization_groups,
         })
     }
@@ -2645,7 +2648,7 @@ impl<'a> CoverageLowerer<'a> {
 
 #[cfg(rust_item_dependencies_patched)]
 fn lower_macro_owner_effect(
-    observed: &PreparedMacroOwnerOutput,
+    observed: &ValidatedMacroOwnerOutput,
     products: &[ObservedProduct],
     observed_product_outputs: &BTreeSet<MacroOutputRange>,
     has_owner_members: bool,
@@ -2656,7 +2659,7 @@ fn lower_macro_owner_effect(
     ),
     ExpansionError,
 > {
-    if !observed.complete || (has_owner_members && !observed.intrinsic) {
+    if has_owner_members && !observed.intrinsic() {
         return Err(ExpansionError::IncompleteOrigin);
     }
     let mut products_by_output = BTreeMap::<MacroOutputRange, BTreeSet<GraphNode>>::new();
@@ -2668,12 +2671,12 @@ fn lower_macro_owner_effect(
     }
     let mut roles_by_output = BTreeMap::new();
     for (&output, role) in observed
-        .dependent_outputs
+        .dependent_outputs()
         .iter()
         .map(|output| (output, MacroOutputDemandRole::Dependent))
         .chain(
             observed
-                .required_outputs
+                .required_outputs()
                 .iter()
                 .map(|output| (output, MacroOutputDemandRole::Required)),
         )
@@ -2689,7 +2692,7 @@ fn lower_macro_owner_effect(
     {
         return Err(ExpansionError::IncompleteOrigin);
     }
-    let effect = if observed.intrinsic {
+    let effect = if observed.intrinsic() {
         MacroOwnerEffect::Semantic
     } else {
         let dependent_products = products_by_output
@@ -3060,143 +3063,26 @@ pub(super) fn coalesce_definition_identity_cohorts(
     Ok(contributor_dag)
 }
 
-#[cfg(rust_item_dependencies_patched)]
-pub(super) fn output_range(
-    range: MacroOutputTokenRange,
-    output_token_count: u32,
-) -> Result<MacroOutputRange, ExpansionError> {
-    (range.start < range.end && range.end <= output_token_count)
-        .then_some(MacroOutputRange {
-            start: range.start,
-            end: range.end,
-        })
-        .ok_or(ExpansionError::IncompleteOrigin)
-}
-
-#[cfg(any(rust_item_dependencies_patched, test))]
-pub(super) fn normalize_discarded_output_ranges(
-    mut discarded: Vec<MacroOutputRange>,
-    output_token_count: u32,
-) -> Result<Vec<MacroOutputRange>, ExpansionError> {
-    discarded.sort();
-    let mut normalized = Vec::<MacroOutputRange>::with_capacity(discarded.len());
-    for output in discarded {
-        if output.start >= output.end || output.end > output_token_count {
-            return Err(ExpansionError::IncompleteOrigin);
-        }
-        if let Some(previous) = normalized.last()
-            && output.start < previous.end
-        {
-            return Err(ExpansionError::IncompleteOrigin);
-        }
-        normalized.push(output);
-    }
-    Ok(normalized)
-}
-
-#[cfg(any(rust_item_dependencies_patched, test))]
-pub(super) fn valid_discarded_output_relations(
-    discarded: &[MacroOutputRange],
-    output_token_count: u32,
-    live: impl IntoIterator<Item = MacroOutputRange>,
-) -> bool {
-    if discarded
-        .iter()
-        .any(|range| range.start >= range.end || range.end > output_token_count)
-        || discarded.windows(2).any(|pair| pair[0].end > pair[1].start)
-    {
-        return false;
-    }
-
-    // Keep the original ranges as independent source-deletion candidates, but
-    // validate containment against their contiguous union. Otherwise two
-    // adjacent discarded ranges can jointly cover a live range while evading
-    // the single-range equality check below.
-    let mut contiguous = Vec::<MacroOutputRange>::with_capacity(discarded.len());
-    for &range in discarded {
-        if let Some(previous) = contiguous.last_mut()
-            && previous.end == range.start
-        {
-            previous.end = range.end;
-        } else {
-            contiguous.push(range);
-        }
-    }
-
-    live.into_iter().all(|live| {
-        if live.start >= live.end || live.end > output_token_count {
-            return false;
-        }
-        let first = discarded.partition_point(|range| range.end <= live.start);
-        let end = discarded.partition_point(|range| range.start < live.end);
-        if first == end {
-            return true;
-        }
-        let first_discarded = discarded[first];
-        let last_discarded = discarded[end - 1];
-        let containing_union = contiguous.partition_point(|range| range.start <= live.start);
-        let fully_discarded =
-            containing_union > 0 && contiguous[containing_union - 1].contains(live);
-        live.contains(first_discarded) && live.contains(last_discarded) && !fully_discarded
-    })
-}
-
-#[cfg(any(rust_item_dependencies_patched, test))]
-pub(super) fn laminar_output_ranges(ranges: impl IntoIterator<Item = MacroOutputRange>) -> bool {
-    let mut ranges = ranges.into_iter().collect::<Vec<_>>();
-    if ranges.iter().any(|range| range.start >= range.end) {
-        return false;
-    }
-    ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
-    ranges.dedup();
-    let mut ancestors = Vec::<MacroOutputRange>::new();
-    for range in ranges {
-        while ancestors
-            .last()
-            .is_some_and(|ancestor| ancestor.end <= range.start)
-        {
-            ancestors.pop();
-        }
-        if ancestors
-            .last()
-            .is_some_and(|ancestor| range.end > ancestor.end)
-        {
-            return false;
-        }
-        ancestors.push(range);
-    }
-    true
-}
-
 #[cfg(any(rust_item_dependencies_patched, test))]
 fn output_classes(
     products: &[ObservedProduct],
-    discarded: &[MacroOutputRange],
-    output_token_count: u32,
+    ledger: &ValidatedMacroOutputLedger,
     source_owner: Option<DefinitionId>,
 ) -> Result<PendingOutputClasses, ExpansionError> {
-    output_classes_with_work(products, discarded, output_token_count, source_owner)
-        .map(|(classes, _)| classes)
+    output_classes_with_work(products, ledger, source_owner).map(|(classes, _)| classes)
 }
 
 #[cfg(any(rust_item_dependencies_patched, test))]
 fn output_classes_with_work(
     products: &[ObservedProduct],
-    discarded: &[MacroOutputRange],
-    output_token_count: u32,
+    ledger: &ValidatedMacroOutputLedger,
     source_owner: Option<DefinitionId>,
 ) -> Result<(PendingOutputClasses, OutputClassWork), ExpansionError> {
-    if !valid_discarded_output_relations(
-        discarded,
-        output_token_count,
-        products.iter().map(|product| product.output),
-    ) {
-        return Err(ExpansionError::IncompleteOrigin);
-    }
+    let output_token_count = ledger.output_token_count();
+    let discarded = ledger.discarded_outputs();
     let mut products_by_range = BTreeMap::<MacroOutputRange, BTreeSet<GraphNode>>::new();
     for &product in products {
-        if product.output.start >= product.output.end
-            || product.output.end > output_token_count
+        if !ledger.contains_live_output(product.output)
             || !products_by_range
                 .entry(product.output)
                 .or_default()
@@ -3204,27 +3090,6 @@ fn output_classes_with_work(
         {
             return Err(ExpansionError::IncompleteOrigin);
         }
-    }
-
-    // Product ranges may be disjoint, equal, or nested, but never partially
-    // overlap. Validate that invariant with one ordered sweep.
-    let mut ranges = products_by_range.keys().copied().collect::<Vec<_>>();
-    ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
-    let mut ancestors = Vec::<MacroOutputRange>::new();
-    for range in &ranges {
-        while ancestors
-            .last()
-            .is_some_and(|ancestor| ancestor.end <= range.start)
-        {
-            ancestors.pop();
-        }
-        if ancestors
-            .last()
-            .is_some_and(|ancestor| range.end > ancestor.end)
-        {
-            return Err(ExpansionError::IncompleteOrigin);
-        }
-        ancestors.push(*range);
     }
 
     // Store each complete product-range payload once. Sweep intervals carry
@@ -3326,18 +3191,16 @@ fn output_classes_with_work(
 fn validate_owner_member_classes(
     members: &[ObservedProduct],
     products: &[ObservedProduct],
-    discarded: &[MacroOutputRange],
-    output_token_count: u32,
+    ledger: &ValidatedMacroOutputLedger,
     classes: &[(MacroOutputRange, PendingOutputClass)],
 ) -> Result<Vec<GraphNode>, ExpansionError> {
     if members.is_empty() {
         return Ok(Vec::new());
     }
-    if !valid_discarded_output_relations(
-        discarded,
-        output_token_count,
-        members.iter().map(|member| member.output),
-    ) {
+    if members
+        .iter()
+        .any(|member| !ledger.contains_live_output(member.output))
+    {
         return Err(ExpansionError::IncompleteOrigin);
     }
 

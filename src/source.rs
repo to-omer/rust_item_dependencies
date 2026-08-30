@@ -11,8 +11,6 @@ pub(crate) use declarative_macro::{
     validate_declarative_macro_source_facts,
 };
 #[cfg(rust_item_dependencies_patched)]
-pub(crate) use declarative_macro::{ValidatedDeclarativeOutput, ValidatedDeclarativeOutputMeaning};
-#[cfg(rust_item_dependencies_patched)]
 pub(crate) use derive::refine_derive_targets_from_compiler;
 use derive::remap_derive_target_facts;
 pub(crate) use derive::{
@@ -47,6 +45,9 @@ use rustc_middle::ty::{MacroImplementationKind, MacroInvocationOrigin, TyCtxt};
 #[cfg(rust_item_dependencies_patched)]
 use rustc_span::hygiene::{ExpnId, ExpnKind, MacroKind};
 use rustc_span::{SourceFile, Span, Symbol, sym};
+
+#[cfg(rust_item_dependencies_patched)]
+use crate::macro_output::ValidatedDeclarativeOutputs;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ByteRange {
@@ -1759,6 +1760,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     inventory: &mut SourceInventory,
+    outputs: &ValidatedDeclarativeOutputs,
     mut omit_one_selection: bool,
 ) -> Result<(), SourceError> {
     let procedural = collect_procedural_macro_observations(compiler, tcx, inventory)?;
@@ -1894,7 +1896,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
         return Err(SourceError::IncompleteMacroRuleObservation);
     }
     refine_macro_rules_outside_opaque_anchors(inventory, observations, &opaque_ranges)?;
-    declarative_macro::refine_declarative_macros_from_compiler(compiler, tcx, inventory)?;
+    declarative_macro::refine_declarative_macros_from_compiler(compiler, tcx, inventory, outputs)?;
     merge_procedural_macro_atomic_groups(inventory, &opaque_anchors)
 }
 
