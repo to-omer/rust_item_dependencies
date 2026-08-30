@@ -51,6 +51,16 @@ jobs:
         env:
           CARGO_TARGET_DIR: target/rid-tool-tests
         run: cargo -Zscript test --manifest-path tools/rid.rs
+      - name: Identify runner image
+        id: runner-image
+        shell: bash
+        run: printf 'name=%s-%s\n' "${ImageOS:?}" "${ImageVersion:?}" >> "$GITHUB_OUTPUT"
+      - name: Restore patched compiler
+        id: patched-compiler-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/rid/rustc
+          key: rid-rustc-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('.github/workflows/ci.yml', '.cargo/config.toml', 'rust-toolchain.toml', 'tools/*.rs', 'scripts/check-acceptance.sh', 'rustc-patches/base-revision', 'rustc-patches/patch-abi', 'rustc-patches/series', 'rustc-patches/patched-revision', 'rustc-patches/queue-digest', 'rustc-patches/*.patch') }}
       - name: Bootstrap patched compiler through cargo rid
         run: >-
           cargo rid tests/fixtures/compiler/driver_smoke.rs
@@ -63,3 +73,9 @@ jobs:
           test -n "$host"
           stage2="$PWD/target/rid/rustc/build/$host/stage2"
           bash scripts/check-acceptance.sh "$stage2"
+      - name: Save patched compiler
+        if: github.ref == 'refs/heads/main' && steps.patched-compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/rid/rustc
+          key: ${{ steps.patched-compiler-cache.outputs.cache-primary-key }}
