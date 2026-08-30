@@ -55,9 +55,6 @@ jobs:
         run: >-
           cargo rid tests/fixtures/compiler/driver_smoke.rs
           -o target/ci-reduced.rs
-      - name: Build patched compiler
-        shell: bash
-        run: bash scripts/build-patched-rustc.sh target/rid/rustc
       - name: Run full acceptance suite
         shell: bash
         run: |

@@ -44,6 +44,10 @@ if [ -n "$(git -C "$rustc_source" status --porcelain)" ]; then
 fi
 
 echo "==> source format"
+(
+    cd "$rustc_source"
+    "$rustc_source/x" fmt --ci=false --check --all
+)
 RUSTFMT="$rustfmt" \
     "$cargo_fmt" fmt \
     --manifest-path "$repository_root/Cargo.toml" --all -- --check
@@ -57,7 +61,8 @@ echo "==> patched compiler observer fixtures"
 (
     cd "$rustc_source"
     RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$queue_digest" \
-        ./x test --ci=false --stage 2 --force-rerun --all-targets \
+        "$rustc_source/x" test --ci=false --stage 2 \
+        --keep-stage 0 --keep-stage 1 --force-rerun --all-targets \
         compiler/rustc_span \
         tests/ui-fulldeps/derive-observer.rs \
         tests/ui-fulldeps/selection-proof-trace.rs \
