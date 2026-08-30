@@ -60,7 +60,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/rid/rustc
-          key: rid-rustc-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('.github/workflows/ci.yml', '.cargo/config.toml', 'rust-toolchain.toml', 'tools/*.rs', 'scripts/check-acceptance.sh', 'rustc-patches/base-revision', 'rustc-patches/patch-abi', 'rustc-patches/series', 'rustc-patches/patched-revision', 'rustc-patches/queue-digest', 'rustc-patches/*.patch') }}
+          key: rid-rustc-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('.github/workflows/ci.yml', '.cargo/config.toml', 'rust-toolchain.toml', 'tools/*.rs', 'scripts/check-acceptance.sh', 'rustc-patches/base-revision', 'rustc-patches/patch-abi', 'rustc-patches/series', 'rustc-patches/patched-revision', 'rustc-patches/queue-digest', 'rustc-patches/*.patch') }}
       - name: Bootstrap patched compiler through cargo rid
         run: >-
           cargo rid tests/fixtures/compiler/driver_smoke.rs
@@ -73,6 +73,20 @@ jobs:
           test -n "$host"
           stage2="$PWD/target/rid/rustc/build/$host/stage2"
           bash scripts/check-acceptance.sh "$stage2"
+      - name: Remove generated directory links before caching
+        if: runner.os == 'Windows' && steps.patched-compiler-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $links = @(Get-ChildItem -LiteralPath target/rid/rustc/build -Recurse -Force -Attributes Directory+ReparsePoint)
+          foreach ($link in $links) {
+            Write-Host "Removing generated directory link: $($link.FullName) ($($link.LinkType))"
+            [System.IO.Directory]::Delete($link.FullName, $false)
+          }
+          $remaining = @(Get-ChildItem -LiteralPath target/rid/rustc/build -Recurse -Force -Attributes Directory+ReparsePoint)
+          if ($remaining.Count -ne 0) {
+            throw "Generated directory links remain in the patched compiler build"
+          }
       - name: Save patched compiler
         if: github.ref == 'refs/heads/main' && steps.patched-compiler-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
