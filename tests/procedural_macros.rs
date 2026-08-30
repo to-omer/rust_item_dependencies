@@ -604,14 +604,34 @@ mod patched {
             "observe_prefix!(+dead_prefix@);",
             "fn main() { println!(\"{} {} {}\", kept_tt(), kept_expr(), kept_prefix()); }",
         );
+        let expected = concat!(
+            "macro_rules! observe_tt {",
+            "($( $name:ident => $punct:tt),*) => {",
+            "$(fn $name() -> &'static str { proc_fixture::punct_spacing!($punct) })*",
+            "};",
+            "}",
+            "macro_rules! observe_expr {",
+            "($( $name:ident => $expr:expr),*) => {",
+            "$(fn $name() -> &'static str { proc_fixture::last_punct_spacing!($expr) })*",
+            "};",
+            "}",
+            "macro_rules! observe_prefix {",
+            "($head:tt $($tail:ident)* @) => {",
+            "fn kept_prefix() -> &'static str { proc_fixture::punct_spacing!($head) }",
+            "",
+            "};",
+            "}",
+            "observe_tt!(kept_tt => +, dead_tt => -);",
+            "observe_expr!(kept_expr => 1.., dead_expr => 2..);",
+            "observe_prefix!(+dead_prefix@);",
+            "fn main() { println!(\"{} {} {}\", kept_tt(), kept_expr(), kept_prefix()); }",
+        );
 
         let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
-        assert_eq!(verified.reduced_source(), source);
+        assert_eq!(verified.reduced_source(), expected);
 
-        let fixed = analyzer
-            .reduce_and_verify(&input(verified.reduced_source()))
-            .unwrap();
-        assert_eq!(fixed.reduced_source(), source);
+        let fixed = analyzer.reduce_and_verify(&input(expected)).unwrap();
+        assert_eq!(fixed.reduced_source(), expected);
 
         let original = compile_and_run(source, &artifacts, "spacing_original", false);
         let reduced = compile_and_run(

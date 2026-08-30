@@ -115,9 +115,22 @@ mod lexical_boundary {
 
 macro_rules! expression_items {
     ($($name:ident),* => $value:expr) => {{
-        $(fn $name() -> u32 { 0 })*
+$(fn $name() -> u32 { 0 })*
         $value
     }};
+}
+
+macro_rules! all_dead_repetition {
+    ($( $name:ident),*) => {
+        pub struct Anchor;
+$(
+pub fn $name() -> u32 { 0 }
+)*
+    };
+}
+
+mod all_dead {
+    all_dead_repetition!(first, second);
 }
 
 fn main() {
@@ -130,6 +143,7 @@ fn main() {
     let _ = leading::Anchor;
     let _ = trailing::Anchor;
     let _ = adjacent::Anchor;
+    let _ = all_dead::Anchor;
     let direct = expression_items!(direct_dead, direct_other => 6);
     assert_eq!(
         star_many::kept_a()

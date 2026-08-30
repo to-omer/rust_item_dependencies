@@ -17,7 +17,10 @@ use rustc_middle::ty::{
 #[cfg(rust_item_dependencies_patched)]
 use rustc_span::hygiene::ExpnId;
 
-use super::syntax::{is_trivia, tokenize_parser_tokens};
+use super::syntax::ParserTokenRewriteGuard;
+#[cfg(rust_item_dependencies_patched)]
+use super::syntax::SourceSyntaxError;
+use super::syntax::{ParserToken, is_trivia, tokenize_parser_tokens};
 use super::{
     ByteRange, CfgState, MacroRuleSourceFacts, SourceError, SourceUnitId, WrittenUnit,
     WrittenUnitKind, validate_macro_rule_facts,
@@ -29,6 +32,22 @@ use super::{DeclarativeContributorParent, DeclarativeGenerationParentState};
 pub(crate) struct MacroTemplateSourceFacts {
     pub unit: SourceUnitId,
     pub rule: SourceUnitId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MacroCaptureInputSourceFacts {
+    pub invocation: SourceUnitId,
+    pub capture_range: ByteRange,
+    pub deletion_range: ByteRange,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct MacroCaptureSlotSourceFacts {
+    pub unit: SourceUnitId,
+    pub rule: SourceUnitId,
+    pub matcher_capture_range: ByteRange,
+    pub trigger_units: Vec<SourceUnitId>,
+    pub inputs: Vec<MacroCaptureInputSourceFacts>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -124,10 +143,58 @@ struct TemplateCandidate {
 }
 
 #[cfg(rust_item_dependencies_patched)]
+struct TemplateExpansionCandidates {
+    candidates: Vec<TemplateCandidate>,
+    blocked_repetition_contents: Vec<ByteRange>,
+    captures: Option<TemplateCaptureObservation>,
+}
+
+#[cfg(rust_item_dependencies_patched)]
+struct TemplateCaptureObservation {
+    components: BTreeSet<ByteRange>,
+    component_captures: BTreeMap<ByteRange, ByteRange>,
+    slots: Vec<ObservedCaptureSlot>,
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[derive(Clone, Copy)]
+struct ObservedCaptureSlot {
+    matcher_capture_range: ByteRange,
+    matcher_deletion_range: ByteRange,
+    input_capture_range: ByteRange,
+    input_deletion_range: ByteRange,
+}
+
+#[cfg(rust_item_dependencies_patched)]
+struct CaptureSlotDraft {
+    matcher_capture_range: ByteRange,
+    matcher_deletion_range: ByteRange,
+    trigger_units: Vec<u32>,
+    inputs: Vec<PendingCaptureInputFacts>,
+}
+
+#[cfg(rust_item_dependencies_patched)]
 #[derive(Clone, Copy)]
 struct PendingTemplateFacts {
     unit: u32,
     rule: u32,
+}
+
+#[cfg(rust_item_dependencies_patched)]
+struct PendingCaptureSlotFacts {
+    unit: u32,
+    rule: u32,
+    matcher_capture_range: ByteRange,
+    trigger_units: Vec<u32>,
+    inputs: Vec<PendingCaptureInputFacts>,
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[derive(Clone, Copy)]
+struct PendingCaptureInputFacts {
+    invocation: u32,
+    capture_range: ByteRange,
+    deletion_range: ByteRange,
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -165,7 +232,10 @@ pub(crate) fn refine_declarative_macros_from_compiler(
         validate_macro_rule_facts, validate_ownerless_attribute_invocations,
     };
 
-    if !inventory.macro_templates.is_empty() || !inventory.macro_repetitions.is_empty() {
+    if !inventory.macro_templates.is_empty()
+        || !inventory.macro_capture_slots.is_empty()
+        || !inventory.macro_repetitions.is_empty()
+    {
         return Err(SourceError::InvalidInventory);
     }
     validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)?;
@@ -218,6 +288,22 @@ pub(crate) fn refine_declarative_macros_from_compiler(
     // rule unsplit so that the conservative rule binding protects its source.
     let mut complete_rules = BTreeMap::<SourceUnitId, bool>::new();
     let mut candidates = BTreeSet::<TemplateCandidate>::new();
+    let mut blocked_repetition_contents = BTreeSet::<(SourceUnitId, ByteRange)>::new();
+    let mut capture_observations = FxHashMap::<ExpnId, TemplateCaptureObservation>::default();
+    let parser_tokens =
+        tokenize_parser_tokens(&inventory.original).map_err(|error| match error {
+            SourceSyntaxError::SourceTooLarge => SourceError::SourceTooLarge,
+            SourceSyntaxError::InvalidRange | SourceSyntaxError::InvalidSyntax => {
+                SourceError::IncompleteDeclarativeMacroObservation
+            }
+        })?;
+    let rewrite_guard =
+        ParserTokenRewriteGuard::new(&inventory.original).map_err(|error| match error {
+            SourceSyntaxError::SourceTooLarge => SourceError::SourceTooLarge,
+            SourceSyntaxError::InvalidRange | SourceSyntaxError::InvalidSyntax => {
+                SourceError::IncompleteDeclarativeMacroObservation
+            }
+        })?;
     for (_, expansion_id, origin) in &ordered {
         if origin.implementation_kind != MacroImplementationKind::Declarative {
             continue;
@@ -237,15 +323,43 @@ pub(crate) fn refine_declarative_macros_from_compiler(
         let Some(expansion) = origin.declarative_expansion.as_ref() else {
             continue;
         };
-        let Some(observed) =
-            template_candidates_for_expansion(compiler, tcx, inventory, rule, expansion)?
-        else {
+        let observed = template_candidates_for_expansion(
+            compiler,
+            tcx,
+            inventory,
+            &parser_tokens,
+            &rewrite_guard,
+            rule,
+            expansion,
+        )?;
+        let Some(observed) = observed else {
             complete_rules.insert(rule, false);
             continue;
         };
-        candidates.extend(observed);
+        candidates.extend(observed.candidates);
+        blocked_repetition_contents.extend(
+            observed
+                .blocked_repetition_contents
+                .into_iter()
+                .map(|range| (rule, range)),
+        );
+        if let Some(captures) = observed.captures
+            && capture_observations
+                .insert(*expansion_id, captures)
+                .is_some()
+        {
+            return Err(SourceError::IncompleteDeclarativeMacroObservation);
+        }
     }
-    candidates.retain(|candidate| complete_rules.get(&candidate.rule) == Some(&true));
+    let blocked_repetition_contents = blocked_range_index(blocked_repetition_contents.into_iter())?;
+    candidates.retain(|candidate| {
+        complete_rules.get(&candidate.rule) == Some(&true)
+            && !range_index_contains(
+                &blocked_repetition_contents,
+                candidate.rule,
+                candidate.range,
+            )
+    });
     let first_refined_rules = inventory
         .macro_rules
         .iter()
@@ -254,6 +368,24 @@ pub(crate) fn refine_declarative_macros_from_compiler(
             MacroRuleSourceFacts::Refined { rules, .. } => rules.first().copied(),
         })
         .collect::<BTreeSet<_>>();
+    let sole_first_rule_selections = inventory
+        .macro_rules
+        .iter()
+        .filter_map(|facts| match facts {
+            MacroRuleSourceFacts::Refined {
+                rules,
+                observed_selections,
+                ..
+            } => rules.first().copied().and_then(|first| {
+                (!observed_selections.is_empty()
+                    && observed_selections
+                        .iter()
+                        .all(|selection| *selection == first))
+                .then_some((first, observed_selections.len()))
+            }),
+            MacroRuleSourceFacts::Whole { .. } => None,
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let (mut pending, _) = pending_units(&inventory.units);
     let mut next_temporary =
@@ -295,6 +427,83 @@ pub(crate) fn refine_declarative_macros_from_compiler(
             unit: temporary_id,
             rule: candidate.rule.0,
         });
+    }
+
+    let mut selected_expansions_by_rule = BTreeMap::<SourceUnitId, Vec<ExpnId>>::new();
+    for (_, expansion, _) in &ordered {
+        if let Some(Some(rule)) = selected_rules.get(expansion) {
+            selected_expansions_by_rule
+                .entry(*rule)
+                .or_default()
+                .push(*expansion);
+        }
+    }
+    let mut template_candidates_by_rule =
+        BTreeMap::<SourceUnitId, Vec<(TemplateCandidate, u32)>>::new();
+    for (candidate, _, _) in &template_layout {
+        template_candidates_by_rule
+            .entry(candidate.rule)
+            .or_default()
+            .push((
+                *candidate,
+                template_units[&(candidate.rule, candidate.range)],
+            ));
+    }
+    for candidates in template_candidates_by_rule.values_mut() {
+        candidates.sort_by_key(|(candidate, _)| {
+            (
+                candidate.range.start,
+                std::cmp::Reverse(candidate.range.end),
+            )
+        });
+    }
+
+    let mut pending_capture_slots = Vec::new();
+    for (rule, expected_selections) in sole_first_rule_selections {
+        if complete_rules.get(&rule) != Some(&true) {
+            continue;
+        }
+        let Some(drafts) = capture_slot_drafts_for_rule(
+            compiler,
+            inventory,
+            &source_resolver,
+            selected_expansions_by_rule
+                .get(&rule)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            &eligible,
+            &capture_observations,
+            template_candidates_by_rule
+                .get(&rule)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            expected_selections,
+        )?
+        else {
+            continue;
+        };
+        for draft in drafts {
+            let temporary_id = next_temporary;
+            next_temporary = next_temporary
+                .checked_add(1)
+                .ok_or(SourceError::SourceTooLarge)?;
+            pending.push(PendingUnit {
+                temporary_id,
+                kind: WrittenUnitKind::NestedItem,
+                full_range: draft.matcher_deletion_range,
+                parent: Some(rule.0),
+                cfg_state: CfgState::Active,
+                atomic_representative: temporary_id,
+                syntax_ordinal: temporary_id,
+            });
+            pending_capture_slots.push(PendingCaptureSlotFacts {
+                unit: temporary_id,
+                rule: rule.0,
+                matcher_capture_range: draft.matcher_capture_range,
+                trigger_units: draft.trigger_units,
+                inputs: draft.inputs,
+            });
+        }
     }
 
     let mut pending_repetitions = Vec::new();
@@ -418,6 +627,29 @@ pub(crate) fn refine_declarative_macros_from_compiler(
             maximum: facts.maximum,
         })
         .collect::<Vec<_>>();
+    let mut capture_slots = pending_capture_slots
+        .into_iter()
+        .map(|facts| MacroCaptureSlotSourceFacts {
+            unit: id_map[&facts.unit],
+            rule: id_map[&facts.rule],
+            matcher_capture_range: facts.matcher_capture_range,
+            trigger_units: facts
+                .trigger_units
+                .into_iter()
+                .map(|trigger| id_map[&trigger])
+                .collect(),
+            inputs: facts
+                .inputs
+                .into_iter()
+                .map(|input| MacroCaptureInputSourceFacts {
+                    invocation: id_map[&input.invocation],
+                    capture_range: input.capture_range,
+                    deletion_range: input.deletion_range,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    capture_slots.sort();
     repetitions.sort_by(|left, right| repetition_key(left).cmp(&repetition_key(right)));
     let mut ownerless_attribute_invocations = inventory
         .ownerless_attribute_invocations
@@ -434,6 +666,7 @@ pub(crate) fn refine_declarative_macros_from_compiler(
         &units,
         &macro_rules,
         &templates,
+        &capture_slots,
         &repetitions,
     )?;
 
@@ -442,6 +675,7 @@ pub(crate) fn refine_declarative_macros_from_compiler(
     inventory.derive_targets = derive_targets;
     inventory.macro_rules = macro_rules;
     inventory.macro_templates = templates;
+    inventory.macro_capture_slots = capture_slots;
     inventory.macro_repetitions = repetitions;
     inventory.ownerless_attribute_invocations = ownerless_attribute_invocations;
     Ok(())
@@ -631,9 +865,11 @@ fn template_candidates_for_expansion(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     inventory: &super::SourceInventory,
+    parser_tokens: &[ParserToken],
+    rewrite_guard: &ParserTokenRewriteGuard<'_>,
     rule: SourceUnitId,
     expansion: &MacroDeclarativeExpansion,
-) -> Result<Option<Vec<TemplateCandidate>>, SourceError> {
+) -> Result<Option<TemplateExpansionCandidates>, SourceError> {
     let parents = expansion
         .components
         .iter()
@@ -644,16 +880,26 @@ fn template_candidates_for_expansion(
         .iter()
         .map(|component| component.kind == MacroTranscriberComponentKind::Repetition)
         .collect::<Vec<_>>();
-    let Some(repetition_ancestors) = component_repetition_ancestors(&parents, &repetitions) else {
+    let direct_repetition_outputs = expansion.output_tokens.iter().try_fold(
+        vec![false; expansion.components.len()],
+        |mut direct, origin| {
+            if origin.component >= expansion.components.len() {
+                return None;
+            }
+            if repetitions[origin.component] {
+                direct[origin.component] = true;
+            }
+            Some(direct)
+        },
+    );
+    let Some(direct_repetition_outputs) = direct_repetition_outputs else {
         return Ok(None);
     };
-    if expansion
-        .output_tokens
-        .iter()
-        .any(|origin| origin.component >= expansion.components.len())
-    {
+    let Some(repetition_output_closure) =
+        component_flag_closure(&parents, &direct_repetition_outputs)
+    else {
         return Ok(None);
-    }
+    };
     let output_len = expansion.output_tokens.len();
     let mut products = Vec::new();
     for definition in &expansion.definitions {
@@ -674,7 +920,19 @@ fn template_candidates_for_expansion(
         }
         products.push((child.output, false));
     }
-    if product_ranges_partially_overlap(products.iter().map(|(range, _)| *range)) {
+    let mut discarded_outputs = expansion.discarded_outputs.clone();
+    discarded_outputs.sort_by_key(|range| (range.start, range.end));
+    if !discarded_outputs_fit_live_products(&discarded_outputs, &products, output_len) {
+        return Ok(None);
+    }
+    let mut output_ranges = products.clone();
+    output_ranges.extend(
+        discarded_outputs
+            .iter()
+            .copied()
+            .map(|range| (range, false)),
+    );
+    if product_ranges_partially_overlap(output_ranges.iter().map(|(range, _)| *range)) {
         return Ok(None);
     }
 
@@ -689,12 +947,21 @@ fn template_candidates_for_expansion(
         inventory,
         rule_range,
         expansion,
-        &repetition_ancestors,
-        products.iter().map(|(range, _)| *range),
+        &repetition_output_closure.ancestors,
+        output_ranges.iter().map(|(range, _)| *range),
     )?;
     let token_ranges = TemplateTokenRangeIndex::new(&token_ranges)?;
+    let captures = capture_observation_for_expansion(
+        compiler,
+        inventory,
+        parser_tokens,
+        rewrite_guard,
+        rule_range,
+        expansion,
+        &output_ranges,
+    )?;
     let mut candidates = BTreeMap::<ByteRange, bool>::new();
-    for (output, is_use) in products {
+    for (output, is_use) in output_ranges {
         let Some(range) = token_ranges.source_range(output.start, output.end) else {
             continue;
         };
@@ -706,8 +973,36 @@ fn template_candidates_for_expansion(
             std::collections::btree_map::Entry::Occupied(_) => return Ok(None),
         }
     }
-    Ok(Some(
-        candidates
+    let mut blocked_repetition_contents = Vec::new();
+    for (component, is_repetition) in repetitions.iter().copied().enumerate() {
+        if !is_repetition {
+            continue;
+        }
+        let range = match super::original_span_range(
+            compiler,
+            &inventory.offsets,
+            expansion.components[component].span,
+        ) {
+            Ok(range) if !range.is_empty() && rule_range.contains(range) => range,
+            Ok(_) | Err(SourceError::InvalidSpan) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if repetition_output_closure.descendants[component]
+            || !rewrite_guard.deletion_preserves_identity(range)
+        {
+            blocked_repetition_contents.push(range);
+            continue;
+        }
+        match candidates.entry(range) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(false);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if !*entry.get() => {}
+            std::collections::btree_map::Entry::Occupied(_) => return Ok(None),
+        }
+    }
+    Ok(Some(TemplateExpansionCandidates {
+        candidates: candidates
             .into_iter()
             .map(|(range, is_use)| TemplateCandidate {
                 rule,
@@ -715,21 +1010,514 @@ fn template_candidates_for_expansion(
                 is_use,
             })
             .collect(),
-    ))
+        blocked_repetition_contents,
+        captures,
+    }))
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn capture_observation_for_expansion(
+    compiler: &Compiler,
+    inventory: &super::SourceInventory,
+    parser_tokens: &[ParserToken],
+    rewrite_guard: &ParserTokenRewriteGuard<'_>,
+    rule_range: ByteRange,
+    expansion: &MacroDeclarativeExpansion,
+    classified_outputs: &[(MacroOutputTokenRange, bool)],
+) -> Result<Option<TemplateCaptureObservation>, SourceError> {
+    let Some(matcher) = expansion
+        .matcher
+        .as_ref()
+        .filter(|matcher| expansion.complete && matcher.invocation_refinement_safe)
+    else {
+        return Ok(None);
+    };
+    if expansion
+        .components
+        .iter()
+        .any(|component| component.kind == MacroTranscriberComponentKind::MetaVarExpr)
+    {
+        return Ok(None);
+    }
+
+    let mut slots = Vec::new();
+    let mut captures_by_input = BTreeMap::<(u32, u32, u32), ByteRange>::new();
+    let mut fixed_separators = BTreeMap::<(u32, u32, u32), ByteRange>::new();
+    let mut matcher_ranges = BTreeSet::new();
+    let mut input_ranges = Vec::new();
+    for capture in matcher
+        .captures
+        .iter()
+        .filter(|capture| capture.path.is_empty())
+    {
+        if !capture.input.complete
+            || capture.input_stream != capture.input.input_stream
+            || capture.input.start >= capture.input.end
+        {
+            return Ok(None);
+        }
+        let matcher_capture_range =
+            match super::original_span_range(compiler, &inventory.offsets, capture.metavar_span) {
+                Ok(range) if !range.is_empty() && rule_range.contains(range) => range,
+                Ok(_) | Err(SourceError::InvalidSpan) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+        let Some((matcher_deletion_range, matcher_separator)) =
+            capture_deletion_layout(parser_tokens, matcher_capture_range)
+        else {
+            return Ok(None);
+        };
+        if !rule_range.contains(matcher_deletion_range)
+            || !rewrite_guard.deletion_preserves_identity(matcher_deletion_range)
+            || !matcher_ranges.insert(matcher_deletion_range)
+        {
+            return Ok(None);
+        }
+
+        let Some(input_capture_range) =
+            matcher_input_source_range(compiler, inventory, matcher, capture.input)?
+        else {
+            return Ok(None);
+        };
+        if input_capture_range.is_empty() {
+            return Ok(None);
+        }
+        let stream = &matcher.input_streams[capture.input_stream as usize];
+        let input_deletion_range = if let Some(matcher_separator) = matcher_separator {
+            let Some(separator_span) = stream.tokens.get(capture.input.end as usize) else {
+                return Ok(None);
+            };
+            let Some(separator_end) = capture.input.end.checked_add(1) else {
+                return Ok(None);
+            };
+            if fixed_separators
+                .insert(
+                    (capture.input_stream, capture.input.end, separator_end),
+                    matcher_capture_range,
+                )
+                .is_some()
+            {
+                return Ok(None);
+            }
+            let input_separator =
+                match super::original_span_range(compiler, &inventory.offsets, *separator_span) {
+                    Ok(range) if !range.is_empty() => range,
+                    Ok(_) | Err(SourceError::InvalidSpan) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+            if input_capture_range.end > input_separator.start
+                || !same_single_parser_token(
+                    &inventory.original,
+                    matcher_separator,
+                    input_separator,
+                )
+            {
+                return Ok(None);
+            }
+            ByteRange {
+                start: input_capture_range.start,
+                end: input_separator.end,
+            }
+        } else {
+            if capture.input.end as usize != stream.tokens.len() {
+                return Ok(None);
+            }
+            input_capture_range
+        };
+        if !rewrite_guard.deletion_preserves_identity(input_deletion_range) {
+            return Ok(None);
+        }
+        input_ranges.push((capture.input_stream, capture.input));
+        if captures_by_input
+            .insert(
+                (capture.input_stream, capture.input.start, capture.input.end),
+                matcher_capture_range,
+            )
+            .is_some()
+        {
+            return Ok(None);
+        }
+        slots.push(ObservedCaptureSlot {
+            matcher_capture_range,
+            matcher_deletion_range,
+            input_capture_range,
+            input_deletion_range,
+        });
+    }
+    input_ranges.sort_by_key(|(stream, range)| (*stream, range.start, range.end));
+    if input_ranges.windows(2).any(|pair| {
+        pair[0].0 == pair[1].0 && pair[0].1.start < pair[1].1.end && pair[1].1.start < pair[0].1.end
+    }) {
+        return Ok(None);
+    }
+    slots.sort_by_key(|slot| slot.matcher_capture_range);
+
+    let mut components = BTreeSet::new();
+    let mut component_ranges = vec![None; expansion.components.len()];
+    for (index, component) in expansion.components.iter().enumerate() {
+        if component.kind != MacroTranscriberComponentKind::MetaVar {
+            continue;
+        }
+        let range = match super::original_span_range(compiler, &inventory.offsets, component.span) {
+            Ok(range) if !range.is_empty() && rule_range.contains(range) => range,
+            Ok(_) | Err(SourceError::InvalidSpan) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !components.insert(range) {
+            return Ok(None);
+        }
+        component_ranges[index] = Some(range);
+    }
+
+    let mut classified_delta = vec![0_i64; expansion.output_tokens.len() + 1];
+    for (range, _) in classified_outputs {
+        if !valid_output_range(*range, expansion.output_tokens.len()) {
+            return Ok(None);
+        }
+        classified_delta[range.start as usize] += 1;
+        classified_delta[range.end as usize] -= 1;
+    }
+    let mut coverage = 0_i64;
+    let classified_output = classified_delta
+        .into_iter()
+        .take(expansion.output_tokens.len())
+        .map(|delta| {
+            coverage += delta;
+            coverage > 0
+        })
+        .collect::<Vec<_>>();
+    let mut component_captures = BTreeMap::new();
+    for (ordinal, output) in expansion.output_tokens.iter().enumerate() {
+        let Some(component) = expansion.components.get(output.component) else {
+            return Ok(None);
+        };
+        if component.kind != MacroTranscriberComponentKind::MetaVar {
+            continue;
+        }
+        let Some(component_range) = component_ranges[output.component] else {
+            return Ok(None);
+        };
+        if !classified_output[ordinal] {
+            return Ok(None);
+        }
+        let mut matched = BTreeSet::new();
+        let mut separator_owners = BTreeSet::new();
+        for input in &output.input_contributors {
+            if !input.complete {
+                return Ok(None);
+            }
+            let key = (input.input_stream, input.start, input.end);
+            if let Some(&capture) = captures_by_input.get(&key) {
+                matched.insert(capture);
+            } else if let Some(&capture) = fixed_separators.get(&key) {
+                separator_owners.insert(capture);
+            } else {
+                return Ok(None);
+            }
+        }
+        let mut matched = matched.into_iter();
+        let Some(matcher_capture_range) = matched.next() else {
+            return Ok(None);
+        };
+        if matched.next().is_some() {
+            return Ok(None);
+        }
+        if separator_owners
+            .iter()
+            .any(|owner| *owner != matcher_capture_range)
+        {
+            return Ok(None);
+        }
+        if component_captures
+            .insert(component_range, matcher_capture_range)
+            .is_some_and(|previous| previous != matcher_capture_range)
+        {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(TemplateCaptureObservation {
+        components,
+        component_captures,
+        slots,
+    }))
+}
+
+fn capture_deletion_layout(
+    tokens: &[ParserToken],
+    capture: ByteRange,
+) -> Option<(ByteRange, Option<ByteRange>)> {
+    if capture.is_empty() {
+        return None;
+    }
+    let first = tokens.partition_point(|token| token.range.end <= capture.start);
+    let end = tokens.partition_point(|token| token.range.start < capture.end);
+    let captured = tokens.get(first..end)?;
+    if captured.first()?.range.start != capture.start
+        || captured.last()?.range.end != capture.end
+        || captured.iter().any(|token| !capture.contains(token.range))
+    {
+        return None;
+    }
+    let previous = tokens.get(first.checked_sub(1)?)?;
+    if !matches!(previous.text.as_str(), "(" | "{" | "[" | "," | ";") {
+        return None;
+    }
+    let next = tokens.get(end)?;
+    if matches!(next.text.as_str(), "," | ";") {
+        return Some((
+            ByteRange {
+                start: capture.start,
+                end: next.range.end,
+            },
+            Some(next.range),
+        ));
+    }
+    matches!(next.text.as_str(), ")" | "}" | "]").then_some((capture, None))
+}
+
+fn same_single_parser_token(source: &str, left: ByteRange, right: ByteRange) -> bool {
+    let Some(left) = source.get(left.start as usize..left.end as usize) else {
+        return false;
+    };
+    let Some(right) = source.get(right.start as usize..right.end as usize) else {
+        return false;
+    };
+    let Ok(left) = tokenize_parser_tokens(left) else {
+        return false;
+    };
+    let Ok(right) = tokenize_parser_tokens(right) else {
+        return false;
+    };
+    matches!((left.as_slice(), right.as_slice()), ([left], [right]) if left.same_identity(right))
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn capture_slot_drafts_for_rule(
+    compiler: &Compiler,
+    inventory: &super::SourceInventory,
+    source_resolver: &super::EditableMacroSourceResolver<'_>,
+    selected: &[ExpnId],
+    eligible: &FxHashSet<ExpnId>,
+    observations: &FxHashMap<ExpnId, TemplateCaptureObservation>,
+    template_candidates: &[(TemplateCandidate, u32)],
+    expected_selections: usize,
+) -> Result<Option<Vec<CaptureSlotDraft>>, SourceError> {
+    if selected.len() != expected_selections || selected.is_empty() {
+        return Ok(None);
+    }
+
+    let mut invocations = BTreeSet::new();
+    let mut expected_components = None;
+    let mut component_captures = BTreeMap::<ByteRange, ByteRange>::new();
+    let mut slots = BTreeMap::<ByteRange, (ByteRange, Vec<PendingCaptureInputFacts>)>::new();
+    let mut expected_slot_ranges = None;
+    for &expansion in selected {
+        if !eligible.contains(&expansion) {
+            return Ok(None);
+        }
+        let Some(observation) = observations.get(&expansion) else {
+            return Ok(None);
+        };
+        if expected_components
+            .as_ref()
+            .is_some_and(|expected| expected != &observation.components)
+        {
+            return Ok(None);
+        }
+        expected_components.get_or_insert_with(|| observation.components.clone());
+        for (&component, &capture) in &observation.component_captures {
+            if component_captures
+                .insert(component, capture)
+                .is_some_and(|previous| previous != capture)
+            {
+                return Ok(None);
+            }
+        }
+
+        let Some(editable) = source_resolver.resolve(compiler, inventory, expansion)? else {
+            return Ok(None);
+        };
+        let Some(invocation) = editable.exact_invocation else {
+            return Ok(None);
+        };
+        if !invocations.insert(invocation)
+            || inventory
+                .units
+                .get(invocation.0 as usize)
+                .is_none_or(|unit| {
+                    unit.id != invocation
+                        || unit.kind != WrittenUnitKind::MacroInvocation
+                        || unit.cfg_state != CfgState::Active
+                })
+        {
+            return Ok(None);
+        }
+
+        let slot_ranges = observation
+            .slots
+            .iter()
+            .map(|slot| slot.matcher_capture_range)
+            .collect::<BTreeSet<_>>();
+        if expected_slot_ranges
+            .as_ref()
+            .is_some_and(|expected| expected != &slot_ranges)
+        {
+            return Ok(None);
+        }
+        expected_slot_ranges.get_or_insert(slot_ranges);
+        for slot in &observation.slots {
+            match slots.entry(slot.matcher_capture_range) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((
+                        slot.matcher_deletion_range,
+                        vec![PendingCaptureInputFacts {
+                            invocation: invocation.0,
+                            capture_range: slot.input_capture_range,
+                            deletion_range: slot.input_deletion_range,
+                        }],
+                    ));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if entry.get().0 != slot.matcher_deletion_range {
+                        return Ok(None);
+                    }
+                    entry.get_mut().1.push(PendingCaptureInputFacts {
+                        invocation: invocation.0,
+                        capture_range: slot.input_capture_range,
+                        deletion_range: slot.input_deletion_range,
+                    });
+                }
+            }
+        }
+    }
+
+    let components = expected_components.unwrap_or_default();
+    if component_captures.keys().copied().collect::<BTreeSet<_>>() != components {
+        return Ok(None);
+    }
+    let Some(component_units) = template_component_units(&components, template_candidates) else {
+        return Ok(None);
+    };
+    let Some(mut trigger_units_by_capture) = capture_trigger_units_with_work(
+        slots.keys().copied(),
+        &component_captures,
+        &component_units,
+        || {},
+    ) else {
+        return Ok(None);
+    };
+
+    let mut drafts = Vec::with_capacity(slots.len());
+    for (matcher_capture_range, (matcher_deletion_range, mut inputs)) in slots {
+        inputs.sort_by_key(|input| input.invocation);
+        let Some(trigger_units) = trigger_units_by_capture.remove(&matcher_capture_range) else {
+            return Ok(None);
+        };
+        drafts.push(CaptureSlotDraft {
+            matcher_capture_range,
+            matcher_deletion_range,
+            trigger_units,
+            inputs,
+        });
+    }
+    Ok(Some(drafts))
 }
 
 #[cfg(any(rust_item_dependencies_patched, test))]
-fn component_repetition_ancestors(
+fn capture_trigger_units_with_work(
+    slot_ranges: impl IntoIterator<Item = ByteRange>,
+    component_captures: &BTreeMap<ByteRange, ByteRange>,
+    component_units: &BTreeMap<ByteRange, u32>,
+    mut visit: impl FnMut(),
+) -> Option<BTreeMap<ByteRange, Vec<u32>>> {
+    let mut by_capture = slot_ranges
+        .into_iter()
+        .map(|capture| (capture, Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    for (&component, &capture) in component_captures {
+        visit();
+        let unit = *component_units.get(&component)?;
+        by_capture.get_mut(&capture)?.push(unit);
+    }
+    for units in by_capture.values_mut() {
+        units.sort_unstable();
+        units.dedup();
+    }
+    Some(by_capture)
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn template_component_units(
+    components: &BTreeSet<ByteRange>,
+    candidates: &[(TemplateCandidate, u32)],
+) -> Option<BTreeMap<ByteRange, u32>> {
+    let components = components.iter().copied().collect::<Vec<_>>();
+    if components
+        .windows(2)
+        .any(|pair| pair[0].end > pair[1].start)
+    {
+        return None;
+    }
+
+    let mut result = BTreeMap::new();
+    let mut stack = Vec::<(ByteRange, u32)>::new();
+    let mut candidate = 0;
+    for component in components {
+        while candidates
+            .get(candidate)
+            .is_some_and(|(candidate, _)| candidate.range.start <= component.start)
+        {
+            let (next, unit) = candidates[candidate];
+            while stack
+                .last()
+                .is_some_and(|(range, _)| range.end <= next.range.start)
+            {
+                stack.pop();
+            }
+            if stack
+                .last()
+                .is_some_and(|(parent, _)| !parent.contains(next.range))
+            {
+                return None;
+            }
+            stack.push((next.range, unit));
+            candidate += 1;
+        }
+        while stack
+            .last()
+            .is_some_and(|(range, _)| range.end <= component.start)
+        {
+            stack.pop();
+        }
+        let &(_, unit) = stack
+            .last()
+            .filter(|(range, _)| range.contains(component))?;
+        result.insert(component, unit);
+    }
+    Some(result)
+}
+
+#[cfg(any(rust_item_dependencies_patched, test))]
+struct ComponentFlagClosure {
+    ancestors: Vec<bool>,
+    descendants: Vec<bool>,
+}
+
+#[cfg(any(rust_item_dependencies_patched, test))]
+fn component_flag_closure(
     parents: &[Option<usize>],
-    repetitions: &[bool],
-) -> Option<Vec<bool>> {
-    if parents.len() != repetitions.len() {
+    marked: &[bool],
+) -> Option<ComponentFlagClosure> {
+    if parents.len() != marked.len() {
         return None;
     }
     // 0 is unseen, 1 is on the current parent chain, and 2 is known to reach
-    // a root. Resolve both forest validity and repetition ancestry once.
+    // a root. Resolve the forest once and reuse its parent-before-child order
+    // for the reverse descendant closure.
     let mut states = vec![0_u8; parents.len()];
-    let mut has_repetition = vec![false; parents.len()];
+    let mut ancestors = vec![false; parents.len()];
+    let mut resolved = Vec::with_capacity(parents.len());
     for start in 0..parents.len() {
         if states[start] == 2 {
             continue;
@@ -750,18 +1538,82 @@ fn component_repetition_ancestors(
                     current = parents[index];
                 }
                 1 => return None,
-                2 => break has_repetition[index],
+                2 => break ancestors[index],
                 _ => unreachable!("component traversal state is internal"),
             }
         };
-        let mut repeated = inherited;
+        let mut inherited = inherited;
         for index in path.into_iter().rev() {
-            repeated |= repetitions[index];
-            has_repetition[index] = repeated;
+            inherited |= marked[index];
+            ancestors[index] = inherited;
             states[index] = 2;
+            resolved.push(index);
         }
     }
-    Some(has_repetition)
+    let mut descendants = marked.to_vec();
+    for index in resolved.into_iter().rev() {
+        if descendants[index]
+            && let Some(parent) = parents[index]
+        {
+            descendants[parent] = true;
+        }
+    }
+    Some(ComponentFlagClosure {
+        ancestors,
+        descendants,
+    })
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn blocked_range_index(
+    ranges: impl IntoIterator<Item = (SourceUnitId, ByteRange)>,
+) -> Result<BTreeMap<SourceUnitId, Vec<ByteRange>>, SourceError> {
+    let mut by_rule = BTreeMap::<SourceUnitId, Vec<ByteRange>>::new();
+    for (rule, range) in ranges {
+        if range.is_empty() {
+            return Err(SourceError::IncompleteDeclarativeMacroObservation);
+        }
+        by_rule.entry(rule).or_default().push(range);
+    }
+    for ranges in by_rule.values_mut() {
+        ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
+        let mut outermost = Vec::<ByteRange>::with_capacity(ranges.len());
+        for range in ranges.drain(..) {
+            if outermost.last().is_some_and(|outer| outer.contains(range)) {
+                continue;
+            }
+            if outermost
+                .last()
+                .is_some_and(|previous| previous.end > range.start)
+            {
+                return Err(SourceError::IncompleteDeclarativeMacroObservation);
+            }
+            outermost.push(range);
+        }
+        *ranges = outermost;
+    }
+    Ok(by_rule)
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn range_index_contains(
+    index: &BTreeMap<SourceUnitId, Vec<ByteRange>>,
+    rule: SourceUnitId,
+    range: ByteRange,
+) -> bool {
+    let Some(ranges) = index.get(&rule) else {
+        return false;
+    };
+    let end = ranges.partition_point(|candidate| candidate.start <= range.start);
+    end > 0 && ranges[end - 1].contains(range)
+}
+
+#[cfg(test)]
+fn component_repetition_ancestors(
+    parents: &[Option<usize>],
+    repetitions: &[bool],
+) -> Option<Vec<bool>> {
+    component_flag_closure(parents, repetitions).map(|closure| closure.ancestors)
 }
 
 #[cfg(any(rust_item_dependencies_patched, test))]
@@ -875,12 +1727,51 @@ fn product_ranges_partially_overlap(ranges: impl Iterator<Item = MacroOutputToke
 }
 
 #[cfg(rust_item_dependencies_patched)]
+fn discarded_outputs_fit_live_products(
+    discarded: &[MacroOutputTokenRange],
+    products: &[(MacroOutputTokenRange, bool)],
+    output_len: usize,
+) -> bool {
+    if discarded
+        .iter()
+        .any(|range| !valid_output_range(*range, output_len))
+        || discarded.windows(2).any(|pair| pair[0].end > pair[1].start)
+    {
+        return false;
+    }
+    let mut continuous_run = Vec::with_capacity(discarded.len());
+    let mut run = 0_usize;
+    for (index, range) in discarded.iter().enumerate() {
+        if index > 0 && discarded[index - 1].end < range.start {
+            run += 1;
+        }
+        continuous_run.push(run);
+    }
+
+    products.iter().all(|(product, _)| {
+        let first = discarded.partition_point(|range| range.end <= product.start);
+        let end = discarded.partition_point(|range| range.start < product.end);
+        if first == end {
+            return true;
+        }
+        let first_discarded = discarded[first];
+        let last_discarded = discarded[end - 1];
+        if first_discarded.start < product.start || last_discarded.end > product.end {
+            return false;
+        }
+        !(first_discarded.start == product.start
+            && continuous_run[first] == continuous_run[end - 1]
+            && last_discarded.end == product.end)
+    })
+}
+
+#[cfg(rust_item_dependencies_patched)]
 fn template_token_source_ranges(
     compiler: &Compiler,
     inventory: &super::SourceInventory,
     rule_range: ByteRange,
     expansion: &MacroDeclarativeExpansion,
-    repetition_ancestors: &[bool],
+    blocked_components: &[bool],
     product_ranges: impl Iterator<Item = MacroOutputTokenRange>,
 ) -> Result<Vec<Option<ByteRange>>, SourceError> {
     let mut coverage_delta = vec![0_i64; expansion.output_tokens.len() + 1];
@@ -901,7 +1792,7 @@ fn template_token_source_ranges(
             if coverage == 0 {
                 return Ok(None);
             }
-            if repetition_ancestors
+            if blocked_components
                 .get(origin.component)
                 .copied()
                 .unwrap_or(true)
@@ -1322,12 +2213,14 @@ pub(crate) fn validate_declarative_macro_source_facts(
     units: &[WrittenUnit],
     macro_rules: &[MacroRuleSourceFacts],
     templates: &[MacroTemplateSourceFacts],
+    capture_slots: &[MacroCaptureSlotSourceFacts],
     repetitions: &[MacroRepetitionSourceFacts],
 ) -> Result<(), SourceError> {
     let census = declarative_unit_census(units)?;
     validate_macro_rule_facts(units, macro_rules)?;
-    validate_refined_rule_links(units, macro_rules, templates, repetitions)?;
-    validate_templates(units, templates, &census.template_units)?;
+    validate_refined_rule_links(units, macro_rules, templates, capture_slots, repetitions)?;
+    validate_templates(units, templates, capture_slots, &census.template_units)?;
+    validate_capture_slots(original, units, macro_rules, templates, capture_slots)?;
     validate_repetitions(original, units, repetitions, &census.matcher_units)
 }
 
@@ -1435,6 +2328,7 @@ fn validate_refined_rule_links(
     units: &[WrittenUnit],
     macro_rules: &[MacroRuleSourceFacts],
     templates: &[MacroTemplateSourceFacts],
+    capture_slots: &[MacroCaptureSlotSourceFacts],
     repetitions: &[MacroRepetitionSourceFacts],
 ) -> Result<(), SourceError> {
     let mut refined_rules = BTreeMap::new();
@@ -1467,6 +2361,10 @@ fn validate_refined_rule_links(
         refined_rules
             .get(&template.rule)
             .is_none_or(|(_, observed)| !observed)
+    }) || capture_slots.iter().any(|slot| {
+        refined_rules
+            .get(&slot.rule)
+            .is_none_or(|(first, observed)| !first || !observed)
     }) || repetitions.iter().any(|repetition| {
         refined_rules
             .get(&repetition.rule)
@@ -1480,6 +2378,7 @@ fn validate_refined_rule_links(
 fn validate_templates(
     units: &[WrittenUnit],
     templates: &[MacroTemplateSourceFacts],
+    capture_slots: &[MacroCaptureSlotSourceFacts],
     expected: &BTreeSet<SourceUnitId>,
 ) -> Result<(), SourceError> {
     if templates.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -1503,6 +2402,14 @@ fn validate_templates(
         }
     }
 
+    let capture_units = capture_slots
+        .iter()
+        .map(|slot| slot.unit)
+        .collect::<BTreeSet<_>>();
+    if capture_units.len() != capture_slots.len() || !actual.is_disjoint(&capture_units) {
+        return Err(SourceError::InvalidInventory);
+    }
+    actual.extend(capture_units);
     (actual == *expected)
         .then_some(())
         .ok_or(SourceError::InvalidInventory)
@@ -1551,6 +2458,186 @@ fn nearest_macro_rule_ancestors(
         }
     }
     Ok(ancestors)
+}
+
+fn validate_capture_slots(
+    original: &str,
+    units: &[WrittenUnit],
+    macro_rules: &[MacroRuleSourceFacts],
+    templates: &[MacroTemplateSourceFacts],
+    slots: &[MacroCaptureSlotSourceFacts],
+) -> Result<(), SourceError> {
+    if slots.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(SourceError::InvalidInventory);
+    }
+    if slots.is_empty() {
+        return Ok(());
+    }
+    let parser_tokens =
+        tokenize_parser_tokens(original).map_err(|_| SourceError::InvalidInventory)?;
+    let rewrite_guard =
+        ParserTokenRewriteGuard::new(original).map_err(|_| SourceError::InvalidInventory)?;
+    let template_rules = templates
+        .iter()
+        .map(|template| (template.unit, template.rule))
+        .collect::<BTreeMap<_, _>>();
+    let slot_units = slots.iter().map(|slot| slot.unit).collect::<BTreeSet<_>>();
+    if slot_units.len() != slots.len() {
+        return Err(SourceError::InvalidInventory);
+    }
+
+    let mut rule_selection_counts = BTreeMap::new();
+    for facts in macro_rules {
+        let MacroRuleSourceFacts::Refined {
+            rules,
+            observed_selections,
+            ..
+        } = facts
+        else {
+            continue;
+        };
+        let Some(&first) = rules.first() else {
+            return Err(SourceError::InvalidInventory);
+        };
+        if !observed_selections.is_empty()
+            && observed_selections
+                .iter()
+                .all(|selection| *selection == first)
+        {
+            rule_selection_counts.insert(first, observed_selections.len());
+        }
+    }
+
+    let mut matcher_deletions = BTreeMap::<SourceUnitId, Vec<ByteRange>>::new();
+    let mut input_deletions = BTreeMap::<SourceUnitId, Vec<ByteRange>>::new();
+    let mut invocations_by_rule = BTreeMap::<SourceUnitId, BTreeSet<SourceUnitId>>::new();
+    let mut capture_order =
+        BTreeMap::<(SourceUnitId, SourceUnitId), Vec<(ByteRange, ByteRange)>>::new();
+    for slot in slots {
+        let unit = active_unit(units, slot.unit)?;
+        let rule = active_unit(units, slot.rule)?;
+        let Some(&selection_count) = rule_selection_counts.get(&rule.id) else {
+            return Err(SourceError::InvalidInventory);
+        };
+        if unit.kind != WrittenUnitKind::NestedItem
+            || rule.kind != WrittenUnitKind::MacroRule
+            || unit.parent != Some(rule.id)
+            || slot.matcher_capture_range.is_empty()
+            || !unit.full_range.contains(slot.matcher_capture_range)
+            || !capture_slot_unit_shape(original, unit.full_range)
+            || slot.trigger_units.windows(2).any(|pair| pair[0] >= pair[1])
+            || slot.inputs.windows(2).any(|pair| pair[0] >= pair[1])
+            || slot.inputs.len() != selection_count
+        {
+            return Err(SourceError::InvalidInventory);
+        }
+        let Some((matcher_deletion, matcher_separator)) =
+            capture_deletion_layout(&parser_tokens, slot.matcher_capture_range)
+        else {
+            return Err(SourceError::InvalidInventory);
+        };
+        if matcher_deletion != unit.full_range
+            || !rewrite_guard.deletion_preserves_identity(matcher_deletion)
+        {
+            return Err(SourceError::InvalidInventory);
+        }
+        matcher_deletions
+            .entry(rule.id)
+            .or_default()
+            .push(matcher_deletion);
+
+        for &trigger in &slot.trigger_units {
+            let trigger = active_unit(units, trigger)?;
+            if slot_units.contains(&trigger.id) || template_rules.get(&trigger.id) != Some(&rule.id)
+            {
+                return Err(SourceError::InvalidInventory);
+            }
+        }
+
+        let mut slot_invocations = BTreeSet::new();
+        for input in &slot.inputs {
+            let invocation = active_unit(units, input.invocation)?;
+            if invocation.kind != WrittenUnitKind::MacroInvocation
+                || input.capture_range.is_empty()
+                || input.deletion_range.start != input.capture_range.start
+                || !input.deletion_range.contains(input.capture_range)
+                || !invocation.full_range.contains(input.deletion_range)
+                || !rewrite_guard.deletion_preserves_identity(input.deletion_range)
+                || !slot_invocations.insert(invocation.id)
+            {
+                return Err(SourceError::InvalidInventory);
+            }
+            match matcher_separator {
+                Some(separator) => {
+                    if input.deletion_range == input.capture_range
+                        || !same_single_parser_token(
+                            original,
+                            separator,
+                            ByteRange {
+                                start: input.capture_range.end,
+                                end: input.deletion_range.end,
+                            },
+                        )
+                    {
+                        return Err(SourceError::InvalidInventory);
+                    }
+                }
+                None if input.deletion_range != input.capture_range => {
+                    return Err(SourceError::InvalidInventory);
+                }
+                None => {}
+            }
+            input_deletions
+                .entry(invocation.id)
+                .or_default()
+                .push(input.deletion_range);
+            capture_order
+                .entry((rule.id, invocation.id))
+                .or_default()
+                .push((slot.matcher_capture_range, input.capture_range));
+        }
+        if invocations_by_rule
+            .insert(rule.id, slot_invocations.clone())
+            .is_some_and(|previous| previous != slot_invocations)
+        {
+            return Err(SourceError::InvalidInventory);
+        }
+    }
+
+    for captures in capture_order.values_mut() {
+        captures.sort_by_key(|(matcher, _)| *matcher);
+        if captures.windows(2).any(|pair| pair[0].1 >= pair[1].1) {
+            return Err(SourceError::InvalidInventory);
+        }
+    }
+
+    for ranges in matcher_deletions
+        .values_mut()
+        .chain(input_deletions.values_mut())
+    {
+        ranges.sort();
+        if ranges
+            .windows(2)
+            .any(|pair| ranges_overlap(pair[0], pair[1]))
+        {
+            return Err(SourceError::InvalidInventory);
+        }
+    }
+    Ok(())
+}
+
+fn capture_slot_unit_shape(source: &str, range: ByteRange) -> bool {
+    let Some(source) = source.get(range.start as usize..range.end as usize) else {
+        return false;
+    };
+    let Ok(tokens) = tokenize_parser_tokens(source) else {
+        return false;
+    };
+    let body = match tokens.as_slice() {
+        [body @ .., separator] if matches!(separator.text.as_str(), "," | ";") => body,
+        body => body,
+    };
+    matches!(body, [dollar, _, colon, _] if dollar.text == "$" && colon.text == ":")
 }
 
 fn validate_repetitions(
@@ -1932,6 +3019,76 @@ mod tests {
         assert_eq!(classify_template_candidates(&siblings).unwrap().len(), 3);
     }
 
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn discarded_outputs_must_not_collectively_cover_a_live_product() {
+        let range = |start, end| MacroOutputTokenRange { start, end };
+        let live = [(range(0, 4), false)];
+
+        assert!(!discarded_outputs_fit_live_products(
+            &[range(0, 2), range(2, 4)],
+            &live,
+            4,
+        ));
+        assert!(!discarded_outputs_fit_live_products(
+            &[range(0, 4)],
+            &live,
+            4,
+        ));
+        assert!(discarded_outputs_fit_live_products(
+            &[range(1, 2), range(2, 3)],
+            &live,
+            4,
+        ));
+        assert!(discarded_outputs_fit_live_products(
+            &[range(0, 1), range(2, 4)],
+            &live,
+            4,
+        ));
+    }
+
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn discarded_output_runs_do_not_rescan_nested_live_products() {
+        const COUNT: u32 = 32_768;
+        let discarded = (1..=COUNT)
+            .map(|start| MacroOutputTokenRange {
+                start,
+                end: start + 1,
+            })
+            .collect::<Vec<_>>();
+        let products = (2..=COUNT + 1)
+            .map(|end| (MacroOutputTokenRange { start: 0, end }, false))
+            .collect::<Vec<_>>();
+
+        assert!(discarded_outputs_fit_live_products(
+            &discarded,
+            &products,
+            COUNT as usize + 1,
+        ));
+    }
+
+    #[cfg(rust_item_dependencies_patched)]
+    #[test]
+    fn template_component_lookup_visits_a_large_laminar_layout_once() {
+        const COUNT: u32 = 20_000;
+        let components = (0..COUNT)
+            .map(|index| ByteRange {
+                start: index * 4 + 1,
+                end: index * 4 + 2,
+            })
+            .collect::<BTreeSet<_>>();
+        let candidates = (0..COUNT)
+            .map(|index| (candidate(1, index * 4, index * 4 + 3, false), index + 10))
+            .collect::<Vec<_>>();
+
+        let resolved = template_component_units(&components, &candidates).unwrap();
+        assert_eq!(resolved.len(), COUNT as usize);
+        for (index, component) in components.into_iter().enumerate() {
+            assert_eq!(resolved[&component], index as u32 + 10);
+        }
+    }
+
     #[test]
     fn component_repetition_ancestry_is_linear_and_fails_closed() {
         let mut parents = vec![None];
@@ -1942,6 +3099,9 @@ mod tests {
         let ancestry = component_repetition_ancestors(&parents, &repetitions).unwrap();
         assert!(ancestry[..512].iter().all(|repeated| !repeated));
         assert!(ancestry[512..].iter().all(|repeated| *repeated));
+        let closure = component_flag_closure(&parents, &repetitions).unwrap();
+        assert!(closure.descendants[..=512].iter().all(|repeated| *repeated));
+        assert!(closure.descendants[513..].iter().all(|repeated| !repeated));
         assert!(component_repetition_ancestors(&parents, &repetitions[..1023]).is_none());
 
         let mut missing = parents.clone();
@@ -2313,6 +3473,7 @@ mod tests {
                 &units,
                 &macro_rules,
                 &templates,
+                &[],
                 &repetitions,
             ),
             Ok(())
@@ -2331,10 +3492,277 @@ mod tests {
                 &units,
                 &macro_rules,
                 &templates,
+                &[],
                 &repetitions,
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn capture_slots_require_a_complete_synchronized_layout() {
+        let source = "macro_rules! m { ($a:tt,$b:tt,$c:tt) => { fn $a() {} fn $b() {} fn $c() {} } }\n\
+m!( left,middle,right);\n\
+m!(other,spare,unused);\n";
+        let nth = |text: &str, index: usize| {
+            let (start, _) = source.match_indices(text).nth(index).unwrap();
+            ByteRange {
+                start: start as u32,
+                end: (start + text.len()) as u32,
+            }
+        };
+        let definition = nth(
+            "macro_rules! m { ($a:tt,$b:tt,$c:tt) => { fn $a() {} fn $b() {} fn $c() {} } }",
+            0,
+        );
+        let rule = nth(
+            "($a:tt,$b:tt,$c:tt) => { fn $a() {} fn $b() {} fn $c() {} }",
+            0,
+        );
+        let matcher_a = nth("$a:tt", 0);
+        let matcher_b = nth("$b:tt", 0);
+        let matcher_c = nth("$c:tt", 0);
+        let matcher_a_deletion = ByteRange {
+            start: matcher_a.start,
+            end: matcher_a.end + 1,
+        };
+        let matcher_b_deletion = ByteRange {
+            start: matcher_b.start,
+            end: matcher_b.end + 1,
+        };
+        let trigger_a = nth("fn $a() {}", 0);
+        let trigger_b = nth("fn $b() {}", 0);
+        let trigger_c = nth("fn $c() {}", 0);
+        let first_invocation = nth("m!( left,middle,right);", 0);
+        let second_invocation = nth("m!(other,spare,unused);", 0);
+        let left = nth("left", 0);
+        let middle = nth("middle", 0);
+        let right = nth("right", 0);
+        let other = nth("other", 0);
+        let spare = nth("spare", 0);
+        let unused = nth("unused", 0);
+        let units = vec![
+            unit(
+                0,
+                WrittenUnitKind::CrateRoot,
+                (0, source.len() as u32),
+                None,
+            ),
+            unit(
+                1,
+                WrittenUnitKind::MacroDefinition,
+                (definition.start, definition.end),
+                Some(0),
+            ),
+            unit(
+                2,
+                WrittenUnitKind::MacroRule,
+                (rule.start, rule.end),
+                Some(1),
+            ),
+            unit(
+                3,
+                WrittenUnitKind::NestedItem,
+                (matcher_a_deletion.start, matcher_a_deletion.end),
+                Some(2),
+            ),
+            unit(
+                4,
+                WrittenUnitKind::NestedItem,
+                (matcher_b_deletion.start, matcher_b_deletion.end),
+                Some(2),
+            ),
+            unit(
+                5,
+                WrittenUnitKind::NestedItem,
+                (matcher_c.start, matcher_c.end),
+                Some(2),
+            ),
+            unit(
+                6,
+                WrittenUnitKind::NestedItem,
+                (trigger_a.start, trigger_a.end),
+                Some(2),
+            ),
+            unit(
+                7,
+                WrittenUnitKind::NestedItem,
+                (trigger_b.start, trigger_b.end),
+                Some(2),
+            ),
+            unit(
+                8,
+                WrittenUnitKind::NestedItem,
+                (trigger_c.start, trigger_c.end),
+                Some(2),
+            ),
+            unit(
+                9,
+                WrittenUnitKind::MacroInvocation,
+                (first_invocation.start, first_invocation.end),
+                Some(0),
+            ),
+            unit(
+                10,
+                WrittenUnitKind::MacroInvocation,
+                (second_invocation.start, second_invocation.end),
+                Some(0),
+            ),
+        ];
+        let macro_rules = refined_rules(1, &[2], &[2, 2]);
+        let templates = (6..=8)
+            .map(|unit| MacroTemplateSourceFacts {
+                unit: SourceUnitId(unit),
+                rule: SourceUnitId(2),
+            })
+            .collect::<Vec<_>>();
+        let inputs = |first: ByteRange, second: ByteRange, separator: bool| {
+            [(SourceUnitId(9), first), (SourceUnitId(10), second)]
+                .into_iter()
+                .map(|(invocation, capture_range)| MacroCaptureInputSourceFacts {
+                    invocation,
+                    capture_range,
+                    deletion_range: ByteRange {
+                        start: capture_range.start,
+                        end: capture_range.end + u32::from(separator),
+                    },
+                })
+                .collect::<Vec<_>>()
+        };
+        let slots = vec![
+            MacroCaptureSlotSourceFacts {
+                unit: SourceUnitId(3),
+                rule: SourceUnitId(2),
+                matcher_capture_range: matcher_a,
+                trigger_units: vec![SourceUnitId(6)],
+                inputs: inputs(left, other, true),
+            },
+            MacroCaptureSlotSourceFacts {
+                unit: SourceUnitId(4),
+                rule: SourceUnitId(2),
+                matcher_capture_range: matcher_b,
+                trigger_units: vec![SourceUnitId(7)],
+                inputs: inputs(middle, spare, true),
+            },
+            MacroCaptureSlotSourceFacts {
+                unit: SourceUnitId(5),
+                rule: SourceUnitId(2),
+                matcher_capture_range: matcher_c,
+                trigger_units: vec![SourceUnitId(8)],
+                inputs: inputs(right, unused, false),
+            },
+        ];
+
+        assert_eq!(
+            validate_declarative_macro_source_facts(
+                source,
+                &units,
+                &macro_rules,
+                &templates,
+                &slots,
+                &[],
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            validate_declarative_macro_source_facts(
+                source,
+                &units,
+                &macro_rules,
+                &templates,
+                &slots[..1],
+                &[],
+            ),
+            Err(SourceError::InvalidInventory)
+        );
+
+        let mut reordered = slots.clone();
+        let first_capture = reordered[0].inputs[0].capture_range;
+        let first_deletion = reordered[0].inputs[0].deletion_range;
+        reordered[0].inputs[0].capture_range = reordered[1].inputs[0].capture_range;
+        reordered[0].inputs[0].deletion_range = reordered[1].inputs[0].deletion_range;
+        reordered[1].inputs[0].capture_range = first_capture;
+        reordered[1].inputs[0].deletion_range = first_deletion;
+        assert_eq!(
+            validate_declarative_macro_source_facts(
+                source,
+                &units,
+                &macro_rules,
+                &templates,
+                &reordered,
+                &[],
+            ),
+            Err(SourceError::InvalidInventory)
+        );
+
+        let mut extended = slots.clone();
+        extended[0].inputs[0].deletion_range.start -= 1;
+        assert_eq!(
+            validate_declarative_macro_source_facts(
+                source,
+                &units,
+                &macro_rules,
+                &templates,
+                &extended,
+                &[],
+            ),
+            Err(SourceError::InvalidInventory)
+        );
+
+        let mut incomplete = slots;
+        incomplete[2].inputs.pop();
+        assert_eq!(
+            validate_declarative_macro_source_facts(
+                source,
+                &units,
+                &macro_rules,
+                &templates,
+                &incomplete,
+                &[],
+            ),
+            Err(SourceError::InvalidInventory)
+        );
+    }
+
+    #[test]
+    fn capture_trigger_index_visits_each_component_once() {
+        const COUNT: u32 = 20_000;
+        let slots = (0..COUNT)
+            .map(|index| ByteRange {
+                start: index * 4,
+                end: index * 4 + 1,
+            })
+            .collect::<Vec<_>>();
+        let component_captures = slots
+            .iter()
+            .enumerate()
+            .map(|(index, &capture)| {
+                (
+                    ByteRange {
+                        start: COUNT * 4 + index as u32 * 2,
+                        end: COUNT * 4 + index as u32 * 2 + 1,
+                    },
+                    capture,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let component_units = component_captures
+            .keys()
+            .enumerate()
+            .map(|(index, &component)| (component, index as u32))
+            .collect::<BTreeMap<_, _>>();
+        let mut visits = 0;
+
+        let indexed =
+            capture_trigger_units_with_work(slots, &component_captures, &component_units, || {
+                visits += 1
+            })
+            .unwrap();
+
+        assert_eq!(visits, COUNT as usize);
+        assert_eq!(indexed.len(), COUNT as usize);
+        assert!(indexed.values().all(|units| units.len() == 1));
     }
 
     #[test]
@@ -2359,6 +3787,7 @@ mod tests {
                 &observed_second,
                 &templates,
                 &[],
+                &[],
             ),
             Ok(())
         );
@@ -2370,6 +3799,7 @@ mod tests {
                 &units,
                 &unobserved_second,
                 &templates,
+                &[],
                 &[],
             ),
             Err(SourceError::InvalidInventory)
@@ -2404,6 +3834,7 @@ mod tests {
                 &units,
                 &observed_second,
                 &[],
+                &[],
                 &repetitions,
             ),
             Err(SourceError::InvalidInventory)
@@ -2411,7 +3842,14 @@ mod tests {
 
         let reordered = refined_rules(1, &[3, 2], &[3]);
         assert_eq!(
-            validate_declarative_macro_source_facts(&source, &units, &reordered, &[], &repetitions,),
+            validate_declarative_macro_source_facts(
+                &source,
+                &units,
+                &reordered,
+                &[],
+                &[],
+                &repetitions,
+            ),
             Err(SourceError::InvalidInventory)
         );
     }
@@ -2440,6 +3878,7 @@ mod tests {
                 &macro_rules,
                 &templates,
                 &[],
+                &[],
             ),
             Err(SourceError::InvalidInventory)
         );
@@ -2455,6 +3894,7 @@ mod tests {
                 &units,
                 &macro_rules,
                 &templates,
+                &[],
                 &repetitions,
             ),
             Err(SourceError::InvalidInventory)
@@ -2468,6 +3908,7 @@ mod tests {
                 &units,
                 &macro_rules,
                 &templates,
+                &[],
                 &repetitions,
             ),
             Err(SourceError::InvalidInventory)
@@ -2484,6 +3925,7 @@ mod tests {
                 &units,
                 &macro_rules,
                 &templates,
+                &[],
                 &repetitions,
             ),
             Err(SourceError::InvalidInventory)
@@ -2497,6 +3939,7 @@ mod tests {
                 &units,
                 &macro_rules,
                 &templates,
+                &[],
                 &repetitions,
             ),
             Err(SourceError::InvalidInventory)
@@ -2513,6 +3956,7 @@ mod tests {
                 &units,
                 &macro_rules,
                 &templates,
+                &[],
                 &repetitions,
             ),
             Err(SourceError::InvalidInventory)
@@ -2531,6 +3975,7 @@ mod tests {
                 &units,
                 &macro_rules,
                 &templates,
+                &[],
                 &repetitions,
             ),
             Err(SourceError::InvalidInventory)
@@ -2564,6 +4009,7 @@ mod tests {
                 &source,
                 &units,
                 &macro_rules,
+                &[],
                 &[],
                 &repetitions,
             ),
@@ -2602,6 +4048,7 @@ mod tests {
                 &units,
                 &macro_rules,
                 &[],
+                &[],
                 &[repetition, overlapping],
             ),
             Err(SourceError::InvalidInventory)
@@ -2624,6 +4071,7 @@ mod tests {
                 &" ".repeat(40),
                 &units,
                 &macro_rules,
+                &[],
                 &[],
                 &[],
             ),

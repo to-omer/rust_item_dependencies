@@ -44,7 +44,10 @@ use super::ExpansionError;
 #[cfg(any(rust_item_dependencies_patched, test))]
 use super::output::MacroOutputRange;
 #[cfg(rust_item_dependencies_patched)]
-use super::output::{MacroProductIdentityRangeIndex, laminar_output_ranges, output_range};
+use super::output::{
+    MacroProductIdentityRangeIndex, laminar_output_ranges, normalize_discarded_output_ranges,
+    output_range, valid_discarded_output_relations,
+};
 
 #[cfg(any(rust_item_dependencies_patched, test))]
 #[derive(Clone, Copy)]
@@ -601,6 +604,87 @@ mod ancestor_resolution_tests {
     }
 
     #[test]
+    fn product_basis_ignores_cfg_discarded_output_ordinals() {
+        let ancestry = SourceAncestryIndex::from_parents(vec![None, None]).unwrap();
+        let excluded = SourceAncestorExclusions::new(&ancestry, []).unwrap();
+        let contributors = [
+            vec![SourceUnitId(0)],
+            vec![SourceUnitId(1)],
+            vec![SourceUnitId(0)],
+        ];
+        with_flat_product_basis_index(&ancestry, &excluded, &contributors, |index| {
+            assert!(
+                index
+                    .intersection(MacroOutputRange { start: 0, end: 3 })?
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .unwrap();
+        with_flat_product_basis_index_excluding(
+            &ancestry,
+            &excluded,
+            &contributors,
+            &[MacroOutputRange { start: 1, end: 2 }],
+            |index| {
+                assert_eq!(
+                    index.intersection(MacroOutputRange { start: 0, end: 3 })?,
+                    vec![SourceUnitId(0)]
+                );
+                assert_eq!(
+                    index.intersection(MacroOutputRange { start: 1, end: 2 }),
+                    Err(ExpansionError::IncompleteOrigin),
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn discarded_product_basis_queries_do_not_rescan_nested_discarded_ranges() {
+        const DISCARDED: usize = 1_024;
+        let token_count = DISCARDED * 3 + 1;
+        let ancestry = SourceAncestryIndex::from_parents(vec![None]).unwrap();
+        let excluded = SourceAncestorExclusions::new(&ancestry, []).unwrap();
+        let contributors = vec![vec![SourceUnitId(0)]; token_count];
+        let discarded = (DISCARDED..DISCARDED * 2)
+            .map(|ordinal| MacroOutputRange {
+                start: ordinal as u32,
+                end: ordinal as u32 + 1,
+            })
+            .collect::<Vec<_>>();
+
+        with_flat_product_basis_index_excluding(
+            &ancestry,
+            &excluded,
+            &contributors,
+            &discarded,
+            |index| {
+                let (construction_work, query_work) = index.work();
+                assert!(construction_work <= discarded.len() + token_count * 3);
+                let query_levels = index.leaf_count.ilog2() as usize + 1;
+                for padding in 0..DISCARDED {
+                    assert_eq!(
+                        index.intersection(MacroOutputRange {
+                            start: (DISCARDED - padding) as u32,
+                            end: (DISCARDED * 2 + 1 + padding) as u32,
+                        })?,
+                        vec![SourceUnitId(0)],
+                    );
+                }
+                let (_, final_query_work) = index.work();
+                assert!(
+                    final_query_work - query_work <= DISCARDED * query_levels,
+                    "each nested range query must visit only one segment-tree path per level",
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn nested_source_frontiers_are_resolved_incrementally_per_contributor_node() {
         const DEPTH: usize = 1_024;
         let mut builder = MacroContributorDagBuilder::default();
@@ -1070,6 +1154,7 @@ pub(super) struct PreparedProducer {
     pub(super) output_token_count: u32,
     pub(super) definition_outputs: Vec<(rustc_hir::def_id::LocalDefId, MacroOutputRange)>,
     pub(super) child_outputs: Vec<(ExpnId, MacroOutputRange)>,
+    pub(super) discarded_outputs: Vec<MacroOutputRange>,
     pub(super) owner_output: PreparedMacroOwnerOutput,
 }
 
@@ -2306,7 +2391,15 @@ pub(super) struct ProductBasisRangeIndex<'a, 'm> {
     frontier_memo: &'m mut IdentityFrontierMemo,
     token_count: usize,
     leaf_count: usize,
-    frontiers: Vec<PersistentFrontierSetId>,
+    // `None` is the intersection identity for an output ordinal that was
+    // discarded before it could contribute to a live product. It is distinct
+    // from the valid empty frontier set produced by a live token whose sources
+    // were all excluded from identity.
+    frontiers: Vec<Option<PersistentFrontierSetId>>,
+    #[cfg(test)]
+    construction_work: usize,
+    #[cfg(test)]
+    query_work: usize,
 }
 
 #[cfg(any(rust_item_dependencies_patched, test))]
@@ -2902,6 +2995,26 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
         contributor_dag: MacroContributorDagRef<'_>,
         token_contributors: &[MacroContributorSetId],
     ) -> Result<Self, ExpansionError> {
+        Self::new_excluding(
+            ancestry,
+            excluded,
+            exclusion_context,
+            frontier_memo,
+            contributor_dag,
+            token_contributors,
+            &[],
+        )
+    }
+
+    fn new_excluding(
+        ancestry: &'a SourceAncestryIndex,
+        excluded: &'a SourceAncestorExclusions<'a>,
+        exclusion_context: u32,
+        frontier_memo: &'m mut IdentityFrontierMemo,
+        contributor_dag: MacroContributorDagRef<'_>,
+        token_contributors: &[MacroContributorSetId],
+        discarded_ranges: &[MacroOutputRange],
+    ) -> Result<Self, ExpansionError> {
         let token_count = token_contributors.len();
         let leaf_count = token_count
             .checked_next_power_of_two()
@@ -2910,28 +3023,70 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
         let node_count = leaf_count
             .checked_mul(2)
             .ok_or(ExpansionError::IncompleteOrigin)?;
-        let empty = PersistentFrontierSets::EMPTY;
-        let mut frontiers = vec![empty; node_count];
+        #[cfg(test)]
+        let mut construction_work = 0;
+        let mut previous_end = None;
+        for &range in discarded_ranges {
+            #[cfg(test)]
+            {
+                construction_work += 1;
+            }
+            if range.start >= range.end
+                || range.end as usize > token_count
+                || previous_end.is_some_and(|end| range.start < end)
+            {
+                return Err(ExpansionError::IncompleteOrigin);
+            }
+            previous_end = Some(range.end);
+        }
+
+        let mut frontiers = vec![None; node_count];
+        let mut discarded_index = 0;
         for (ordinal, &root) in token_contributors.iter().enumerate() {
-            frontiers[leaf_count + ordinal] = frontier_memo.resolve_frontier_set(
-                exclusion_context,
-                contributor_dag,
-                ancestry,
-                excluded,
-                root,
-            )?;
+            #[cfg(test)]
+            {
+                construction_work += 1;
+            }
+            while discarded_ranges
+                .get(discarded_index)
+                .is_some_and(|range| range.end as usize <= ordinal)
+            {
+                #[cfg(test)]
+                {
+                    construction_work += 1;
+                }
+                discarded_index += 1;
+            }
+            let discarded = discarded_ranges.get(discarded_index).is_some_and(|range| {
+                range.start as usize <= ordinal && ordinal < range.end as usize
+            });
+            if !discarded {
+                frontiers[leaf_count + ordinal] = Some(frontier_memo.resolve_frontier_set(
+                    exclusion_context,
+                    contributor_dag,
+                    ancestry,
+                    excluded,
+                    root,
+                )?);
+            }
         }
         for index in (1..leaf_count).rev() {
-            frontiers[index] = if frontiers[index * 2] == frontiers[index * 2 + 1] {
-                frontiers[index * 2]
-            } else {
-                frontier_memo.intersection(
+            #[cfg(test)]
+            {
+                construction_work += 1;
+            }
+            let left = frontiers[index * 2];
+            let right = frontiers[index * 2 + 1];
+            frontiers[index] = match (left, right) {
+                (Some(left), Some(right)) if left != right => Some(frontier_memo.intersection(
                     exclusion_context,
                     ancestry,
                     excluded,
-                    frontiers[index * 2],
-                    frontiers[index * 2 + 1],
-                )?
+                    left,
+                    right,
+                )?),
+                (Some(frontier), _) | (_, Some(frontier)) => Some(frontier),
+                (None, None) => None,
             };
         }
         Ok(Self {
@@ -2942,6 +3097,10 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
             token_count,
             leaf_count,
             frontiers,
+            #[cfg(test)]
+            construction_work,
+            #[cfg(test)]
+            query_work: 0,
         })
     }
 
@@ -2949,6 +3108,19 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
         &mut self,
         range: MacroOutputRange,
     ) -> Result<Vec<SourceUnitId>, ExpansionError> {
+        let result = self.intersection_frontier(range)?;
+        self.frontier_memo.materialize(result, self.ancestry)
+    }
+
+    #[cfg(test)]
+    fn work(&self) -> (usize, usize) {
+        (self.construction_work, self.query_work)
+    }
+
+    fn intersection_frontier(
+        &mut self,
+        range: MacroOutputRange,
+    ) -> Result<PersistentFrontierSetId, ExpansionError> {
         let mut start = range.start as usize;
         let mut end = range.end as usize;
         if start >= end || end > self.token_count {
@@ -2958,19 +3130,26 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
         end += self.leaf_count;
         let mut result = None::<PersistentFrontierSetId>;
         while start < end {
+            #[cfg(test)]
+            {
+                self.query_work += 1;
+            }
             if start % 2 == 1 {
-                result = Some(self.merge(result, self.frontiers[start])?);
+                if let Some(frontier) = self.frontiers[start] {
+                    result = Some(self.merge(result, frontier)?);
+                }
                 start += 1;
             }
             if end % 2 == 1 {
                 end -= 1;
-                result = Some(self.merge(result, self.frontiers[end])?);
+                if let Some(frontier) = self.frontiers[end] {
+                    result = Some(self.merge(result, frontier)?);
+                }
             }
             start /= 2;
             end /= 2;
         }
-        let result = result.ok_or(ExpansionError::IncompleteOrigin)?;
-        self.frontier_memo.materialize(result, self.ancestry)
+        result.ok_or(ExpansionError::IncompleteOrigin)
     }
 
     fn merge(
@@ -2999,6 +3178,17 @@ pub(super) fn with_flat_product_basis_index<R>(
     token_contributors: &[Vec<SourceUnitId>],
     query: impl FnOnce(&mut ProductBasisRangeIndex<'_, '_>) -> Result<R, ExpansionError>,
 ) -> Result<R, ExpansionError> {
+    with_flat_product_basis_index_excluding(ancestry, excluded, token_contributors, &[], query)
+}
+
+#[cfg(test)]
+fn with_flat_product_basis_index_excluding<R>(
+    ancestry: &SourceAncestryIndex,
+    excluded: &SourceAncestorExclusions<'_>,
+    token_contributors: &[Vec<SourceUnitId>],
+    discarded_ranges: &[MacroOutputRange],
+    query: impl FnOnce(&mut ProductBasisRangeIndex<'_, '_>) -> Result<R, ExpansionError>,
+) -> Result<R, ExpansionError> {
     let mut builder = MacroContributorDagBuilder::default();
     let roots = token_contributors
         .iter()
@@ -3006,13 +3196,14 @@ pub(super) fn with_flat_product_basis_index<R>(
         .collect::<Result<Vec<_>, _>>()?;
     let mut memo = IdentityFrontierMemo::new(ancestry.parents.len())?;
     let context = memo.context(Vec::new())?;
-    let mut index = ProductBasisRangeIndex::new(
+    let mut index = ProductBasisRangeIndex::new_excluding(
         ancestry,
         excluded,
         context,
         &mut memo,
         builder.view(),
         &roots,
+        discarded_ranges,
     )?;
     query(&mut index)
 }
@@ -3825,6 +4016,18 @@ impl<'a> ProvenanceCollector<'a> {
             return Err(ExpansionError::IncompleteOrigin);
         }
 
+        let discarded_outputs = discarded_output_ranges(expansion, output_token_count)?;
+        if !valid_discarded_output_relations(
+            &discarded_outputs,
+            output_token_count,
+            definition_outputs
+                .iter()
+                .map(|(_, output)| *output)
+                .chain(child_outputs.iter().map(|(_, output)| *output)),
+        ) {
+            return Err(ExpansionError::IncompleteOrigin);
+        }
+
         let RustcMacroOwnerOutput {
             complete,
             intrinsic,
@@ -3865,6 +4068,7 @@ impl<'a> ProvenanceCollector<'a> {
             output_token_count,
             definition_outputs,
             child_outputs,
+            discarded_outputs,
             owner_output,
         })
     }
@@ -3903,16 +4107,25 @@ impl<'a> ProvenanceCollector<'a> {
         if definitions.is_empty() {
             return Ok(());
         }
+        let discarded_outputs = discarded_output_ranges(expansion, output_token_count)?;
+        if !valid_discarded_output_relations(
+            &discarded_outputs,
+            output_token_count,
+            definitions.iter().map(|(_, output)| *output),
+        ) {
+            return Err(ExpansionError::IncompleteOrigin);
+        }
 
         let exclusion_context = self.identity_frontier_memo.context(excluded.clone())?;
         let excluded_ancestors = SourceAncestorExclusions::new(&self.source_ancestry, excluded)?;
-        let mut range_index = ProductBasisRangeIndex::new(
+        let mut range_index = ProductBasisRangeIndex::new_excluding(
             &self.source_ancestry,
             &excluded_ancestors,
             exclusion_context,
             &mut self.identity_frontier_memo,
             contributor_dag,
             token_contributors.as_slice(),
+            &discarded_outputs,
         )?;
         let mut by_range = BTreeMap::<MacroOutputRange, Vec<SourceUnitId>>::new();
         let mut raw_bases = Vec::with_capacity(definitions.len());
@@ -4334,6 +4547,19 @@ impl<'a> ProvenanceCollector<'a> {
             .map(ValidatedDeclarativeOutput::observation)
             .ok_or(ExpansionError::IncompleteOrigin)
     }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn discarded_output_ranges(
+    expansion: &MacroDeclarativeExpansion,
+    output_token_count: u32,
+) -> Result<Vec<MacroOutputRange>, ExpansionError> {
+    let discarded = expansion
+        .discarded_outputs
+        .iter()
+        .map(|&output| output_range(output, output_token_count))
+        .collect::<Result<Vec<_>, _>>()?;
+    normalize_discarded_output_ranges(discarded, output_token_count)
 }
 
 #[cfg(rust_item_dependencies_patched)]

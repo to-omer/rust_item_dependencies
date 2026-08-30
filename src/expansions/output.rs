@@ -318,6 +318,9 @@ impl MacroProducerCoverageInventory {
 pub(crate) struct MacroProducerCoverage {
     pub(super) producer: ExpansionId,
     pub(super) output_token_count: u32,
+    /// Normalized output ranges removed by compiler configuration before they
+    /// could materialize a product or owner effect.
+    pub(super) discarded_outputs: Vec<MacroOutputRange>,
     pub(super) materialization_groups: Vec<MacroOutputMaterializationGroup>,
 }
 
@@ -328,6 +331,10 @@ impl MacroProducerCoverage {
 
     pub(crate) fn output_token_count(&self) -> u32 {
         self.output_token_count
+    }
+
+    pub(crate) fn discarded_outputs(&self) -> &[MacroOutputRange] {
+        &self.discarded_outputs
     }
 
     pub(crate) fn materialization_groups(&self) -> &[MacroOutputMaterializationGroup] {
@@ -343,8 +350,14 @@ impl MacroProducerCoverage {
         Self {
             producer,
             output_token_count,
+            discarded_outputs: Vec::new(),
             materialization_groups,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_discarded_outputs(&mut self, discarded_outputs: Vec<MacroOutputRange>) {
+        self.discarded_outputs = discarded_outputs;
     }
 
     #[cfg(test)]
@@ -1354,10 +1367,10 @@ mod product_classification_tests {
             output: range(2, 8),
             product: GraphNode::Definition(DefinitionId(2)),
         };
-        let classes = output_classes(&[nested], 10, Some(owner)).unwrap();
+        let classes = output_classes(&[nested], &[], 10, Some(owner)).unwrap();
 
         assert_eq!(
-            validate_owner_member_classes(&[member], &[nested], classes.intervals()),
+            validate_owner_member_classes(&[member], &[nested], &[], 10, classes.intervals()),
             Ok(vec![member.product])
         );
 
@@ -1365,9 +1378,9 @@ mod product_classification_tests {
             output: range(0, 10),
             product: nested.product,
         };
-        let classes = output_classes(&[whole], 10, Some(owner)).unwrap();
+        let classes = output_classes(&[whole], &[], 10, Some(owner)).unwrap();
         assert_eq!(
-            validate_owner_member_classes(&[member], &[whole], classes.intervals()),
+            validate_owner_member_classes(&[member], &[whole], &[], 10, classes.intervals()),
             Err(ExpansionError::IncompleteOrigin)
         );
     }
@@ -1382,11 +1395,134 @@ mod product_classification_tests {
             output: range(5, 12),
             product: GraphNode::Definition(DefinitionId(2)),
         };
-        let classes = output_classes(&[crossing], 12, Some(DefinitionId(0))).unwrap();
+        let classes = output_classes(&[crossing], &[], 12, Some(DefinitionId(0))).unwrap();
 
         assert_eq!(
-            validate_owner_member_classes(&[member], &[crossing], classes.intervals()),
+            validate_owner_member_classes(&[member], &[crossing], &[], 12, classes.intervals(),),
             Err(ExpansionError::IncompleteOrigin)
+        );
+    }
+
+    #[test]
+    fn discarded_output_is_excluded_from_product_and_owner_materialization() {
+        let owner = DefinitionId(0);
+        let product = ObservedProduct {
+            output: range(0, 10),
+            product: GraphNode::Definition(DefinitionId(1)),
+        };
+        let classes = output_classes(&[product], &[range(3, 7)], 10, Some(owner)).unwrap();
+
+        assert_eq!(
+            classes.intervals(),
+            &[
+                (range(0, 3), PendingOutputClass::Products(ProductClassId(0))),
+                (
+                    range(7, 10),
+                    PendingOutputClass::Products(ProductClassId(0))
+                ),
+            ],
+        );
+        assert_eq!(classes.product_classes, vec![vec![product.product]]);
+
+        let all_discarded = output_classes(&[], &[range(0, 10)], 10, None).unwrap();
+        assert!(all_discarded.intervals().is_empty());
+        assert!(all_discarded.product_classes.is_empty());
+    }
+
+    #[test]
+    fn discarded_output_must_be_normalized_and_only_nested_in_live_products() {
+        let product = |output| ObservedProduct {
+            output,
+            product: GraphNode::Definition(DefinitionId(1)),
+        };
+        assert_eq!(
+            normalize_discarded_output_ranges(vec![range(3, 5), range(1, 2), range(2, 3)], 10,),
+            Ok(vec![range(1, 2), range(2, 3), range(3, 5)]),
+        );
+        assert!(normalize_discarded_output_ranges(vec![range(1, 4), range(3, 5)], 10).is_err());
+        assert!(output_classes(&[], &[range(1, 4), range(3, 5)], 10, None).is_err());
+        assert!(output_classes(&[], &[range(0, 3), range(3, 5)], 5, None).is_ok());
+        assert!(output_classes(&[], &[range(9, 11)], 10, None).is_err());
+        assert!(output_classes(&[product(range(1, 4))], &[range(1, 4)], 10, None).is_err());
+        assert!(
+            output_classes(
+                &[product(range(0, 4))],
+                &[range(0, 2), range(2, 4)],
+                4,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            output_classes(
+                &[product(range(0, 4))],
+                &[range(0, 1), range(2, 4)],
+                4,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(
+            output_classes(
+                &[product(range(0, 4))],
+                &[range(1, 2), range(2, 3)],
+                4,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(output_classes(&[product(range(2, 3))], &[range(1, 4)], 10, None).is_err());
+        assert!(output_classes(&[product(range(0, 3))], &[range(2, 4)], 10, None).is_err());
+        assert!(output_classes(&[product(range(0, 5))], &[range(2, 4)], 5, None).is_ok());
+        assert!(
+            output_classes(
+                &[product(range(0, 3)), product(range(3, 6))],
+                &[range(1, 3), range(3, 5)],
+                6,
+                None,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn owner_member_allows_discarded_tokens_but_still_needs_live_owner_output() {
+        let owner = DefinitionId(0);
+        let member = ObservedProduct {
+            output: range(0, 10),
+            product: GraphNode::Definition(DefinitionId(1)),
+        };
+        let nested = ObservedProduct {
+            output: range(2, 6),
+            product: GraphNode::Definition(DefinitionId(2)),
+        };
+        let discarded = [range(8, 10)];
+        let classes = output_classes(&[nested], &discarded, 10, Some(owner)).unwrap();
+        assert_eq!(
+            validate_owner_member_classes(
+                &[member],
+                &[nested],
+                &discarded,
+                10,
+                classes.intervals(),
+            ),
+            Ok(vec![member.product]),
+        );
+
+        let nested = ObservedProduct {
+            output: range(0, 8),
+            product: nested.product,
+        };
+        let classes = output_classes(&[nested], &discarded, 10, Some(owner)).unwrap();
+        assert_eq!(
+            validate_owner_member_classes(
+                &[member],
+                &[nested],
+                &discarded,
+                10,
+                classes.intervals(),
+            ),
+            Err(ExpansionError::IncompleteOrigin),
         );
     }
 
@@ -1682,12 +1818,18 @@ mod product_classification_tests {
                 product: GraphNode::Definition(DefinitionId(MEMBERS + index + 1)),
             })
             .collect::<Vec<_>>();
-        let classes = output_classes(&products, MEMBERS * 2, Some(DefinitionId(0))).unwrap();
+        let classes = output_classes(&products, &[], MEMBERS * 2, Some(DefinitionId(0))).unwrap();
 
         assert_eq!(
-            validate_owner_member_classes(&members, &products, classes.intervals())
-                .unwrap()
-                .len(),
+            validate_owner_member_classes(
+                &members,
+                &products,
+                &[],
+                MEMBERS * 2,
+                classes.intervals(),
+            )
+            .unwrap()
+            .len(),
             MEMBERS as usize,
         );
     }
@@ -1709,7 +1851,7 @@ mod product_classification_tests {
         }));
 
         let (classes, work) =
-            output_classes_with_work(&products, output_token_count, None).unwrap();
+            output_classes_with_work(&products, &[], output_token_count, None).unwrap();
 
         assert_eq!(classes.intervals.len(), output_token_count as usize);
         assert_eq!(classes.product_classes.len(), NESTED_RANGES as usize + 1);
@@ -2421,10 +2563,19 @@ impl<'a> CoverageLowerer<'a> {
             return Err(ExpansionError::IncompleteOrigin);
         }
 
-        let interval_classes =
-            output_classes(&products, prepared.output_token_count, raw.source_owner)?;
-        let owner_members =
-            validate_owner_member_classes(&owner_members, &products, interval_classes.intervals())?;
+        let interval_classes = output_classes(
+            &products,
+            &prepared.discarded_outputs,
+            prepared.output_token_count,
+            raw.source_owner,
+        )?;
+        let owner_members = validate_owner_member_classes(
+            &owner_members,
+            &products,
+            &prepared.discarded_outputs,
+            prepared.output_token_count,
+            interval_classes.intervals(),
+        )?;
         let (interval_classes, mut product_classes) = interval_classes.into_parts();
         let mut classes = BTreeMap::<
             PendingOutputClass,
@@ -2486,6 +2637,7 @@ impl<'a> CoverageLowerer<'a> {
         Ok(MacroProducerCoverage {
             producer,
             output_token_count: prepared.output_token_count,
+            discarded_outputs: prepared.discarded_outputs.clone(),
             materialization_groups,
         })
     }
@@ -2922,6 +3074,74 @@ pub(super) fn output_range(
 }
 
 #[cfg(any(rust_item_dependencies_patched, test))]
+pub(super) fn normalize_discarded_output_ranges(
+    mut discarded: Vec<MacroOutputRange>,
+    output_token_count: u32,
+) -> Result<Vec<MacroOutputRange>, ExpansionError> {
+    discarded.sort();
+    let mut normalized = Vec::<MacroOutputRange>::with_capacity(discarded.len());
+    for output in discarded {
+        if output.start >= output.end || output.end > output_token_count {
+            return Err(ExpansionError::IncompleteOrigin);
+        }
+        if let Some(previous) = normalized.last()
+            && output.start < previous.end
+        {
+            return Err(ExpansionError::IncompleteOrigin);
+        }
+        normalized.push(output);
+    }
+    Ok(normalized)
+}
+
+#[cfg(any(rust_item_dependencies_patched, test))]
+pub(super) fn valid_discarded_output_relations(
+    discarded: &[MacroOutputRange],
+    output_token_count: u32,
+    live: impl IntoIterator<Item = MacroOutputRange>,
+) -> bool {
+    if discarded
+        .iter()
+        .any(|range| range.start >= range.end || range.end > output_token_count)
+        || discarded.windows(2).any(|pair| pair[0].end > pair[1].start)
+    {
+        return false;
+    }
+
+    // Keep the original ranges as independent source-deletion candidates, but
+    // validate containment against their contiguous union. Otherwise two
+    // adjacent discarded ranges can jointly cover a live range while evading
+    // the single-range equality check below.
+    let mut contiguous = Vec::<MacroOutputRange>::with_capacity(discarded.len());
+    for &range in discarded {
+        if let Some(previous) = contiguous.last_mut()
+            && previous.end == range.start
+        {
+            previous.end = range.end;
+        } else {
+            contiguous.push(range);
+        }
+    }
+
+    live.into_iter().all(|live| {
+        if live.start >= live.end || live.end > output_token_count {
+            return false;
+        }
+        let first = discarded.partition_point(|range| range.end <= live.start);
+        let end = discarded.partition_point(|range| range.start < live.end);
+        if first == end {
+            return true;
+        }
+        let first_discarded = discarded[first];
+        let last_discarded = discarded[end - 1];
+        let containing_union = contiguous.partition_point(|range| range.start <= live.start);
+        let fully_discarded =
+            containing_union > 0 && contiguous[containing_union - 1].contains(live);
+        live.contains(first_discarded) && live.contains(last_discarded) && !fully_discarded
+    })
+}
+
+#[cfg(any(rust_item_dependencies_patched, test))]
 pub(super) fn laminar_output_ranges(ranges: impl IntoIterator<Item = MacroOutputRange>) -> bool {
     let mut ranges = ranges.into_iter().collect::<Vec<_>>();
     if ranges.iter().any(|range| range.start >= range.end) {
@@ -2951,18 +3171,28 @@ pub(super) fn laminar_output_ranges(ranges: impl IntoIterator<Item = MacroOutput
 #[cfg(any(rust_item_dependencies_patched, test))]
 fn output_classes(
     products: &[ObservedProduct],
+    discarded: &[MacroOutputRange],
     output_token_count: u32,
     source_owner: Option<DefinitionId>,
 ) -> Result<PendingOutputClasses, ExpansionError> {
-    output_classes_with_work(products, output_token_count, source_owner).map(|(classes, _)| classes)
+    output_classes_with_work(products, discarded, output_token_count, source_owner)
+        .map(|(classes, _)| classes)
 }
 
 #[cfg(any(rust_item_dependencies_patched, test))]
 fn output_classes_with_work(
     products: &[ObservedProduct],
+    discarded: &[MacroOutputRange],
     output_token_count: u32,
     source_owner: Option<DefinitionId>,
 ) -> Result<(PendingOutputClasses, OutputClassWork), ExpansionError> {
+    if !valid_discarded_output_relations(
+        discarded,
+        output_token_count,
+        products.iter().map(|product| product.output),
+    ) {
+        return Err(ExpansionError::IncompleteOrigin);
+    }
     let mut products_by_range = BTreeMap::<MacroOutputRange, BTreeSet<GraphNode>>::new();
     for &product in products {
         if product.output.start >= product.output.end
@@ -3024,8 +3254,13 @@ fn output_classes_with_work(
         positions.insert(range.start);
         positions.insert(range.end);
     }
+    for &range in discarded {
+        positions.insert(range.start);
+        positions.insert(range.end);
+    }
     let positions = positions.into_iter().collect::<Vec<_>>();
     let mut active = BTreeSet::<(u32, u32, u32)>::new();
+    let mut discarded_index = 0;
     let mut classified = Vec::new();
     for pair in positions.windows(2) {
         let position = pair[0];
@@ -3044,6 +3279,18 @@ fn output_classes_with_work(
             end: pair[1],
         };
         if range.is_empty() {
+            continue;
+        }
+        while discarded
+            .get(discarded_index)
+            .is_some_and(|discarded| discarded.end <= position)
+        {
+            discarded_index += 1;
+        }
+        if discarded
+            .get(discarded_index)
+            .is_some_and(|discarded| discarded.start <= range.start && range.end <= discarded.end)
+        {
             continue;
         }
         let class = if let Some(&(_, start, end)) = active.first() {
@@ -3079,10 +3326,19 @@ fn output_classes_with_work(
 fn validate_owner_member_classes(
     members: &[ObservedProduct],
     products: &[ObservedProduct],
+    discarded: &[MacroOutputRange],
+    output_token_count: u32,
     classes: &[(MacroOutputRange, PendingOutputClass)],
 ) -> Result<Vec<GraphNode>, ExpansionError> {
     if members.is_empty() {
         return Ok(Vec::new());
+    }
+    if !valid_discarded_output_relations(
+        discarded,
+        output_token_count,
+        members.iter().map(|member| member.output),
+    ) {
+        return Err(ExpansionError::IncompleteOrigin);
     }
 
     let mut product_ranges = products
@@ -3105,7 +3361,7 @@ fn validate_owner_member_classes(
     if classes.iter().any(|(range, _)| range.is_empty())
         || classes
             .windows(2)
-            .any(|pair| pair[0].0.end != pair[1].0.start)
+            .any(|pair| pair[0].0.end > pair[1].0.start)
     {
         return Err(ExpansionError::IncompleteOrigin);
     }
@@ -3139,11 +3395,7 @@ fn validate_owner_member_classes(
 
         let first = classes.partition_point(|(range, _)| range.end <= member.output.start);
         let end = classes.partition_point(|(range, _)| range.start < member.output.end);
-        if first >= end
-            || classes[first].0.start > member.output.start
-            || classes[end - 1].0.end < member.output.end
-            || owner_prefix[end] == owner_prefix[first]
-        {
+        if first >= end || owner_prefix[end] == owner_prefix[first] {
             return Err(ExpansionError::IncompleteOrigin);
         }
     }

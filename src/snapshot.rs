@@ -2451,6 +2451,7 @@ mod tests {
             derive_targets: Vec::new(),
             macro_rules: Vec::new(),
             macro_templates: Vec::new(),
+            macro_capture_slots: Vec::new(),
             macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         }
@@ -2519,6 +2520,7 @@ mod tests {
             derive_targets: Vec::new(),
             macro_rules: Vec::new(),
             macro_templates: Vec::new(),
+            macro_capture_slots: Vec::new(),
             macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         }

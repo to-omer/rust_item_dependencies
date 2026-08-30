@@ -1,7 +1,11 @@
 macro_rules! choose_rule {
-    ($one:ident) => {
+    ($one:ident; $discarded:ident) => {
         pub fn $one() -> u32 {
             99
+        }
+#[cfg(any())]
+pub fn $discarded() -> u32 {
+            0
         }
     };
     ($($many:ident),*) => {
@@ -18,7 +22,7 @@ pub fn dead_direct() -> u32 {
 }
 
 mod selected_first {
-    choose_rule!(kept);
+    choose_rule!(kept; discarded);
 }
 
 mod selected_second {

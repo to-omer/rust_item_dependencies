@@ -3,9 +3,12 @@ mod derive;
 pub(crate) mod syntax;
 
 #[cfg(test)]
+pub(crate) use declarative_macro::MacroCaptureInputSourceFacts;
+#[cfg(test)]
 pub(crate) use declarative_macro::MacroRepetitionElementSourceFacts;
 pub(crate) use declarative_macro::{
-    MacroRepetitionSourceFacts, MacroTemplateSourceFacts, validate_declarative_macro_source_facts,
+    MacroCaptureSlotSourceFacts, MacroRepetitionSourceFacts, MacroTemplateSourceFacts,
+    validate_declarative_macro_source_facts,
 };
 #[cfg(rust_item_dependencies_patched)]
 pub(crate) use declarative_macro::{ValidatedDeclarativeOutput, ValidatedDeclarativeOutputMeaning};
@@ -213,6 +216,7 @@ pub struct SourceInventory {
     pub(crate) derive_targets: Vec<DeriveTargetSourceFacts>,
     pub(crate) macro_rules: Vec<MacroRuleSourceFacts>,
     pub(crate) macro_templates: Vec<MacroTemplateSourceFacts>,
+    pub(crate) macro_capture_slots: Vec<MacroCaptureSlotSourceFacts>,
     pub(crate) macro_repetitions: Vec<MacroRepetitionSourceFacts>,
     pub(crate) ownerless_attribute_invocations: Vec<SourceUnitId>,
 }
@@ -1369,6 +1373,7 @@ pub(crate) fn collect_source(
         derive_targets,
         macro_rules: Vec::new(),
         macro_templates: Vec::new(),
+        macro_capture_slots: Vec::new(),
         macro_repetitions: Vec::new(),
         ownerless_attribute_invocations: Vec::new(),
     })
@@ -3729,6 +3734,7 @@ mod tests {
             derive_targets: Vec::new(),
             macro_rules: Vec::new(),
             macro_templates: Vec::new(),
+            macro_capture_slots: Vec::new(),
             macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         };
@@ -3838,6 +3844,7 @@ mod tests {
             derive_targets: Vec::new(),
             macro_rules: Vec::new(),
             macro_templates: Vec::new(),
+            macro_capture_slots: Vec::new(),
             macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         };
@@ -4636,6 +4643,7 @@ mod tests {
             derive_targets: Vec::new(),
             macro_rules,
             macro_templates: Vec::new(),
+            macro_capture_slots: Vec::new(),
             macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         }

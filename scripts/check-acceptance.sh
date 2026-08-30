@@ -63,6 +63,8 @@ echo "==> patched compiler observer fixtures"
     RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$queue_digest" \
         "$rustc_source/x" test --ci=false --stage 2 \
         --keep-stage 0 --keep-stage 1 --force-rerun --all-targets \
+        compiler/rustc_expand \
+        compiler/rustc_resolve \
         compiler/rustc_span \
         tests/ui-fulldeps/derive-observer.rs \
         tests/ui-fulldeps/selection-proof-trace.rs \

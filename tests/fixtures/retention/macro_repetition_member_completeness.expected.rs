@@ -1,6 +1,6 @@
 trait Bounds {
     fn maximum() -> Self;
-    fn minimum() -> Self;
+
 }
 
 macro_rules! impl_bounds {
@@ -11,9 +11,7 @@ macro_rules! impl_bounds {
                     $primitive::MAX
                 }
 
-                fn minimum() -> Self {
-                    $primitive::MIN
-                }
+
             }
         )*
     };

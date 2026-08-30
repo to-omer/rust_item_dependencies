@@ -6,7 +6,7 @@ trait One {
 
 macro_rules! implement {
 ($({$(<$T:ident:$Bound:ident>)? $Trait:ident $method:ident $($ty:ty)*, $value:expr})*) => {
-    $(implement!(@impl [$(<$T:$Bound>)?] $Trait $method [$($ty)*], $value);)*
+    $(implement!(@impl [] $Trait $method [$($ty)*], $value);)*
 };
 
 (@impl [] $Trait:ident $method:ident [$($ty:ty)*], $value:expr) => {

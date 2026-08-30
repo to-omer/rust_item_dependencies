@@ -3,7 +3,7 @@
 mod macro_repetition;
 
 pub(crate) use macro_repetition::MacroRepetitionTokenRequirements;
-use macro_repetition::macro_repetition_deletions;
+use macro_repetition::{deletions_preserve_parser_tokens, macro_repetition_deletions};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -166,6 +166,11 @@ pub(crate) fn rewrite_source(
         retained,
         &piece_boundaries,
     )?);
+    deletions.extend(macro_capture_input_deletions(
+        inventory,
+        retained,
+        &piece_boundaries,
+    )?);
 
     deletions.sort();
     let deletions = merge_deletions(&inventory.original, deletions, &piece_boundaries)?;
@@ -275,6 +280,7 @@ fn validate_inventory(inventory: &SourceInventory) -> Result<BTreeSet<u32>, Sour
         &inventory.units,
         &inventory.macro_rules,
         &inventory.macro_templates,
+        &inventory.macro_capture_slots,
         &inventory.macro_repetitions,
     )
     .map_err(|_| SourceRewriteError::InvalidInventory)?;
@@ -357,6 +363,70 @@ fn frontier_deletions(
             }
         })
         .collect()
+}
+
+fn macro_capture_input_deletions(
+    inventory: &SourceInventory,
+    retained: &BTreeSet<SourceUnitId>,
+    piece_boundaries: &BTreeSet<u32>,
+) -> Result<Vec<ByteRange>, SourceRewriteError> {
+    let mut inputs = Vec::new();
+    let mut checked_deletions = Vec::new();
+    for slot in &inventory.macro_capture_slots {
+        if retained.contains(&slot.unit) {
+            continue;
+        }
+        if slot
+            .trigger_units
+            .iter()
+            .any(|trigger| retained.contains(trigger))
+        {
+            return Err(SourceRewriteError::InvalidRetention);
+        }
+        if !retained.contains(&slot.rule) {
+            if slot
+                .inputs
+                .iter()
+                .any(|input| retained.contains(&input.invocation))
+            {
+                return Err(SourceRewriteError::InvalidRetention);
+            }
+            continue;
+        }
+
+        let matcher = inventory
+            .units
+            .get(slot.unit.0 as usize)
+            .filter(|unit| unit.id == slot.unit)
+            .ok_or(SourceRewriteError::InvalidInventory)?
+            .full_range;
+        validate_deletion_range(&inventory.original, matcher, piece_boundaries)?;
+        checked_deletions.push(matcher);
+        for input in &slot.inputs {
+            if !retained.contains(&input.invocation) {
+                continue;
+            }
+            validate_deletion_range(&inventory.original, input.deletion_range, piece_boundaries)?;
+            inputs.push(input.deletion_range);
+            checked_deletions.push(input.deletion_range);
+        }
+    }
+
+    checked_deletions.sort();
+    let mut merged = Vec::<ByteRange>::new();
+    for deletion in checked_deletions {
+        if let Some(previous) = merged.last_mut()
+            && deletion.start <= previous.end
+        {
+            previous.end = previous.end.max(deletion.end);
+        } else {
+            merged.push(deletion);
+        }
+    }
+    if !merged.is_empty() && !deletions_preserve_parser_tokens(&inventory.original, &merged) {
+        return Err(SourceRewriteError::InvalidRetention);
+    }
+    Ok(inputs)
 }
 
 fn rewrite_derive_attribute(
