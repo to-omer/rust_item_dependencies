@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use crate::source::{
-    CfgState, DeriveAttributeSourceFacts, DeriveTargetSourceFacts,
-    MacroRepetitionElementSourceFacts, MacroRepetitionSourceFacts, OriginalOffsetMap, OwnedPiece,
-    PieceKind, SourceInventory, WrittenUnit,
+    CfgState, DeriveAttributeSourceFacts, DeriveTargetSourceFacts, MacroCaptureInputSourceFacts,
+    MacroCaptureSlotSourceFacts, MacroRepetitionElementSourceFacts, MacroRepetitionSourceFacts,
+    MacroRuleSourceFacts, MacroTemplateSourceFacts, OriginalOffsetMap, OwnedPiece, PieceKind,
+    SourceInventory, WrittenUnit,
 };
 
 use super::macro_repetition::{
@@ -1519,6 +1520,182 @@ fn deletes_the_whole_derive_attribute_when_no_element_is_retained() {
     );
 }
 
+#[test]
+fn rewrites_macro_matcher_captures_and_every_retained_invocation_together() {
+    let source = "macro_rules! m { ($a:tt,$b:tt) => { fn $a() {} fn $b() {} } }\n\
+m!(left,right);\n\
+m!(other,unused);\n";
+    let mut inventory = macro_capture_inventory(source);
+
+    let keep_first = BTreeSet::from([
+        SourceUnitId(0),
+        SourceUnitId(1),
+        SourceUnitId(2),
+        SourceUnitId(3),
+        SourceUnitId(5),
+        SourceUnitId(7),
+        SourceUnitId(8),
+    ]);
+    assert_eq!(
+        rewrite_source(&inventory, &keep_first).unwrap().source,
+        "macro_rules! m { ($a:tt,) => { fn $a() {}  } }\nm!(left,);\nm!(other,);\n"
+    );
+
+    let keep_second = BTreeSet::from([
+        SourceUnitId(0),
+        SourceUnitId(1),
+        SourceUnitId(2),
+        SourceUnitId(4),
+        SourceUnitId(6),
+        SourceUnitId(7),
+        SourceUnitId(8),
+    ]);
+    assert_eq!(
+        rewrite_source(&inventory, &keep_second).unwrap().source,
+        "macro_rules! m { ($b:tt) => {  fn $b() {} } }\nm!(right);\nm!(unused);\n"
+    );
+
+    let invalid = BTreeSet::from([
+        SourceUnitId(0),
+        SourceUnitId(1),
+        SourceUnitId(2),
+        SourceUnitId(6),
+        SourceUnitId(7),
+        SourceUnitId(8),
+    ]);
+    assert_eq!(
+        rewrite_source(&inventory, &invalid),
+        Err(SourceRewriteError::InvalidRetention)
+    );
+
+    inventory.macro_capture_slots[1].inputs.pop();
+    assert_eq!(
+        rewrite_source(&inventory, &keep_first),
+        Err(SourceRewriteError::InvalidInventory)
+    );
+}
+
+fn macro_capture_inventory(source: &str) -> SourceInventory {
+    let nth = |text: &str, index: usize| {
+        let (start, _) = source.match_indices(text).nth(index).unwrap();
+        ByteRange {
+            start: start as u32,
+            end: (start + text.len()) as u32,
+        }
+    };
+    let definition = nth(
+        "macro_rules! m { ($a:tt,$b:tt) => { fn $a() {} fn $b() {} } }",
+        0,
+    );
+    let rule = nth("($a:tt,$b:tt) => { fn $a() {} fn $b() {} }", 0);
+    let matcher_a = nth("$a:tt", 0);
+    let matcher_b = nth("$b:tt", 0);
+    let trigger_a = nth("fn $a() {}", 0);
+    let trigger_b = nth("fn $b() {}", 0);
+    let first_invocation = nth("m!(left,right);", 0);
+    let second_invocation = nth("m!(other,unused);", 0);
+    let left = nth("left", 0);
+    let right = nth("right", 0);
+    let other = nth("other", 0);
+    let unused = nth("unused", 0);
+    let mut inventory = inventory(
+        source,
+        &[
+            unit(
+                WrittenUnitKind::MacroDefinition,
+                definition.start,
+                definition.end,
+                0,
+                1,
+            ),
+            unit(WrittenUnitKind::MacroRule, rule.start, rule.end, 1, 2),
+            unit(
+                WrittenUnitKind::NestedItem,
+                matcher_a.start,
+                matcher_a.end + 1,
+                2,
+                3,
+            ),
+            unit(
+                WrittenUnitKind::NestedItem,
+                matcher_b.start,
+                matcher_b.end,
+                2,
+                4,
+            ),
+            unit(
+                WrittenUnitKind::NestedItem,
+                trigger_a.start,
+                trigger_a.end,
+                2,
+                5,
+            ),
+            unit(
+                WrittenUnitKind::NestedItem,
+                trigger_b.start,
+                trigger_b.end,
+                2,
+                6,
+            ),
+            unit(
+                WrittenUnitKind::MacroInvocation,
+                first_invocation.start,
+                first_invocation.end,
+                0,
+                7,
+            ),
+            unit(
+                WrittenUnitKind::MacroInvocation,
+                second_invocation.start,
+                second_invocation.end,
+                0,
+                8,
+            ),
+        ],
+    );
+    inventory.macro_rules = vec![MacroRuleSourceFacts::Refined {
+        definition: SourceUnitId(1),
+        rules: vec![SourceUnitId(2)],
+        observed_selections: vec![SourceUnitId(2), SourceUnitId(2)],
+    }];
+    inventory.macro_templates = (5..=6)
+        .map(|unit| MacroTemplateSourceFacts {
+            unit: SourceUnitId(unit),
+            rule: SourceUnitId(2),
+        })
+        .collect();
+    let inputs = |first: ByteRange, second: ByteRange, separator: bool| {
+        [(SourceUnitId(7), first), (SourceUnitId(8), second)]
+            .into_iter()
+            .map(|(invocation, capture_range)| MacroCaptureInputSourceFacts {
+                invocation,
+                capture_range,
+                deletion_range: ByteRange {
+                    start: capture_range.start,
+                    end: capture_range.end + if separator { 1 } else { 0 },
+                },
+            })
+            .collect()
+    };
+    inventory.macro_capture_slots = vec![
+        MacroCaptureSlotSourceFacts {
+            unit: SourceUnitId(3),
+            rule: SourceUnitId(2),
+            matcher_capture_range: matcher_a,
+            trigger_units: vec![SourceUnitId(5)],
+            inputs: inputs(left, other, true),
+        },
+        MacroCaptureSlotSourceFacts {
+            unit: SourceUnitId(4),
+            rule: SourceUnitId(2),
+            matcher_capture_range: matcher_b,
+            trigger_units: vec![SourceUnitId(6)],
+            inputs: inputs(right, unused, false),
+        },
+    ];
+    inventory
+}
+
 fn inventory(source: &str, children: &[WrittenUnit]) -> SourceInventory {
     let (normalized, offsets) = OriginalOffsetMap::from_source(source).unwrap();
     let mut units = vec![WrittenUnit {
@@ -1557,6 +1734,7 @@ fn inventory(source: &str, children: &[WrittenUnit]) -> SourceInventory {
         derive_targets: Vec::new(),
         macro_rules: Vec::new(),
         macro_templates: Vec::new(),
+        macro_capture_slots: Vec::new(),
         macro_repetitions: Vec::new(),
         ownerless_attribute_invocations: Vec::new(),
     }

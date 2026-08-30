@@ -15,8 +15,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::{
     MacroDeclarativeExpansion, MacroExpansionOutputStructure,
     MacroImplementationKind as RustcImplementationKind, MacroInputTokenRange,
-    MacroInvocationFragmentKind, MacroInvocationOrigin, MacroOutputTokenRange,
-    MacroOwnerOutput as RustcMacroOwnerOutput, MacroTranscriberComponentKind,
+    MacroInvocationFragmentKind, MacroInvocationOrigin, MacroTranscriberComponentKind,
 };
 #[cfg(rust_item_dependencies_patched)]
 use rustc_span::hygiene::{AstPass, DesugaringKind as RustcDesugaringKind};
@@ -28,6 +27,14 @@ use crate::dependency_graph::{
     AstPassKind, DesugaringKind, ExpansionFragmentKind, ExpansionId, ExpansionKind,
     MacroImplementationKind, MacroStyle,
 };
+#[cfg(any(rust_item_dependencies_patched, test))]
+use crate::macro_output::MacroOutputRange;
+use crate::macro_output::ValidatedDeclarativeOutputs;
+#[cfg(rust_item_dependencies_patched)]
+use crate::macro_output::{
+    ValidatedDeclarativeOutputMeaning, ValidatedMacroDefinitionOutput, ValidatedMacroOutputLedger,
+    ValidatedMacroOwnerOutput,
+};
 use crate::source::SourceInventory;
 use crate::source::SourceUnitId;
 #[cfg(any(rust_item_dependencies_patched, test))]
@@ -36,15 +43,12 @@ use crate::source::{ByteRange, MacroProductSource, SourceUnitIdentityKind};
 use crate::source::{
     DeclarativeContributorParent, DeclarativeGenerationParentState, EditableMacroSource,
     EditableMacroSourceResolver, EditableMacroSourceRole, MacroRuleSelectionIndex, SourceError,
-    ValidatedDeclarativeOutput, ValidatedDeclarativeOutputMeaning, declarative_generation_parent,
-    original_span_range, resolve_declarative_contributor_parent,
+    declarative_generation_parent, original_span_range, resolve_declarative_contributor_parent,
 };
 
 use super::ExpansionError;
-#[cfg(any(rust_item_dependencies_patched, test))]
-use super::output::MacroOutputRange;
 #[cfg(rust_item_dependencies_patched)]
-use super::output::{MacroProductIdentityRangeIndex, laminar_output_ranges, output_range};
+use super::output::MacroProductIdentityRangeIndex;
 
 #[cfg(any(rust_item_dependencies_patched, test))]
 #[derive(Clone, Copy)]
@@ -601,6 +605,87 @@ mod ancestor_resolution_tests {
     }
 
     #[test]
+    fn product_basis_ignores_cfg_discarded_output_ordinals() {
+        let ancestry = SourceAncestryIndex::from_parents(vec![None, None]).unwrap();
+        let excluded = SourceAncestorExclusions::new(&ancestry, []).unwrap();
+        let contributors = [
+            vec![SourceUnitId(0)],
+            vec![SourceUnitId(1)],
+            vec![SourceUnitId(0)],
+        ];
+        with_flat_product_basis_index(&ancestry, &excluded, &contributors, |index| {
+            assert!(
+                index
+                    .intersection(MacroOutputRange { start: 0, end: 3 })?
+                    .is_empty()
+            );
+            Ok(())
+        })
+        .unwrap();
+        with_flat_product_basis_index_excluding(
+            &ancestry,
+            &excluded,
+            &contributors,
+            &[MacroOutputRange { start: 1, end: 2 }],
+            |index| {
+                assert_eq!(
+                    index.intersection(MacroOutputRange { start: 0, end: 3 })?,
+                    vec![SourceUnitId(0)]
+                );
+                assert_eq!(
+                    index.intersection(MacroOutputRange { start: 1, end: 2 }),
+                    Err(ExpansionError::IncompleteOrigin),
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn discarded_product_basis_queries_do_not_rescan_nested_discarded_ranges() {
+        const DISCARDED: usize = 1_024;
+        let token_count = DISCARDED * 3 + 1;
+        let ancestry = SourceAncestryIndex::from_parents(vec![None]).unwrap();
+        let excluded = SourceAncestorExclusions::new(&ancestry, []).unwrap();
+        let contributors = vec![vec![SourceUnitId(0)]; token_count];
+        let discarded = (DISCARDED..DISCARDED * 2)
+            .map(|ordinal| MacroOutputRange {
+                start: ordinal as u32,
+                end: ordinal as u32 + 1,
+            })
+            .collect::<Vec<_>>();
+
+        with_flat_product_basis_index_excluding(
+            &ancestry,
+            &excluded,
+            &contributors,
+            &discarded,
+            |index| {
+                let (construction_work, query_work) = index.work();
+                assert!(construction_work <= discarded.len() + token_count * 3);
+                let query_levels = index.leaf_count.ilog2() as usize + 1;
+                for padding in 0..DISCARDED {
+                    assert_eq!(
+                        index.intersection(MacroOutputRange {
+                            start: (DISCARDED - padding) as u32,
+                            end: (DISCARDED * 2 + 1 + padding) as u32,
+                        })?,
+                        vec![SourceUnitId(0)],
+                    );
+                }
+                let (_, final_query_work) = index.work();
+                assert!(
+                    final_query_work - query_work <= DISCARDED * query_levels,
+                    "each nested range query must visit only one segment-tree path per level",
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn nested_source_frontiers_are_resolved_incrementally_per_contributor_node() {
         const DEPTH: usize = 1_024;
         let mut builder = MacroContributorDagBuilder::default();
@@ -1067,18 +1152,19 @@ pub(crate) struct MacroProvenance;
 
 #[cfg(rust_item_dependencies_patched)]
 pub(super) struct PreparedProducer {
-    pub(super) output_token_count: u32,
     pub(super) definition_outputs: Vec<(rustc_hir::def_id::LocalDefId, MacroOutputRange)>,
     pub(super) child_outputs: Vec<(ExpnId, MacroOutputRange)>,
-    pub(super) owner_output: PreparedMacroOwnerOutput,
+    pub(super) ledger: ValidatedMacroOutputLedger,
+    pub(super) owner_output: ValidatedMacroOwnerOutput,
 }
 
 #[cfg(rust_item_dependencies_patched)]
-pub(super) struct PreparedMacroOwnerOutput {
-    pub(super) complete: bool,
-    pub(super) intrinsic: bool,
-    pub(super) dependent_outputs: Vec<MacroOutputRange>,
-    pub(super) required_outputs: Vec<MacroOutputRange>,
+struct PendingProducerPreparation {
+    expansion: MacroDeclarativeExpansion,
+    definitions: Box<[ValidatedMacroDefinitionOutput]>,
+    ledger: ValidatedMacroOutputLedger,
+    requires_coverage: bool,
+    contributors: PendingProducerContributors,
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -1313,6 +1399,7 @@ pub(crate) fn collect_macro_provenance(
     _compiler: &Compiler,
     _tcx: TyCtxt<'_>,
     _source: &SourceInventory,
+    _outputs: &ValidatedDeclarativeOutputs,
 ) -> Result<MacroProvenance, ExpansionError> {
     Ok(MacroProvenance)
 }
@@ -1322,9 +1409,10 @@ pub(crate) fn collect_macro_provenance(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
+    outputs: &ValidatedDeclarativeOutputs,
 ) -> Result<MacroProvenance, ExpansionError> {
     let origins = PreparedExpansionOrigins::new(compiler, tcx, source)?;
-    ProvenanceCollector::new(compiler, tcx, source, origins)?.collect()
+    ProvenanceCollector::new(compiler, tcx, source, outputs, origins)?.collect()
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -2306,7 +2394,15 @@ pub(super) struct ProductBasisRangeIndex<'a, 'm> {
     frontier_memo: &'m mut IdentityFrontierMemo,
     token_count: usize,
     leaf_count: usize,
-    frontiers: Vec<PersistentFrontierSetId>,
+    // `None` is the intersection identity for an output ordinal that was
+    // discarded before it could contribute to a live product. It is distinct
+    // from the valid empty frontier set produced by a live token whose sources
+    // were all excluded from identity.
+    frontiers: Vec<Option<PersistentFrontierSetId>>,
+    #[cfg(test)]
+    construction_work: usize,
+    #[cfg(test)]
+    query_work: usize,
 }
 
 #[cfg(any(rust_item_dependencies_patched, test))]
@@ -2902,6 +2998,26 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
         contributor_dag: MacroContributorDagRef<'_>,
         token_contributors: &[MacroContributorSetId],
     ) -> Result<Self, ExpansionError> {
+        Self::new_excluding(
+            ancestry,
+            excluded,
+            exclusion_context,
+            frontier_memo,
+            contributor_dag,
+            token_contributors,
+            &[],
+        )
+    }
+
+    fn new_excluding(
+        ancestry: &'a SourceAncestryIndex,
+        excluded: &'a SourceAncestorExclusions<'a>,
+        exclusion_context: u32,
+        frontier_memo: &'m mut IdentityFrontierMemo,
+        contributor_dag: MacroContributorDagRef<'_>,
+        token_contributors: &[MacroContributorSetId],
+        discarded_ranges: &[MacroOutputRange],
+    ) -> Result<Self, ExpansionError> {
         let token_count = token_contributors.len();
         let leaf_count = token_count
             .checked_next_power_of_two()
@@ -2910,28 +3026,70 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
         let node_count = leaf_count
             .checked_mul(2)
             .ok_or(ExpansionError::IncompleteOrigin)?;
-        let empty = PersistentFrontierSets::EMPTY;
-        let mut frontiers = vec![empty; node_count];
+        #[cfg(test)]
+        let mut construction_work = 0;
+        let mut previous_end = None;
+        for &range in discarded_ranges {
+            #[cfg(test)]
+            {
+                construction_work += 1;
+            }
+            if range.start >= range.end
+                || range.end as usize > token_count
+                || previous_end.is_some_and(|end| range.start < end)
+            {
+                return Err(ExpansionError::IncompleteOrigin);
+            }
+            previous_end = Some(range.end);
+        }
+
+        let mut frontiers = vec![None; node_count];
+        let mut discarded_index = 0;
         for (ordinal, &root) in token_contributors.iter().enumerate() {
-            frontiers[leaf_count + ordinal] = frontier_memo.resolve_frontier_set(
-                exclusion_context,
-                contributor_dag,
-                ancestry,
-                excluded,
-                root,
-            )?;
+            #[cfg(test)]
+            {
+                construction_work += 1;
+            }
+            while discarded_ranges
+                .get(discarded_index)
+                .is_some_and(|range| range.end as usize <= ordinal)
+            {
+                #[cfg(test)]
+                {
+                    construction_work += 1;
+                }
+                discarded_index += 1;
+            }
+            let discarded = discarded_ranges.get(discarded_index).is_some_and(|range| {
+                range.start as usize <= ordinal && ordinal < range.end as usize
+            });
+            if !discarded {
+                frontiers[leaf_count + ordinal] = Some(frontier_memo.resolve_frontier_set(
+                    exclusion_context,
+                    contributor_dag,
+                    ancestry,
+                    excluded,
+                    root,
+                )?);
+            }
         }
         for index in (1..leaf_count).rev() {
-            frontiers[index] = if frontiers[index * 2] == frontiers[index * 2 + 1] {
-                frontiers[index * 2]
-            } else {
-                frontier_memo.intersection(
+            #[cfg(test)]
+            {
+                construction_work += 1;
+            }
+            let left = frontiers[index * 2];
+            let right = frontiers[index * 2 + 1];
+            frontiers[index] = match (left, right) {
+                (Some(left), Some(right)) if left != right => Some(frontier_memo.intersection(
                     exclusion_context,
                     ancestry,
                     excluded,
-                    frontiers[index * 2],
-                    frontiers[index * 2 + 1],
-                )?
+                    left,
+                    right,
+                )?),
+                (Some(frontier), _) | (_, Some(frontier)) => Some(frontier),
+                (None, None) => None,
             };
         }
         Ok(Self {
@@ -2942,6 +3100,10 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
             token_count,
             leaf_count,
             frontiers,
+            #[cfg(test)]
+            construction_work,
+            #[cfg(test)]
+            query_work: 0,
         })
     }
 
@@ -2949,6 +3111,19 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
         &mut self,
         range: MacroOutputRange,
     ) -> Result<Vec<SourceUnitId>, ExpansionError> {
+        let result = self.intersection_frontier(range)?;
+        self.frontier_memo.materialize(result, self.ancestry)
+    }
+
+    #[cfg(test)]
+    fn work(&self) -> (usize, usize) {
+        (self.construction_work, self.query_work)
+    }
+
+    fn intersection_frontier(
+        &mut self,
+        range: MacroOutputRange,
+    ) -> Result<PersistentFrontierSetId, ExpansionError> {
         let mut start = range.start as usize;
         let mut end = range.end as usize;
         if start >= end || end > self.token_count {
@@ -2958,19 +3133,26 @@ impl<'a, 'm> ProductBasisRangeIndex<'a, 'm> {
         end += self.leaf_count;
         let mut result = None::<PersistentFrontierSetId>;
         while start < end {
+            #[cfg(test)]
+            {
+                self.query_work += 1;
+            }
             if start % 2 == 1 {
-                result = Some(self.merge(result, self.frontiers[start])?);
+                if let Some(frontier) = self.frontiers[start] {
+                    result = Some(self.merge(result, frontier)?);
+                }
                 start += 1;
             }
             if end % 2 == 1 {
                 end -= 1;
-                result = Some(self.merge(result, self.frontiers[end])?);
+                if let Some(frontier) = self.frontiers[end] {
+                    result = Some(self.merge(result, frontier)?);
+                }
             }
             start /= 2;
             end /= 2;
         }
-        let result = result.ok_or(ExpansionError::IncompleteOrigin)?;
-        self.frontier_memo.materialize(result, self.ancestry)
+        result.ok_or(ExpansionError::IncompleteOrigin)
     }
 
     fn merge(
@@ -2999,6 +3181,17 @@ pub(super) fn with_flat_product_basis_index<R>(
     token_contributors: &[Vec<SourceUnitId>],
     query: impl FnOnce(&mut ProductBasisRangeIndex<'_, '_>) -> Result<R, ExpansionError>,
 ) -> Result<R, ExpansionError> {
+    with_flat_product_basis_index_excluding(ancestry, excluded, token_contributors, &[], query)
+}
+
+#[cfg(test)]
+fn with_flat_product_basis_index_excluding<R>(
+    ancestry: &SourceAncestryIndex,
+    excluded: &SourceAncestorExclusions<'_>,
+    token_contributors: &[Vec<SourceUnitId>],
+    discarded_ranges: &[MacroOutputRange],
+    query: impl FnOnce(&mut ProductBasisRangeIndex<'_, '_>) -> Result<R, ExpansionError>,
+) -> Result<R, ExpansionError> {
     let mut builder = MacroContributorDagBuilder::default();
     let roots = token_contributors
         .iter()
@@ -3006,13 +3199,14 @@ pub(super) fn with_flat_product_basis_index<R>(
         .collect::<Result<Vec<_>, _>>()?;
     let mut memo = IdentityFrontierMemo::new(ancestry.parents.len())?;
     let context = memo.context(Vec::new())?;
-    let mut index = ProductBasisRangeIndex::new(
+    let mut index = ProductBasisRangeIndex::new_excluding(
         ancestry,
         excluded,
         context,
         &mut memo,
         builder.view(),
         &roots,
+        discarded_ranges,
     )?;
     query(&mut index)
 }
@@ -3203,8 +3397,9 @@ struct ProvenanceCollector<'a> {
     compiler: &'a Compiler,
     source: &'a SourceInventory,
     origins: &'a rustc_data_structures::unord::UnordMap<ExpnId, MacroInvocationOrigin>,
+    outputs: &'a ValidatedDeclarativeOutputs,
     prepared: PreparedExpansionOrigins,
-    child_outputs: FxHashMap<ExpnId, Vec<(ExpnId, MacroOutputTokenRange)>>,
+    child_outputs: FxHashMap<ExpnId, Vec<(ExpnId, MacroOutputRange)>>,
     template_indices: BTreeMap<SourceUnitId, SourceUnitIntervalIndex>,
     repetition_indices: BTreeMap<(SourceUnitId, SourceUnitId), SourceUnitIntervalIndex>,
     source_ancestry: SourceAncestryIndex,
@@ -3225,30 +3420,25 @@ impl<'a> ProvenanceCollector<'a> {
         compiler: &'a Compiler,
         tcx: TyCtxt<'tcx>,
         source: &'a SourceInventory,
+        outputs: &'a ValidatedDeclarativeOutputs,
         prepared: PreparedExpansionOrigins,
     ) -> Result<Self, ExpansionError> {
         let origins = &tcx.resolutions(()).macro_invocation_origins;
 
-        let mut child_outputs =
-            FxHashMap::<ExpnId, Vec<(ExpnId, MacroOutputTokenRange)>>::default();
+        let mut child_outputs = FxHashMap::<ExpnId, Vec<(ExpnId, MacroOutputRange)>>::default();
         for expansion in prepared
             .ordered
             .iter()
             .filter(|expansion| expansion.parent_definition.is_some())
         {
-            let Some(observation) = origins
-                .get(&expansion.compiler_id)
-                .and_then(|origin| origin.declarative_expansion.as_ref())
-                .and_then(|observation| ValidatedDeclarativeOutput::new(observation))
-                .map(ValidatedDeclarativeOutput::observation)
-            else {
+            let Some(observation) = outputs.output(origins, expansion.compiler_id) else {
                 continue;
             };
-            for child in &observation.child_expansions {
+            for child in observation.children() {
                 child_outputs
-                    .entry(child.expansion)
+                    .entry(child.expansion())
                     .or_default()
-                    .push((expansion.compiler_id, child.output));
+                    .push((expansion.compiler_id, child.output()));
             }
         }
 
@@ -3291,6 +3481,7 @@ impl<'a> ProvenanceCollector<'a> {
             compiler,
             source,
             origins,
+            outputs,
             prepared,
             child_outputs,
             template_indices,
@@ -3325,18 +3516,12 @@ impl<'a> ProvenanceCollector<'a> {
                 {
                     return None;
                 }
-                let expansion = self
-                    .origins
-                    .get(&raw.compiler_id)?
-                    .declarative_expansion
-                    .as_ref()
-                    .and_then(|expansion| ValidatedDeclarativeOutputMeaning::new(expansion))?
-                    .observation();
-                (!expansion.owner_output.intrinsic
-                    && expansion.owner_output.dependent_outputs.is_empty()
-                    && expansion.owner_output.required_outputs.is_empty()
-                    && expansion.definitions.is_empty()
-                    && expansion.child_expansions.is_empty())
+                let output = self.outputs.meaning(self.origins, raw.compiler_id)?;
+                (!output.owner().intrinsic()
+                    && output.owner().dependent_outputs().is_empty()
+                    && output.owner().required_outputs().is_empty()
+                    && output.definitions().is_empty()
+                    && output.children().is_empty())
                 .then_some(raw.compiler_id)
             })
             .collect::<Vec<_>>();
@@ -3366,17 +3551,11 @@ impl<'a> ProvenanceCollector<'a> {
             {
                 continue;
             }
-            let Some(expansion) = self
-                .origins
-                .get(&raw.compiler_id)
-                .and_then(|origin| origin.declarative_expansion.as_ref())
-                .and_then(|expansion| ValidatedDeclarativeOutputMeaning::new(expansion))
-                .map(ValidatedDeclarativeOutputMeaning::observation)
-            else {
+            let Some(validated) = self.outputs.meaning(self.origins, raw.compiler_id) else {
                 continue;
             };
             if producers
-                .insert(raw.compiler_id, Self::prepare_producer(expansion)?)
+                .insert(raw.compiler_id, Self::prepare_producer(&validated)?)
                 .is_some()
             {
                 return Err(ExpansionError::IncompleteOrigin);
@@ -3443,12 +3622,7 @@ impl<'a> ProvenanceCollector<'a> {
             let raw = self.raw_expansion(compiler_id)?;
             if raw.implementation != Some(MacroImplementationKind::Declarative)
                 || raw.selected_rule_unit().is_none()
-                || self
-                    .origins
-                    .get(&compiler_id)
-                    .and_then(|origin| origin.declarative_expansion.as_ref())
-                    .and_then(|expansion| ValidatedDeclarativeOutputMeaning::new(expansion))
-                    .is_none()
+                || self.outputs.meaning(self.origins, compiler_id).is_none()
             {
                 return Err(ExpansionError::IncompleteOrigin);
             }
@@ -3568,17 +3742,29 @@ impl<'a> ProvenanceCollector<'a> {
             .ok_or(ExpansionError::IncompleteOrigin)?;
         let mut pending = FxHashMap::default();
         for &(compiler_id, requires_coverage) in &preparation {
-            let expansion = self
-                .origins
-                .get(&compiler_id)
-                .and_then(|origin| origin.declarative_expansion.as_ref())
-                .and_then(|expansion| ValidatedDeclarativeOutput::new(expansion))
-                .map(ValidatedDeclarativeOutput::observation)
-                .cloned()
+            let validated = self
+                .outputs
+                .output(self.origins, compiler_id)
                 .ok_or(ExpansionError::IncompleteOrigin)?;
+            let observation = validated.observation();
+            let (expansion, ledger) = if let Some(prepared) = producers.get(&compiler_id) {
+                (observation.clone(), prepared.ledger.clone())
+            } else {
+                (validated.observation().clone(), validated.ledger().clone())
+            };
+            let definitions = validated.definitions().to_vec().into_boxed_slice();
             let contributors = self.prepare_pending_contributors(compiler_id, &expansion)?;
             if pending
-                .insert(compiler_id, (expansion, requires_coverage, contributors))
+                .insert(
+                    compiler_id,
+                    PendingProducerPreparation {
+                        expansion,
+                        definitions,
+                        ledger,
+                        requires_coverage,
+                        contributors,
+                    },
+                )
                 .is_some()
             {
                 return Err(ExpansionError::IncompleteOrigin);
@@ -3589,21 +3775,24 @@ impl<'a> ProvenanceCollector<'a> {
             .map(|(compiler_id, _)| *compiler_id)
             .collect::<Vec<_>>();
         let (preparation_order, _) = dependency_postorder(starts, |compiler_id| {
-            let (_, _, contributors) = pending.get(&compiler_id)?;
-            let mut dependencies = contributors
+            let pending = pending.get(&compiler_id)?;
+            let mut dependencies = pending
+                .contributors
                 .base
                 .parent_ranges
                 .iter()
                 .map(|(parent, _)| *parent)
                 .chain(
-                    contributors
+                    pending
+                        .contributors
                         .base
                         .parent_tokens
                         .iter()
                         .map(|(parent, _)| *parent),
                 )
                 .collect::<Vec<_>>();
-            let mut input_ids = contributors
+            let mut input_ids = pending
+                .contributors
                 .tokens
                 .iter()
                 .flat_map(|token| token.inputs.iter().copied())
@@ -3626,11 +3815,11 @@ impl<'a> ProvenanceCollector<'a> {
         let mut definition_bases = FxHashMap::default();
         let mut resolved_inputs = ResolvedPendingInputs::new(self.pending_inputs.len());
         for compiler_id in preparation_order {
-            let (expansion, requires_coverage, pending_contributors) = pending
+            let pending = pending
                 .remove(&compiler_id)
                 .ok_or(ExpansionError::IncompleteOrigin)?;
             let prepared_tokens = Self::build_token_contributors(
-                &pending_contributors,
+                &pending.contributors,
                 &self.pending_inputs,
                 &mut resolved_inputs,
                 &token_contributors,
@@ -3638,12 +3827,14 @@ impl<'a> ProvenanceCollector<'a> {
             )?;
             self.prepare_definition_bases(
                 compiler_id,
-                &expansion,
+                &pending.expansion,
+                &pending.definitions,
+                &pending.ledger,
                 &prepared_tokens,
                 contributor_builder.view(),
                 &mut definition_bases,
             )?;
-            if requires_coverage && !producers.contains_key(&compiler_id) {
+            if pending.requires_coverage && !producers.contains_key(&compiler_id) {
                 return Err(ExpansionError::IncompleteOrigin);
             }
             if token_contributors
@@ -3742,12 +3933,7 @@ impl<'a> ProvenanceCollector<'a> {
             && raw
                 .macro_definition
                 .is_some_and(|definition| definition.is_local())
-            && self
-                .origins
-                .get(&compiler_id)
-                .and_then(|origin| origin.declarative_expansion.as_ref())
-                .and_then(|expansion| ValidatedDeclarativeOutput::new(expansion))
-                .is_some();
+            && self.outputs.output(self.origins, compiler_id).is_some();
         if !complete {
             return Ok(None);
         }
@@ -3759,17 +3945,9 @@ impl<'a> ProvenanceCollector<'a> {
     }
 
     fn parent_link_complete(&self, child: ExpnId, parent: ExpnId) -> Result<bool, ExpansionError> {
-        let Some(observation) = self
-            .origins
-            .get(&parent)
-            .and_then(|origin| origin.declarative_expansion.as_ref())
-            .and_then(|observation| ValidatedDeclarativeOutput::new(observation))
-            .map(ValidatedDeclarativeOutput::observation)
-        else {
+        if self.outputs.output(self.origins, parent).is_none() {
             return Ok(false);
-        };
-        let output_token_count = u32::try_from(observation.output_tokens.len())
-            .map_err(|_| ExpansionError::IncompleteOrigin)?;
+        }
         let matching = self
             .child_outputs
             .get(&child)
@@ -3777,95 +3955,25 @@ impl<'a> ProvenanceCollector<'a> {
             .flatten()
             .filter(|(candidate_parent, _)| *candidate_parent == parent)
             .collect::<Vec<_>>();
-        Ok(matches!(matching.as_slice(), [(_, output)] if output_range(
-            *output,
-            output_token_count,
-        ).is_ok()))
+        Ok(matches!(matching.as_slice(), [(_, _)]))
     }
 
     fn prepare_producer(
-        expansion: &MacroDeclarativeExpansion,
+        validated: &ValidatedDeclarativeOutputMeaning<'_>,
     ) -> Result<PreparedProducer, ExpansionError> {
-        let output_token_count = u32::try_from(expansion.output_tokens.len())
-            .map_err(|_| ExpansionError::IncompleteOrigin)?;
-
-        let mut definition_outputs = Vec::new();
-        let mut observed_definitions = FxHashSet::default();
-        for definition in &expansion.definitions {
-            let raw_id = definition.definition.local_def_index.as_u32();
-            let output = output_range(definition.output, output_token_count)?;
-            if !observed_definitions.insert(raw_id) {
-                return Err(ExpansionError::IncompleteOrigin);
-            }
-            definition_outputs.push((definition.definition, output));
-        }
-        definition_outputs.sort_by_key(|(definition, output)| {
-            (
-                output.start,
-                output.end,
-                definition.local_def_index.as_u32(),
-            )
-        });
-
-        let mut child_outputs = Vec::with_capacity(expansion.child_expansions.len());
-        for child in &expansion.child_expansions {
-            child_outputs.push((
-                child.expansion,
-                output_range(child.output, output_token_count)?,
-            ));
-        }
-        child_outputs.sort_by_key(|(child, output)| {
-            (
-                output.start,
-                output.end,
-                child.expn_hash().local_hash().as_u64(),
-            )
-        });
-        if child_outputs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(ExpansionError::IncompleteOrigin);
-        }
-
-        let RustcMacroOwnerOutput {
-            complete,
-            intrinsic,
-            dependent_outputs,
-            required_outputs,
-        } = &expansion.owner_output;
-        let (dependent_outputs, required_outputs) = if *complete {
-            let dependent_outputs = dependent_outputs
-                .iter()
-                .map(|&output| output_range(output, output_token_count))
-                .collect::<Result<Vec<_>, _>>()?;
-            let required_outputs = required_outputs
-                .iter()
-                .map(|&output| output_range(output, output_token_count))
-                .collect::<Result<Vec<_>, _>>()?;
-            if dependent_outputs
-                .windows(2)
-                .chain(required_outputs.windows(2))
-                .any(|pair| pair[0] >= pair[1])
-                || dependent_outputs
-                    .iter()
-                    .any(|output| required_outputs.binary_search(output).is_ok())
-            {
-                return Err(ExpansionError::IncompleteOrigin);
-            }
-            (dependent_outputs, required_outputs)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let owner_output = PreparedMacroOwnerOutput {
-            complete: *complete,
-            intrinsic: *intrinsic,
-            dependent_outputs,
-            required_outputs,
-        };
-
         Ok(PreparedProducer {
-            output_token_count,
-            definition_outputs,
-            child_outputs,
-            owner_output,
+            definition_outputs: validated
+                .definitions()
+                .iter()
+                .map(|definition| (definition.definition(), definition.output()))
+                .collect(),
+            child_outputs: validated
+                .children()
+                .iter()
+                .map(|child| (child.expansion(), child.output()))
+                .collect(),
+            ledger: validated.ledger().clone(),
+            owner_output: validated.owner().clone(),
         })
     }
 
@@ -3873,12 +3981,16 @@ impl<'a> ProvenanceCollector<'a> {
         &mut self,
         compiler_id: ExpnId,
         expansion: &MacroDeclarativeExpansion,
+        definitions: &[ValidatedMacroDefinitionOutput],
+        ledger: &ValidatedMacroOutputLedger,
         token_contributors: &PreparedTokenContributors,
         contributor_dag: MacroContributorDagRef<'_>,
         definition_bases: &mut FxHashMap<u32, Vec<MacroProductSource>>,
     ) -> Result<(), ExpansionError> {
         let output_token_count = token_contributors.output_token_count()?;
-        if output_token_count as usize != expansion.output_tokens.len() {
+        if output_token_count as usize != expansion.output_tokens.len()
+            || ledger.output_token_count() != output_token_count
+        {
             return Err(ExpansionError::IncompleteOrigin);
         }
         let raw = self.raw_expansion(compiler_id)?;
@@ -3887,36 +3999,33 @@ impl<'a> ProvenanceCollector<'a> {
             .flatten()
             .collect::<Vec<_>>();
 
-        let mut observed_definitions = FxHashSet::default();
-        let mut definitions = Vec::with_capacity(expansion.definitions.len());
-        for definition in &expansion.definitions {
-            let raw_id = definition.definition.local_def_index.as_u32();
-            let output = output_range(definition.output, output_token_count)?;
-            if !observed_definitions.insert(raw_id) {
+        let mut definition_ranges = Vec::with_capacity(definitions.len());
+        for definition in definitions {
+            let raw_id = definition.definition().local_def_index.as_u32();
+            let output = definition.output();
+            if !ledger.contains_live_output(output) {
                 return Err(ExpansionError::IncompleteOrigin);
             }
-            definitions.push((raw_id, output));
+            definition_ranges.push((raw_id, output));
         }
-        if !laminar_output_ranges(definitions.iter().map(|(_, output)| *output)) {
-            return Err(ExpansionError::IncompleteOrigin);
-        }
-        if definitions.is_empty() {
+        if definition_ranges.is_empty() {
             return Ok(());
         }
 
         let exclusion_context = self.identity_frontier_memo.context(excluded.clone())?;
         let excluded_ancestors = SourceAncestorExclusions::new(&self.source_ancestry, excluded)?;
-        let mut range_index = ProductBasisRangeIndex::new(
+        let mut range_index = ProductBasisRangeIndex::new_excluding(
             &self.source_ancestry,
             &excluded_ancestors,
             exclusion_context,
             &mut self.identity_frontier_memo,
             contributor_dag,
             token_contributors.as_slice(),
+            ledger.discarded_outputs(),
         )?;
         let mut by_range = BTreeMap::<MacroOutputRange, Vec<SourceUnitId>>::new();
-        let mut raw_bases = Vec::with_capacity(definitions.len());
-        for (raw_id, output) in definitions {
+        let mut raw_bases = Vec::with_capacity(definition_ranges.len());
+        for (raw_id, output) in definition_ranges {
             let basis = if let Some(basis) = by_range.get(&output) {
                 basis.clone()
             } else {
@@ -4043,16 +4152,9 @@ impl<'a> ProvenanceCollector<'a> {
             if matching.next().is_some() {
                 return Err(ExpansionError::IncompleteOrigin);
             }
-            let output = output_range(
-                *raw_output,
-                u32::try_from(
-                    self.expansion_observation(*observed_parent)?
-                        .output_tokens
-                        .len(),
-                )
-                .map_err(|_| ExpansionError::IncompleteOrigin)?,
-            )?;
-            contributors.parent_ranges.push((*observed_parent, output));
+            contributors
+                .parent_ranges
+                .push((*observed_parent, *raw_output));
         } else if written_invocation.is_none() {
             return Err(ExpansionError::IncompleteOrigin);
         }
@@ -4327,11 +4429,9 @@ impl<'a> ProvenanceCollector<'a> {
         &self,
         compiler_id: ExpnId,
     ) -> Result<&MacroDeclarativeExpansion, ExpansionError> {
-        self.origins
-            .get(&compiler_id)
-            .and_then(|origin| origin.declarative_expansion.as_deref())
-            .and_then(ValidatedDeclarativeOutput::new)
-            .map(ValidatedDeclarativeOutput::observation)
+        self.outputs
+            .output(self.origins, compiler_id)
+            .map(|validated| validated.observation())
             .ok_or(ExpansionError::IncompleteOrigin)
     }
 }

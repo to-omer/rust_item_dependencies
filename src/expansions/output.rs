@@ -6,8 +6,6 @@ use std::sync::Arc;
 #[cfg(rust_item_dependencies_patched)]
 use rustc_data_structures::fx::FxHashMap;
 #[cfg(rust_item_dependencies_patched)]
-use rustc_middle::ty::MacroOutputTokenRange;
-#[cfg(rust_item_dependencies_patched)]
 use rustc_span::ExpnId;
 
 #[cfg(rust_item_dependencies_patched)]
@@ -16,6 +14,13 @@ use crate::dependency_graph::{
     DependencyEdge, DependencyKind, ExpansionId, ExpansionKind, ExpansionNode, GraphNode,
 };
 use crate::graph::{Definition, DefinitionId, DefinitionOrigin};
+use crate::macro_output::MacroOutputRange;
+#[cfg(rust_item_dependencies_patched)]
+use crate::macro_output::ValidatedMacroOwnerOutput;
+#[cfg(test)]
+use crate::macro_output::normalize_discarded_output_ranges;
+#[cfg(any(rust_item_dependencies_patched, test))]
+use crate::macro_output::{ValidatedMacroOutputLedger, laminar_output_ranges};
 #[cfg(test)]
 use crate::source::SourceUnitId;
 #[cfg(rust_item_dependencies_patched)]
@@ -35,51 +40,7 @@ use super::provenance::{
 use super::provenance::{IndexedInterval, IntervalStartIndex};
 use super::provenance::{MacroContributorDag, MacroContributorSetId};
 #[cfg(rust_item_dependencies_patched)]
-use super::provenance::{MacroProvenance, PreparedMacroOwnerOutput, PreparedProducer};
-
-/// One half-open range in a producer's output-token ordinal space.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct MacroOutputRange {
-    pub(super) start: u32,
-    pub(super) end: u32,
-}
-
-impl MacroOutputRange {
-    fn len(self) -> u32 {
-        self.end - self.start
-    }
-
-    fn is_empty(self) -> bool {
-        self.start == self.end
-    }
-
-    fn contains(self, other: Self) -> bool {
-        self.start <= other.start && other.end <= self.end
-    }
-
-    pub(crate) fn start(self) -> u32 {
-        self.start
-    }
-
-    pub(crate) fn end(self) -> u32 {
-        self.end
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_new(start: u32, end: u32) -> Self {
-        Self { start, end }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_set_start(&mut self, start: u32) {
-        self.start = start;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_set_end(&mut self, end: u32) {
-        self.end = end;
-    }
-}
+use super::provenance::{MacroProvenance, PreparedProducer};
 
 /// All producer-local output ledgers and the one contributor DAG their root
 /// identifiers belong to.
@@ -318,6 +279,9 @@ impl MacroProducerCoverageInventory {
 pub(crate) struct MacroProducerCoverage {
     pub(super) producer: ExpansionId,
     pub(super) output_token_count: u32,
+    /// Normalized output ranges removed by compiler configuration before they
+    /// could materialize a product or owner effect.
+    pub(super) discarded_outputs: Vec<MacroOutputRange>,
     pub(super) materialization_groups: Vec<MacroOutputMaterializationGroup>,
 }
 
@@ -328,6 +292,10 @@ impl MacroProducerCoverage {
 
     pub(crate) fn output_token_count(&self) -> u32 {
         self.output_token_count
+    }
+
+    pub(crate) fn discarded_outputs(&self) -> &[MacroOutputRange] {
+        &self.discarded_outputs
     }
 
     pub(crate) fn materialization_groups(&self) -> &[MacroOutputMaterializationGroup] {
@@ -343,8 +311,14 @@ impl MacroProducerCoverage {
         Self {
             producer,
             output_token_count,
+            discarded_outputs: Vec::new(),
             materialization_groups,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_discarded_outputs(&mut self, discarded_outputs: Vec<MacroOutputRange>) {
+        self.discarded_outputs = discarded_outputs;
     }
 
     #[cfg(test)]
@@ -1037,6 +1011,54 @@ mod product_classification_tests {
         MacroOutputRange { start, end }
     }
 
+    fn output_classes(
+        products: &[ObservedProduct],
+        discarded: &[MacroOutputRange],
+        output_token_count: u32,
+        source_owner: Option<DefinitionId>,
+    ) -> Result<PendingOutputClasses, ExpansionError> {
+        let ledger = ValidatedMacroOutputLedger::new(
+            output_token_count,
+            products.iter().map(|product| product.output).collect(),
+            discarded.to_vec(),
+        )
+        .ok_or(ExpansionError::IncompleteOrigin)?;
+        super::output_classes(products, &ledger, source_owner)
+    }
+
+    fn output_classes_with_work(
+        products: &[ObservedProduct],
+        discarded: &[MacroOutputRange],
+        output_token_count: u32,
+        source_owner: Option<DefinitionId>,
+    ) -> Result<(PendingOutputClasses, OutputClassWork), ExpansionError> {
+        let ledger = ValidatedMacroOutputLedger::new(
+            output_token_count,
+            products.iter().map(|product| product.output).collect(),
+            discarded.to_vec(),
+        )
+        .ok_or(ExpansionError::IncompleteOrigin)?;
+        super::output_classes_with_work(products, &ledger, source_owner)
+    }
+
+    fn validate_owner_member_classes(
+        members: &[ObservedProduct],
+        products: &[ObservedProduct],
+        discarded: &[MacroOutputRange],
+        output_token_count: u32,
+        classes: &[(MacroOutputRange, PendingOutputClass)],
+    ) -> Result<Vec<GraphNode>, ExpansionError> {
+        let live_outputs = products
+            .iter()
+            .chain(members)
+            .map(|product| product.output)
+            .collect();
+        let ledger =
+            ValidatedMacroOutputLedger::new(output_token_count, live_outputs, discarded.to_vec())
+                .ok_or(ExpansionError::IncompleteOrigin)?;
+        super::validate_owner_member_classes(members, products, &ledger, classes)
+    }
+
     #[test]
     fn product_identity_range_uses_the_token_piece_envelope() {
         let (source, index) = identity_index(&[
@@ -1354,10 +1376,10 @@ mod product_classification_tests {
             output: range(2, 8),
             product: GraphNode::Definition(DefinitionId(2)),
         };
-        let classes = output_classes(&[nested], 10, Some(owner)).unwrap();
+        let classes = output_classes(&[nested], &[], 10, Some(owner)).unwrap();
 
         assert_eq!(
-            validate_owner_member_classes(&[member], &[nested], classes.intervals()),
+            validate_owner_member_classes(&[member], &[nested], &[], 10, classes.intervals()),
             Ok(vec![member.product])
         );
 
@@ -1365,9 +1387,9 @@ mod product_classification_tests {
             output: range(0, 10),
             product: nested.product,
         };
-        let classes = output_classes(&[whole], 10, Some(owner)).unwrap();
+        let classes = output_classes(&[whole], &[], 10, Some(owner)).unwrap();
         assert_eq!(
-            validate_owner_member_classes(&[member], &[whole], classes.intervals()),
+            validate_owner_member_classes(&[member], &[whole], &[], 10, classes.intervals()),
             Err(ExpansionError::IncompleteOrigin)
         );
     }
@@ -1382,11 +1404,134 @@ mod product_classification_tests {
             output: range(5, 12),
             product: GraphNode::Definition(DefinitionId(2)),
         };
-        let classes = output_classes(&[crossing], 12, Some(DefinitionId(0))).unwrap();
+        let classes = output_classes(&[crossing], &[], 12, Some(DefinitionId(0))).unwrap();
 
         assert_eq!(
-            validate_owner_member_classes(&[member], &[crossing], classes.intervals()),
+            validate_owner_member_classes(&[member], &[crossing], &[], 12, classes.intervals(),),
             Err(ExpansionError::IncompleteOrigin)
+        );
+    }
+
+    #[test]
+    fn discarded_output_is_excluded_from_product_and_owner_materialization() {
+        let owner = DefinitionId(0);
+        let product = ObservedProduct {
+            output: range(0, 10),
+            product: GraphNode::Definition(DefinitionId(1)),
+        };
+        let classes = output_classes(&[product], &[range(3, 7)], 10, Some(owner)).unwrap();
+
+        assert_eq!(
+            classes.intervals(),
+            &[
+                (range(0, 3), PendingOutputClass::Products(ProductClassId(0))),
+                (
+                    range(7, 10),
+                    PendingOutputClass::Products(ProductClassId(0))
+                ),
+            ],
+        );
+        assert_eq!(classes.product_classes, vec![vec![product.product]]);
+
+        let all_discarded = output_classes(&[], &[range(0, 10)], 10, None).unwrap();
+        assert!(all_discarded.intervals().is_empty());
+        assert!(all_discarded.product_classes.is_empty());
+    }
+
+    #[test]
+    fn discarded_output_must_be_normalized_and_only_nested_in_live_products() {
+        let product = |output| ObservedProduct {
+            output,
+            product: GraphNode::Definition(DefinitionId(1)),
+        };
+        assert_eq!(
+            normalize_discarded_output_ranges(vec![range(3, 5), range(1, 2), range(2, 3)], 10,),
+            Some(vec![range(1, 2), range(2, 3), range(3, 5)]),
+        );
+        assert!(normalize_discarded_output_ranges(vec![range(1, 4), range(3, 5)], 10).is_none());
+        assert!(output_classes(&[], &[range(1, 4), range(3, 5)], 10, None).is_err());
+        assert!(output_classes(&[], &[range(0, 3), range(3, 5)], 5, None).is_ok());
+        assert!(output_classes(&[], &[range(9, 11)], 10, None).is_err());
+        assert!(output_classes(&[product(range(1, 4))], &[range(1, 4)], 10, None).is_err());
+        assert!(
+            output_classes(
+                &[product(range(0, 4))],
+                &[range(0, 2), range(2, 4)],
+                4,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            output_classes(
+                &[product(range(0, 4))],
+                &[range(0, 1), range(2, 4)],
+                4,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(
+            output_classes(
+                &[product(range(0, 4))],
+                &[range(1, 2), range(2, 3)],
+                4,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(output_classes(&[product(range(2, 3))], &[range(1, 4)], 10, None).is_err());
+        assert!(output_classes(&[product(range(0, 3))], &[range(2, 4)], 10, None).is_err());
+        assert!(output_classes(&[product(range(0, 5))], &[range(2, 4)], 5, None).is_ok());
+        assert!(
+            output_classes(
+                &[product(range(0, 3)), product(range(3, 6))],
+                &[range(1, 3), range(3, 5)],
+                6,
+                None,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn owner_member_allows_discarded_tokens_but_still_needs_live_owner_output() {
+        let owner = DefinitionId(0);
+        let member = ObservedProduct {
+            output: range(0, 10),
+            product: GraphNode::Definition(DefinitionId(1)),
+        };
+        let nested = ObservedProduct {
+            output: range(2, 6),
+            product: GraphNode::Definition(DefinitionId(2)),
+        };
+        let discarded = [range(8, 10)];
+        let classes = output_classes(&[nested], &discarded, 10, Some(owner)).unwrap();
+        assert_eq!(
+            validate_owner_member_classes(
+                &[member],
+                &[nested],
+                &discarded,
+                10,
+                classes.intervals(),
+            ),
+            Ok(vec![member.product]),
+        );
+
+        let nested = ObservedProduct {
+            output: range(0, 8),
+            product: nested.product,
+        };
+        let classes = output_classes(&[nested], &discarded, 10, Some(owner)).unwrap();
+        assert_eq!(
+            validate_owner_member_classes(
+                &[member],
+                &[nested],
+                &discarded,
+                10,
+                classes.intervals(),
+            ),
+            Err(ExpansionError::IncompleteOrigin),
         );
     }
 
@@ -1682,12 +1827,18 @@ mod product_classification_tests {
                 product: GraphNode::Definition(DefinitionId(MEMBERS + index + 1)),
             })
             .collect::<Vec<_>>();
-        let classes = output_classes(&products, MEMBERS * 2, Some(DefinitionId(0))).unwrap();
+        let classes = output_classes(&products, &[], MEMBERS * 2, Some(DefinitionId(0))).unwrap();
 
         assert_eq!(
-            validate_owner_member_classes(&members, &products, classes.intervals())
-                .unwrap()
-                .len(),
+            validate_owner_member_classes(
+                &members,
+                &products,
+                &[],
+                MEMBERS * 2,
+                classes.intervals(),
+            )
+            .unwrap()
+            .len(),
             MEMBERS as usize,
         );
     }
@@ -1709,7 +1860,7 @@ mod product_classification_tests {
         }));
 
         let (classes, work) =
-            output_classes_with_work(&products, output_token_count, None).unwrap();
+            output_classes_with_work(&products, &[], output_token_count, None).unwrap();
 
         assert_eq!(classes.intervals.len(), output_token_count as usize);
         assert_eq!(classes.product_classes.len(), NESTED_RANGES as usize + 1);
@@ -2242,7 +2393,7 @@ impl<'a> CoverageLowerer<'a> {
     ) -> Result<MacroCompleteOutputMeaningInventory, ExpansionError> {
         let mut meanings = Vec::with_capacity(self.provenance.producers.len());
         for (&compiler_id, prepared) in &self.provenance.producers {
-            if prepared.output_token_count == 0 {
+            if prepared.ledger.output_token_count() == 0 {
                 return Err(ExpansionError::IncompleteOrigin);
             }
             let producer = self
@@ -2375,7 +2526,7 @@ impl<'a> CoverageLowerer<'a> {
             owner_effect,
             dependent_expansions,
             output_demands,
-            residual_intrinsic: prepared.owner_output.intrinsic,
+            residual_intrinsic: prepared.owner_output.intrinsic(),
         })
     }
 
@@ -2401,7 +2552,7 @@ impl<'a> CoverageLowerer<'a> {
             .token_contributors
             .get(&compiler_id)
             .ok_or(ExpansionError::IncompleteOrigin)?;
-        if token_contributors.output_token_count()? != prepared.output_token_count {
+        if token_contributors.output_token_count()? != prepared.ledger.output_token_count() {
             return Err(ExpansionError::IncompleteOrigin);
         }
 
@@ -2421,10 +2572,13 @@ impl<'a> CoverageLowerer<'a> {
             return Err(ExpansionError::IncompleteOrigin);
         }
 
-        let interval_classes =
-            output_classes(&products, prepared.output_token_count, raw.source_owner)?;
-        let owner_members =
-            validate_owner_member_classes(&owner_members, &products, interval_classes.intervals())?;
+        let interval_classes = output_classes(&products, &prepared.ledger, raw.source_owner)?;
+        let owner_members = validate_owner_member_classes(
+            &owner_members,
+            &products,
+            &prepared.ledger,
+            interval_classes.intervals(),
+        )?;
         let (interval_classes, mut product_classes) = interval_classes.into_parts();
         let mut classes = BTreeMap::<
             PendingOutputClass,
@@ -2485,7 +2639,8 @@ impl<'a> CoverageLowerer<'a> {
         }
         Ok(MacroProducerCoverage {
             producer,
-            output_token_count: prepared.output_token_count,
+            output_token_count: prepared.ledger.output_token_count(),
+            discarded_outputs: prepared.ledger.discarded_outputs().to_vec(),
             materialization_groups,
         })
     }
@@ -2493,7 +2648,7 @@ impl<'a> CoverageLowerer<'a> {
 
 #[cfg(rust_item_dependencies_patched)]
 fn lower_macro_owner_effect(
-    observed: &PreparedMacroOwnerOutput,
+    observed: &ValidatedMacroOwnerOutput,
     products: &[ObservedProduct],
     observed_product_outputs: &BTreeSet<MacroOutputRange>,
     has_owner_members: bool,
@@ -2504,7 +2659,7 @@ fn lower_macro_owner_effect(
     ),
     ExpansionError,
 > {
-    if !observed.complete || (has_owner_members && !observed.intrinsic) {
+    if has_owner_members && !observed.intrinsic() {
         return Err(ExpansionError::IncompleteOrigin);
     }
     let mut products_by_output = BTreeMap::<MacroOutputRange, BTreeSet<GraphNode>>::new();
@@ -2516,12 +2671,12 @@ fn lower_macro_owner_effect(
     }
     let mut roles_by_output = BTreeMap::new();
     for (&output, role) in observed
-        .dependent_outputs
+        .dependent_outputs()
         .iter()
         .map(|output| (output, MacroOutputDemandRole::Dependent))
         .chain(
             observed
-                .required_outputs
+                .required_outputs()
                 .iter()
                 .map(|output| (output, MacroOutputDemandRole::Required)),
         )
@@ -2537,7 +2692,7 @@ fn lower_macro_owner_effect(
     {
         return Err(ExpansionError::IncompleteOrigin);
     }
-    let effect = if observed.intrinsic {
+    let effect = if observed.intrinsic() {
         MacroOwnerEffect::Semantic
     } else {
         let dependent_products = products_by_output
@@ -2908,65 +3063,26 @@ pub(super) fn coalesce_definition_identity_cohorts(
     Ok(contributor_dag)
 }
 
-#[cfg(rust_item_dependencies_patched)]
-pub(super) fn output_range(
-    range: MacroOutputTokenRange,
-    output_token_count: u32,
-) -> Result<MacroOutputRange, ExpansionError> {
-    (range.start < range.end && range.end <= output_token_count)
-        .then_some(MacroOutputRange {
-            start: range.start,
-            end: range.end,
-        })
-        .ok_or(ExpansionError::IncompleteOrigin)
-}
-
-#[cfg(any(rust_item_dependencies_patched, test))]
-pub(super) fn laminar_output_ranges(ranges: impl IntoIterator<Item = MacroOutputRange>) -> bool {
-    let mut ranges = ranges.into_iter().collect::<Vec<_>>();
-    if ranges.iter().any(|range| range.start >= range.end) {
-        return false;
-    }
-    ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
-    ranges.dedup();
-    let mut ancestors = Vec::<MacroOutputRange>::new();
-    for range in ranges {
-        while ancestors
-            .last()
-            .is_some_and(|ancestor| ancestor.end <= range.start)
-        {
-            ancestors.pop();
-        }
-        if ancestors
-            .last()
-            .is_some_and(|ancestor| range.end > ancestor.end)
-        {
-            return false;
-        }
-        ancestors.push(range);
-    }
-    true
-}
-
 #[cfg(any(rust_item_dependencies_patched, test))]
 fn output_classes(
     products: &[ObservedProduct],
-    output_token_count: u32,
+    ledger: &ValidatedMacroOutputLedger,
     source_owner: Option<DefinitionId>,
 ) -> Result<PendingOutputClasses, ExpansionError> {
-    output_classes_with_work(products, output_token_count, source_owner).map(|(classes, _)| classes)
+    output_classes_with_work(products, ledger, source_owner).map(|(classes, _)| classes)
 }
 
 #[cfg(any(rust_item_dependencies_patched, test))]
 fn output_classes_with_work(
     products: &[ObservedProduct],
-    output_token_count: u32,
+    ledger: &ValidatedMacroOutputLedger,
     source_owner: Option<DefinitionId>,
 ) -> Result<(PendingOutputClasses, OutputClassWork), ExpansionError> {
+    let output_token_count = ledger.output_token_count();
+    let discarded = ledger.discarded_outputs();
     let mut products_by_range = BTreeMap::<MacroOutputRange, BTreeSet<GraphNode>>::new();
     for &product in products {
-        if product.output.start >= product.output.end
-            || product.output.end > output_token_count
+        if !ledger.contains_live_output(product.output)
             || !products_by_range
                 .entry(product.output)
                 .or_default()
@@ -2974,27 +3090,6 @@ fn output_classes_with_work(
         {
             return Err(ExpansionError::IncompleteOrigin);
         }
-    }
-
-    // Product ranges may be disjoint, equal, or nested, but never partially
-    // overlap. Validate that invariant with one ordered sweep.
-    let mut ranges = products_by_range.keys().copied().collect::<Vec<_>>();
-    ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
-    let mut ancestors = Vec::<MacroOutputRange>::new();
-    for range in &ranges {
-        while ancestors
-            .last()
-            .is_some_and(|ancestor| ancestor.end <= range.start)
-        {
-            ancestors.pop();
-        }
-        if ancestors
-            .last()
-            .is_some_and(|ancestor| range.end > ancestor.end)
-        {
-            return Err(ExpansionError::IncompleteOrigin);
-        }
-        ancestors.push(*range);
     }
 
     // Store each complete product-range payload once. Sweep intervals carry
@@ -3024,8 +3119,13 @@ fn output_classes_with_work(
         positions.insert(range.start);
         positions.insert(range.end);
     }
+    for &range in discarded {
+        positions.insert(range.start);
+        positions.insert(range.end);
+    }
     let positions = positions.into_iter().collect::<Vec<_>>();
     let mut active = BTreeSet::<(u32, u32, u32)>::new();
+    let mut discarded_index = 0;
     let mut classified = Vec::new();
     for pair in positions.windows(2) {
         let position = pair[0];
@@ -3044,6 +3144,18 @@ fn output_classes_with_work(
             end: pair[1],
         };
         if range.is_empty() {
+            continue;
+        }
+        while discarded
+            .get(discarded_index)
+            .is_some_and(|discarded| discarded.end <= position)
+        {
+            discarded_index += 1;
+        }
+        if discarded
+            .get(discarded_index)
+            .is_some_and(|discarded| discarded.start <= range.start && range.end <= discarded.end)
+        {
             continue;
         }
         let class = if let Some(&(_, start, end)) = active.first() {
@@ -3079,10 +3191,17 @@ fn output_classes_with_work(
 fn validate_owner_member_classes(
     members: &[ObservedProduct],
     products: &[ObservedProduct],
+    ledger: &ValidatedMacroOutputLedger,
     classes: &[(MacroOutputRange, PendingOutputClass)],
 ) -> Result<Vec<GraphNode>, ExpansionError> {
     if members.is_empty() {
         return Ok(Vec::new());
+    }
+    if members
+        .iter()
+        .any(|member| !ledger.contains_live_output(member.output))
+    {
+        return Err(ExpansionError::IncompleteOrigin);
     }
 
     let mut product_ranges = products
@@ -3105,7 +3224,7 @@ fn validate_owner_member_classes(
     if classes.iter().any(|(range, _)| range.is_empty())
         || classes
             .windows(2)
-            .any(|pair| pair[0].0.end != pair[1].0.start)
+            .any(|pair| pair[0].0.end > pair[1].0.start)
     {
         return Err(ExpansionError::IncompleteOrigin);
     }
@@ -3139,11 +3258,7 @@ fn validate_owner_member_classes(
 
         let first = classes.partition_point(|(range, _)| range.end <= member.output.start);
         let end = classes.partition_point(|(range, _)| range.start < member.output.end);
-        if first >= end
-            || classes[first].0.start > member.output.start
-            || classes[end - 1].0.end < member.output.end
-            || owner_prefix[end] == owner_prefix[first]
-        {
+        if first >= end || owner_prefix[end] == owner_prefix[first] {
             return Err(ExpansionError::IncompleteOrigin);
         }
     }

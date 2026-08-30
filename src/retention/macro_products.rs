@@ -2427,7 +2427,10 @@ pub(super) fn validate_macro_product_constraints(
             .copied()
             .collect::<BTreeSet<_>>();
 
-        let mut census = Vec::new();
+        let mut census = coverage.discarded_outputs().to_vec();
+        if !census.is_empty() {
+            validate_discarded_output_ranges(&census, coverage.output_token_count())?;
+        }
         for group in coverage.materialization_groups() {
             let mut pending = PendingMacroMaterializationGroup {
                 producer: producer_id,
@@ -2550,7 +2553,10 @@ pub(super) fn validate_macro_product_constraints(
             pending_materializations.push(pending);
         }
         validate_macro_output_census(coverage.output_token_count(), census)?;
-        if coverage.output_token_count() == 0 && !coverage.materialization_groups().is_empty() {
+        if coverage.output_token_count() == 0
+            && (!coverage.discarded_outputs().is_empty()
+                || !coverage.materialization_groups().is_empty())
+        {
             return Err(RetentionError::InvalidConstraint);
         }
     }
@@ -2694,6 +2700,23 @@ fn validate_macro_output_ranges(
         || ranges
             .windows(2)
             .any(|pair| pair[0].end() >= pair[1].start())
+    {
+        return Err(RetentionError::InvalidConstraint);
+    }
+    Ok(())
+}
+
+fn validate_discarded_output_ranges(
+    ranges: &[MacroOutputRange],
+    output_token_count: u32,
+) -> Result<(), RetentionError> {
+    if ranges.is_empty()
+        || ranges
+            .iter()
+            .any(|range| range.start() >= range.end() || range.end() > output_token_count)
+        || ranges
+            .windows(2)
+            .any(|pair| pair[0].end() > pair[1].start())
     {
         return Err(RetentionError::InvalidConstraint);
     }

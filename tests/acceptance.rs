@@ -65,6 +65,12 @@ const MACRO_COMPONENT_CASES: &[(&str, &str, &str, &str)] = &[
         "macro_template_components",
     ),
     (
+        "macro cfg fragments",
+        include_str!("fixtures/retention/macro_cfg_fragments.input.rs"),
+        include_str!("fixtures/retention/macro_cfg_fragments.expected.rs"),
+        "macro_cfg_fragments",
+    ),
+    (
         "macro repetition components",
         include_str!("fixtures/retention/macro_repetition_components.input.rs"),
         include_str!("fixtures/retention/macro_repetition_components.expected.rs"),

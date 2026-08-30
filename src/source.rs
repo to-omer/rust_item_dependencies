@@ -3,12 +3,13 @@ mod derive;
 pub(crate) mod syntax;
 
 #[cfg(test)]
+pub(crate) use declarative_macro::MacroCaptureInputSourceFacts;
+#[cfg(test)]
 pub(crate) use declarative_macro::MacroRepetitionElementSourceFacts;
 pub(crate) use declarative_macro::{
-    MacroRepetitionSourceFacts, MacroTemplateSourceFacts, validate_declarative_macro_source_facts,
+    MacroCaptureSlotSourceFacts, MacroRepetitionSourceFacts, MacroTemplateSourceFacts,
+    validate_declarative_macro_source_facts,
 };
-#[cfg(rust_item_dependencies_patched)]
-pub(crate) use declarative_macro::{ValidatedDeclarativeOutput, ValidatedDeclarativeOutputMeaning};
 #[cfg(rust_item_dependencies_patched)]
 pub(crate) use derive::refine_derive_targets_from_compiler;
 use derive::remap_derive_target_facts;
@@ -44,6 +45,9 @@ use rustc_middle::ty::{MacroImplementationKind, MacroInvocationOrigin, TyCtxt};
 #[cfg(rust_item_dependencies_patched)]
 use rustc_span::hygiene::{ExpnId, ExpnKind, MacroKind};
 use rustc_span::{SourceFile, Span, Symbol, sym};
+
+#[cfg(rust_item_dependencies_patched)]
+use crate::macro_output::ValidatedDeclarativeOutputs;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ByteRange {
@@ -213,6 +217,7 @@ pub struct SourceInventory {
     pub(crate) derive_targets: Vec<DeriveTargetSourceFacts>,
     pub(crate) macro_rules: Vec<MacroRuleSourceFacts>,
     pub(crate) macro_templates: Vec<MacroTemplateSourceFacts>,
+    pub(crate) macro_capture_slots: Vec<MacroCaptureSlotSourceFacts>,
     pub(crate) macro_repetitions: Vec<MacroRepetitionSourceFacts>,
     pub(crate) ownerless_attribute_invocations: Vec<SourceUnitId>,
 }
@@ -1369,6 +1374,7 @@ pub(crate) fn collect_source(
         derive_targets,
         macro_rules: Vec::new(),
         macro_templates: Vec::new(),
+        macro_capture_slots: Vec::new(),
         macro_repetitions: Vec::new(),
         ownerless_attribute_invocations: Vec::new(),
     })
@@ -1754,6 +1760,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
     inventory: &mut SourceInventory,
+    outputs: &ValidatedDeclarativeOutputs,
     mut omit_one_selection: bool,
 ) -> Result<(), SourceError> {
     let procedural = collect_procedural_macro_observations(compiler, tcx, inventory)?;
@@ -1889,7 +1896,7 @@ pub(crate) fn refine_macro_rules_from_compiler(
         return Err(SourceError::IncompleteMacroRuleObservation);
     }
     refine_macro_rules_outside_opaque_anchors(inventory, observations, &opaque_ranges)?;
-    declarative_macro::refine_declarative_macros_from_compiler(compiler, tcx, inventory)?;
+    declarative_macro::refine_declarative_macros_from_compiler(compiler, tcx, inventory, outputs)?;
     merge_procedural_macro_atomic_groups(inventory, &opaque_anchors)
 }
 
@@ -3729,6 +3736,7 @@ mod tests {
             derive_targets: Vec::new(),
             macro_rules: Vec::new(),
             macro_templates: Vec::new(),
+            macro_capture_slots: Vec::new(),
             macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         };
@@ -3838,6 +3846,7 @@ mod tests {
             derive_targets: Vec::new(),
             macro_rules: Vec::new(),
             macro_templates: Vec::new(),
+            macro_capture_slots: Vec::new(),
             macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         };
@@ -4636,6 +4645,7 @@ mod tests {
             derive_targets: Vec::new(),
             macro_rules,
             macro_templates: Vec::new(),
+            macro_capture_slots: Vec::new(),
             macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         }

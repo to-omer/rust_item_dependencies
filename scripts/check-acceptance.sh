@@ -63,11 +63,14 @@ echo "==> patched compiler observer fixtures"
     RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$queue_digest" \
         "$rustc_source/x" test --ci=false --stage 2 \
         --keep-stage 0 --keep-stage 1 --force-rerun --all-targets \
+        compiler/rustc_expand \
+        compiler/rustc_resolve \
         compiler/rustc_span \
         tests/ui-fulldeps/derive-observer.rs \
         tests/ui-fulldeps/selection-proof-trace.rs \
         tests/ui-fulldeps/macro-rule-observer.rs \
         tests/ui-fulldeps/proc-macro-load-guard.rs \
+        tests/ui-fulldeps/run-compiler-twice.rs \
         tests/ui-fulldeps/external-crate-load-requirements.rs \
         tests/ui-fulldeps/associated-item-proof.rs \
         tests/ui-fulldeps/typed-mono-successors.rs \

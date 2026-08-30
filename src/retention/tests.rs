@@ -15,9 +15,10 @@ use crate::graph::{
 };
 use crate::source::{
     AtomicGroupId, ByteRange, DeriveAttributeSourceFacts, DeriveHelperSourceFacts,
-    DeriveSourceRequirement, DeriveTargetSourceFacts, MacroRepetitionElementSourceFacts,
-    MacroRepetitionSourceFacts, MacroRuleSourceFacts, MacroTemplateSourceFacts, OriginalOffsetMap,
-    SourceInventory, WrittenUnit,
+    DeriveSourceRequirement, DeriveTargetSourceFacts, MacroCaptureInputSourceFacts,
+    MacroCaptureSlotSourceFacts, MacroRepetitionElementSourceFacts, MacroRepetitionSourceFacts,
+    MacroRuleSourceFacts, MacroTemplateSourceFacts, OriginalOffsetMap, SourceInventory,
+    WrittenUnit,
 };
 
 use super::macro_products::MacroGroupDemand;
@@ -449,6 +450,7 @@ fn inventory(source: &str, units: Vec<WrittenUnit>) -> SourceInventory {
         derive_targets: Vec::new(),
         macro_rules: Vec::new(),
         macro_templates: Vec::new(),
+        macro_capture_slots: Vec::new(),
         macro_repetitions: Vec::new(),
         ownerless_attribute_invocations: Vec::new(),
     }
@@ -4198,6 +4200,24 @@ fn macro_product_validation_rejects_missing_duplicate_and_cross_kind_facts() {
         Err(RetentionError::InvalidConstraint)
     );
 
+    let mut discarded_tail = constraints.clone();
+    coverage_mut(&mut discarded_tail)[0].test_set_output_token_count(2);
+    coverage_mut(&mut discarded_tail)[0].test_set_discarded_outputs(vec![output_range(1, 2)]);
+    assert!(compute_retention(&inventory, &graph, &discarded_tail).is_ok());
+
+    let mut discarded_overlap = discarded_tail.clone();
+    coverage_mut(&mut discarded_overlap)[0].test_set_discarded_outputs(vec![output_range(0, 1)]);
+    assert_eq!(
+        compute_retention(&inventory, &graph, &discarded_overlap),
+        Err(RetentionError::InvalidConstraint)
+    );
+
+    let mut adjacent_discarded = discarded_tail.clone();
+    coverage_mut(&mut adjacent_discarded)[0].test_set_output_token_count(3);
+    coverage_mut(&mut adjacent_discarded)[0]
+        .test_set_discarded_outputs(vec![output_range(1, 2), output_range(2, 3)]);
+    assert!(compute_retention(&inventory, &graph, &adjacent_discarded).is_ok());
+
     let mut gap = constraints.clone();
     coverage_mut(&mut gap)[0].test_set_output_token_count(3);
     coverage_mut(&mut gap)[0]
@@ -7359,6 +7379,117 @@ fn macro_contributor_provenance_indexes_deep_and_shared_parent_chains() {
     assert_eq!(
         resolve_macro_contributor_provenance(&missing).err(),
         Some(RetentionError::IncompleteMacroProductConstraints)
+    );
+}
+
+#[test]
+fn macro_capture_slots_use_directed_compile_requirements_and_exact_invocation_coverage() {
+    let units = vec![
+        unit(0, WrittenUnitKind::CrateRoot, (0, 40), None, 0),
+        unit(1, WrittenUnitKind::MacroDefinition, (0, 20), Some(0), 1),
+        unit(2, WrittenUnitKind::MacroRule, (2, 18), Some(1), 2),
+        unit(3, WrittenUnitKind::NestedItem, (4, 8), Some(2), 3),
+        unit(4, WrittenUnitKind::NestedItem, (10, 14), Some(2), 4),
+        unit(5, WrittenUnitKind::MacroInvocation, (22, 28), Some(0), 5),
+        unit(6, WrittenUnitKind::MacroInvocation, (30, 36), Some(0), 6),
+    ];
+    let mut inventory = inventory(&"x".repeat(40), units);
+    inventory.macro_capture_slots = vec![MacroCaptureSlotSourceFacts {
+        unit: SourceUnitId(3),
+        rule: SourceUnitId(2),
+        matcher_capture_range: ByteRange { start: 4, end: 7 },
+        trigger_units: vec![SourceUnitId(4)],
+        inputs: vec![
+            MacroCaptureInputSourceFacts {
+                invocation: SourceUnitId(5),
+                capture_range: ByteRange { start: 23, end: 24 },
+                deletion_range: ByteRange { start: 23, end: 24 },
+            },
+            MacroCaptureInputSourceFacts {
+                invocation: SourceUnitId(6),
+                capture_range: ByteRange { start: 31, end: 32 },
+                deletion_range: ByteRange { start: 31, end: 32 },
+            },
+        ],
+    }];
+
+    let constraints = SourceConstraints::from_source(&inventory);
+    assert_eq!(
+        constraints.macro_rule_requirements,
+        vec![SourceRequirement {
+            trigger: SourceUnitId(4),
+            required: SourceUnitId(3),
+        }]
+    );
+    let groups = (0..inventory.units.len())
+        .map(|unit| vec![SourceUnitId(unit as u32)])
+        .collect::<Vec<_>>();
+    let requirement_index = SourceRequirementIndex::new(
+        inventory.units.len(),
+        &groups,
+        &[],
+        &[],
+        &[],
+        &constraints.macro_rule_requirements,
+    )
+    .unwrap();
+    let mut semantic_retained = BTreeSet::from([SourceUnitId(4)]);
+    let mut semantic_new = Vec::new();
+    let mut semantic =
+        SourceRequirementClosure::new(&requirement_index, SourceRequirementMode::Semantic);
+    semantic.seed(&semantic_retained).unwrap();
+    semantic
+        .close(&mut semantic_retained, &mut semantic_new)
+        .unwrap();
+    assert!(!semantic_retained.contains(&SourceUnitId(3)));
+    let mut compile_retained = BTreeSet::from([SourceUnitId(4)]);
+    let mut compile_new = Vec::new();
+    let mut compile =
+        SourceRequirementClosure::new(&requirement_index, SourceRequirementMode::Compile);
+    compile.seed(&compile_retained).unwrap();
+    compile
+        .close(&mut compile_retained, &mut compile_new)
+        .unwrap();
+    assert!(compile_retained.contains(&SourceUnitId(3)));
+
+    let mut graph = DependencyGraph {
+        definitions: DefinitionGraph {
+            definitions: Vec::new(),
+            external_definitions: Vec::new(),
+            edges: Vec::new(),
+        },
+        expansions: vec![
+            test_expansion_node(0, Some(SourceUnitId(5)), None, None, None),
+            test_expansion_node(1, Some(SourceUnitId(6)), None, None, None),
+        ],
+        proofs: Vec::new(),
+        mono_nodes: Vec::new(),
+        edges: Vec::new(),
+        roots: Vec::new(),
+    };
+    let selections = vec![
+        MacroRuleSelectionRequirement {
+            expansion: ExpansionId(0),
+            rule: SourceUnitId(2),
+        },
+        MacroRuleSelectionRequirement {
+            expansion: ExpansionId(1),
+            rule: SourceUnitId(2),
+        },
+    ];
+    assert_eq!(
+        validate_macro_capture_slot_coverage(&inventory, &graph, &selections),
+        Ok(())
+    );
+
+    graph.expansions[1].written_invocation = None;
+    assert_eq!(
+        validate_macro_capture_slot_coverage(&inventory, &graph, &selections),
+        Err(RetentionError::InvalidConstraint)
+    );
+    assert_eq!(
+        validate_macro_capture_slot_coverage(&inventory, &graph, &selections[..1]),
+        Err(RetentionError::InvalidConstraint)
     );
 }
 

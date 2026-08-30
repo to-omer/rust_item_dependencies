@@ -21,6 +21,7 @@ use crate::graph::{
     Definition, DefinitionEdge, DefinitionGraph, DefinitionKey, DefinitionKeyPart, DefinitionKind,
     DefinitionOrigin, DefinitionTarget, DependencyKind as DefinitionDependencyKind,
 };
+use crate::macro_output::ValidatedDeclarativeOutputs;
 use crate::source::{
     SourceInventory, SourceUnitIdentityKind, WrittenUnitKind, collect_source,
     refine_attribute_macros_from_compiler, refine_derive_targets_from_compiler,
@@ -210,6 +211,7 @@ fn same_product_basis_definitions_share_retention_contributors() {
     let mut coverage = vec![MacroProducerCoverage {
         producer: ExpansionId(0),
         output_token_count: 2,
+        discarded_outputs: Vec::new(),
         materialization_groups: vec![
             MacroOutputMaterializationGroup::test_new(
                 vec![SourceUnitId(2)],
@@ -241,6 +243,7 @@ fn same_product_basis_definitions_share_retention_contributors() {
         MacroProducerCoverage {
             producer: ExpansionId(0),
             output_token_count: 1,
+            discarded_outputs: Vec::new(),
             materialization_groups: vec![MacroOutputMaterializationGroup::test_new(
                 vec![SourceUnitId(2)],
                 vec![MacroOutputSlice {
@@ -252,6 +255,7 @@ fn same_product_basis_definitions_share_retention_contributors() {
         MacroProducerCoverage {
             producer: ExpansionId(1),
             output_token_count: 1,
+            discarded_outputs: Vec::new(),
             materialization_groups: vec![MacroOutputMaterializationGroup::test_new(
                 vec![SourceUnitId(3)],
                 vec![MacroOutputSlice {
@@ -650,10 +654,33 @@ fn stacked_written_derive_attributes_are_independent_source_roots() {
 
 #[test]
 fn definition_identity_survives_when_the_last_split_component_disappears() {
-    let original = include_str!("../../tests/fixtures/retention/macro_rule_stability.input.rs");
-    let reduced = include_str!("../../tests/fixtures/retention/macro_rule_stability.expected.rs");
-    let original = collect(original);
-    let reduced = collect(reduced);
+    const ORIGINAL: &str = "macro_rules! choose_rule {\n\
+    ($one:ident) => { pub fn $one() -> u32 { 99 } };\n\
+    ($($many:ident),*) => {\n\
+        pub fn dead_direct() -> u32 { 123 }\n\
+        pub enum Generated { $($many),* }\n\
+    };\n\
+}\n\
+mod selected_first { choose_rule!(kept); }\n\
+mod selected_second { choose_rule!(Kept, Dead); }\n\
+fn main() {\n\
+    assert_eq!(selected_first::kept(), 99);\n\
+    let _ = selected_second::Generated::Kept;\n\
+}\n";
+    const REDUCED: &str = "macro_rules! choose_rule {\n\
+    ($one:ident) => { pub fn $one() -> u32 { 99 } };\n\
+    ($($many:ident),*) => {\n\
+        pub enum Generated { $($many),* }\n\
+    };\n\
+}\n\
+mod selected_first { choose_rule!(kept); }\n\
+mod selected_second { choose_rule!(Kept, Dead); }\n\
+fn main() {\n\
+    assert_eq!(selected_first::kept(), 99);\n\
+    let _ = selected_second::Generated::Kept;\n\
+}\n";
+    let original = collect(ORIGINAL);
+    let reduced = collect(REDUCED);
 
     let producer_is_covered = |collected: &TestCollection, invocation: ByteRange| {
         let producer = collected
@@ -679,21 +706,15 @@ fn definition_identity_survives_when_the_last_split_component_disappears() {
 
     assert!(producer_is_covered(
         &original,
-        marker(
-            include_str!("../../tests/fixtures/retention/macro_rule_stability.input.rs"),
-            "choose_rule!(kept, dead)",
-        ),
+        marker(ORIGINAL, "choose_rule!(Kept, Dead)"),
     ));
     assert!(!producer_is_covered(
         &reduced,
-        marker(
-            include_str!("../../tests/fixtures/retention/macro_rule_stability.expected.rs"),
-            "choose_rule!(kept, dead)",
-        ),
+        marker(REDUCED, "choose_rule!(Kept, Dead)"),
     ));
-    let original_basis = definition_product_basis(&original, "dead")
+    let original_basis = definition_product_basis(&original, "Dead")
         .expect("the original producer must have an exact product basis");
-    let reduced_basis = definition_product_basis(&reduced, "dead")
+    let reduced_basis = definition_product_basis(&reduced, "Dead")
         .expect("the producer must keep its exact product basis after source splitting disappears");
     assert_eq!(original_basis, reduced_basis);
     assert!(
@@ -703,21 +724,20 @@ fn definition_identity_survives_when_the_last_split_component_disappears() {
 }
 
 #[test]
-fn late_parsed_inner_macro_inherits_its_refined_parent_product_basis() {
+fn late_parsed_inner_macro_inherits_its_refined_parent_component_basis() {
     let collected = collect(FIXTURE);
     let basis = definition_product_basis(&collected, "forwarded_generated")
         .expect("the late-parsed child definition must have an exact product basis");
-    let parent_rule = marker(
-        FIXTURE,
-        "($($tokens:tt)*) => {\n        $($tokens)*\n    };",
-    );
-
+    let parent_component = marker_in(FIXTURE, "$($tokens)*\n    };", "$tokens");
     assert!(
         basis.iter().any(|source| {
-            source.kind == SourceUnitIdentityKind::Written(WrittenUnitKind::MacroRule)
-                && source.range == parent_rule
+            source.kind
+                == SourceUnitIdentityKind::Declarative(
+                    crate::source::DeclarativeSourceUnitKind::TemplateComponent,
+                )
+                && source.range == parent_component
         }),
-        "excluding the child's own anchor and rule must retain the refined parent's rule contributor",
+        "the exact product basis must retain the refined parent contributor",
     );
 }
 
@@ -818,6 +838,7 @@ fn collect(source: &str) -> TestCollection {
         source: Arc::from(source),
         result: Arc::clone(&result),
         inventory: None,
+        declarative_outputs: None,
     };
     let arguments = vec![
         "rust-item-dependencies-expansions".to_owned(),
@@ -845,6 +866,7 @@ struct ExpansionCallbacks {
     source: Arc<str>,
     result: Arc<Mutex<Option<Result<TestCollection, ExpansionError>>>>,
     inventory: Option<SourceInventory>,
+    declarative_outputs: Option<ValidatedDeclarativeOutputs>,
 }
 
 struct TestCollection {
@@ -892,25 +914,30 @@ impl Callbacks for ExpansionCallbacks {
             .inventory
             .as_ref()
             .expect("source inventory must survive through analysis");
-        let value = collect_macro_provenance(compiler, tcx, inventory).and_then(|provenance| {
-            collect_definitions(compiler, tcx, inventory, &provenance)
-                .map_err(ExpansionError::from)
-                .and_then(|mut definitions| {
-                    let expansions = collect_expansions(
-                        compiler,
-                        tcx,
-                        inventory,
-                        &mut definitions,
-                        &provenance,
-                    )?;
-                    Ok(TestCollection {
-                        product_bases: definitions.product_bases().to_vec(),
-                        definitions: definitions.graph,
-                        expansions,
-                        source_units: inventory.units.clone(),
+        let outputs = self
+            .declarative_outputs
+            .as_ref()
+            .expect("declarative outputs must survive through analysis");
+        let value =
+            collect_macro_provenance(compiler, tcx, inventory, outputs).and_then(|provenance| {
+                collect_definitions(compiler, tcx, inventory, &provenance)
+                    .map_err(ExpansionError::from)
+                    .and_then(|mut definitions| {
+                        let expansions = collect_expansions(
+                            compiler,
+                            tcx,
+                            inventory,
+                            &mut definitions,
+                            &provenance,
+                        )?;
+                        Ok(TestCollection {
+                            product_bases: definitions.product_bases().to_vec(),
+                            definitions: definitions.graph,
+                            expansions,
+                            source_units: inventory.units.clone(),
+                        })
                     })
-                })
-        });
+            });
         *self
             .result
             .lock()
@@ -919,6 +946,7 @@ impl Callbacks for ExpansionCallbacks {
     }
 
     fn after_expansion<'tcx>(&mut self, compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
+        let declarative_outputs = ValidatedDeclarativeOutputs::collect(tcx);
         {
             let (_, krate) = tcx.resolver_for_lowering();
             let krate = krate.borrow();
@@ -946,9 +974,11 @@ impl Callbacks for ExpansionCallbacks {
             self.inventory
                 .as_mut()
                 .expect("source inventory must survive through expansion"),
+            &declarative_outputs,
             false,
         )
         .expect("macro rule inventory must be complete");
+        self.declarative_outputs = Some(declarative_outputs);
         Compilation::Continue
     }
 }

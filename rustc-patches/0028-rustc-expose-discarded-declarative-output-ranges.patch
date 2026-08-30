@@ -1,0 +1,1418 @@
+From fadf30423059884f13acf1029e4837192e8910e0 Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Sun, 30 Aug 2026 18:00:00 +0900
+Subject: [PATCH] rustc: expose discarded declarative output ranges
+
+---
+ compiler/rustc_ast/src/tokenstream.rs         |  11 +-
+ compiler/rustc_driver_impl/src/lib.rs         |   2 +-
+ compiler/rustc_expand/src/base.rs             |   6 +
+ compiler/rustc_expand/src/expand.rs           | 300 +++++++++++++++++-
+ compiler/rustc_expand/src/mbe.rs              |   2 +
+ compiler/rustc_expand/src/mbe/quoted.rs       |   8 +-
+ compiler/rustc_expand/src/mbe/transcribe.rs   |   8 +-
+ compiler/rustc_middle/src/ty/mod.rs           |   2 +
+ .../rustc_parse/src/parser/attr_wrapper.rs    |  52 ++-
+ compiler/rustc_parse/src/parser/function.rs   |   4 +
+ compiler/rustc_parse/src/parser/generics.rs   |   1 +
+ compiler/rustc_parse/src/parser/mod.rs        |  19 ++
+ compiler/rustc_parse/src/parser/stmt.rs       |   5 +-
+ compiler/rustc_resolve/src/def_collector.rs   |   1 +
+ compiler/rustc_resolve/src/macros.rs          | 177 ++++++++++-
+ .../auxiliary/macro-rule-observer-input.rs    | 126 ++++++++
+ tests/ui-fulldeps/macro-rule-observer.rs      | 176 +++++++++-
+ 17 files changed, 870 insertions(+), 30 deletions(-)
+
+diff --git a/compiler/rustc_ast/src/tokenstream.rs b/compiler/rustc_ast/src/tokenstream.rs
+index 6e1ca64ab..f21df7021 100644
+--- a/compiler/rustc_ast/src/tokenstream.rs
++++ b/compiler/rustc_ast/src/tokenstream.rs
+@@ -14,7 +14,7 @@
+ use rustc_data_structures::sync;
+ use rustc_macros::{Decodable, Encodable, StableHash, Walkable};
+ use rustc_serialize::{Decodable, Encodable};
+-use rustc_span::{DUMMY_SP, Span, SpanDecoder, SpanEncoder, Symbol, sym};
++use rustc_span::{AttrId, DUMMY_SP, Span, SpanDecoder, SpanEncoder, Symbol, sym};
+ use thin_vec::ThinVec;
+ 
+ use crate::ast::AttrStyle;
+@@ -191,6 +191,8 @@ pub struct MacroParserRange {
+     pub use_trees: Vec<MacroParserSubrange>,
+     /// Function-like macro calls in AST traversal order.
+     pub macro_calls: Vec<MacroParserSubrange>,
++    /// Deletion-safe ranges keyed by the `cfg` or `cfg_attr` attribute on the node.
++    pub cfg_components: ThinVec<MacroParserCfgRange>,
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -199,6 +201,13 @@ pub struct MacroParserSubrange {
+     pub complete: bool,
+ }
+ 
++#[derive(Clone, Debug)]
++pub struct MacroParserCfgRange {
++    pub attr: AttrId,
++    pub range: ParserRange,
++    pub complete: bool,
++}
++
+ /// A token range within an individual AST node's (lazy) token stream, i.e.
+ /// relative to that node's first token. Distinct from `ParserRange` so the two
+ /// kinds of range can't be mixed up.
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 575ac1160..9f6bbe0e5 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 24;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 25;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_expand/src/base.rs b/compiler/rustc_expand/src/base.rs
+index 513ef347d..0b30ca373 100644
+--- a/compiler/rustc_expand/src/base.rs
++++ b/compiler/rustc_expand/src/base.rs
+@@ -1131,6 +1131,12 @@ fn record_macro_expansion_output_structure(
+ 
+     fn mark_declarative_macro_output_census_incomplete(&mut self, invocation_id: LocalExpnId);
+ 
++    fn record_declarative_macro_discarded_output(
++        &mut self,
++        invocation_id: LocalExpnId,
++        range: Option<rustc_ast::tokenstream::MacroParserSubrange>,
++    );
++
+     fn finalize_declarative_macro_owner_output(
+         &mut self,
+         invocation_id: LocalExpnId,
+diff --git a/compiler/rustc_expand/src/expand.rs b/compiler/rustc_expand/src/expand.rs
+index 9501bcef2..b7b7c0865 100644
+--- a/compiler/rustc_expand/src/expand.rs
++++ b/compiler/rustc_expand/src/expand.rs
+@@ -4,7 +4,9 @@
+ use std::{iter, mem, slice};
+ 
+ use rustc_ast::mut_visit::*;
+-use rustc_ast::tokenstream::{MacroParserRange, TokenStream};
++use rustc_ast::tokenstream::{
++    MacroParserCfgRange, MacroParserRange, MacroParserSubrange, TokenStream,
++};
+ use rustc_ast::visit::{AssocCtxt, Visitor, VisitorResult, try_visit, walk_list};
+ use rustc_ast::{
+     self as ast, AssocItemKind, AstNodeWrapper, AttrArgs, AttrKind, AttrStyle, AttrVec,
+@@ -710,6 +712,10 @@ fn collect_invocations(
+         self.cx.resolver.resolve_dollar_crates();
+ 
+         let invocations = {
++            let mut cfg_component_range_cache = CfgComponentRangeCache::default();
++            if let Some(range) = &root_macro_range {
++                cfg_component_range_cache.insert(range);
++            }
+             let mut collector = InvocationCollector {
+                 // Non-derive macro invocations cannot see the results of cfg expansion - they
+                 // will either be removed along with the item, or invoked before the cfg/cfg_attr
+@@ -721,6 +727,8 @@ fn collect_invocations(
+                 monotonic: self.monotonic,
+                 inherited_macro_range: root_macro_range.clone(),
+                 macro_range_indices: FxHashMap::default(),
++                cfg_component_range_cache,
++                configured_attr_ranges: FxHashMap::default(),
+                 owner_product_role: initial_owner_product_role(&fragment),
+                 owner_child_roles: observe_owner_output.then(|| {
+                     extra_placeholders
+@@ -2529,10 +2537,101 @@ struct InvocationCollector<'a, 'b> {
+     monotonic: bool,
+     inherited_macro_range: Option<rustc_ast::tokenstream::MacroParserRange>,
+     macro_range_indices: FxHashMap<u32, usize>,
++    cfg_component_range_cache: CfgComponentRangeCache,
++    configured_attr_ranges:
++        FxHashMap<rustc_span::AttrId, Option<rustc_ast::tokenstream::MacroParserSubrange>>,
+     owner_product_role: MacroOwnerProductRole,
+     owner_child_roles: Option<Vec<(LocalExpnId, MacroOwnerProductRole)>>,
+ }
+ 
++#[derive(Default)]
++struct CfgComponentRangeCache {
++    by_scope: FxHashMap<u32, CfgComponentRanges>,
++}
++
++impl CfgComponentRangeCache {
++    fn insert(&mut self, range: &MacroParserRange) {
++        if range.cfg_components.is_empty() {
++            return;
++        }
++        self.by_scope
++            .entry(range.scope)
++            .or_insert_with(|| CfgComponentRanges::new(&range.cfg_components));
++    }
++
++    fn get(
++        &self,
++        range: &MacroParserRange,
++        attr: rustc_span::AttrId,
++    ) -> Option<MacroParserSubrange> {
++        self.by_scope.get(&range.scope)?.get(attr)
++    }
++}
++
++#[derive(Default)]
++struct CfgComponentRanges {
++    by_attr: FxHashMap<rustc_span::AttrId, Option<MacroParserSubrange>>,
++}
++
++impl CfgComponentRanges {
++    fn new<'c>(components: impl IntoIterator<Item = &'c MacroParserCfgRange>) -> Self {
++        let mut ranges = Self::default();
++        for component in components {
++            ranges.insert(component);
++        }
++        ranges
++    }
++
++    fn insert(&mut self, component: &MacroParserCfgRange) {
++        let candidate =
++            MacroParserSubrange { range: component.range.clone(), complete: component.complete };
++        match self.by_attr.entry(component.attr) {
++            std::collections::hash_map::Entry::Vacant(entry) => {
++                entry.insert(Some(candidate));
++            }
++            std::collections::hash_map::Entry::Occupied(mut entry) => {
++                let Some(current) = entry.get_mut() else { return };
++                let current_range = &current.range.0;
++                let candidate_range = &candidate.range.0;
++                if current_range.start == candidate_range.start
++                    && current_range.end == candidate_range.end
++                {
++                    current.complete |= candidate.complete;
++                } else if candidate_range.start <= current_range.start
++                    && current_range.end <= candidate_range.end
++                {
++                    *current = candidate;
++                } else if !(current_range.start <= candidate_range.start
++                    && candidate_range.end <= current_range.end)
++                {
++                    entry.insert(None);
++                }
++            }
++        }
++    }
++
++    fn get_with_work(
++        &self,
++        attr: rustc_span::AttrId,
++        record_lookup: impl FnOnce(),
++    ) -> Option<MacroParserSubrange> {
++        record_lookup();
++        self.by_attr.get(&attr).cloned().flatten().filter(|range| range.complete)
++    }
++
++    fn get(&self, attr: rustc_span::AttrId) -> Option<MacroParserSubrange> {
++        self.get_with_work(attr, || {})
++    }
++}
++
++fn replace_inherited_macro_range(
++    inherited: &mut Option<MacroParserRange>,
++    own: Option<&MacroParserRange>,
++) -> Option<Option<MacroParserRange>> {
++    let own = own?.clone();
++    Some(inherited.replace(own))
++}
++
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ enum MacroOwnerProductRole {
+     Dependent,
+@@ -2540,6 +2639,15 @@ enum MacroOwnerProductRole {
+ }
+ 
+ impl<'a, 'b> InvocationCollector<'a, 'b> {
++    fn enter_macro_range(
++        &mut self,
++        own: Option<&MacroParserRange>,
++    ) -> Option<Option<MacroParserRange>> {
++        let previous = replace_inherited_macro_range(&mut self.inherited_macro_range, own)?;
++        self.cfg_component_range_cache.insert(self.inherited_macro_range.as_ref().unwrap());
++        Some(previous)
++    }
++
+     fn cfg(&self) -> StripUnconfigured<'_> {
+         StripUnconfigured {
+             sess: self.cx.sess,
+@@ -2600,6 +2708,7 @@ fn next_bang_macro_range(&mut self) -> Option<rustc_ast::tokenstream::MacroParse
+             complete: range.complete,
+             use_trees: Vec::new(),
+             macro_calls: Vec::new(),
++            cfg_components: Default::default(),
+         })
+     }
+ 
+@@ -2688,6 +2797,32 @@ fn take_first_attr(
+         attr
+     }
+ 
++    fn cfg_component_range(
++        &self,
++        attr: rustc_span::AttrId,
++    ) -> Option<rustc_ast::tokenstream::MacroParserSubrange> {
++        if let Some(range) = self.configured_attr_ranges.get(&attr) {
++            return range.clone();
++        }
++        let inherited = self.inherited_macro_range.as_ref()?;
++        self.cfg_component_range_cache.get(inherited, attr)
++    }
++
++    fn register_configured_attr_range(
++        &mut self,
++        attr: rustc_span::AttrId,
++        range: Option<rustc_ast::tokenstream::MacroParserSubrange>,
++    ) {
++        match self.configured_attr_ranges.entry(attr) {
++            std::collections::hash_map::Entry::Vacant(entry) => {
++                entry.insert(range);
++            }
++            std::collections::hash_map::Entry::Occupied(mut entry) => {
++                entry.insert(None);
++            }
++        }
++    }
++
+     // Detect use of feature-gated or invalid attributes on macro invocations
+     // since they will not be detected after macro expansion.
+     fn check_attributes(&self, attrs: &[ast::Attribute], call: &ast::MacCall) {
+@@ -2786,11 +2921,20 @@ fn expand_cfg_true(
+         res
+     }
+ 
+-    fn expand_cfg_attr(&self, node: &mut impl HasAttrs, attr: &ast::Attribute, pos: usize) {
++    fn expand_cfg_attr(&mut self, node: &mut impl HasAttrs, attr: &ast::Attribute, pos: usize) {
++        let observing =
++            self.cx.resolver.declarative_macro_expansion_observed(self.cx.current_expansion.id);
++        let source_range = observing.then(|| self.cfg_component_range(attr.id)).flatten();
++        let expanded = self.cfg().expand_cfg_attr(attr, false);
++        if observing {
++            for generated in &expanded {
++                self.register_configured_attr_range(generated.id, source_range.clone());
++            }
++        }
+         node.visit_attrs(|attrs| {
+             // Repeated `insert` calls is inefficient, but the number of
+             // insertions is almost always 0 or 1 in practice.
+-            for cfg in self.cfg().expand_cfg_attr(attr, false).into_iter().rev() {
++            for cfg in expanded.into_iter().rev() {
+                 attrs.insert(pos, cfg)
+             }
+         });
+@@ -2800,11 +2944,11 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
+         &mut self,
+         node: Node,
+     ) -> Node::OutputTy {
+-        let inherited =
+-            node.macro_parser_range().cloned().or_else(|| self.inherited_macro_range.clone());
+-        let previous = mem::replace(&mut self.inherited_macro_range, inherited);
++        let previous = self.enter_macro_range(node.macro_parser_range());
+         let output = self.flat_map_node_inner(node);
+-        self.inherited_macro_range = previous;
++        if let Some(previous) = previous {
++            self.inherited_macro_range = previous;
++        }
+         output
+     }
+ 
+@@ -2816,10 +2960,16 @@ fn flat_map_node_inner<Node: InvocationCollectorNode<OutputTy: Default>>(
+             return match self.take_first_attr(&mut node) {
+                 Some((attr, pos, derives)) => match attr.name() {
+                     Some(sym::cfg) => {
++                        let attr_id = attr.id;
+                         let res = self.expand_cfg_true(&mut node, attr, pos);
+                         match res {
+                             EvalConfigResult::True => continue,
+                             EvalConfigResult::False { reason, reason_span } => {
++                                let range = self.cfg_component_range(attr_id);
++                                self.cx.resolver.record_declarative_macro_discarded_output(
++                                    self.cx.current_expansion.id,
++                                    range,
++                                );
+                                 for ident in node.declared_idents() {
+                                     self.cx.resolver.append_stripped_cfg_item(
+                                         self.cx.current_expansion.lint_node_id,
+@@ -2929,11 +3079,11 @@ fn visit_node<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode
+         &mut self,
+         node: &mut Node,
+     ) {
+-        let inherited =
+-            node.macro_parser_range().cloned().or_else(|| self.inherited_macro_range.clone());
+-        let previous = mem::replace(&mut self.inherited_macro_range, inherited);
++        let previous = self.enter_macro_range(node.macro_parser_range());
+         self.visit_node_inner(node);
+-        self.inherited_macro_range = previous;
++        if let Some(previous) = previous {
++            self.inherited_macro_range = previous;
++        }
+     }
+ 
+     fn visit_node_inner<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode>(
+@@ -2949,6 +3099,12 @@ fn visit_node_inner<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyA
+                             continue;
+                         }
+ 
++                        // Unlike `flat_map_node`, this path cannot remove the whole parser
++                        // product. Do not misclassify its enclosing range as discarded output.
++                        self.cx.resolver.record_declarative_macro_discarded_output(
++                            self.cx.current_expansion.id,
++                            None,
++                        );
+                         node.expand_cfg_false(self, pos, span);
+                         continue;
+                     }
+@@ -3223,3 +3379,125 @@ pub fn default(crate_name: Symbol, features: &Features) -> ExpansionConfig<'_> {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::cell::Cell;
++
++    use rustc_ast::tokenstream::ParserRange;
++    use rustc_span::AttrId;
++
++    use super::*;
++
++    fn cfg_component(attr: u32, start: u32, end: u32, complete: bool) -> MacroParserCfgRange {
++        MacroParserCfgRange {
++            attr: AttrId::from_u32(attr),
++            range: ParserRange(start..end),
++            complete,
++        }
++    }
++
++    #[test]
++    fn cfg_component_ranges_preserve_fail_closed_normalization() {
++        let components = [
++            cfg_component(0, 2, 4, true),
++            cfg_component(0, 1, 5, false),
++            cfg_component(0, 1, 5, true),
++            cfg_component(1, 10, 20, true),
++            cfg_component(1, 12, 18, true),
++            cfg_component(2, 20, 30, true),
++            cfg_component(2, 25, 35, true),
++            cfg_component(3, 40, 45, true),
++            cfg_component(3, 50, 55, true),
++            cfg_component(4, 60, 65, false),
++        ];
++
++        let ranges = CfgComponentRanges::new(&components);
++        let outer = ranges.get(AttrId::from_u32(0)).unwrap();
++        assert_eq!(outer.range.0, 1..5);
++        let containing = ranges.get(AttrId::from_u32(1)).unwrap();
++        assert_eq!(containing.range.0, 10..20);
++        assert!(ranges.get(AttrId::from_u32(2)).is_none());
++        assert!(ranges.get(AttrId::from_u32(3)).is_none());
++        assert!(ranges.get(AttrId::from_u32(4)).is_none());
++    }
++
++    #[test]
++    fn cfg_component_range_cache_keeps_each_parser_scope() {
++        let root = MacroParserRange {
++            scope: 1,
++            range: ParserRange(0..20),
++            complete: true,
++            use_trees: Vec::new(),
++            macro_calls: Vec::new(),
++            cfg_components: vec![cfg_component(0, 0, 10, true)].into(),
++        };
++        let item = MacroParserRange {
++            scope: 2,
++            range: ParserRange(20..40),
++            complete: true,
++            use_trees: Vec::new(),
++            macro_calls: Vec::new(),
++            cfg_components: vec![cfg_component(1, 20, 30, true)].into(),
++        };
++        let mut cache = CfgComponentRangeCache::default();
++        cache.insert(&root);
++        cache.insert(&item);
++
++        assert_eq!(cache.get(&root, AttrId::from_u32(0)).unwrap().range.0, 0..10);
++        assert!(cache.get(&root, AttrId::from_u32(1)).is_none());
++        assert_eq!(cache.get(&item, AttrId::from_u32(1)).unwrap().range.0, 20..30);
++        assert!(cache.get(&item, AttrId::from_u32(0)).is_none());
++    }
++
++    #[test]
++    fn empty_cfg_component_scopes_are_not_cached() {
++        let range = MacroParserRange {
++            scope: 1,
++            range: ParserRange(0..10),
++            complete: true,
++            use_trees: Vec::new(),
++            macro_calls: Vec::new(),
++            cfg_components: Default::default(),
++        };
++        let mut cache = CfgComponentRangeCache::default();
++        cache.insert(&range);
++        assert!(cache.by_scope.is_empty());
++    }
++
++    #[test]
++    fn absent_node_ranges_do_not_clone_or_replace_the_inherited_range() {
++        let mut inherited = Some(MacroParserRange {
++            scope: 1,
++            range: ParserRange(0..10),
++            complete: true,
++            use_trees: Vec::new(),
++            macro_calls: Vec::new(),
++            cfg_components: vec![cfg_component(0, 0, 10, true)].into(),
++        });
++        let components = inherited.as_ref().unwrap().cfg_components.as_ptr();
++
++        assert!(replace_inherited_macro_range(&mut inherited, None).is_none());
++        assert_eq!(inherited.as_ref().unwrap().cfg_components.as_ptr(), components);
++    }
++
++    #[test]
++    fn large_cfg_component_lists_use_one_index_lookup_per_attribute() {
++        const COMPONENT_COUNT: u32 = 4_096;
++        let components = (0..COMPONENT_COUNT)
++            .map(|index| cfg_component(index, index * 2, index * 2 + 1, true))
++            .collect::<Vec<_>>();
++        let ranges = CfgComponentRanges::new(&components);
++        let lookup_work = Cell::new(0);
++
++        for index in 0..COMPONENT_COUNT {
++            let range = ranges
++                .get_with_work(AttrId::from_u32(index), || {
++                    lookup_work.set(lookup_work.get() + 1);
++                })
++                .unwrap();
++            assert_eq!(range.range.0, index * 2..index * 2 + 1);
++        }
++        assert_eq!(lookup_work.get(), COMPONENT_COUNT);
++    }
++}
+diff --git a/compiler/rustc_expand/src/mbe.rs b/compiler/rustc_expand/src/mbe.rs
+index 3bed1f7b8..2d09d5320 100644
+--- a/compiler/rustc_expand/src/mbe.rs
++++ b/compiler/rustc_expand/src/mbe.rs
+@@ -29,6 +29,8 @@ pub(crate) struct Delimited {
+ 
+ #[derive(PartialEq, Encodable, Decodable, Debug)]
+ pub(crate) struct SequenceRepetition {
++    /// Full source span from the leading `$` through the Kleene operator.
++    source_span: Span,
+     /// The sequence of token trees
+     tts: Vec<TokenTree>,
+     /// The optional separator
+diff --git a/compiler/rustc_expand/src/mbe/quoted.rs b/compiler/rustc_expand/src/mbe/quoted.rs
+index 2779291ab..96a3966fb 100644
+--- a/compiler/rustc_expand/src/mbe/quoted.rs
++++ b/compiler/rustc_expand/src/mbe/quoted.rs
+@@ -318,7 +318,13 @@ fn parse_tree<'a>(
+                         if part.is_pattern() { count_metavar_decls(&sequence) } else { 0 };
+                     TokenTree::Sequence(
+                         delim_span,
+-                        SequenceRepetition { tts: sequence, separator, kleene, num_captures },
++                        SequenceRepetition {
++                            source_span: dollar_span.to(kleene.span),
++                            tts: sequence,
++                            separator,
++                            kleene,
++                            num_captures,
++                        },
+                     )
+                 }
+ 
+diff --git a/compiler/rustc_expand/src/mbe/transcribe.rs b/compiler/rustc_expand/src/mbe/transcribe.rs
+index d341f2925..8e8fd63b4 100644
+--- a/compiler/rustc_expand/src/mbe/transcribe.rs
++++ b/compiler/rustc_expand/src/mbe/transcribe.rs
+@@ -448,7 +448,11 @@ fn inventory_components(
+         };
+         let id = components.len();
+         component_ids.insert(tree as *const mbe::TokenTree as usize, id);
+-        components.push(MacroTranscriberComponent { kind, span: tree.span(), parent });
++        let span = match tree {
++            mbe::TokenTree::Sequence(_, sequence) => sequence.source_span,
++            _ => tree.span(),
++        };
++        components.push(MacroTranscriberComponent { kind, span, parent });
+         let children = match tree {
+             mbe::TokenTree::Delimited(_, _, delimited) => &delimited.tts,
+             mbe::TokenTree::Sequence(_, sequence) => &sequence.tts,
+@@ -675,6 +679,7 @@ pub(super) fn transcribe<'a>(
+                     complete: matcher_index.complete && matcher_observation_complete(matcher),
+                     components: Vec::new(),
+                     output_tokens: Vec::new(),
++                    discarded_outputs: Vec::new(),
+                     owner_output: rustc_middle::ty::MacroOwnerOutput {
+                         complete: false,
+                         intrinsic: true,
+@@ -823,6 +828,7 @@ pub(super) fn transcribe<'a>(
+                                     complete,
+                                     components: tscx.components,
+                                     output_tokens,
++                                    discarded_outputs: Vec::new(),
+                                     owner_output: rustc_middle::ty::MacroOwnerOutput {
+                                         complete: false,
+                                         intrinsic: true,
+diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
+index da9551d83..d72ffed78 100644
+--- a/compiler/rustc_middle/src/ty/mod.rs
++++ b/compiler/rustc_middle/src/ty/mod.rs
+@@ -467,6 +467,8 @@ pub struct MacroDeclarativeExpansion {
+     pub complete: bool,
+     pub components: Vec<MacroTranscriberComponent>,
+     pub output_tokens: Vec<MacroOutputTokenOrigin>,
++    /// Parser-token ranges removed by successful `cfg` configuration.
++    pub discarded_outputs: Vec<MacroOutputTokenRange>,
+     /// How output outside generated definitions and child expansions contributes to the owner,
+     /// and which direct products the owner needs.
+     pub owner_output: MacroOwnerOutput,
+diff --git a/compiler/rustc_parse/src/parser/attr_wrapper.rs b/compiler/rustc_parse/src/parser/attr_wrapper.rs
+index d333b52ee..9cf0b9029 100644
+--- a/compiler/rustc_parse/src/parser/attr_wrapper.rs
++++ b/compiler/rustc_parse/src/parser/attr_wrapper.rs
+@@ -1,7 +1,7 @@
+ use std::borrow::Cow;
+ use std::mem;
+ 
+-use rustc_ast::token::Token;
++use rustc_ast::token::{self, Token};
+ use rustc_ast::tokenstream::{
+     AttrsTarget, LazyAttrTokenStream, MacroParserRange, NodeRange, ParserRange, Spacing,
+     TokenCursor,
+@@ -191,7 +191,7 @@ pub(super) fn collect_tokens<R: HasTokens>(
+ 
+         let mut collect_pos = self.collect_pos();
+         let has_outer_attrs = !attrs.attrs.is_empty();
+-        let observed_start_pos = attrs.start_pos.unwrap_or(collect_pos.start_pos);
++        let mut observed_start_pos = attrs.start_pos.unwrap_or(collect_pos.start_pos);
+         let parser_replacements_start = self.capture_state.parser_replacements.len();
+ 
+         // We set and restore `Capturing::Yes` on either side of the call to
+@@ -210,6 +210,9 @@ pub(super) fn collect_tokens<R: HasTokens>(
+         };
+         let observed_ranges = observing.then(finish_observed_node_scope);
+         let (mut ret, capture_trailing, use_pre_attr_pos) = parsed?;
++        if observing && matches!(use_pre_attr_pos, UsePreAttrPos::Yes) {
++            observed_start_pos = pre_attr_pos.as_ref().unwrap().start_pos;
++        }
+ 
+         // - `None`: Our target doesn't support tokens at all (e.g. `NtIdent`).
+         // - `Some(None)`: Our target supports tokens and has none.
+@@ -218,6 +221,38 @@ pub(super) fn collect_tokens<R: HasTokens>(
+         let ret_supports_tokens = ret.tokens_mut().is_some();
+         let ret_can_hold_tokens = matches!(ret.tokens_mut(), Some(None));
+ 
++        let end_pos = self.num_bump_calls
++            + capture_trailing as u32
++            // A partially consumed glued token still occupies one token in the input stream.
++            + if self.break_last_token == 0 { 0 } else { 1 };
++
++        let mut observed_ranges = observed_ranges;
++        if let Some(ranges) = &mut observed_ranges {
++            let observed_capture_trailing =
++                ranges.capture_trailing || matches!(capture_trailing, Trailing::Yes);
++            let observed_end_pos = self.num_bump_calls
++                + u32::from(observed_capture_trailing)
++                + if self.break_last_token == 0 { 0 } else { 1 };
++            // A comma that remains outside the captured range belongs to this list element's
++            // separator. Calling the range deletion-safe in that state could leave a leading or
++            // doubled comma. Individual list parsers opt in to capturing that trailing comma.
++            let complete = collect_pos.break_last_token == 0
++                && self.break_last_token == 0
++                && (self.token != token::Comma || observed_capture_trailing);
++            ranges.cfg_components.extend(
++                ret.attrs()
++                    .iter()
++                    .filter(|attr| {
++                        attr.name().is_some_and(|name| name == sym::cfg || name == sym::cfg_attr)
++                    })
++                    .map(|attr| rustc_ast::tokenstream::MacroParserCfgRange {
++                        attr: attr.id,
++                        range: ParserRange(observed_start_pos..observed_end_pos),
++                        complete,
++                    }),
++            );
++        }
++
+         // Observer mode is also inherited by parser paths whose result has no token slot. Preserve
+         // nested ranges in the enclosing product; the final `None` returned by an item loop has no
+         // ranges and no enclosing product, so this is also a no-op for that case.
+@@ -306,16 +341,6 @@ pub(super) fn collect_tokens<R: HasTokens>(
+         );
+         assert!(self.break_last_token <= 2, "cannot break token more than twice");
+ 
+-        let end_pos = self.num_bump_calls
+-            + capture_trailing as u32
+-            // If we "broke" the last token (e.g. breaking a `>>` token once into `>` + `>`, or
+-            // breaking a `>>=` token twice into `>` + `>` + `=`), then extend the range of
+-            // captured tokens to include it, because the parser was not actually bumped past it.
+-            // (Even if we broke twice, it was still just one token originally, hence the `1`.)
+-            // When the `LazyAttrTokenStream` gets converted into an `AttrTokenStream`, we will
+-            // rebreak that final token once or twice.
+-            + if self.break_last_token == 0 { 0 } else { 1 };
+-
+         let num_calls = end_pos - collect_pos.start_pos;
+ 
+         // Take the captured `ParserRange`s for any inner attributes that we parsed in
+@@ -384,6 +409,7 @@ pub(super) fn collect_tokens<R: HasTokens>(
+             complete: collect_pos.break_last_token == 0 && self.break_last_token == 0,
+             use_trees: observed_ranges.as_ref().unwrap().use_trees.clone(),
+             macro_calls: observed_ranges.as_ref().unwrap().macro_calls.clone(),
++            cfg_components: observed_ranges.as_ref().unwrap().cfg_components.clone(),
+         });
+         let tokens = LazyAttrTokenStream::new_pending(
+             collect_pos.start_token,
+@@ -450,6 +476,8 @@ pub(super) fn collect_tokens<R: HasTokens>(
+                         range
+                             .macro_calls
+                             .sort_by_key(|subrange| (subrange.range.0.start, subrange.range.0.end));
++                        range.cfg_components.extend(inner.cfg_components.iter().cloned());
++                        range.cfg_components.sort_by_key(|component| component.attr);
+                     }
+                     *existing = existing.clone().with_macro_parser_range(range);
+                 }
+diff --git a/compiler/rustc_parse/src/parser/function.rs b/compiler/rustc_parse/src/parser/function.rs
+index 1523aba4b..3ee00e1f7 100644
+--- a/compiler/rustc_parse/src/parser/function.rs
++++ b/compiler/rustc_parse/src/parser/function.rs
+@@ -735,6 +735,7 @@ pub(super) fn parse_param_general(
+             if let Some(mut param) = this.parse_self_param()? {
+                 param.attrs = attrs;
+                 let res = if first_param { Ok(param) } else { this.recover_bad_self_param(param) };
++                this.capture_observed_trailing_token(this.token == token::Comma);
+                 return Ok((res?, Trailing::No, UsePreAttrPos::No));
+             }
+ 
+@@ -774,6 +775,7 @@ pub(super) fn parse_param_general(
+                         let guar = err.emit();
+                         let mut arg = dummy_arg(ident, guar);
+                         arg.span = pat_span;
++                        this.capture_observed_trailing_token(this.token == token::Comma);
+                         Ok((arg, Trailing::No, UsePreAttrPos::No))
+                     } else {
+                         Err(err)
+@@ -795,6 +797,7 @@ pub(super) fn parse_param_general(
+                         && let Some(guar) =
+                             this.check_trailing_angle_brackets(segment, &[exp!(CloseParen)])
+                     {
++                        this.capture_observed_trailing_token(this.token == token::Comma);
+                         return Ok((
+                             dummy_arg(segment.ident, guar),
+                             Trailing::No,
+@@ -827,6 +830,7 @@ pub(super) fn parse_param_general(
+             };
+ 
+             let span = lo.to(this.prev_token.span);
++            this.capture_observed_trailing_token(this.token == token::Comma);
+ 
+             Ok((
+                 Param { attrs, id: ast::DUMMY_NODE_ID, is_placeholder: false, pat, span, ty },
+diff --git a/compiler/rustc_parse/src/parser/generics.rs b/compiler/rustc_parse/src/parser/generics.rs
+index ec9860c0f..5caca9abe 100644
+--- a/compiler/rustc_parse/src/parser/generics.rs
++++ b/compiler/rustc_parse/src/parser/generics.rs
+@@ -495,6 +495,7 @@ fn parse_where_clause_common(
+                     span: pred_lo.to(this.prev_token.span),
+                     is_placeholder: false,
+                 });
++                this.capture_observed_trailing_token(this.token == token::Comma);
+                 Ok((predicate, Trailing::No, UsePreAttrPos::No))
+             })?;
+             match predicate {
+diff --git a/compiler/rustc_parse/src/parser/mod.rs b/compiler/rustc_parse/src/parser/mod.rs
+index 9e79bf289..f829b06bf 100644
+--- a/compiler/rustc_parse/src/parser/mod.rs
++++ b/compiler/rustc_parse/src/parser/mod.rs
+@@ -166,8 +166,10 @@ struct ObservedNodeRanges {
+     scope: u32,
+     full_start: u32,
+     body_start: u32,
++    capture_trailing: bool,
+     use_trees: Vec<rustc_ast::tokenstream::MacroParserSubrange>,
+     macro_calls: Vec<rustc_ast::tokenstream::MacroParserSubrange>,
++    cfg_components: ThinVec<rustc_ast::tokenstream::MacroParserCfgRange>,
+ }
+ 
+ pub fn with_macro_output_observer<R>(observe: bool, f: impl FnOnce() -> R) -> R {
+@@ -206,6 +208,7 @@ pub fn with_macro_output_fragment<R>(
+                 complete: start.1 && end.1 && start.0 < end.0,
+                 use_trees: ranges.use_trees,
+                 macro_calls: ranges.macro_calls,
++                cfg_components: ranges.cfg_components,
+             };
+             (result, Some(root))
+         })
+@@ -276,6 +279,7 @@ fn merge_observed_node_ranges_into_parent(ranges: ObservedNodeRanges) {
+         if let Some(parent) = scopes.borrow_mut().last_mut() {
+             parent.use_trees.extend(ranges.use_trees);
+             parent.macro_calls.extend(ranges.macro_calls);
++            parent.cfg_components.extend(ranges.cfg_components);
+         }
+     });
+ }
+@@ -307,6 +311,21 @@ fn finish_observed_use_tree(slot: Option<(usize, (u32, bool))>, range_end: (u32,
+ }
+ 
+ impl<'a> Parser<'a> {
++    /// Includes the parser's current token in the current observer-only node range.
++    ///
++    /// This must not use [`Trailing::Yes`], because that also changes the lazy token stream
++    /// retained for procedural macros and matched nonterminals.
++    pub(super) fn capture_observed_trailing_token(&self, capture: bool) {
++        if !capture || !macro_output_observer_active() {
++            return;
++        }
++        OBSERVED_NODE_RANGES.with(|scopes| {
++            if let Some(current) = scopes.borrow_mut().last_mut() {
++                current.capture_trailing = true;
++            }
++        });
++    }
++
+     pub(super) fn observed_macro_call_start(&self) -> Option<(u32, bool)> {
+         macro_output_observer_active().then(|| self.observer_token_stream_pos())
+     }
+diff --git a/compiler/rustc_parse/src/parser/stmt.rs b/compiler/rustc_parse/src/parser/stmt.rs
+index 66d4405ee..97a180f1f 100644
+--- a/compiler/rustc_parse/src/parser/stmt.rs
++++ b/compiler/rustc_parse/src/parser/stmt.rs
+@@ -145,7 +145,9 @@ pub fn parse_stmt_without_recovery(
+                 AttrWrapper::empty(),
+                 force_collect,
+                 |this, _empty_attrs| {
+-                    Ok((this.parse_stmt_path_start(lo, attrs)?, Trailing::No, UsePreAttrPos::Yes))
++                    let stmt = this.parse_stmt_path_start(lo, attrs)?;
++                    this.capture_observed_trailing_token(capture_semi && this.token == token::Semi);
++                    Ok((stmt, Trailing::No, UsePreAttrPos::Yes))
+                 },
+             );
+             match stmt {
+@@ -183,6 +185,7 @@ pub fn parse_stmt_without_recovery(
+                 force_collect,
+                 |this, _empty_attrs| {
+                     let (expr, _) = this.parse_expr_res_after_attrs(restrictions, attrs)?;
++                    this.capture_observed_trailing_token(capture_semi && this.token == token::Semi);
+                     Ok((expr, Trailing::No, UsePreAttrPos::Yes))
+                 },
+             )?;
+diff --git a/compiler/rustc_resolve/src/def_collector.rs b/compiler/rustc_resolve/src/def_collector.rs
+index eefaf3d11..3d71cc3ca 100644
+--- a/compiler/rustc_resolve/src/def_collector.rs
++++ b/compiler/rustc_resolve/src/def_collector.rs
+@@ -65,6 +65,7 @@ pub(crate) fn next_macro_use_tree_range(&mut self) -> Option<MacroParserRange> {
+             complete: range.complete,
+             use_trees: Vec::new(),
+             macro_calls: Vec::new(),
++            cfg_components: Default::default(),
+         })
+     }
+ 
+diff --git a/compiler/rustc_resolve/src/macros.rs b/compiler/rustc_resolve/src/macros.rs
+index 87ca088a7..89bc9c20f 100644
+--- a/compiler/rustc_resolve/src/macros.rs
++++ b/compiler/rustc_resolve/src/macros.rs
+@@ -24,7 +24,8 @@
+ use rustc_middle::middle::stability;
+ use rustc_middle::ty::{
+     DeriveHelperUse, DeriveOutputInfluence, MacroImplementationKind, MacroInvocationFragmentKind,
+-    MacroInvocationOrigin, MacroRuleDefinition, MacroRuleSelection, RegisteredTools, TyCtxt,
++    MacroInvocationOrigin, MacroOutputTokenRange, MacroRuleDefinition, MacroRuleSelection,
++    RegisteredTools, TyCtxt,
+ };
+ use rustc_session::Session;
+ use rustc_session::diagnostics::feature_err;
+@@ -166,6 +167,133 @@ fn macro_implementation_kind(ext: &SyntaxExtension) -> MacroImplementationKind {
+     }
+ }
+ 
++/// Checks that every discarded output range is either disjoint from a product or strictly nested
++/// in it. `discarded_outputs` must be sorted and disjoint, and `products` must be sorted by start
++/// and reverse end and form a laminar family.
++///
++/// Adjacent discarded ranges remain separate observations, but their contiguous union must not
++/// cover an entire product. Otherwise the product would be classified as live even though none of
++/// its output survives configuration.
++fn discarded_outputs_fit_products(
++    discarded_outputs: &[MacroOutputTokenRange],
++    products: &[(MacroOutputTokenRange, bool, bool)],
++    mut record_work: impl FnMut(),
++) -> bool {
++    let mut next_product = 0;
++    let mut containing_products = Vec::<MacroOutputTokenRange>::new();
++    for discarded in discarded_outputs {
++        record_work();
++        while let Some((product, _, _)) = products.get(next_product)
++            && product.start <= discarded.start
++        {
++            record_work();
++            while containing_products.last().is_some_and(|parent| parent.end <= product.start) {
++                record_work();
++                containing_products.pop();
++            }
++            containing_products.push(*product);
++            next_product += 1;
++        }
++        while containing_products.last().is_some_and(|product| product.end <= discarded.start) {
++            record_work();
++            containing_products.pop();
++        }
++
++        if containing_products.last().is_some_and(|product| {
++            discarded.end > product.end
++                || (product.start == discarded.start && product.end == discarded.end)
++        }) {
++            return false;
++        }
++        // A product beginning inside the discarded range cannot contain that range. Laminarity
++        // means no later product can make this overlap valid.
++        if products.get(next_product).is_some_and(|(product, _, _)| product.start < discarded.end) {
++            return false;
++        }
++    }
++
++    let mut contiguous_discarded = Vec::<MacroOutputTokenRange>::new();
++    for discarded in discarded_outputs {
++        record_work();
++        if let Some(previous) = contiguous_discarded.last_mut()
++            && previous.end == discarded.start
++        {
++            previous.end = discarded.end;
++        } else {
++            contiguous_discarded.push(*discarded);
++        }
++    }
++
++    let mut next_discarded = 0;
++    for (product, _, _) in products {
++        record_work();
++        while contiguous_discarded
++            .get(next_discarded)
++            .is_some_and(|discarded| discarded.end <= product.start)
++        {
++            record_work();
++            next_discarded += 1;
++        }
++        if contiguous_discarded.get(next_discarded).is_some_and(|discarded| {
++            discarded.start <= product.start && product.end <= discarded.end
++        }) {
++            return false;
++        }
++    }
++
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{MacroOutputTokenRange, discarded_outputs_fit_products};
++
++    fn range(start: u32, end: u32) -> MacroOutputTokenRange {
++        MacroOutputTokenRange { start, end }
++    }
++
++    fn products(ranges: &[(u32, u32)]) -> Vec<(MacroOutputTokenRange, bool, bool)> {
++        ranges.iter().map(|&(start, end)| (range(start, end), true, false)).collect()
++    }
++
++    #[test]
++    fn adjacent_discarded_outputs_must_not_cover_a_product() {
++        let product = products(&[(0, 4)]);
++        assert!(!discarded_outputs_fit_products(&[range(0, 2), range(2, 4)], &product, || {}));
++        assert!(discarded_outputs_fit_products(&[range(0, 1), range(2, 4)], &product, || {}));
++        assert!(discarded_outputs_fit_products(&[range(1, 2), range(2, 3)], &product, || {}));
++
++        let separate_products = products(&[(0, 3), (3, 6)]);
++        assert!(discarded_outputs_fit_products(
++            &[range(1, 3), range(3, 5)],
++            &separate_products,
++            || {}
++        ));
++    }
++
++    #[test]
++    fn discarded_output_product_validation_is_linear() {
++        const COUNT: u32 = 1024;
++        let products =
++            (0..COUNT).map(|index| (range(0, 4 * COUNT - index), true, false)).collect::<Vec<_>>();
++        let discarded_outputs = (0..COUNT)
++            .map(|index| range(COUNT + 2 * index, COUNT + 2 * index + 1))
++            .collect::<Vec<_>>();
++        let mut work = 0;
++        assert!(discarded_outputs_fit_products(&discarded_outputs, &products, || work += 1));
++        assert!(work <= 3 * discarded_outputs.len() + 3 * products.len(), "work: {work}");
++
++        let products = (0..COUNT)
++            .map(|index| (range(4 * index, 4 * index + 4), true, false))
++            .collect::<Vec<_>>();
++        let discarded_outputs =
++            (0..COUNT).map(|index| range(4 * index + 1, 4 * index + 2)).collect::<Vec<_>>();
++        let mut work = 0;
++        assert!(discarded_outputs_fit_products(&discarded_outputs, &products, || work += 1));
++        assert!(work <= 3 * discarded_outputs.len() + 3 * products.len(), "work: {work}");
++    }
++}
++
+ const PREDEFINED_TOOLS: &[Symbol] =
+     &[sym::clippy, sym::rustfmt, sym::diagnostic, sym::miri, sym::rust_analyzer];
+ 
+@@ -571,6 +699,35 @@ fn mark_declarative_macro_output_census_incomplete(&mut self, invocation_id: Loc
+         expansion.complete = false;
+     }
+ 
++    fn record_declarative_macro_discarded_output(
++        &mut self,
++        invocation_id: LocalExpnId,
++        range: Option<rustc_ast::tokenstream::MacroParserSubrange>,
++    ) {
++        let Some(origin) = self.macro_invocation_origins.get_mut(&invocation_id.to_expn_id())
++        else {
++            return;
++        };
++        let Some(expansion) = origin.declarative_expansion.as_mut() else {
++            return;
++        };
++        let Some(range) = range else {
++            expansion.output_census_complete = false;
++            expansion.output_provenance_complete = false;
++            expansion.complete = false;
++            return;
++        };
++        let start = range.range.0.start;
++        let end = range.range.0.end;
++        if !range.complete || start >= end || end as usize > expansion.output_tokens.len() {
++            expansion.output_census_complete = false;
++            expansion.output_provenance_complete = false;
++            expansion.complete = false;
++            return;
++        }
++        expansion.discarded_outputs.push(rustc_middle::ty::MacroOutputTokenRange { start, end });
++    }
++
+     fn finalize_declarative_macro_owner_output(
+         &mut self,
+         invocation_id: LocalExpnId,
+@@ -618,6 +775,17 @@ fn finalize_declarative_macro_owner_output(
+             return;
+         }
+ 
++        expansion.discarded_outputs.sort_by_key(|range| (range.start, range.end));
++        if expansion.discarded_outputs.iter().any(|range| {
++            range.start < root_start || range.start >= range.end || range.end > root_end
++        }) || expansion.discarded_outputs.windows(2).any(|pair| pair[0].end > pair[1].start)
++        {
++            expansion.output_census_complete = false;
++            expansion.output_provenance_complete = false;
++            expansion.complete = false;
++            return;
++        }
++
+         // Product ranges are laminar: a definition can contain child calls, but independent
+         // products cannot partially overlap. Nested products remain classified so consumers can
+         // attach their demand to the nearest containing definition instead of to the root owner.
+@@ -661,6 +829,13 @@ fn finalize_declarative_macro_owner_output(
+             containing_ends.push(range.end);
+         }
+ 
++        if !discarded_outputs_fit_products(&expansion.discarded_outputs, &merged, || {}) {
++            expansion.output_census_complete = false;
++            expansion.output_provenance_complete = false;
++            expansion.complete = false;
++            return;
++        }
++
+         if !classification_precise {
+             intrinsic = true;
+         }
+diff --git a/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs b/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs
+index 4fc959c62..58b0747ba 100644
+--- a/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs
++++ b/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs
+@@ -3,6 +3,7 @@
+ #![feature(macro_attr)]
+ #![feature(macro_derive)]
+ #![feature(macro_metavar_expr)]
++#![feature(where_clause_attrs)]
+ 
+ use macro_rule_observer_proc::{last_spacing, punct_spacing};
+ 
+@@ -304,6 +305,129 @@ macro_rules! cfg_elided_output {
+     () => {
+         #[cfg(any())]
+         fn removed_by_cfg() {}
++
++        #[cfg_attr(all(), cfg(any()))]
++        struct RemovedByCfgAttr;
++    };
++}
++
++macro_rules! cfg_component_ranges {
++    () => {
++        struct ConfiguredComponents {
++            #[cfg(any())]
++            first: i32,
++            #[cfg(all())]
++            retained: i32,
++            kept: i32,
++            #[cfg_attr(all(), cfg(any()))]
++            last: i32,
++        }
++
++        enum ConfiguredChoice {
++            #[cfg(any())]
++            First,
++            Kept,
++            #[cfg_attr(all(), cfg(any()))]
++            Last,
++        }
++
++        trait ConfiguredAssociatedItems {
++            #[cfg(any())]
++            type RemovedAssociatedType;
++
++            #[cfg_attr(all(), cfg(any()))]
++            const REMOVED_ASSOCIATED_CONST: usize;
++        }
++
++        unsafe extern "C" {
++            #[cfg(any())]
++            fn removed_foreign_function();
++
++            #[cfg_attr(all(), cfg(any()))]
++            static REMOVED_FOREIGN_STATIC: i32;
++        }
++
++        fn configure_component_uses(value: ConfiguredComponents) -> ConfiguredComponents {
++            let ConfiguredComponents {
++                #[cfg(any())]
++                first: _,
++                #[cfg(all())]
++                retained,
++                kept,
++                #[cfg_attr(all(), cfg(any()))]
++                last: _,
++            } = value;
++            ConfiguredComponents {
++                #[cfg(any())]
++                first: 0,
++                #[cfg(all())]
++                retained,
++                kept,
++                #[cfg_attr(all(), cfg(any()))]
++                last: 0,
++            }
++        }
++    };
++}
++
++macro_rules! cfg_list_component_ranges {
++    () => {
++        fn configured_parameter_first(
++            #[cfg(any())]
++            removed_parameter_first: u8,
++            kept: i32,
++        ) -> i32 {
++            kept
++        }
++
++        fn configured_parameter_middle(
++            kept_before: i32,
++            #[cfg_attr(all(), cfg(any()))]
++            removed_parameter_middle: u16,
++            kept_after: i32,
++        ) -> i32 {
++            kept_before + kept_after
++        }
++
++        fn configured_parameter_last(
++            kept: i32,
++            #[cfg(any())]
++            removed_parameter_last: u32
++        ) -> i32 {
++            kept
++        }
++
++        fn configured_generics<
++            #[cfg(any())]
++            RemovedGenericFirst,
++            KeptGeneric,
++            #[cfg_attr(all(), cfg(any()))]
++            RemovedGenericLast,
++        >() {
++            let _: Option<KeptGeneric> = None;
++        }
++
++        fn configured_where<T>()
++        where
++            #[cfg(any())]
++            T: DiscardedWhereFirst,
++            T: Sized,
++            #[cfg_attr(all(), cfg(any()))]
++            T: DiscardedWhereSecond,
++        {
++        }
++
++        fn configured_statements() {
++            #[cfg(any())]
++            removed_statement();
++            #[cfg_attr(all(), cfg(any()))]
++            removed_macro_statement!();
++            match 0 {
++                #[cfg(any())]
++                0 => discarded_arm(),
++                _ => (),
++            }
++        }
+     };
+ }
+ 
+@@ -404,6 +528,8 @@ fn accepts_opaque_parameter(_: opaque_parameter_type!()) {}
+ fixed_prefix_spacing!(+prefix_dead@);
+ empty_output!(discarded_name);
+ cfg_elided_output!();
++cfg_component_ranges!();
++cfg_list_component_ranges!();
+ incomplete_empty_output!(
+     /// Documentation makes the matcher token-to-source boundaries ambiguous after desugaring.
+     fn discarded_documented_item() {}
+diff --git a/tests/ui-fulldeps/macro-rule-observer.rs b/tests/ui-fulldeps/macro-rule-observer.rs
+index 3097a328d..65dee4a15 100644
+--- a/tests/ui-fulldeps/macro-rule-observer.rs
++++ b/tests/ui-fulldeps/macro-rule-observer.rs
+@@ -292,6 +292,8 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+         let fixed_prefix_spacing = named_macro(tcx, "fixed_prefix_spacing");
+         let empty_output = named_macro(tcx, "empty_output");
+         let cfg_elided_output = named_macro(tcx, "cfg_elided_output");
++        let cfg_component_ranges = named_macro(tcx, "cfg_component_ranges");
++        let cfg_list_component_ranges = named_macro(tcx, "cfg_list_component_ranges");
+         let semicolon_output = named_macro(tcx, "semicolon_output");
+         let nested_semicolon_output = named_macro(tcx, "nested_semicolon_output");
+         let incomplete_empty_output = named_macro(tcx, "incomplete_empty_output");
+@@ -301,7 +303,7 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+         let deep_repetition = named_macro(tcx, "deep_repetition");
+         let grow_repetition_input = named_macro(tcx, "grow_repetition_input");
+ 
+-        assert_eq!(resolutions.macro_rules_definitions.len(), 58);
++        assert_eq!(resolutions.macro_rules_definitions.len(), 60);
+         assert!(!resolutions.macro_rules_definitions.contains_key(&modern));
+         assert_rule_snippets(
+             tcx,
+@@ -493,6 +495,8 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+                 ((fixed_prefix_spacing, 0), 1),
+                 ((empty_output, 0), 1),
+                 ((cfg_elided_output, 0), 1),
++                ((cfg_component_ranges, 0), 1),
++                ((cfg_list_component_ranges, 0), 1),
+                 ((semicolon_output, 0), 1),
+                 ((nested_semicolon_output, 0), 2),
+                 ((incomplete_empty_output, 0), 1),
+@@ -652,6 +656,17 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+             .owner_output
+             .required_outputs
+             .contains(&prefix_child.output));
++        let (_, cfg_elided_tail_origin) = invocation(cfg_elided_tail, 0);
++        let cfg_elided_tail = cfg_elided_tail_origin.declarative_expansion.as_ref().unwrap();
++        assert!(!cfg_elided_tail.complete, "{cfg_elided_tail:#?}");
++        assert!(cfg_elided_tail.output_census_complete, "{cfg_elided_tail:#?}");
++        assert!(cfg_elided_tail.output_provenance_complete, "{cfg_elided_tail:#?}");
++        assert_eq!(cfg_elided_tail.discarded_outputs.len(), 1, "{cfg_elided_tail:#?}");
++        assert_eq!(cfg_elided_tail.discarded_outputs[0].start, 0);
++        assert_eq!(
++            cfg_elided_tail.discarded_outputs[0].end as usize,
++            cfg_elided_tail.output_tokens.len()
++        );
+ 
+         let (_, recursive_parent_origin) = invocation(recursive_empty_output, 0);
+         let recursive_parent = recursive_parent_origin.declarative_expansion.as_ref().unwrap();
+@@ -837,10 +852,24 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+             emitted.components[outer_component].kind,
+             rustc_middle::ty::MacroTranscriberComponentKind::Repetition
+         );
++        let outer_repetition_source = tcx
++            .sess
++            .source_map()
++            .span_to_snippet(emitted.components[outer_component].span)
++            .unwrap();
++        assert!(outer_repetition_source.starts_with("$("), "{outer_repetition_source:?}");
++        assert!(outer_repetition_source.ends_with(")*"), "{outer_repetition_source:?}");
+         assert_eq!(
+             emitted.components[inner_component].kind,
+             rustc_middle::ty::MacroTranscriberComponentKind::Repetition
+         );
++        let inner_repetition_source = tcx
++            .sess
++            .source_map()
++            .span_to_snippet(emitted.components[inner_component].span)
++            .unwrap();
++        assert!(inner_repetition_source.starts_with("$("), "{inner_repetition_source:?}");
++        assert!(inner_repetition_source.ends_with(")?"), "{inner_repetition_source:?}");
+         assert!(component_has_ancestor(emitted, inner_component, outer_component));
+         assert_eq!(emitted.components[extra_output.component].parent, Some(inner_component));
+         let use_ranges: HashSet<_> = emitted
+@@ -1240,6 +1269,133 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+         assert!(!cfg_elided_output.output_tokens.is_empty());
+         assert!(cfg_elided_output.definitions.is_empty());
+         assert!(cfg_elided_output.child_expansions.is_empty());
++        assert_eq!(cfg_elided_output.discarded_outputs.len(), 2);
++        assert_eq!(cfg_elided_output.discarded_outputs[0].start, 0);
++        assert_eq!(
++            cfg_elided_output.discarded_outputs[1].end as usize,
++            cfg_elided_output.output_tokens.len()
++        );
++        assert_eq!(
++            cfg_elided_output.discarded_outputs[0].end,
++            cfg_elided_output.discarded_outputs[1].start
++        );
++
++        let (_, cfg_component_ranges_origin) = invocation(cfg_component_ranges, 0);
++        let cfg_component_ranges =
++            cfg_component_ranges_origin.declarative_expansion.as_ref().unwrap();
++        assert!(cfg_component_ranges.complete, "{cfg_component_ranges:#?}");
++        assert!(cfg_component_ranges.owner_output.complete, "{cfg_component_ranges:#?}");
++        assert_eq!(cfg_component_ranges.discarded_outputs.len(), 12);
++        assert!(cfg_component_ranges.discarded_outputs.windows(2).all(|pair| {
++            pair[0].end <= pair[1].start
++        }));
++        assert!(cfg_component_ranges.discarded_outputs.iter().all(|discarded| {
++            cfg_component_ranges.definitions.iter().any(|definition| {
++                definition.output.start <= discarded.start
++                    && discarded.end <= definition.output.end
++            })
++        }));
++        let component_snippet = |output: u32| {
++            tcx.sess
++                .source_map()
++                .span_to_snippet(
++                    cfg_component_ranges.components
++                        [cfg_component_ranges.output_tokens[output as usize].component]
++                        .span,
++                )
++                .unwrap()
++        };
++        let discarded_for = |marker: &str| {
++            let matches = cfg_component_ranges
++                .discarded_outputs
++                .iter()
++                .copied()
++                .filter(|discarded| {
++                    (discarded.start..discarded.end)
++                        .any(|output| component_snippet(output) == marker)
++                })
++                .collect::<Vec<_>>();
++            assert_eq!(matches.len(), 1, "{marker}: {matches:#?}");
++            matches[0]
++        };
++        assert!(cfg_component_ranges.discarded_outputs.iter().all(|discarded| {
++            !(discarded.start..discarded.end)
++                .any(|output| component_snippet(output) == "retained")
++        }));
++        let endings = cfg_component_ranges
++            .discarded_outputs
++            .iter()
++            .map(|discarded| component_snippet(discarded.end - 1))
++            .collect::<Vec<_>>();
++        assert_eq!(endings.iter().filter(|ending| ending.as_str() == ",").count(), 8);
++        assert_eq!(endings.iter().filter(|ending| ending.as_str() == ";").count(), 4);
++        for marker in [
++            "RemovedAssociatedType",
++            "REMOVED_ASSOCIATED_CONST",
++            "removed_foreign_function",
++            "REMOVED_FOREIGN_STATIC",
++        ] {
++            let discarded = discarded_for(marker);
++            assert_eq!(component_snippet(discarded.end - 1), ";", "{marker}");
++        }
++
++        let (_, cfg_list_component_ranges_origin) = invocation(cfg_list_component_ranges, 0);
++        let cfg_list_component_ranges =
++            cfg_list_component_ranges_origin.declarative_expansion.as_ref().unwrap();
++        assert!(cfg_list_component_ranges.complete, "{cfg_list_component_ranges:#?}");
++        assert!(
++            cfg_list_component_ranges.owner_output.complete,
++            "{cfg_list_component_ranges:#?}"
++        );
++        assert_eq!(cfg_list_component_ranges.discarded_outputs.len(), 10);
++        assert!(cfg_list_component_ranges.discarded_outputs.windows(2).all(|pair| {
++            pair[0].end <= pair[1].start
++        }));
++        assert!(cfg_list_component_ranges.discarded_outputs.iter().all(|discarded| {
++            cfg_list_component_ranges.definitions.iter().any(|definition| {
++                definition.output.start <= discarded.start
++                    && discarded.end <= definition.output.end
++                    && definition.output != *discarded
++            })
++        }));
++        let component_snippet = |output: u32| {
++            tcx.sess
++                .source_map()
++                .span_to_snippet(
++                    cfg_list_component_ranges.components
++                        [cfg_list_component_ranges.output_tokens[output as usize].component]
++                        .span,
++                )
++                .unwrap()
++        };
++        let discarded_for = |marker: &str| {
++            let matches = cfg_list_component_ranges
++                .discarded_outputs
++                .iter()
++                .copied()
++                .filter(|discarded| {
++                    (discarded.start..discarded.end)
++                        .any(|output| component_snippet(output) == marker)
++                })
++                .collect::<Vec<_>>();
++            assert_eq!(matches.len(), 1, "{marker}: {matches:#?}");
++            matches[0]
++        };
++        for (marker, expected_last) in [
++            ("removed_parameter_first", ","),
++            ("removed_parameter_middle", ","),
++            ("removed_parameter_last", "u32"),
++            ("RemovedGenericFirst", ","),
++            ("RemovedGenericLast", ","),
++            ("DiscardedWhereFirst", ","),
++            ("DiscardedWhereSecond", ","),
++            ("removed_statement", ";"),
++            ("removed_macro_statement", ";"),
++            ("discarded_arm", ","),
++        ] {
++            let discarded = discarded_for(marker);
++            assert_eq!(component_snippet(discarded.end - 1), expected_last, "{marker}");
++        }
+ 
+         let (_, incomplete_empty_origin) = invocation(incomplete_empty_output, 0);
+         let incomplete_empty = incomplete_empty_origin.declarative_expansion.as_ref().unwrap();
+@@ -1294,6 +1450,24 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
+                 .count(),
+             32 * 1024
+         );
++        let first_capture_output = large_repetition_expansion
++            .output_tokens
++            .iter()
++            .find(|origin| origin.component == capture_component)
++            .unwrap();
++        let [iteration] = first_capture_output.iterations.as_slice() else { panic!() };
++        let repetition_component = iteration.repetition_component;
++        assert_eq!(
++            large_repetition_expansion.components[repetition_component].kind,
++            rustc_middle::ty::MacroTranscriberComponentKind::Repetition
++        );
++        assert_eq!(
++            tcx.sess
++                .source_map()
++                .span_to_snippet(large_repetition_expansion.components[repetition_component].span)
++                .unwrap(),
++            "$($token),*"
++        );
+ 
+         let (_, deep_repetition_origin) = invocation(deep_repetition, 0);
+         let deep_repetition_expansion =
+-- 
+2.55.0
+

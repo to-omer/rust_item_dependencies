@@ -190,6 +190,20 @@ fn source_derive_requirements(
     })
 }
 
+fn source_macro_capture_requirements(
+    source: &SourceInventory,
+) -> impl Iterator<Item = SourceRequirement> + '_ {
+    source.macro_capture_slots.iter().flat_map(|slot| {
+        slot.trigger_units
+            .iter()
+            .copied()
+            .map(move |trigger| SourceRequirement {
+                trigger,
+                required: slot.unit,
+            })
+    })
+}
+
 fn source_macro_repetition_disjunctions(
     source: &SourceInventory,
 ) -> impl Iterator<Item = SourceDisjunction> + '_ {
@@ -266,7 +280,7 @@ impl SourceConstraints {
                 .collect(),
             shell_requirements: Vec::new(),
             derive_requirements: source_derive_requirements(source).collect(),
-            macro_rule_requirements: Vec::new(),
+            macro_rule_requirements: source_macro_capture_requirements(source).collect(),
             disjunctions: source_macro_rule_disjunctions(source)
                 .chain(source_macro_repetition_disjunctions(source))
                 .collect(),
@@ -1710,7 +1724,8 @@ fn validate_constraints(
         &constraints.macro_rule_requirements,
         RequirementClass::Semantic,
     )?;
-    if !macro_rules.is_empty() {
+    let expected_macro_rules = source_macro_capture_requirements(source).collect::<BTreeSet<_>>();
+    if macro_rules.iter().copied().collect::<BTreeSet<_>>() != expected_macro_rules {
         return Err(RetentionError::InvalidConstraint);
     }
     let ValidatedDeclarativeMacroConstraints {
@@ -1724,6 +1739,7 @@ fn validate_constraints(
         definition_units,
         declarative_macros,
     )?;
+    validate_macro_capture_slot_coverage(source, macro_graph, &macro_rule_selection_requirements)?;
     let mut singleton_definitions_by_source = vec![Vec::new(); unit_count];
     for (index, unit) in singleton_definition_units.iter().copied().enumerate() {
         if let Some(unit) = unit {
@@ -2091,6 +2107,51 @@ fn validate_macro_rule_selection_requirements(
         return Err(RetentionError::InvalidConstraint);
     }
     Ok(requirements.into_iter().collect())
+}
+
+fn validate_macro_capture_slot_coverage(
+    source: &SourceInventory,
+    graph: &DependencyGraph,
+    selections: &[MacroRuleSelectionRequirement],
+) -> Result<(), RetentionError> {
+    let mut expected_by_rule = BTreeMap::<SourceUnitId, BTreeSet<SourceUnitId>>::new();
+    for slot in &source.macro_capture_slots {
+        let invocations = slot
+            .inputs
+            .iter()
+            .map(|input| input.invocation)
+            .collect::<BTreeSet<_>>();
+        if expected_by_rule
+            .insert(slot.rule, invocations.clone())
+            .is_some_and(|previous| previous != invocations)
+        {
+            return Err(RetentionError::InvalidConstraint);
+        }
+    }
+
+    let mut observed_by_rule = expected_by_rule
+        .keys()
+        .copied()
+        .map(|rule| (rule, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for selection in selections {
+        let Some(observed) = observed_by_rule.get_mut(&selection.rule) else {
+            continue;
+        };
+        let invocation = graph
+            .expansions
+            .get(selection.expansion.0 as usize)
+            .filter(|expansion| expansion.id == selection.expansion)
+            .and_then(|expansion| expansion.written_invocation)
+            .ok_or(RetentionError::InvalidConstraint)?;
+        if !observed.insert(invocation) {
+            return Err(RetentionError::InvalidConstraint);
+        }
+    }
+    if observed_by_rule != expected_by_rule {
+        return Err(RetentionError::InvalidConstraint);
+    }
+    Ok(())
 }
 
 fn macro_rule_selection_definition(
@@ -2582,6 +2643,7 @@ fn validate_source(source: &SourceInventory) -> Result<(), RetentionError> {
         &source.units,
         &source.macro_rules,
         &source.macro_templates,
+        &source.macro_capture_slots,
         &source.macro_repetitions,
     )
     .map_err(|_| RetentionError::InvalidSource)?;

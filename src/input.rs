@@ -49,6 +49,7 @@ use crate::expansions::{ExpansionError, collect_expansions, collect_macro_proven
 use crate::external::PreparedProcMacroLoadState;
 use crate::external::{ExternalCrate, PreparedExternalCrates, prepare_external_crates};
 use crate::graph::{DefinitionGraph, DefinitionKind, DefinitionOrigin};
+use crate::macro_output::ValidatedDeclarativeOutputs;
 use crate::monomorphization::{
     CollectedMonomorphization, MonomorphizationError, collect_monomorphization,
 };
@@ -831,6 +832,16 @@ struct CollectedDependencies {
     definition_identity_universe: DefinitionIdentityUniverse,
 }
 
+struct DependencyCollectionInput<'a> {
+    inventory: &'a SourceInventory,
+    declarative_outputs: &'a ValidatedDeclarativeOutputs,
+    coordinates: Option<&'a SourceRewrite>,
+    expected_definition_identity: Option<&'a DefinitionIdentityUniverse>,
+    external_artifact_directories: &'a [PathBuf],
+    crate_type: CrateType,
+    entry_points: &'a [ResolvedEntryPoint],
+}
+
 struct CompilerInspection {
     source: SourceInventory,
     definitions: Option<DefinitionGraph>,
@@ -874,6 +885,7 @@ fn run_inspection(
         proc_macro_load_state: context.external_crates().proc_macro_load_state(),
         result: Arc::clone(&result),
         inventory: None,
+        declarative_outputs: None,
         collection_mode,
         coordinates: coordinates.cloned(),
         expected_definition_identity: expected_identity.cloned(),
@@ -1158,6 +1170,7 @@ struct InputCallbacks {
     proc_macro_load_state: PreparedProcMacroLoadState,
     result: Arc<Mutex<Option<Result<CompilerInspection, InputError>>>>,
     inventory: Option<SourceInventory>,
+    declarative_outputs: Option<ValidatedDeclarativeOutputs>,
     collection_mode: CollectionMode,
     coordinates: Option<SourceRewrite>,
     expected_definition_identity: Option<DefinitionIdentityUniverse>,
@@ -1429,6 +1442,7 @@ impl Callbacks for InputCallbacks {
             return Compilation::Stop;
         }
         self.expansion_complete.store(true, Ordering::Relaxed);
+        let declarative_outputs = ValidatedDeclarativeOutputs::collect(tcx);
         #[cfg(rust_item_dependencies_patched)]
         if let Some(error) = validate_attribute_expansions(tcx, &self.offsets) {
             return self.finish(Err(error));
@@ -1498,11 +1512,13 @@ impl Callbacks for InputCallbacks {
                 self.inventory
                     .as_mut()
                     .expect("source inventory must survive through expansion"),
+                &declarative_outputs,
                 omit_one_selection,
             ) {
                 return self.finish(Err(error.into()));
             }
         }
+        self.declarative_outputs = Some(declarative_outputs);
         tcx.ensure_ok().early_lint_checks(());
         if let Err(error) = validate_standard_entry(tcx, self.crate_type) {
             return self.finish(Err(error));
@@ -1525,25 +1541,31 @@ impl Callbacks for InputCallbacks {
             .inventory
             .as_ref()
             .expect("source inventory must survive through analysis");
+        let declarative_outputs = self
+            .declarative_outputs
+            .as_ref()
+            .expect("declarative outputs must survive through analysis");
         let (definitions, dependencies) = match self.collection_mode {
             CollectionMode::Source => (None, None),
-            CollectionMode::Definitions => match collect_definition_graph(compiler, tcx, inventory)
-            {
-                Ok(definitions) => (Some(definitions), None),
-                Err(error) => return self.finish(Err(error.into())),
-            },
+            CollectionMode::Definitions => {
+                match collect_definition_graph(compiler, tcx, inventory, declarative_outputs) {
+                    Ok(definitions) => (Some(definitions), None),
+                    Err(error) => return self.finish(Err(error.into())),
+                }
+            }
             CollectionMode::Dependencies => {
                 match collect_dependency_graph(
                     compiler,
                     tcx,
-                    inventory,
-                    (
-                        self.coordinates.as_ref(),
-                        self.expected_definition_identity.as_ref(),
-                    ),
-                    &self.external_artifact_directories,
-                    self.crate_type,
-                    &entry_points,
+                    DependencyCollectionInput {
+                        inventory,
+                        declarative_outputs,
+                        coordinates: self.coordinates.as_ref(),
+                        expected_definition_identity: self.expected_definition_identity.as_ref(),
+                        external_artifact_directories: &self.external_artifact_directories,
+                        crate_type: self.crate_type,
+                        entry_points: &entry_points,
+                    },
                 ) {
                     Ok(dependencies) => (None, Some(dependencies)),
                     Err(error) => return self.finish(Err(error.into())),
@@ -1613,14 +1635,18 @@ fn validate_no_main_target_entry(tcx: TyCtxt<'_>, crate_type: CrateType) -> Resu
 fn collect_dependency_graph(
     compiler: &Compiler,
     tcx: TyCtxt<'_>,
-    source: &SourceInventory,
-    definition_identity: (Option<&SourceRewrite>, Option<&DefinitionIdentityUniverse>),
-    external_artifact_directories: &[PathBuf],
-    crate_type: CrateType,
-    entry_points: &[ResolvedEntryPoint],
+    input: DependencyCollectionInput<'_>,
 ) -> Result<CollectedDependencies, DependencyError> {
-    let (coordinates, expected_identity) = definition_identity;
-    let provenance = collect_macro_provenance(compiler, tcx, source)?;
+    let DependencyCollectionInput {
+        inventory: source,
+        declarative_outputs: outputs,
+        coordinates,
+        expected_definition_identity: expected_identity,
+        external_artifact_directories,
+        crate_type,
+        entry_points,
+    } = input;
+    let provenance = collect_macro_provenance(compiler, tcx, source, outputs)?;
     let mut definitions = collect_definitions_with_identity(
         compiler,
         tcx,
