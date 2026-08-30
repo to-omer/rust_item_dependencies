@@ -267,7 +267,7 @@ index f5d581624..cd0456a88 100644
 +    std::fs::create_dir_all(directory).unwrap();
 +    let destination = directory.join(source.file_name().unwrap());
 +    std::fs::copy(source, &destination).unwrap();
-+    destination
++    std::fs::canonicalize(destination).unwrap()
 +}
 +
  fn compiler_paths(args: &[String]) -> (PathBuf, Option<&Path>) {
@@ -298,4 +298,3 @@ index f5d581624..cd0456a88 100644
      }
 -- 
 2.55.0
-
