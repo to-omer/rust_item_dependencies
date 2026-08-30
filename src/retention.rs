@@ -1,7 +1,7 @@
 //! Deterministic source-retention fixed point over the owned compiler graph.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rustc_hir::def::DefKind;
@@ -309,7 +309,7 @@ pub(crate) fn collect_source_constraints(
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
     definitions: &CollectedDefinitions,
-    external_artifact_directory: Option<&Path>,
+    external_artifact_directories: &[PathBuf],
 ) -> Result<SourceConstraints, RetentionError> {
     validate_source(source)?;
     let local_definitions = reverse_local_definitions(tcx, definitions)?;
@@ -322,7 +322,7 @@ pub(crate) fn collect_source_constraints(
         definitions,
         &local_definitions,
         &definition_units,
-        external_artifact_directory,
+        external_artifact_directories,
     )
     .map_err(|_| RetentionError::IncompleteExternalCrateConstraints)?;
 

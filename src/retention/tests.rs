@@ -6913,7 +6913,7 @@ fn missing_external_activation_is_an_observation_gap() {
 }
 
 #[test]
-fn removable_user_external_native_link_metadata_is_rejected() {
+fn all_user_external_native_link_metadata_is_rejected() {
     let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     let units = vec![
         unit(0, WrittenUnitKind::CrateRoot, (0, 48), None, 0),
@@ -6954,10 +6954,16 @@ fn removable_user_external_native_link_metadata_is_rejected() {
     );
 
     constraints.external_crates.activations[0].source = Some(SourceUnitId(0));
-    assert!(compute_retention(&inventory, &graph, &constraints).is_ok());
+    assert_eq!(
+        compute_retention(&inventory, &graph, &constraints),
+        Err(RetentionError::UnsupportedExternalNativeLink)
+    );
 
     constraints.external_crates.activations[0].source = None;
-    assert!(compute_retention(&inventory, &graph, &constraints).is_ok());
+    assert_eq!(
+        compute_retention(&inventory, &graph, &constraints),
+        Err(RetentionError::UnsupportedExternalNativeLink)
+    );
 }
 
 #[test]

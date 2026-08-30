@@ -45,6 +45,8 @@ use crate::error::{AnalysisError, EntryPointError, UnsupportedReason};
 #[cfg(all(test, rust_item_dependencies_patched))]
 use crate::expansions::validated_outputless_macro_expansions;
 use crate::expansions::{ExpansionError, collect_expansions, collect_macro_provenance};
+#[cfg(rust_item_dependencies_patched)]
+use crate::external::PreparedProcMacroLoadState;
 use crate::external::{ExternalCrate, PreparedExternalCrates, prepare_external_crates};
 use crate::graph::{DefinitionGraph, DefinitionKind, DefinitionOrigin};
 use crate::monomorphization::{
@@ -869,12 +871,7 @@ fn run_inspection(
         #[cfg(rust_item_dependencies_patched)]
         denied_proc_macro: Arc::clone(&denied_proc_macro),
         #[cfg(rust_item_dependencies_patched)]
-        allowed_proc_macro_artifacts: context
-            .external_crates()
-            .proc_macro_execution_artifacts()
-            .iter()
-            .map(|artifact| artifact.artifact().to_owned())
-            .collect(),
+        proc_macro_load_state: context.external_crates().proc_macro_load_state(),
         result: Arc::clone(&result),
         inventory: None,
         collection_mode,
@@ -886,10 +883,11 @@ fn run_inspection(
             .iter()
             .map(|external| external.extern_name().to_owned())
             .collect(),
-        external_artifact_directory: context
+        external_artifact_directories: context
             .external_crates()
-            .search_directory()
-            .map(PathBuf::from),
+            .artifact_directories()
+            .map(Path::to_owned)
+            .collect(),
         crate_type: context.crate_type(),
         crate_name: context.crate_name().to_owned(),
         entry_points: context.entry_points().cloned().collect(),
@@ -1094,7 +1092,7 @@ fn compiler_arguments(context: &CompilationContext<'_>) -> Vec<String> {
             external.artifact_argument()
         ));
     }
-    if let Some(directory) = context.external_crates().search_directory() {
+    for directory in context.external_crates().search_directories() {
         arguments.push("-L".to_owned());
         arguments.push(format!("dependency={directory}"));
         arguments.push("-L".to_owned());
@@ -1157,14 +1155,14 @@ struct InputCallbacks {
     #[cfg(rust_item_dependencies_patched)]
     denied_proc_macro: Arc<Mutex<Option<DeniedFile>>>,
     #[cfg(rust_item_dependencies_patched)]
-    allowed_proc_macro_artifacts: BTreeSet<PathBuf>,
+    proc_macro_load_state: PreparedProcMacroLoadState,
     result: Arc<Mutex<Option<Result<CompilerInspection, InputError>>>>,
     inventory: Option<SourceInventory>,
     collection_mode: CollectionMode,
     coordinates: Option<SourceRewrite>,
     expected_definition_identity: Option<DefinitionIdentityUniverse>,
     direct_external_crates: BTreeSet<String>,
-    external_artifact_directory: Option<PathBuf>,
+    external_artifact_directories: Vec<PathBuf>,
     crate_type: CrateType,
     crate_name: String,
     entry_points: Vec<EntryPoint>,
@@ -1362,12 +1360,13 @@ impl Callbacks for InputCallbacks {
                         .push(span);
                 }));
 
-            let allowed = self.allowed_proc_macro_artifacts.clone();
+            let load_state = self.proc_macro_load_state.clone();
+            let load_observer = load_state.clone();
             let denied_proc_macro = Arc::clone(&self.denied_proc_macro);
             let diagnostics = Arc::clone(&self.diagnostics);
-            config.proc_macro_load_guard =
-                Some(rustc_driver::ProcMacroLoadGuard::new(move |artifact| {
-                    if allowed.contains(artifact) {
+            config.proc_macro_load_guard = Some(
+                rustc_driver::ProcMacroLoadGuard::new(move |artifact| {
+                    if load_state.is_allowed(artifact) {
                         return true;
                     }
                     let diagnostic_index = diagnostics
@@ -1387,7 +1386,9 @@ impl Callbacks for InputCallbacks {
                         }
                     }
                     false
-                }));
+                })
+                .with_load_observer(move |artifact| load_observer.loaded(artifact)),
+            );
         }
     }
 
@@ -1540,7 +1541,7 @@ impl Callbacks for InputCallbacks {
                         self.coordinates.as_ref(),
                         self.expected_definition_identity.as_ref(),
                     ),
-                    self.external_artifact_directory.as_deref(),
+                    &self.external_artifact_directories,
                     self.crate_type,
                     &entry_points,
                 ) {
@@ -1614,7 +1615,7 @@ fn collect_dependency_graph(
     tcx: TyCtxt<'_>,
     source: &SourceInventory,
     definition_identity: (Option<&SourceRewrite>, Option<&DefinitionIdentityUniverse>),
-    external_artifact_directory: Option<&Path>,
+    external_artifact_directories: &[PathBuf],
     crate_type: CrateType,
     entry_points: &[ResolvedEntryPoint],
 ) -> Result<CollectedDependencies, DependencyError> {
@@ -1641,7 +1642,7 @@ fn collect_dependency_graph(
                 tcx,
                 source,
                 &definitions,
-                external_artifact_directory,
+                external_artifact_directories,
             )
         })
         .transpose()?;
@@ -1715,7 +1716,7 @@ fn collect_dependency_graph(
                 tcx,
                 source,
                 &definitions,
-                external_artifact_directory,
+                external_artifact_directories,
             )
         },
         Ok,
