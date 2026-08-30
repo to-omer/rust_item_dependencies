@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(windows)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, Weak};
 
 use crate::digest::sha256;
 use crate::error::AnalysisError;
@@ -27,6 +27,7 @@ const SNAPSHOT_DIRECTORY_ATTEMPTS: u64 = 1_024;
 const SNAPSHOT_PARENT_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_PARENT";
 const SNAPSHOT_OWNER_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_OWNER";
 const ANALYZER_SNAPSHOT_PREFIX: &str = "rust-item-dependencies-";
+const SNAPSHOT_PROBE_PREFIX: &str = "rust-item-dependencies-probe-";
 #[cfg(windows)]
 const PROCESS_OWNER_PREFIX: &str = ".rust-item-dependencies-owner-";
 #[cfg(windows)]
@@ -70,7 +71,7 @@ pub(crate) struct PreparedExternalCrates {
     direct: Vec<PreparedExternalCrate>,
     dependencies: Vec<PreparedDependencyArtifact>,
     proc_macro_execution_artifacts: Vec<PreparedProcMacroExecutionArtifact>,
-    snapshot: Option<PreparedSnapshot>,
+    snapshot: Option<SnapshotDirectory>,
 }
 
 impl PreparedExternalCrates {
@@ -86,8 +87,78 @@ impl PreparedExternalCrates {
         &self.proc_macro_execution_artifacts
     }
 
-    pub(crate) fn search_directory(&self) -> Option<&str> {
-        self.snapshot.as_ref().map(PreparedSnapshot::argument)
+    pub(crate) fn search_directories(&self) -> impl Iterator<Item = &str> {
+        let analyzer = self.snapshot.iter().map(SnapshotDirectory::argument);
+        #[cfg(windows)]
+        {
+            analyzer.chain(
+                self.proc_macro_execution_artifacts
+                    .iter()
+                    .map(|artifact| artifact.snapshot.argument()),
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            analyzer
+        }
+    }
+
+    pub(crate) fn artifact_directories(&self) -> impl Iterator<Item = &Path> {
+        let analyzer = self.snapshot.iter().map(SnapshotDirectory::path);
+        #[cfg(windows)]
+        {
+            analyzer.chain(
+                self.proc_macro_execution_artifacts
+                    .iter()
+                    .map(|artifact| artifact.snapshot.path()),
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            analyzer
+        }
+    }
+
+    pub(crate) fn proc_macro_load_state(&self) -> PreparedProcMacroLoadState {
+        let allowed = self
+            .proc_macro_execution_artifacts
+            .iter()
+            .map(|artifact| artifact.artifact.clone())
+            .collect();
+        #[cfg(windows)]
+        let snapshots = self
+            .proc_macro_execution_artifacts
+            .iter()
+            .map(|artifact| (artifact.artifact.clone(), artifact.snapshot.clone()))
+            .collect();
+        PreparedProcMacroLoadState {
+            allowed,
+            #[cfg(windows)]
+            snapshots,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PreparedProcMacroLoadState {
+    allowed: BTreeSet<PathBuf>,
+    #[cfg(windows)]
+    snapshots: BTreeMap<PathBuf, ProcessSnapshot>,
+}
+
+impl PreparedProcMacroLoadState {
+    pub(crate) fn is_allowed(&self, artifact: &Path) -> bool {
+        self.allowed.contains(artifact)
+    }
+
+    pub(crate) fn loaded(&self, artifact: &Path) {
+        #[cfg(windows)]
+        self.snapshots
+            .get(artifact)
+            .expect("an allowed procedural macro must have a prepared snapshot")
+            .pin();
+        #[cfg(not(windows))]
+        let _ = artifact;
     }
 }
 
@@ -151,12 +222,24 @@ impl PreparedDependencyArtifact {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct PreparedProcMacroExecutionArtifact {
     file_name: String,
     artifact: PathBuf,
     digest: [u8; 32],
+    #[cfg(windows)]
+    snapshot: ProcessSnapshot,
 }
+
+impl PartialEq for PreparedProcMacroExecutionArtifact {
+    fn eq(&self, other: &Self) -> bool {
+        self.file_name == other.file_name
+            && self.artifact == other.artifact
+            && self.digest == other.digest
+    }
+}
+
+impl Eq for PreparedProcMacroExecutionArtifact {}
 
 impl PreparedProcMacroExecutionArtifact {
     pub(crate) fn file_name(&self) -> &str {
@@ -169,31 +252,6 @@ impl PreparedProcMacroExecutionArtifact {
 
     pub(crate) fn digest(&self) -> [u8; 32] {
         self.digest
-    }
-}
-
-#[derive(Debug)]
-enum PreparedSnapshot {
-    Analyzer(SnapshotDirectory),
-    #[cfg(windows)]
-    Process(ProcessSnapshot),
-}
-
-impl PreparedSnapshot {
-    fn path(&self) -> &Path {
-        match self {
-            Self::Analyzer(snapshot) => snapshot.path(),
-            #[cfg(windows)]
-            Self::Process(snapshot) => snapshot.path(),
-        }
-    }
-
-    fn argument(&self) -> &str {
-        match self {
-            Self::Analyzer(snapshot) => snapshot.argument(),
-            #[cfg(windows)]
-            Self::Process(snapshot) => snapshot.argument(),
-        }
     }
 }
 
@@ -263,11 +321,6 @@ impl SnapshotDirectory {
             .expect("snapshot location must exist")
             .argument()
     }
-
-    #[cfg(windows)]
-    fn persist(mut self) -> SnapshotLocation {
-        self.0.take().expect("snapshot location must exist")
-    }
 }
 
 fn snapshot_parent() -> Result<PathBuf, AnalysisError> {
@@ -292,22 +345,46 @@ impl Drop for SnapshotDirectory {
 
 #[cfg(windows)]
 #[derive(Clone, Debug)]
-struct ProcessSnapshot(SnapshotLocation);
+struct ProcessSnapshot {
+    store: ProcessStoreKey,
+    snapshot: Arc<SnapshotDirectory>,
+}
 
 #[cfg(windows)]
 impl ProcessSnapshot {
     fn path(&self) -> &Path {
-        self.0.path()
+        self.snapshot.path()
     }
 
     fn argument(&self) -> &str {
-        self.0.argument()
+        self.snapshot.argument()
+    }
+
+    fn pin(&self) {
+        let stores = PROCESS_EXTERNAL_STORES.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut stores = stores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store = stores
+            .get_mut(&self.store)
+            .expect("a prepared procedural macro store must remain registered");
+        if !store
+            .loaded
+            .iter()
+            .any(|snapshot| Arc::ptr_eq(snapshot, &self.snapshot))
+        {
+            store.loaded.push(Arc::clone(&self.snapshot));
+        }
     }
 }
 
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ArtifactSetKey(Vec<(String, ExternalArtifactKind, [u8; 32])>);
+struct ArtifactKey {
+    file_name: String,
+    kind: ExternalArtifactKind,
+    digest: [u8; 32],
+}
 
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -321,7 +398,8 @@ struct ProcessStoreKey {
 struct ProcessExternalArtifactStore {
     root: PathBuf,
     _owner: File,
-    snapshots: BTreeMap<ArtifactSetKey, ProcessSnapshot>,
+    snapshots: BTreeMap<ArtifactKey, Weak<SnapshotDirectory>>,
+    loaded: Vec<Arc<SnapshotDirectory>>,
 }
 
 #[cfg(windows)]
@@ -386,6 +464,7 @@ impl ProcessExternalArtifactStore {
                         root: root_path,
                         _owner: owner,
                         snapshots: BTreeMap::new(),
+                        loaded: Vec::new(),
                     });
                 }
                 Err(error) => {
@@ -404,28 +483,25 @@ impl ProcessExternalArtifactStore {
 
     fn snapshot(
         &mut self,
-        staged: &BTreeMap<String, RequestedArtifact>,
-    ) -> Result<ProcessSnapshot, AnalysisError> {
-        let key = ArtifactSetKey(
-            staged
-                .values()
-                .map(|artifact| {
-                    (
-                        artifact.file_name.clone(),
-                        artifact.kind,
-                        artifact.loaded.digest,
-                    )
-                })
-                .collect(),
-        );
-        if let Some(snapshot) = self.snapshots.get(&key) {
-            return Ok(snapshot.clone());
+        artifact: &RequestedArtifact,
+    ) -> Result<Arc<SnapshotDirectory>, AnalysisError> {
+        let key = ArtifactKey {
+            file_name: artifact.file_name.clone(),
+            kind: artifact.kind,
+            digest: artifact.loaded.digest,
+        };
+        if let Some(snapshot) = self.snapshots.get(&key).and_then(Weak::upgrade) {
+            return Ok(snapshot);
         }
 
-        let snapshot = SnapshotDirectory::create(&self.root, PROCESS_SNAPSHOT_PREFIX)?;
-        stage_artifacts(&snapshot, staged)?;
-        let snapshot = ProcessSnapshot(snapshot.persist());
-        self.snapshots.insert(key, snapshot.clone());
+        let snapshot = Arc::new(SnapshotDirectory::create(
+            &self.root,
+            PROCESS_SNAPSHOT_PREFIX,
+        )?);
+        write_snapshot_artifact(&snapshot, artifact).map_err(|error| {
+            snapshot_failure(snapshot.path().join(&artifact.file_name), error.kind())
+        })?;
+        self.snapshots.insert(key, Arc::downgrade(&snapshot));
         Ok(snapshot)
     }
 }
@@ -480,28 +556,50 @@ fn reap_stale_process_stores(
 
 #[cfg(windows)]
 fn process_snapshot(
-    parent: &Path,
-    staged: &BTreeMap<String, RequestedArtifact>,
+    key: &ProcessStoreKey,
+    artifact: &RequestedArtifact,
     parent_lock: &SnapshotParentLock,
 ) -> Result<ProcessSnapshot, AnalysisError> {
-    let key = ProcessStoreKey {
-        parent: parent.to_owned(),
-        token: configured_process_store_token()?,
-    };
     let stores = PROCESS_EXTERNAL_STORES.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut stores = stores
         .lock()
-        .expect("process external artifact store mutex is poisoned");
-    if !stores.contains_key(&key) {
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !stores.contains_key(key) {
         stores.insert(
             key.clone(),
-            ProcessExternalArtifactStore::create(parent, key.token.as_deref(), parent_lock)?,
+            ProcessExternalArtifactStore::create(&key.parent, key.token.as_deref(), parent_lock)?,
         );
     }
-    stores
-        .get_mut(&key)
+    let snapshot = stores
+        .get_mut(key)
         .expect("process external artifact store must exist")
-        .snapshot(staged)
+        .snapshot(artifact)?;
+    Ok(ProcessSnapshot {
+        store: key.clone(),
+        snapshot,
+    })
+}
+
+#[cfg(windows)]
+fn process_store_root(
+    key: &ProcessStoreKey,
+    parent_lock: &SnapshotParentLock,
+) -> Result<PathBuf, AnalysisError> {
+    let stores = PROCESS_EXTERNAL_STORES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut stores = stores
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !stores.contains_key(key) {
+        stores.insert(
+            key.clone(),
+            ProcessExternalArtifactStore::create(&key.parent, key.token.as_deref(), parent_lock)?,
+        );
+    }
+    Ok(stores
+        .get(key)
+        .expect("process external artifact store must exist")
+        .root
+        .clone())
 }
 
 #[cfg(windows)]
@@ -521,25 +619,88 @@ fn configured_process_store_token() -> Result<Option<String>, AnalysisError> {
         .ok_or_else(|| snapshot_failure(path, io::ErrorKind::InvalidInput))
 }
 
-fn prepare_snapshot(
+struct PreparedSnapshots {
+    analyzer: Option<SnapshotDirectory>,
+    #[cfg(windows)]
+    proc_macros: BTreeMap<(String, [u8; 32]), ProcessSnapshot>,
+}
+
+impl PreparedSnapshots {
+    fn artifact_path(&self, artifact: &RequestedArtifact) -> PathBuf {
+        #[cfg(windows)]
+        if let Some(snapshot) = self
+            .proc_macros
+            .get(&(artifact.file_name.clone(), artifact.loaded.digest))
+        {
+            return snapshot.path().join(&artifact.file_name);
+        }
+        self.analyzer
+            .as_ref()
+            .expect("every ordinary external artifact must have an analyzer snapshot")
+            .path()
+            .join(&artifact.file_name)
+    }
+}
+
+fn prepare_snapshots(
     parent: &Path,
     staged: &BTreeMap<String, RequestedArtifact>,
-    process_owned: bool,
-) -> Result<PreparedSnapshot, AnalysisError> {
+    proc_macro_execution_artifacts: &BTreeSet<(String, [u8; 32])>,
+) -> Result<PreparedSnapshots, AnalysisError> {
     #[cfg(windows)]
     {
         let parent_lock = SnapshotParentLock::acquire(parent)?;
         reap_stale_process_stores(parent, &parent_lock)?;
-        if process_owned {
-            return process_snapshot(parent, staged, &parent_lock).map(PreparedSnapshot::Process);
+        let key = ProcessStoreKey {
+            parent: parent.to_owned(),
+            token: configured_process_store_token()?,
+        };
+        let root = process_store_root(&key, &parent_lock)?;
+        validate_snapshot_file_names(&root, staged)?;
+        let ordinary = staged
+            .iter()
+            .filter(|(_, artifact)| {
+                !proc_macro_execution_artifacts
+                    .contains(&(artifact.file_name.clone(), artifact.loaded.digest))
+            })
+            .map(|(name, artifact)| (name.clone(), artifact.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let analyzer = if ordinary.is_empty() {
+            None
+        } else {
+            let snapshot = SnapshotDirectory::create(&root, ANALYZER_SNAPSHOT_PREFIX)?;
+            stage_artifacts(&snapshot, &ordinary)?;
+            Some(snapshot)
+        };
+        let mut proc_macros = BTreeMap::new();
+        for artifact in staged.values().filter(|artifact| {
+            proc_macro_execution_artifacts
+                .contains(&(artifact.file_name.clone(), artifact.loaded.digest))
+        }) {
+            let snapshot = process_snapshot(&key, artifact, &parent_lock)?;
+            proc_macros.insert(
+                (artifact.file_name.clone(), artifact.loaded.digest),
+                snapshot,
+            );
         }
+        Ok(PreparedSnapshots {
+            analyzer,
+            proc_macros,
+        })
     }
     #[cfg(not(windows))]
-    let _ = process_owned;
-
-    let snapshot = SnapshotDirectory::create(parent, ANALYZER_SNAPSHOT_PREFIX)?;
-    stage_artifacts(&snapshot, staged)?;
-    Ok(PreparedSnapshot::Analyzer(snapshot))
+    {
+        let _ = proc_macro_execution_artifacts;
+        validate_snapshot_file_names(parent, staged)?;
+        let analyzer = if staged.is_empty() {
+            None
+        } else {
+            let snapshot = SnapshotDirectory::create(parent, ANALYZER_SNAPSHOT_PREFIX)?;
+            stage_artifacts(&snapshot, staged)?;
+            Some(snapshot)
+        };
+        Ok(PreparedSnapshots { analyzer })
+    }
 }
 
 fn reap_snapshot_parent(parent: &Path) -> Result<(), AnalysisError> {
@@ -625,13 +786,12 @@ pub(crate) fn prepare_external_crates<'a>(
             .map(|(_, artifact)| artifact)
             .chain(dependency_requests.iter()),
     )?;
-    let process_owned = !proc_macro_execution_artifacts.is_empty();
-    let snapshot = prepare_snapshot(&snapshot_parent, &staged, process_owned)?;
+    let snapshots = prepare_snapshots(&snapshot_parent, &staged, &proc_macro_execution_artifacts)?;
 
     let mut direct = direct_requests
         .into_iter()
         .map(|(extern_name, artifact)| PreparedExternalCrate {
-            artifact: snapshot.path().join(&artifact.file_name),
+            artifact: snapshots.artifact_path(&artifact),
             extern_name,
             file_name: artifact.file_name,
             digest: artifact.loaded.digest,
@@ -668,10 +828,35 @@ pub(crate) fn prepare_external_crates<'a>(
 
     let proc_macro_execution_artifacts = proc_macro_execution_artifacts
         .into_iter()
-        .map(|(file_name, digest)| PreparedProcMacroExecutionArtifact {
-            artifact: snapshot.path().join(&file_name),
-            file_name,
-            digest,
+        .map(|(file_name, digest)| {
+            #[cfg(windows)]
+            let snapshot = snapshots
+                .proc_macros
+                .get(&(file_name.clone(), digest))
+                .expect("every permitted procedural macro must have a process snapshot")
+                .clone();
+            let artifact = {
+                #[cfg(windows)]
+                {
+                    snapshot.path().join(&file_name)
+                }
+                #[cfg(not(windows))]
+                {
+                    snapshots
+                        .analyzer
+                        .as_ref()
+                        .expect("every external artifact must have an analyzer snapshot")
+                        .path()
+                        .join(&file_name)
+                }
+            };
+            PreparedProcMacroExecutionArtifact {
+                artifact,
+                file_name,
+                digest,
+                #[cfg(windows)]
+                snapshot,
+            }
         })
         .collect();
 
@@ -679,7 +864,7 @@ pub(crate) fn prepare_external_crates<'a>(
         direct,
         dependencies,
         proc_macro_execution_artifacts,
-        snapshot: Some(snapshot),
+        snapshot: snapshots.analyzer,
     })
 }
 
@@ -878,6 +1063,11 @@ fn write_snapshot_artifact(
     artifact: &RequestedArtifact,
 ) -> io::Result<()> {
     let path = snapshot.path().join(&artifact.file_name);
+    let mut file = create_snapshot_file(&path)?;
+    file.write_all(&artifact.loaded.bytes)
+}
+
+fn create_snapshot_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -885,8 +1075,43 @@ fn write_snapshot_artifact(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    file.write_all(&artifact.loaded.bytes)
+    options.open(path)
+}
+
+fn validate_snapshot_file_names(
+    parent: &Path,
+    staged: &BTreeMap<String, RequestedArtifact>,
+) -> Result<(), AnalysisError> {
+    if staged.is_empty() {
+        return Ok(());
+    }
+    let probe = SnapshotDirectory::create(parent, SNAPSHOT_PROBE_PREFIX)?;
+    let mut written = Vec::new();
+    for artifact in staged.values() {
+        match create_snapshot_file(&probe.path().join(&artifact.file_name)) {
+            Ok(_) => written.push(artifact),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let Some(previous) = matching_snapshot_artifact(&probe, artifact, &written) else {
+                    return Err(snapshot_failure(
+                        probe.path().join(&artifact.file_name),
+                        error.kind(),
+                    ));
+                };
+                return Err(AnalysisError::ConflictingExternalCrateArtifactName {
+                    file_name: artifact.file_name.clone(),
+                    first_path: previous.original_path.clone(),
+                    second_path: artifact.original_path.clone(),
+                });
+            }
+            Err(error) => {
+                return Err(snapshot_failure(
+                    probe.path().join(&artifact.file_name),
+                    error.kind(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn stage_artifacts(
@@ -1056,7 +1281,9 @@ mod tests {
         let direct = directory.artifact("libdirect.rlib", b"direct");
         let dependency = directory.artifact("libdependency.rlib", b"dependency");
         let prepared = prepare(&[("direct", &direct)], &[&dependency]).unwrap();
-        let snapshot_directory = PathBuf::from(prepared.search_directory().unwrap());
+        let snapshot_directories = prepared.search_directories().collect::<Vec<_>>();
+        assert_eq!(snapshot_directories.len(), 1);
+        let snapshot_directory = PathBuf::from(snapshot_directories[0]);
 
         fs::write(&direct, b"changed").unwrap();
         fs::write(&dependency, b"changed").unwrap();
@@ -1151,30 +1378,256 @@ mod tests {
             b"trusted native code"
         );
         assert_ne!(permissions[0].artifact(), dynamic);
+        assert!(
+            prepared
+                .artifact_directories()
+                .any(|directory| permissions[0].artifact().parent() == Some(directory))
+        );
+        let load_state = prepared.proc_macro_load_state();
+        assert!(load_state.is_allowed(permissions[0].artifact()));
+        assert!(!load_state.is_allowed(&dynamic));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn permitted_identical_artifacts_share_a_snapshot_across_sets() {
+        let directory = TestDirectory::new();
+        let dynamic = directory.host_dynamic_library("", "shared_macros", b"shared native code");
+        let first_rlib = directory.artifact("libfirst.rlib", b"first");
+        let second_rlib = directory.artifact("libsecond.rlib", b"second");
+
+        let first = prepare_with_permissions(
+            &[("macros", &dynamic), ("first", &first_rlib)],
+            &[],
+            &[&dynamic],
+        )
+        .unwrap();
+        let second = prepare_with_permissions(
+            &[("macros", &dynamic), ("second", &second_rlib)],
+            &[],
+            &[&dynamic],
+        )
+        .unwrap();
         assert_eq!(
-            permissions[0].artifact().parent().unwrap(),
-            Path::new(prepared.search_directory().unwrap())
+            first.proc_macro_execution_artifacts()[0].artifact(),
+            second.proc_macro_execution_artifacts()[0].artifact()
+        );
+        assert_eq!(
+            first.snapshot.as_ref().unwrap().path().parent(),
+            first.proc_macro_execution_artifacts()[0]
+                .artifact()
+                .parent()
+                .unwrap()
+                .parent()
+        );
+        assert_ne!(
+            first.snapshot.as_ref().unwrap().path(),
+            second.snapshot.as_ref().unwrap().path()
+        );
+
+        fs::write(&dynamic, b"different trusted native code").unwrap();
+        let different =
+            prepare_with_permissions(&[("macros", &dynamic)], &[], &[&dynamic]).unwrap();
+        assert_ne!(
+            first.proc_macro_execution_artifacts()[0].artifact(),
+            different.proc_macro_execution_artifacts()[0].artifact()
+        );
+        assert_eq!(
+            fs::read(first.proc_macro_execution_artifacts()[0].artifact()).unwrap(),
+            b"shared native code"
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn permitted_identical_artifact_sets_reuse_the_process_snapshot() {
+    fn partially_overlapping_proc_macro_sets_share_only_identical_artifacts() {
         let directory = TestDirectory::new();
-        let dynamic = directory.host_dynamic_library("", "macros", b"trusted native code");
+        let shared = directory.host_dynamic_library("", "overlap_shared", b"shared");
+        let first_only = directory.host_dynamic_library("", "overlap_first", b"first");
+        let second_only = directory.host_dynamic_library("", "overlap_second", b"second");
 
+        let first = prepare_with_permissions(
+            &[("shared", &shared), ("first", &first_only)],
+            &[],
+            &[&shared, &first_only],
+        )
+        .unwrap();
+        let second = prepare_with_permissions(
+            &[("shared", &shared), ("second", &second_only)],
+            &[],
+            &[&shared, &second_only],
+        )
+        .unwrap();
+        let artifact = |prepared: &PreparedExternalCrates, name: &str| {
+            prepared
+                .proc_macro_execution_artifacts()
+                .iter()
+                .find(|artifact| artifact.file_name() == name)
+                .unwrap()
+                .artifact()
+                .to_owned()
+        };
+
+        let first_shared = artifact(&first, shared.file_name().unwrap().to_str().unwrap());
+        let second_shared = artifact(&second, shared.file_name().unwrap().to_str().unwrap());
+        let first_only = artifact(&first, first_only.file_name().unwrap().to_str().unwrap());
+        let second_only = artifact(&second, second_only.file_name().unwrap().to_str().unwrap());
+        assert_eq!(first_shared, second_shared);
+        assert_ne!(first_shared.parent(), first_only.parent());
+        assert_ne!(second_shared.parent(), second_only.parent());
+        assert_ne!(first_only.parent(), second_only.parent());
+        assert_eq!(first.search_directories().count(), 2);
+        assert_eq!(second.search_directories().count(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unused_permitted_proc_macro_is_removed_with_the_last_lease() {
+        let directory = TestDirectory::new();
+        let dynamic = directory.host_dynamic_library("", "unused_permitted", b"unused native code");
         let first = prepare_with_permissions(&[("macros", &dynamic)], &[], &[&dynamic]).unwrap();
         let second = prepare_with_permissions(&[("macros", &dynamic)], &[], &[&dynamic]).unwrap();
-        assert_eq!(first.search_directory(), second.search_directory());
-
-        fs::write(&dynamic, b"different trusted native code").unwrap();
-        let different =
-            prepare_with_permissions(&[("macros", &dynamic)], &[], &[&dynamic]).unwrap();
-        assert_ne!(first.search_directory(), different.search_directory());
+        let artifact = first.proc_macro_execution_artifacts()[0]
+            .artifact()
+            .to_owned();
         assert_eq!(
-            fs::read(first.proc_macro_execution_artifacts()[0].artifact()).unwrap(),
-            b"trusted native code"
+            artifact,
+            second.proc_macro_execution_artifacts()[0].artifact()
         );
+        let snapshot = artifact.parent().unwrap().to_owned();
+
+        drop(first);
+        assert!(artifact.is_file());
+        drop(second);
+        assert!(!snapshot.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loaded_proc_macro_is_pinned_once_for_the_process() {
+        let directory = TestDirectory::new();
+        let dynamic = directory.host_dynamic_library("", "loaded_once", b"loaded native code");
+        let ordinary = directory.artifact("libloaded_once_dependency.rlib", b"ordinary");
+        let prepared = prepare_with_permissions(
+            &[("macros", &dynamic), ("ordinary", &ordinary)],
+            &[],
+            &[&dynamic],
+        )
+        .unwrap();
+        let artifact = prepared.proc_macro_execution_artifacts()[0]
+            .artifact()
+            .to_owned();
+        let analyzer_snapshot = prepared.snapshot.as_ref().unwrap().path().to_owned();
+        let process_snapshot = prepared.proc_macro_execution_artifacts()[0]
+            .snapshot
+            .clone();
+        let state = prepared.proc_macro_load_state();
+        let before = Arc::strong_count(&process_snapshot.snapshot);
+
+        state.loaded(&artifact);
+        assert_eq!(Arc::strong_count(&process_snapshot.snapshot), before + 1);
+        state.loaded(&artifact);
+        assert_eq!(Arc::strong_count(&process_snapshot.snapshot), before + 1);
+
+        drop(process_snapshot);
+        drop(state);
+        drop(prepared);
+        assert!(artifact.is_file());
+        assert!(!analyzer_snapshot.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_prepare_and_load_share_one_snapshot_and_pin() {
+        let directory = TestDirectory::new();
+        let dynamic =
+            directory.host_dynamic_library("", "concurrent_prepare", b"concurrent native code");
+        let prepared = std::thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| {
+                    let dynamic = &dynamic;
+                    scope.spawn(move || {
+                        prepare_with_permissions(&[("macros", dynamic)], &[], &[dynamic]).unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let artifact = prepared[0].proc_macro_execution_artifacts()[0]
+            .artifact()
+            .to_owned();
+        assert!(prepared.iter().all(|candidate| {
+            candidate.proc_macro_execution_artifacts()[0].artifact() == artifact
+        }));
+
+        let states = prepared
+            .iter()
+            .map(PreparedExternalCrates::proc_macro_load_state)
+            .collect::<Vec<_>>();
+        std::thread::scope(|scope| {
+            for state in states {
+                let artifact = &artifact;
+                scope.spawn(move || state.loaded(artifact));
+            }
+        });
+
+        let process_snapshot = &prepared[0].proc_macro_execution_artifacts()[0].snapshot;
+        let stores = PROCESS_EXTERNAL_STORES.get().unwrap();
+        let stores = stores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let store = stores.get(&process_snapshot.store).unwrap();
+        assert_eq!(
+            store
+                .loaded
+                .iter()
+                .filter(|snapshot| Arc::ptr_eq(snapshot, &process_snapshot.snapshot))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_snapshot_sharing_is_scoped_by_parent_and_owner_token() {
+        let first_parent = TestDirectory::new();
+        let second_parent = TestDirectory::new();
+        let artifacts = TestDirectory::new();
+        let dynamic = artifacts.host_dynamic_library("", "store_scope", b"scoped native code");
+        let mut loaded = BTreeMap::new();
+        let artifact = load_requested_artifact(&dynamic, &mut loaded).unwrap();
+        let first_key = ProcessStoreKey {
+            parent: fs::canonicalize(&first_parent.0).unwrap(),
+            token: Some("first".to_owned()),
+        };
+        let other_owner_key = ProcessStoreKey {
+            parent: first_key.parent.clone(),
+            token: Some("second".to_owned()),
+        };
+        let other_parent_key = ProcessStoreKey {
+            parent: fs::canonicalize(&second_parent.0).unwrap(),
+            token: first_key.token.clone(),
+        };
+        let prepare = |key: &ProcessStoreKey| {
+            let parent_lock = SnapshotParentLock::acquire(&key.parent).unwrap();
+            process_snapshot(key, &artifact, &parent_lock).unwrap()
+        };
+
+        let first = prepare(&first_key);
+        let other_owner = prepare(&other_owner_key);
+        let other_parent = prepare(&other_parent_key);
+        assert_ne!(first.path(), other_owner.path());
+        assert_ne!(first.path(), other_parent.path());
+
+        drop(first);
+        drop(other_owner);
+        drop(other_parent);
+        release_process_store(&first_key);
+        release_process_store(&other_owner_key);
+        release_process_store(&other_parent_key);
     }
 
     #[test]
@@ -1353,9 +1806,17 @@ mod tests {
 
         let upper_different = directory.artifact("third/libCASE.rlib", b"different");
         let different = prepare(&[("lower", &lower)], &[&upper_different]);
+        let lower_dynamic = directory.host_dynamic_library("dynamic-lower", "case", b"lower");
+        let upper_dynamic = directory.host_dynamic_library("dynamic-upper", "CASE", b"upper");
+        let split = prepare_with_permissions(
+            &[("lower_dynamic", &lower_dynamic)],
+            &[&upper_dynamic],
+            &[&lower_dynamic],
+        );
         if temporary_file_names_distinguish_ascii_case() {
             assert!(same.is_ok());
             assert!(different.is_ok());
+            assert!(split.is_ok());
         } else {
             assert!(matches!(
                 same,
@@ -1363,6 +1824,10 @@ mod tests {
             ));
             assert!(matches!(
                 different,
+                Err(AnalysisError::ConflictingExternalCrateArtifactName { .. })
+            ));
+            assert!(matches!(
+                split,
                 Err(AnalysisError::ConflictingExternalCrateArtifactName { .. })
             ));
         }
@@ -1404,8 +1869,8 @@ mod tests {
     }
 
     fn temporary_file_names_distinguish_ascii_case() -> bool {
-        let directory = TestDirectory::new();
-        let snapshot = SnapshotDirectory::create(&directory.0, ANALYZER_SNAPSHOT_PREFIX).unwrap();
+        let parent = snapshot_parent().unwrap();
+        let snapshot = SnapshotDirectory::create(&parent, ANALYZER_SNAPSHOT_PREFIX).unwrap();
         fs::write(snapshot.path().join("case-probe"), b"probe").unwrap();
         match OpenOptions::new()
             .write(true)
@@ -1416,5 +1881,15 @@ mod tests {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
             Err(error) => panic!("cannot probe temporary filesystem case handling: {error}"),
         }
+    }
+
+    #[cfg(windows)]
+    fn release_process_store(key: &ProcessStoreKey) {
+        let stores = PROCESS_EXTERNAL_STORES.get().unwrap();
+        let store = stores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+        drop(store);
     }
 }

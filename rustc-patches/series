@@ -25,3 +25,4 @@
 0024-rustc-observe-unused-builtin-derives.patch
 0025-rustc-expose-declarative-macro-component-origins.patch
 0026-rustc-preserve-associated-selections-across-mir-inlining.patch
+0027-rustc-observe-successful-proc-macro-library-loads.patch

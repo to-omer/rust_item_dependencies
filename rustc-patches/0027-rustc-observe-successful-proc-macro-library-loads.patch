@@ -1,0 +1,301 @@
+From 0b58b8b7166e7018e33fdf2595ed45e01aab5ff5 Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Sun, 30 Aug 2026 16:25:19 +0900
+Subject: [PATCH] rustc: observe successful proc-macro library loads
+
+---
+ compiler/rustc_driver_impl/src/lib.rs      |   2 +-
+ compiler/rustc_metadata/src/creader.rs     |  10 +-
+ compiler/rustc_session/src/session.rs      |  26 ++++-
+ tests/ui-fulldeps/proc-macro-load-guard.rs | 119 +++++++++++++++++++--
+ 4 files changed, 144 insertions(+), 13 deletions(-)
+
+diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
+index 416094a2e..575ac1160 100644
+--- a/compiler/rustc_driver_impl/src/lib.rs
++++ b/compiler/rustc_driver_impl/src/lib.rs
+@@ -120,7 +120,7 @@ pub(super) fn install() {}
+ 
+ /// Incremented whenever the observer records consumed by rust-item-dependencies
+ /// change incompatibly.
+-pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 23;
++pub const RUST_ITEM_DEPENDENCIES_PATCH_ABI: u32 = 24;
+ 
+ /// Digest of the ordered patch queue used to build this compiler.
+ ///
+diff --git a/compiler/rustc_metadata/src/creader.rs b/compiler/rustc_metadata/src/creader.rs
+index d540f1b11..41616def2 100644
+--- a/compiler/rustc_metadata/src/creader.rs
++++ b/compiler/rustc_metadata/src/creader.rs
+@@ -754,9 +754,13 @@ fn register_crate<'tcx>(
+             private_dep,
+         )?;
+ 
+-        let raw_proc_macros = authorized_proc_macro_load
+-            .map(|(dylib, stable_id)| self.dlsym_proc_macros(&dylib, stable_id))
+-            .transpose()?;
++        let raw_proc_macros = if let Some((dylib, stable_id)) = authorized_proc_macro_load {
++            let macros = self.dlsym_proc_macros(&dylib, stable_id)?;
++            tcx.sess.report_proc_macro_loaded(&dylib);
++            Some(macros)
++        } else {
++            None
++        };
+ 
+         let crate_metadata = CrateMetadata::new(
+             tcx,
+diff --git a/compiler/rustc_session/src/session.rs b/compiler/rustc_session/src/session.rs
+index a3fe5a3c5..61a98a981 100644
+--- a/compiler/rustc_session/src/session.rs
++++ b/compiler/rustc_session/src/session.rs
+@@ -110,15 +110,29 @@ fn report(&self, resource_use: ExternalResourceUse) {
+     }
+ }
+ 
+-pub struct ProcMacroLoadGuard(IntoDynSyncSend<Box<dyn Fn(&Path) -> bool + Send + Sync>>);
++pub struct ProcMacroLoadGuard {
++    authorize: IntoDynSyncSend<Box<dyn Fn(&Path) -> bool + Send + Sync>>,
++    loaded: Option<IntoDynSyncSend<Box<dyn Fn(&Path) + Send + Sync>>>,
++}
+ 
+ impl ProcMacroLoadGuard {
+     pub fn new(guard: impl Fn(&Path) -> bool + Send + Sync + 'static) -> Self {
+-        ProcMacroLoadGuard(IntoDynSyncSend(Box::new(guard)))
++        ProcMacroLoadGuard { authorize: IntoDynSyncSend(Box::new(guard)), loaded: None }
++    }
++
++    pub fn with_load_observer(mut self, observer: impl Fn(&Path) + Send + Sync + 'static) -> Self {
++        self.loaded = Some(IntoDynSyncSend(Box::new(observer)));
++        self
+     }
+ 
+     fn is_allowed(&self, path: &Path) -> bool {
+-        (self.0)(path)
++        (self.authorize)(path)
++    }
++
++    fn report_loaded(&self, path: &Path) {
++        if let Some(observer) = &self.loaded {
++            observer(path);
++        }
+     }
+ }
+ 
+@@ -525,6 +539,12 @@ pub fn is_proc_macro_load_allowed(&self, path: &Path) -> bool {
+         self.proc_macro_load_guard.as_ref().is_none_or(|guard| guard.is_allowed(path))
+     }
+ 
++    pub fn report_proc_macro_loaded(&self, path: &Path) {
++        if let Some(guard) = &self.proc_macro_load_guard {
++            guard.report_loaded(path);
++        }
++    }
++
+     pub fn miri_unleashed_feature(&self, span: Span, feature_gate: Option<Symbol>) {
+         self.miri_unleashed_features.lock().push((span, feature_gate));
+     }
+diff --git a/tests/ui-fulldeps/proc-macro-load-guard.rs b/tests/ui-fulldeps/proc-macro-load-guard.rs
+index f5d581624..cd0456a88 100644
+--- a/tests/ui-fulldeps/proc-macro-load-guard.rs
++++ b/tests/ui-fulldeps/proc-macro-load-guard.rs
+@@ -10,6 +10,7 @@
+ extern crate rustc_driver;
+ extern crate rustc_interface;
+ 
++use std::io::Write;
+ use std::path::{Path, PathBuf};
+ use std::process::{Command, ExitCode};
+ use std::sync::{Arc, Mutex};
+@@ -21,6 +22,8 @@ fn main() -> ExitCode {
+         let args: Vec<_> = std::env::args().collect();
+         if args.get(1).is_some_and(|arg| arg == "--deny-child") {
+             run_denied(&args[2..]);
++        } else if args.get(1).is_some_and(|arg| arg == "--failure-child") {
++            run_failure_child(&args[2..]);
+         } else {
+             run_test(&args[1..]);
+         }
+@@ -45,6 +48,11 @@ pub fn make_function(_: TokenStream) -> TokenStream {
+                 "fn generated() -> usize { 1 }".parse().unwrap()
+             }
+ 
++            #[proc_macro]
++            pub fn panic_after_load(_: TokenStream) -> TokenStream {
++                panic!("the loaded procedural macro panicked")
++            }
++
+             #[proc_macro_attribute]
+             pub fn passthrough(_: TokenStream, item: TokenStream) -> TokenStream {
+                 item
+@@ -95,7 +103,14 @@ fn main() {
+         "#,
+     )
+     .unwrap();
++    let panic_client_source = tmp.join("panic-client.rs");
++    std::fs::write(
++        &panic_client_source,
++        "fn main() { let _ = guard_macros::panic_after_load!(); }\n",
++    )
++    .unwrap();
+ 
++    let _ = std::fs::remove_file(tmp.join("denied-loaded"));
+     let deny = Command::new(std::env::current_exe().unwrap())
+         .arg("--deny-child")
+         .args(args)
+@@ -112,6 +127,7 @@ fn main() {
+     );
+     let denied_path = std::fs::read_to_string(tmp.join("denied-path")).unwrap();
+     assert_eq!(Path::new(&denied_path), macro_dylib);
++    assert!(!tmp.join("denied-loaded").exists());
+ 
+     let direct_extern = format!("--extern=guard_macros={}", macro_dylib.display());
+     compile_client(
+@@ -124,7 +140,8 @@ fn main() {
+         &mut DefaultCallbacks,
+     );
+ 
+-    let observed = Arc::new(Mutex::new(Vec::new()));
++    let authorized = Arc::new(Mutex::new(Vec::new()));
++    let loaded = Arc::new(Mutex::new(Vec::new()));
+     compile_client(
+         &sysroot,
+         linker,
+@@ -132,10 +149,46 @@ fn main() {
+         &tmp.join("allow-out"),
+         "allowed",
+         &[direct_extern],
+-        &mut GuardCallbacks::allow(macro_dylib.clone(), observed.clone()),
++        &mut GuardCallbacks::allow(
++            macro_dylib.clone(),
++            authorized.clone(),
++            loaded.clone(),
++        ),
+     );
+-    assert_eq!(*observed.lock().unwrap(), [macro_dylib.clone()]);
+-
++    assert_eq!(*authorized.lock().unwrap(), [macro_dylib.clone()]);
++    assert_eq!(*loaded.lock().unwrap(), [macro_dylib.clone()]);
++
++    for (mode, dylib, client, expect_loaded) in [
++        (
++            "corrupt",
++            copy_proc_macro(&macro_dylib, &tmp.join("corrupt")),
++            client_source,
++            false,
++        ),
++        ("panic", macro_dylib, panic_client_source, true),
++    ] {
++        let authorized = tmp.join(format!("{mode}-authorized"));
++        let loaded = tmp.join(format!("{mode}-loaded"));
++        let _ = std::fs::remove_file(&authorized);
++        let _ = std::fs::remove_file(&loaded);
++        let failure = Command::new(std::env::current_exe().unwrap())
++            .arg("--failure-child")
++            .args(args)
++            .env("PROC_MACRO_GUARD_FAILURE", mode)
++            .env("PROC_MACRO_GUARD_DYLIB", &dylib)
++            .env("PROC_MACRO_GUARD_CLIENT", &client)
++            .env("PROC_MACRO_GUARD_TMP", &tmp)
++            .output()
++            .unwrap();
++        assert!(!failure.status.success(), "{mode} unexpectedly compiled");
++        let authorized_path = std::fs::read_to_string(authorized).unwrap();
++        assert_eq!(Path::new(&authorized_path), dylib);
++        assert_eq!(loaded.exists(), expect_loaded, "{mode} load notification");
++        if expect_loaded {
++            let loaded_path = std::fs::read_to_string(loaded).unwrap();
++            assert_eq!(Path::new(&loaded_path), dylib);
++        }
++    }
+ }
+ 
+ fn run_denied(args: &[String]) {
+@@ -145,10 +198,14 @@ fn run_denied(args: &[String]) {
+     let tmp = PathBuf::from(std::env::var_os("PROC_MACRO_GUARD_TMP").unwrap());
+     let observed = tmp.join("denied-path");
+     let expected = macro_dylib.clone();
++    let loaded = tmp.join("denied-loaded");
+     let guard = ProcMacroLoadGuard::new(move |path| {
+         std::fs::write(&observed, path.to_string_lossy().as_bytes()).unwrap();
+         assert_eq!(path, expected);
+         false
++    })
++    .with_load_observer(move |path| {
++        std::fs::write(&loaded, path.to_string_lossy().as_bytes()).unwrap();
+     });
+     compile_client(
+         &sysroot,
+@@ -161,6 +218,47 @@ fn run_denied(args: &[String]) {
+     );
+ }
+ 
++fn run_failure_child(args: &[String]) {
++    let (sysroot, linker) = compiler_paths(args);
++    let mode = std::env::var("PROC_MACRO_GUARD_FAILURE").unwrap();
++    let macro_dylib = PathBuf::from(std::env::var_os("PROC_MACRO_GUARD_DYLIB").unwrap());
++    let client = PathBuf::from(std::env::var_os("PROC_MACRO_GUARD_CLIENT").unwrap());
++    let tmp = PathBuf::from(std::env::var_os("PROC_MACRO_GUARD_TMP").unwrap());
++    let authorized = tmp.join(format!("{mode}-authorized"));
++    let loaded = tmp.join(format!("{mode}-loaded"));
++    let expected = macro_dylib.clone();
++    let corrupt = mode == "corrupt";
++    let guard = ProcMacroLoadGuard::new(move |path| {
++        std::fs::write(&authorized, path.to_string_lossy().as_bytes()).unwrap();
++        assert_eq!(path, expected);
++        if corrupt {
++            let mut artifact = std::fs::OpenOptions::new().write(true).open(path).unwrap();
++            artifact.write_all(&[0; 16]).unwrap();
++            artifact.flush().unwrap();
++        }
++        true
++    })
++    .with_load_observer(move |path| {
++        std::fs::write(&loaded, path.to_string_lossy().as_bytes()).unwrap();
++    });
++    compile_client(
++        &sysroot,
++        linker,
++        &client,
++        &tmp.join(format!("{mode}-out")),
++        &format!("{mode}_failure"),
++        &[format!("--extern=guard_macros={}", macro_dylib.display())],
++        &mut GuardCallbacks { guard: Some(guard) },
++    );
++}
++
++fn copy_proc_macro(source: &Path, directory: &Path) -> PathBuf {
++    std::fs::create_dir_all(directory).unwrap();
++    let destination = directory.join(source.file_name().unwrap());
++    std::fs::copy(source, &destination).unwrap();
++    destination
++}
++
+ fn compiler_paths(args: &[String]) -> (PathBuf, Option<&Path>) {
+     let sysroot = args.first().expect("expected sysroot").as_str().into();
+     let linker = args.get(1).map(|arg| Path::new(arg));
+@@ -232,11 +330,20 @@ struct GuardCallbacks {
+ }
+ 
+ impl GuardCallbacks {
+-    fn allow(expected: PathBuf, observed: Arc<Mutex<Vec<PathBuf>>>) -> Self {
++    fn allow(
++        expected: PathBuf,
++        authorized: Arc<Mutex<Vec<PathBuf>>>,
++        loaded: Arc<Mutex<Vec<PathBuf>>>,
++    ) -> Self {
++        let loaded_expected = expected.clone();
+         Self {
+             guard: Some(ProcMacroLoadGuard::new(move |path| {
+-                observed.lock().unwrap().push(path.to_owned());
++                authorized.lock().unwrap().push(path.to_owned());
+                 path == expected
++            })
++            .with_load_observer(move |path| {
++                assert_eq!(path, loaded_expected);
++                loaded.lock().unwrap().push(path.to_owned());
+             })),
+         }
+     }
+-- 
+2.55.0
+

@@ -120,6 +120,106 @@ mod patched {
         }
     }
 
+    struct DependentProcMacroArtifacts {
+        _directory: TestDirectory,
+        proc_macro: PathBuf,
+        unused_proc_macro: PathBuf,
+        dependency: PathBuf,
+    }
+
+    impl DependentProcMacroArtifacts {
+        fn build() -> Self {
+            let directory = TestDirectory::new();
+            let dependency_source = directory.path().join("lifetime_support.rs");
+            let dependency = directory.path().join("liblifetime_support.rlib");
+            let macro_source = directory.path().join("lifetime_macros.rs");
+            let proc_macro = dynamic_library_path(directory.path(), "lifetime_macros");
+            let unused_proc_macro =
+                dynamic_library_path(directory.path(), "lifetime_unused_macros");
+            fs::write(
+                &dependency_source,
+                "pub fn expression() -> &'static str { \"40 + 2\" }\n",
+            )
+            .unwrap();
+            fs::write(
+                &macro_source,
+                concat!(
+                    "extern crate proc_macro;\n",
+                    "extern crate lifetime_support;\n",
+                    "use proc_macro::TokenStream;\n",
+                    "#[proc_macro]\n",
+                    "pub fn from_support(_: TokenStream) -> TokenStream {\n",
+                    "    lifetime_support::expression().parse().unwrap()\n",
+                    "}\n",
+                    "#[proc_macro]\n",
+                    "pub fn panic_after_load(_: TokenStream) -> TokenStream {\n",
+                    "    let _ = lifetime_support::expression();\n",
+                    "    panic!(\"the loaded macro panicked\")\n",
+                    "}\n",
+                ),
+            )
+            .unwrap();
+            assert_success(
+                Command::new(compiler())
+                    .arg(&dependency_source)
+                    .args([
+                        "--crate-name",
+                        "lifetime_support",
+                        "--crate-type=rlib",
+                        "--edition=2024",
+                        "--target",
+                        &host_target(),
+                        "-Awarnings",
+                        "-o",
+                    ])
+                    .arg(&dependency)
+                    .output()
+                    .expect("the procedural macro dependency compiler must finish"),
+                "building a procedural macro dependency",
+            );
+            for (crate_name, artifact) in [
+                ("lifetime_macros", &proc_macro),
+                ("lifetime_unused_macros", &unused_proc_macro),
+            ] {
+                assert_success(
+                    Command::new(compiler())
+                        .arg(&macro_source)
+                        .args(["--crate-name", crate_name, "--crate-type=proc-macro"])
+                        .arg("--edition=2024")
+                        .args(["--target", &host_target()])
+                        .arg("--extern")
+                        .arg(format!("lifetime_support={}", dependency.display()))
+                        .arg("-L")
+                        .arg(format!("dependency={}", directory.path().display()))
+                        .args(["-Awarnings", "-o"])
+                        .arg(artifact)
+                        .output()
+                        .expect("the dependent procedural macro compiler must finish"),
+                    "building a dependent procedural macro",
+                );
+            }
+            Self {
+                _directory: directory,
+                proc_macro,
+                unused_proc_macro,
+                dependency,
+            }
+        }
+
+        fn options(&self) -> CompilationOptions {
+            CompilationOptions::new()
+                .with_external_crate("lifetime_macros", &self.proc_macro)
+                .with_dependency_artifact(&self.dependency)
+                .allow_proc_macro_execution(&self.proc_macro)
+        }
+
+        fn options_with_unused_permission(&self) -> CompilationOptions {
+            self.options()
+                .with_external_crate("lifetime_unused_macros", &self.unused_proc_macro)
+                .allow_proc_macro_execution(&self.unused_proc_macro)
+        }
+    }
+
     #[test]
     fn permitted_proc_macros_reduce_as_atomic_inputs_compile_and_reach_a_fixed_point() {
         let artifacts = ProcMacroArtifacts::build();
@@ -712,63 +812,53 @@ mod patched {
         assert_eq!(reduced.reduced_source(), source.source);
     }
 
+    const SNAPSHOT_TEST_PHASE_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_TEST_PHASE";
+    const SNAPSHOT_PARENT_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_PARENT";
+
     #[test]
     fn loaded_proc_macro_snapshots_follow_the_loader_process_lifetime() {
-        const PHASE_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_TEST_PHASE";
-        const SNAPSHOT_PARENT_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_PARENT";
-        const TEST_NAME: &str =
-            "patched::loaded_proc_macro_snapshots_follow_the_loader_process_lifetime";
+        run_snapshot_lifetime_case(
+            "patched::loaded_proc_macro_snapshots_follow_the_loader_process_lifetime",
+            loaded_dependent_proc_macro_case,
+        );
+    }
 
-        let phase = std::env::var(PHASE_ENV).ok();
-        if phase.as_deref() == Some("reap") {
-            drop(Analyzer::new().unwrap());
-            return;
-        }
-        if phase.as_deref() == Some("owner") {
-            let snapshot_parent = fs::canonicalize(
-                std::env::var_os(SNAPSHOT_PARENT_ENV).expect("snapshot parent must be configured"),
-            )
-            .unwrap();
-            let artifacts = ProcMacroArtifacts::build();
-            let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
-            let snapshot = unique_directory_containing(
-                &snapshot_parent,
-                artifacts.direct.file_name().unwrap(),
-            );
+    #[test]
+    fn a_proc_macro_panic_still_pins_the_loaded_library() {
+        run_snapshot_lifetime_case(
+            "patched::a_proc_macro_panic_still_pins_the_loaded_library",
+            panicking_proc_macro_case,
+        );
+    }
 
-            analyzer
-                .analyze(&input("fn main() { let _ = proc_fixture::one!(); }\n"))
+    fn run_snapshot_lifetime_case(test_name: &str, owner_case: fn(&Path) -> Option<PathBuf>) {
+        match std::env::var(SNAPSHOT_TEST_PHASE_ENV).ok().as_deref() {
+            Some("reap") => {
+                drop(Analyzer::new().unwrap());
+                return;
+            }
+            Some("owner") => {
+                let snapshot_parent = fs::canonicalize(
+                    std::env::var_os(SNAPSHOT_PARENT_ENV)
+                        .expect("snapshot parent must be configured"),
+                )
                 .unwrap();
-            assert!(
-                snapshot.try_exists().unwrap(),
-                "the analyzer snapshot was not created"
-            );
-
-            let last_owner = analyzer.clone();
-            drop(analyzer);
-            assert!(
-                snapshot.try_exists().unwrap(),
-                "a live analyzer lost its procedural macro snapshot"
-            );
-
-            let reap = run_snapshot_phase(TEST_NAME, PHASE_ENV, "reap", &snapshot_parent);
-            assert_success(reap, "checking an active procedural macro snapshot");
-            assert!(
-                snapshot.try_exists().unwrap(),
-                "another process reaped an active procedural macro snapshot"
-            );
-
-            drop(last_owner);
-            #[cfg(windows)]
-            assert!(snapshot.try_exists().unwrap());
-            #[cfg(not(windows))]
-            assert!(!snapshot.try_exists().unwrap());
-            println!("SNAPSHOT:{}", snapshot.display());
-            return;
+                if let Some(snapshot) = owner_case(&snapshot_parent) {
+                    println!("SNAPSHOT:{}", snapshot.display());
+                }
+                return;
+            }
+            Some(phase) => panic!("unexpected snapshot test phase: {phase}"),
+            None => {}
         }
 
         let snapshot_parent = TestDirectory::new();
-        let output = run_snapshot_phase(TEST_NAME, PHASE_ENV, "owner", snapshot_parent.path());
+        let output = run_snapshot_phase(
+            test_name,
+            SNAPSHOT_TEST_PHASE_ENV,
+            "owner",
+            snapshot_parent.path(),
+        );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -782,23 +872,126 @@ mod patched {
         let snapshot = stdout
             .lines()
             .find_map(|line| line.strip_prefix("SNAPSHOT:"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!("the owner did not report its snapshot:\n{stdout}\n{stderr}")
-            });
-        #[cfg(windows)]
+            .map(PathBuf::from);
+        #[cfg(not(windows))]
+        assert!(
+            snapshot.is_none(),
+            "Unix must remove its analyzer-owned snapshot: {snapshot:?}"
+        );
+        let Some(snapshot) = snapshot else {
+            return;
+        };
         assert!(
             snapshot.try_exists().unwrap(),
             "the process-owned snapshot disappeared before it could be reaped"
         );
 
-        let reap = run_snapshot_phase(TEST_NAME, PHASE_ENV, "reap", snapshot_parent.path());
+        let reap = run_snapshot_phase(
+            test_name,
+            SNAPSHOT_TEST_PHASE_ENV,
+            "reap",
+            snapshot_parent.path(),
+        );
         assert_success(reap, "reaping a finished procedural macro snapshot");
         assert!(
             !snapshot.try_exists().unwrap(),
             "the finished process snapshot remains at {}",
             snapshot.display()
         );
+    }
+
+    fn loaded_dependent_proc_macro_case(snapshot_parent: &Path) -> Option<PathBuf> {
+        let artifacts = DependentProcMacroArtifacts::build();
+        let analyzer =
+            Analyzer::new_with_options(artifacts.options_with_unused_permission()).unwrap();
+        let macro_snapshot =
+            unique_directory_containing(snapshot_parent, artifacts.proc_macro.file_name().unwrap());
+        let unused_macro_snapshot = unique_directory_containing(
+            snapshot_parent,
+            artifacts.unused_proc_macro.file_name().unwrap(),
+        );
+        let dependency_snapshot =
+            unique_directory_containing(snapshot_parent, artifacts.dependency.file_name().unwrap());
+        #[cfg(windows)]
+        {
+            assert_ne!(macro_snapshot, unused_macro_snapshot);
+            assert_ne!(macro_snapshot, dependency_snapshot);
+            assert_ne!(unused_macro_snapshot, dependency_snapshot);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(macro_snapshot, unused_macro_snapshot);
+            assert_eq!(macro_snapshot, dependency_snapshot);
+        }
+
+        let source = input("fn main() { println!(\"{}\", lifetime_macros::from_support!()); }\n");
+        let verified = analyzer.reduce_and_verify(&source).unwrap();
+        assert_eq!(verified.reduced_source(), source.source);
+
+        let last_owner = analyzer.clone();
+        drop(analyzer);
+        assert!(macro_snapshot.try_exists().unwrap());
+        let reap = run_snapshot_phase(
+            "patched::loaded_proc_macro_snapshots_follow_the_loader_process_lifetime",
+            SNAPSHOT_TEST_PHASE_ENV,
+            "reap",
+            snapshot_parent,
+        );
+        assert_success(reap, "checking an active procedural macro snapshot");
+        assert!(macro_snapshot.try_exists().unwrap());
+
+        drop(last_owner);
+        #[cfg(windows)]
+        {
+            assert!(macro_snapshot.try_exists().unwrap());
+            assert!(!unused_macro_snapshot.try_exists().unwrap());
+            assert!(!dependency_snapshot.try_exists().unwrap());
+            let reused = Analyzer::new_with_options(artifacts.options()).unwrap();
+            assert_eq!(
+                unique_directory_containing(
+                    snapshot_parent,
+                    artifacts.proc_macro.file_name().unwrap()
+                ),
+                macro_snapshot,
+                "a loaded procedural macro must reuse its process-owned snapshot"
+            );
+            drop(reused);
+            assert!(macro_snapshot.try_exists().unwrap());
+            Some(macro_snapshot)
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(!macro_snapshot.try_exists().unwrap());
+            None
+        }
+    }
+
+    fn panicking_proc_macro_case(snapshot_parent: &Path) -> Option<PathBuf> {
+        let artifacts = DependentProcMacroArtifacts::build();
+        let analyzer = Analyzer::new_with_options(artifacts.options()).unwrap();
+        let macro_snapshot =
+            unique_directory_containing(snapshot_parent, artifacts.proc_macro.file_name().unwrap());
+        let dependency_snapshot =
+            unique_directory_containing(snapshot_parent, artifacts.dependency.file_name().unwrap());
+        assert!(matches!(
+            analyzer.analyze(&input(
+                "fn main() { let _ = lifetime_macros::panic_after_load!(); }\n"
+            )),
+            Err(AnalysisError::OriginalCompilationFailed(_))
+        ));
+        drop(analyzer);
+        #[cfg(windows)]
+        {
+            assert!(macro_snapshot.try_exists().unwrap());
+            assert!(!dependency_snapshot.try_exists().unwrap());
+            Some(macro_snapshot)
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(macro_snapshot, dependency_snapshot);
+            assert!(!macro_snapshot.try_exists().unwrap());
+            None
+        }
     }
 
     fn run_snapshot_phase(test_name: &str, phase_env: &str, phase: &str, parent: &Path) -> Output {

@@ -3,7 +3,7 @@ use std::cell::Cell;
 #[cfg(rust_item_dependencies_patched)]
 use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::PathBuf;
 
 #[cfg(rust_item_dependencies_patched)]
 use rustc_hir::def::DefKind;
@@ -242,7 +242,7 @@ pub(super) fn collect_external_crate_facts(
     definitions: &CollectedDefinitions,
     local_definitions: &[LocalDefId],
     definition_units: &[SourceUnitId],
-    external_artifact_directory: Option<&Path>,
+    external_artifact_directories: &[PathBuf],
 ) -> Result<ExternalCrateFacts, RetentionError> {
     use rustc_hir::attrs::LangItem;
     use rustc_hir::{ItemKind, find_attr};
@@ -336,10 +336,10 @@ pub(super) fn collect_external_crate_facts(
         {
             return Err(RetentionError::IncompleteExternalCrateConstraints);
         }
-        if external_artifact_directory.is_some_and(|directory| {
-            tcx.used_crate_source(crate_num)
-                .paths()
-                .any(|path| path.starts_with(directory))
+        if tcx.used_crate_source(crate_num).paths().any(|path| {
+            external_artifact_directories
+                .iter()
+                .any(|directory| path.starts_with(directory))
         }) {
             user_artifact_crates.insert(dependency.crate_identity);
         }
@@ -611,7 +611,7 @@ pub(super) fn collect_external_crate_facts(
     _definitions: &CollectedDefinitions,
     _local_definitions: &[LocalDefId],
     _definition_units: &[SourceUnitId],
-    _external_artifact_directory: Option<&Path>,
+    _external_artifact_directories: &[PathBuf],
 ) -> Result<ExternalCrateFacts, RetentionError> {
     Ok(ExternalCrateFacts::default())
 }
@@ -1003,27 +1003,11 @@ pub(super) fn validate_external_crate_facts(
     {
         return Err(incomplete);
     }
-    for provider in providers.iter().filter(|provider| {
+    if providers.iter().any(|provider| {
         provider.kind == ExternalMetadataProviderKind::ExternalNativeLink
             && user_artifact_crates.contains(&provider.crate_identity)
     }) {
-        let required = ExternalCrateDependency {
-            crate_identity: provider.crate_identity,
-            kind: *loaded.get(&provider.crate_identity).ok_or(incomplete)?,
-        };
-        let fixed_source_load = source_loads.iter().any(|(carrier, load)| {
-            matches!(carrier, CompilerCrateLoadCarrier::Source(unit)
-                if source.units[unit.0 as usize].kind
-                    == crate::source::WrittenUnitKind::CrateRoot)
-                && satisfies(load, required)
-        });
-        if !fixed_source_load
-            && !source_free_loads
-                .iter()
-                .any(|load| satisfies(load, required))
-        {
-            return Err(RetentionError::UnsupportedExternalNativeLink);
-        }
+        return Err(RetentionError::UnsupportedExternalNativeLink);
     }
     let metadata_requirements = facts.requirements.iter().copied().collect::<BTreeSet<_>>();
     if metadata_requirements.len() != facts.requirements.len()
