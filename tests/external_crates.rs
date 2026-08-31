@@ -9,8 +9,8 @@ mod patched {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use rust_item_dependencies::{
-        AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel,
-        Reduction, SourceInput, UnsupportedReason, error::DiagnosticLevel, source::ByteRange,
+        AnalysisError, Analyzer, ByteRange, CompilationOptions, Edition, EntryPoint,
+        OptimizationLevel, Reduction, SourceInput, UnsupportedReason, error::DiagnosticLevel,
     };
 
     const LEAF_SOURCE: &str = include_str!("fixtures/external_crates/leaf.rs");
@@ -159,12 +159,16 @@ mod patched {
             );
 
             let original_output = compile_and_run(
-                &original,
+                case.source,
+                case.edition,
+                &target,
                 &artifacts,
                 &format!("{}_original", edition_name(case.edition)),
             );
             let reduced_output = compile_and_run(
-                &reduced,
+                reduction.reduced_source(),
+                case.edition,
+                &target,
                 &artifacts,
                 &format!("{}_reduced", edition_name(case.edition)),
             );
@@ -223,8 +227,20 @@ mod patched {
             .expect("the external associated selection must reach a fixed point");
         assert_eq!(fixed.reduced_source(), reduction.reduced_source());
 
-        let original_output = compile_and_run(&original, &artifacts, "external_inline_original");
-        let reduced_output = compile_and_run(&reduced, &artifacts, "external_inline_reduced");
+        let original_output = compile_and_run(
+            source,
+            Edition::Rust2021,
+            &target,
+            &artifacts,
+            "external_inline_original",
+        );
+        let reduced_output = compile_and_run(
+            reduction.reduced_source(),
+            Edition::Rust2021,
+            &target,
+            &artifacts,
+            "external_inline_reduced",
+        );
         assert!(original_output.status.success());
         assert_eq!(reduced_output.status, original_output.status);
         assert_eq!(reduced_output.stdout, original_output.stdout);
@@ -257,10 +273,20 @@ mod patched {
             let fixed = analyzer.reduce(&reduced).unwrap();
             assert_eq!(fixed.reduced_source(), expected, "{name}");
 
-            let original_output =
-                compile_and_run(&original, &artifacts, &format!("empty_{name}_original"));
-            let reduced_output =
-                compile_and_run(&reduced, &artifacts, &format!("empty_{name}_reduced"));
+            let original_output = compile_and_run(
+                source,
+                edition,
+                &target,
+                &artifacts,
+                &format!("empty_{name}_original"),
+            );
+            let reduced_output = compile_and_run(
+                expected,
+                edition,
+                &target,
+                &artifacts,
+                &format!("empty_{name}_reduced"),
+            );
             assert!(original_output.status.success(), "{name}");
             assert_eq!(original_output.stdout, b"ok\n", "{name}");
             assert_eq!(reduced_output.status, original_output.status, "{name}");
@@ -454,8 +480,13 @@ mod patched {
             );
             assert!(!reduction.reduced_source().contains("long_activation"));
 
-            let mut fixed_input = input.clone();
-            fixed_input.source = reduction.reduced_source().to_owned();
+            let fixed_input = SourceInput::library(
+                reduction.reduced_source(),
+                Edition::Rust2024,
+                target.clone(),
+                "runtime_input",
+            )
+            .with_entry_point(EntryPoint::new("runtime_input::entry"));
             let fixed = analyzer.reduce(&fixed_input).unwrap();
             assert_eq!(fixed.reduced_source(), reduction.reduced_source());
 
@@ -513,7 +544,7 @@ mod patched {
         let artifacts = ExternalArtifacts::build();
         let error = Analyzer::new_with_options(artifacts.options())
             .unwrap()
-            .analyze(&input(
+            .reduce(&input(
                 LEAF_DIRECT_SOURCE,
                 Edition::Rust2018,
                 &host_target(),
@@ -537,7 +568,7 @@ mod patched {
 
         let error = Analyzer::new_with_options(artifacts.options())
             .unwrap()
-            .analyze(&input(
+            .reduce(&input(
                 LEAF_DIRECT_2015_SOURCE,
                 Edition::Rust2015,
                 &host_target(),
@@ -588,7 +619,7 @@ mod patched {
             ),
         ] {
             let error = analyzer
-                .analyze(&input(source, Edition::Rust2018, &target))
+                .reduce(&input(source, Edition::Rust2018, &target))
                 .expect_err("input-originated imports and proc_macro must remain unsupported");
             assert_eq!(
                 error,
@@ -598,139 +629,6 @@ mod patched {
                 }
             );
         }
-    }
-
-    #[test]
-    fn recipe_uses_artifact_contents_names_and_roles_but_not_paths_or_order() {
-        let artifacts = ExternalArtifacts::build();
-        let copied_directory = TestDirectory::new();
-        let copied_leaf = copied_directory.path().join("libexternal_leaf.rlib");
-        let copied_wrapper = copied_directory.path().join("libexternal_wrapper.rlib");
-        let renamed_wrapper = copied_directory.path().join("librenamed_wrapper.rlib");
-        let explicit_wrapper = copied_directory.path().join("lib-.rlib");
-        fs::copy(&artifacts.leaf, &copied_leaf).unwrap();
-        fs::copy(&artifacts.wrapper, &copied_wrapper).unwrap();
-        fs::copy(&artifacts.wrapper, &renamed_wrapper).unwrap();
-        fs::copy(&artifacts.wrapper, &explicit_wrapper).unwrap();
-        let target = host_target();
-        let original = input(CASES[0].source, Edition::Rust2018, &target);
-
-        let expected = Analyzer::new_with_options(artifacts.options())
-            .unwrap()
-            .analyze(&original)
-            .unwrap()
-            .recipe();
-        let copied = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_dependency_artifact(&copied_leaf)
-                .with_external_crate("external_wrapper", &copied_wrapper)
-                .with_dependency_artifact(&copied_leaf)
-                .with_external_crate("external_wrapper", &copied_wrapper),
-        )
-        .unwrap()
-        .analyze(&original)
-        .unwrap()
-        .recipe();
-        assert_eq!(copied, expected);
-
-        let repeated_direct_artifact = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("external_wrapper", &artifacts.wrapper)
-                .with_dependency_artifact(&artifacts.wrapper)
-                .with_dependency_artifact(&artifacts.leaf),
-        )
-        .unwrap()
-        .analyze(&original)
-        .unwrap()
-        .recipe();
-        assert_eq!(repeated_direct_artifact, expected);
-
-        let explicit_path = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("external_wrapper", &explicit_wrapper)
-                .with_dependency_artifact(&copied_leaf),
-        )
-        .unwrap()
-        .analyze(&original)
-        .unwrap()
-        .recipe();
-        let repeated_explicit_path = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("external_wrapper", &explicit_wrapper)
-                .with_dependency_artifact(&explicit_wrapper)
-                .with_dependency_artifact(&copied_leaf),
-        )
-        .unwrap()
-        .analyze(&original)
-        .unwrap()
-        .recipe();
-        assert_eq!(repeated_explicit_path, explicit_path);
-
-        let renamed_file = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("external_wrapper", renamed_wrapper)
-                .with_dependency_artifact(&copied_leaf),
-        )
-        .unwrap()
-        .analyze(&original)
-        .unwrap()
-        .recipe();
-        assert_ne!(renamed_file, expected);
-
-        let different_role = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("external_wrapper", &artifacts.wrapper)
-                .with_external_crate("external_leaf", &artifacts.leaf),
-        )
-        .unwrap()
-        .analyze(&original)
-        .unwrap()
-        .recipe();
-        assert_ne!(different_role, expected);
-
-        let renamed_source = CASES[0]
-            .source
-            .replace("external_wrapper", "renamed_wrapper");
-        let renamed = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("renamed_wrapper", &artifacts.wrapper)
-                .with_dependency_artifact(&artifacts.leaf),
-        )
-        .unwrap()
-        .analyze(&input(&renamed_source, Edition::Rust2018, &target))
-        .unwrap()
-        .recipe();
-        assert_ne!(renamed, expected);
-
-        let changed_directory = TestDirectory::new();
-        let changed_source = changed_directory.path().join("external_wrapper.rs");
-        let changed_wrapper = changed_directory.path().join("libexternal_wrapper.rlib");
-        fs::write(
-            &changed_source,
-            format!("{WRAPPER_SOURCE}\npub fn additional_public_item() {{}}\n"),
-        )
-        .unwrap();
-        compile_library(
-            "external_wrapper",
-            &changed_source,
-            &changed_wrapper,
-            &[
-                "--extern".into(),
-                format!("external_leaf={}", artifacts.leaf.display()),
-                "-L".into(),
-                format!("dependency={}", artifacts.directory().display()),
-            ],
-        );
-        let changed = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("external_wrapper", changed_wrapper)
-                .with_dependency_artifact(&artifacts.leaf),
-        )
-        .unwrap()
-        .analyze(&original)
-        .unwrap()
-        .recipe();
-        assert_ne!(changed, expected);
     }
 
     #[test]
@@ -1159,7 +1057,9 @@ mod patched {
     }
 
     fn compile_and_run(
-        input: &SourceInput,
+        input_source: &str,
+        edition: Edition,
+        target: &str,
         artifacts: &ExternalArtifacts,
         artifact_name: &str,
     ) -> Output {
@@ -1167,12 +1067,12 @@ mod patched {
         let executable = artifacts
             .directory()
             .join(format!("{artifact_name}{}", std::env::consts::EXE_SUFFIX));
-        fs::write(&source, &input.source).expect("the program source must be writable");
+        fs::write(&source, input_source).expect("the program source must be writable");
         let compiled = Command::new(compiler())
             .arg(&source)
             .args(["--crate-name", artifact_name, "--crate-type=bin"])
-            .arg(format!("--edition={}", edition_name(input.edition)))
-            .args(["--target", &input.target])
+            .arg(format!("--edition={}", edition_name(edition)))
+            .args(["--target", target])
             .arg("--extern")
             .arg(format!("external_wrapper={}", artifacts.wrapper.display()))
             .arg("-L")
@@ -1196,19 +1096,6 @@ mod patched {
 
     fn assert_reduction(case: &Case, reduction: &Reduction) {
         assert_eq!(reduction.reduced_source(), case.expected, "{}", case.name);
-        assert_eq!(
-            reduction
-                .pieces()
-                .iter()
-                .map(|piece| {
-                    &case.source
-                        [piece.original_range.start as usize..piece.original_range.end as usize]
-                })
-                .collect::<String>(),
-            case.expected,
-            "{}",
-            case.name
-        );
     }
 
     fn input(source: &str, edition: Edition, target: &str) -> SourceInput {

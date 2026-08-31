@@ -1,17 +1,10 @@
 #![feature(rustc_private)]
 
 #[cfg(rust_item_dependencies_patched)]
-use rust_item_dependencies::dependency_graph::{
-    DependencyKind, GraphNode, MonoCollection, MonoDependencyKind, ObservationSite, RootReason,
-};
-#[cfg(rust_item_dependencies_patched)]
 use rust_item_dependencies::{
     AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel, Reduction,
     SourceInput,
 };
-#[cfg(rust_item_dependencies_patched)]
-use std::collections::BTreeSet;
-
 #[cfg(rust_item_dependencies_patched)]
 const CASES: &[(&str, &str, &str)] = &[
     (
@@ -154,7 +147,7 @@ fn complex_reductions_match_handwritten_sources() {
         let reduction = analyzer
             .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_reduction(case, source, expected, &reduction);
+        assert_reduction(case, expected, &reduction);
     }
 }
 
@@ -170,7 +163,7 @@ fn macro_component_reductions_preserve_execution_and_reach_a_fixed_point() {
         let reduction = analyzer
             .reduce(&original_input)
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_reduction(case, source, expected, &reduction);
+        assert_reduction(case, expected, &reduction);
 
         let reduced_input = input(expected, &target);
         let fixed = analyzer
@@ -210,25 +203,6 @@ fn inlined_associated_selections_preserve_selected_overrides() {
     let target = host_target();
     let source = include_str!("fixtures/retention/inlined_associated_selection.input.rs");
     let original_input = input(source, &target);
-    let analysis = analyzer
-        .analyze(&original_input)
-        .expect("the optimized associated selections must be observable");
-    assert!(analysis.graph().edges.iter().any(|edge| {
-        matches!(
-            &edge.kind,
-            DependencyKind::SelectionProof {
-                relation: MonoDependencyKind::SourceAssociatedItem,
-                collection: MonoCollection::Mentioned,
-            }
-        ) && edge.sites.iter().any(|site| {
-            matches!(
-                site,
-                ObservationSite::Source(range)
-                    if &source[range.start as usize..range.end as usize] == "M::transform(value)"
-            )
-        })
-    }));
-
     let reduction = analyzer
         .reduce(&original_input)
         .expect("the selected associated overrides must survive optimized MIR inlining");
@@ -238,8 +212,7 @@ fn inlined_associated_selections_preserve_selected_overrides() {
     assert!(reduced.contains("fn normalize(value: u32) -> u32"));
     assert!(reduced.contains("fn transform(value: u32) -> u32"));
 
-    let mut reduced_input = original_input.clone();
-    reduced_input.source = reduced.to_owned();
+    let reduced_input = original_input.with_source(reduced);
     let fixed = analyzer
         .reduce(&reduced_input)
         .expect("the optimized reduction must reach a fixed point");
@@ -304,7 +277,7 @@ fn inactive_cfg_components_are_removed_across_stable_syntax() {
     let reduction = analyzer
         .reduce(&original_input)
         .expect("inactive cfg components must be reducible");
-    assert_reduction("inactive cfg components", source, expected, &reduction);
+    assert_reduction("inactive cfg components", expected, &reduction);
 
     let reduced_input = input(expected, &target);
     let fixed = analyzer
@@ -339,7 +312,7 @@ fn associated_struct_paths_keep_the_selected_impl_and_reach_a_fixed_point() {
     let reduction = analyzer
         .reduce(&input(source, &target))
         .expect("associated struct expressions and patterns must be reducible");
-    assert_reduction("associated struct paths", source, expected, &reduction);
+    assert_reduction("associated struct paths", expected, &reduction);
 
     let fixed = analyzer
         .reduce(&input(expected, &target))
@@ -385,22 +358,13 @@ fn compilation_context_is_shared_by_reduction_fixed_point_and_linking() {
     let reduction = analyzer
         .reduce(&original_input)
         .expect("the configured source must preserve compiler decisions");
-    assert_reduction("shared compilation context", source, expected, &reduction);
+    assert_reduction("shared compilation context", expected, &reduction);
 
-    let mut reduced_input = original_input.clone();
-    reduced_input.source = reduction.reduced_source().to_owned();
+    let reduced_input = original_input.with_source(reduction.reduced_source());
     let fixed = analyzer
         .reduce(&reduced_input)
         .expect("the configured reduction must be byte-idempotent");
     assert_eq!(fixed.reduced_source(), reduction.reduced_source());
-    assert_eq!(
-        fixed.original_analysis().recipe(),
-        reduction.original_analysis().recipe()
-    );
-    assert_ne!(
-        fixed.original_analysis().source_digest(),
-        reduction.original_analysis().source_digest()
-    );
 
     let original_output =
         compile_and_run(&original_input, &options, "compilation_context_original");
@@ -439,7 +403,7 @@ fn crate_codegen_and_subsystem_attributes_survive_binary_reduction() {
     let reduction = analyzer
         .reduce(&original_input)
         .expect("crate codegen and subsystem attributes must be reducible");
-    assert_reduction("crate attributes", source, expected, &reduction);
+    assert_reduction("crate attributes", expected, &reduction);
 
     let reduced_input = input(expected, &target);
     let fixed = analyzer
@@ -512,24 +476,7 @@ fn no_main_uses_existing_external_symbol_roots_without_standard_entry_roots() {
     let reduction = analyzer
         .reduce(&original_input)
         .expect("the no_main program must preserve compiler decisions");
-    assert_reduction("no_main external entry", source, expected, &reduction);
-    assert!(
-        reduction
-            .original_analysis()
-            .roots()
-            .iter()
-            .all(|root| !matches!(root.reason, RootReason::Main | RootReason::StartInstance))
-    );
-    assert_eq!(
-        reduction
-            .original_analysis()
-            .roots()
-            .iter()
-            .filter(|root| root.reason == RootReason::ExternalSymbol)
-            .count(),
-        1
-    );
-
+    assert_reduction("no_main external entry", expected, &reduction);
     let reduced_input = input(expected, &target);
     let fixed = analyzer
         .reduce(&reduced_input)
@@ -564,7 +511,7 @@ fn unreachable_inline_assembly_is_removed_with_its_owner() {
     let reduction = analyzer
         .reduce(&input(source, &target))
         .expect("assembly in an unreachable owner must not block reduction");
-    assert_reduction("unreachable inline assembly", source, expected, &reduction);
+    assert_reduction("unreachable inline assembly", expected, &reduction);
 
     let fixed = analyzer
         .reduce(&input(expected, &target))
@@ -603,7 +550,6 @@ fn required_assembly_preserves_every_active_source_unit() {
                 "fn unused() {}\n",
                 "fn main() { unsafe { core::arch::asm!(\"\"); } println!(\"ok\"); }\n",
             ),
-            0,
         ),
         (
             "macro-generated inline assembly",
@@ -613,7 +559,6 @@ fn required_assembly_preserves_every_active_source_unit() {
                 "fn unused() {}\n",
                 "fn main() { run_assembly!(); println!(\"ok\"); }\n",
             ),
-            0,
         ),
         (
             "naked assembly",
@@ -625,7 +570,6 @@ fn required_assembly_preserves_every_active_source_unit() {
                 "fn unused() {}\n",
                 "fn main() { println!(\"ok\"); }\n",
             ),
-            0,
         ),
         (
             "global assembly",
@@ -642,27 +586,15 @@ fn required_assembly_preserves_every_active_source_unit() {
                 "fn unused() {}\n",
                 "fn main() { println!(\"ok\"); }\n",
             ),
-            1,
         ),
     ];
 
-    for (case, artifact, source, expected_global_roots) in cases {
+    for (case, artifact, source) in cases {
         let source_input = input(source, &target);
         let reduction = analyzer
             .reduce(&source_input)
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_reduction(case, source, source, &reduction);
-        assert_eq!(
-            reduction
-                .original_analysis()
-                .roots()
-                .iter()
-                .filter(|root| root.reason == RootReason::GlobalAssembly)
-                .count(),
-            expected_global_roots,
-            "{case}",
-        );
-
+        assert_reduction(case, source, &reduction);
         let fixed = analyzer
             .reduce(&source_input)
             .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
@@ -677,7 +609,7 @@ fn required_assembly_preserves_every_active_source_unit() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
-fn no_main_with_a_rust_entry_and_global_assembly_uses_the_same_roots() {
+fn no_main_with_a_rust_entry_and_global_assembly_links_and_runs() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();
     let source = concat!(
@@ -695,26 +627,7 @@ fn no_main_with_a_rust_entry_and_global_assembly_uses_the_same_roots() {
     let reduction = analyzer
         .reduce(&source_input)
         .expect("a Rust target entry may coexist with global assembly");
-    assert_reduction("no_main with global assembly", source, source, &reduction);
-    assert_eq!(
-        reduction
-            .original_analysis()
-            .roots()
-            .iter()
-            .filter(|root| root.reason == RootReason::GlobalAssembly)
-            .count(),
-        1,
-    );
-    assert_eq!(
-        reduction
-            .original_analysis()
-            .roots()
-            .iter()
-            .filter(|root| root.reason == RootReason::ExternalSymbol)
-            .count(),
-        1,
-    );
-
+    assert_reduction("no_main with global assembly", source, &reduction);
     let output = compile_and_run(
         &source_input,
         &CompilationOptions::default(),
@@ -806,7 +719,7 @@ fn main() {}
         let reduction = analyzer
             .reduce(&original_input)
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_reduction(case, source, expected, &reduction);
+        assert_reduction(case, expected, &reduction);
 
         let reduced_input = input(expected, &target);
         let fixed = analyzer
@@ -853,7 +766,7 @@ fn external_symbol_roots_preserve_linked_entry_points() {
     let reduction = analyzer
         .reduce(&input(source, &target))
         .expect("external symbols must be retained as compiler roots");
-    assert_reduction("external symbol roots", source, expected, &reduction);
+    assert_reduction("external symbol roots", expected, &reduction);
 
     let fixed = analyzer
         .reduce(&input(expected, &target))
@@ -904,7 +817,7 @@ fn a_global_allocator_and_its_generated_entry_points_survive_reduction() {
     let reduction = analyzer
         .reduce(&input(source, &target))
         .expect("a global allocator must be retained through its generated entry points");
-    assert_reduction("global allocator", source, expected, &reduction);
+    assert_reduction("global allocator", expected, &reduction);
 
     let fixed = analyzer
         .reduce(&input(expected, &target))
@@ -949,7 +862,6 @@ fn foreign_items_are_reduced_independently_and_preserve_linked_behavior() {
             .unwrap_or_else(|error| panic!("Rust {edition_name}: {error:?}"));
         assert_reduction(
             &format!("foreign items in Rust {edition_name}"),
-            source,
             expected,
             &reduction,
         );
@@ -1018,16 +930,7 @@ fn native_link_directives_are_roots_without_pinning_unused_declarations() {
     let reduction = analyzer
         .reduce(&input(source, &target))
         .expect("an active native link directive must be reducible");
-    assert_reduction("native link directive", source, &expected, &reduction);
-    let roots = reduction
-        .original_analysis()
-        .roots()
-        .iter()
-        .filter(|root| root.reason == RootReason::NativeLink)
-        .collect::<Vec<_>>();
-    assert_eq!(roots.len(), 1);
-    assert!(matches!(roots[0].node, GraphNode::Definition(_)));
-
+    assert_reduction("native link directive", &expected, &reduction);
     let fixed = analyzer
         .reduce(&input(&expected, &target))
         .expect("a reduced native link directive must remain reducible");
@@ -1054,7 +957,7 @@ fn native_link_directives_are_roots_without_pinning_unused_declarations() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
-fn native_link_and_explicit_library_roots_share_the_same_graph() {
+fn native_link_and_explicit_library_entry_reduce_together() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();
     let source = concat!(
@@ -1077,25 +980,20 @@ fn native_link_and_explicit_library_roots_share_the_same_graph() {
             "\n",
         )
     );
-    let input = SourceInput::library(source, Edition::Rust2024, target, "linked_library")
+    let input = SourceInput::library(source, Edition::Rust2024, target.clone(), "linked_library")
         .with_entry_point(EntryPoint::new("linked_library::entry"));
 
     let reduction = analyzer
         .reduce(&input)
         .expect("native links and explicit library entries must be reducible together");
-    assert_reduction("native link library", source, &expected, &reduction);
-    assert_eq!(
-        reduction
-            .original_analysis()
-            .roots()
-            .iter()
-            .map(|root| root.reason)
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([RootReason::ExplicitEntry, RootReason::NativeLink])
-    );
-
-    let mut fixed_input = input;
-    fixed_input.source = expected.to_owned();
+    assert_reduction("native link library", &expected, &reduction);
+    let fixed_input = SourceInput::library(
+        expected.to_owned(),
+        Edition::Rust2024,
+        target,
+        "linked_library",
+    )
+    .with_entry_point(EntryPoint::new("linked_library::entry"));
     let fixed = analyzer
         .reduce(&fixed_input)
         .expect("the reduced library must remain byte-identical");
@@ -1139,22 +1037,7 @@ fn a_macro_generated_native_link_directive_is_a_compiler_root() {
     let reduction = analyzer
         .reduce(&input(source, &target))
         .expect("a generated native link directive must be reducible");
-    assert_reduction(
-        "generated native link directive",
-        source,
-        expected,
-        &reduction,
-    );
-    assert_eq!(
-        reduction
-            .original_analysis()
-            .roots()
-            .iter()
-            .filter(|root| root.reason == RootReason::NativeLink)
-            .count(),
-        1
-    );
-
+    assert_reduction("generated native link directive", expected, &reduction);
     let fixed = analyzer
         .reduce(&input(expected, &target))
         .expect("a reduced generated native link directive must remain reducible");
@@ -1178,15 +1061,7 @@ fn an_unused_wasm_import_module_does_not_become_a_linker_root() {
     let reduction = analyzer
         .reduce(&input(source, &target))
         .expect("an unused wasm import module must be reducible");
-    assert_reduction("unused wasm import module", source, expected, &reduction);
-    assert!(
-        reduction
-            .original_analysis()
-            .roots()
-            .iter()
-            .all(|root| root.reason != RootReason::NativeLink)
-    );
-
+    assert_reduction("unused wasm import module", expected, &reduction);
     let fixed = analyzer
         .reduce(&input(expected, &target))
         .expect("a reduced wasm import module input must remain reducible");
@@ -1226,17 +1101,7 @@ fn raw_dylib_import_declarations_are_compiler_roots() {
     let reduction = analyzer
         .reduce(&input(source, &target))
         .expect("raw-dylib imports must be reducible without changing the import list");
-    assert_reduction("raw-dylib imports", source, expected, &reduction);
-    assert_eq!(
-        reduction
-            .original_analysis()
-            .roots()
-            .iter()
-            .filter(|root| root.reason == RootReason::NativeLink)
-            .count(),
-        4
-    );
-
+    assert_reduction("raw-dylib imports", expected, &reduction);
     let fixed = analyzer
         .reduce(&input(expected, &target))
         .expect("reduced raw-dylib imports must remain reducible");
@@ -1295,12 +1160,7 @@ fn a_macro_generated_foreign_function_block_is_reducible() {
         .reduce(&input(source, &target))
         .expect("a generated foreign function declaration must be reducible");
 
-    assert_reduction(
-        "generated foreign function block",
-        source,
-        expected,
-        &reduction,
-    );
+    assert_reduction("generated foreign function block", expected, &reduction);
 
     let fixed = analyzer
         .reduce(&input(expected, &target))
@@ -1424,7 +1284,7 @@ fn supported_ffi_constructs_follow_the_same_reduction_rules_as_rust_items() {
         let reduction = analyzer
             .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_reduction(case, source, expected, &reduction);
+        assert_reduction(case, expected, &reduction);
 
         let fixed = analyzer
             .reduce(&input(expected, &target))
@@ -1521,7 +1381,7 @@ fn main() {
     let reduction = analyzer
         .reduce(&input(source, &target))
         .expect("a used constructor static must be reducible");
-    assert_reduction("used constructor static", source, &expected, &reduction);
+    assert_reduction("used constructor static", &expected, &reduction);
 
     let fixed = analyzer
         .reduce(&input(&expected, &target))
@@ -1559,7 +1419,7 @@ fn builtin_derives_are_reduced_by_element_without_changing_compiler_behavior() {
     let reduction = analyzer
         .reduce(&original_input)
         .expect("stable builtin derives must be reducible by element");
-    assert_reduction("builtin derive elements", source, expected, &reduction);
+    assert_reduction("builtin derive elements", expected, &reduction);
 
     let reduced_input = input(expected, &target);
     let fixed = analyzer
@@ -1593,7 +1453,7 @@ fn opaque_builtin_derive_boundaries_keep_their_written_source_units() {
     let reduction = analyzer
         .reduce(&original_input)
         .expect("opaque builtin derive inputs must remain reducible");
-    assert_reduction("builtin derive boundaries", source, expected, &reduction);
+    assert_reduction("builtin derive boundaries", expected, &reduction);
 
     let reduced_input = input(expected, &target);
     let fixed = analyzer
@@ -1662,7 +1522,7 @@ fn x86_sysroot_sources_are_not_treated_as_user_inputs() {
         let reduction = analyzer
             .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_reduction(case, source, expected, &reduction);
+        assert_reduction(case, expected, &reduction);
 
         let fixed = analyzer
             .reduce(&input(reduction.reduced_source(), &target))
@@ -1698,7 +1558,7 @@ fn builtin_test_attributes_are_accepted_and_their_unreachable_items_are_removed(
         let reduction = analyzer
             .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_reduction(case, source, expected, &reduction);
+        assert_reduction(case, expected, &reduction);
 
         let fixed = analyzer
             .reduce(&input(reduction.reduced_source(), &target))
@@ -1776,7 +1636,7 @@ fn cfg_attr_wrapped_macro_invocations_resolve_their_written_source() {
         let reduction = analyzer
             .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_reduction(case, source, expected, &reduction);
+        assert_reduction(case, expected, &reduction);
 
         let fixed = analyzer
             .reduce(&input(reduction.reduced_source(), &target))
@@ -1796,7 +1656,7 @@ fn an_edition_error_is_reported_before_the_recovery_ast_is_inspected() {
         "fn main() {}\n",
     );
     let error = analyzer
-        .analyze(&SourceInput::binary(
+        .reduce(&SourceInput::binary(
             source.to_owned(),
             Edition::Rust2024,
             host_target(),
@@ -1814,24 +1674,13 @@ fn an_edition_error_is_reported_before_the_recovery_ast_is_inspected() {
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn assert_reduction(case: &str, original: &str, expected: &str, reduction: &Reduction) {
+fn assert_reduction(case: &str, expected: &str, reduction: &Reduction) {
     assert_eq!(reduction.reduced_source(), expected, "{case}");
-    assert_eq!(
-        reduction
-            .pieces()
-            .iter()
-            .map(|piece| {
-                &original[piece.original_range.start as usize..piece.original_range.end as usize]
-            })
-            .collect::<String>(),
-        expected,
-        "{case}"
-    );
 }
 
 #[cfg(rust_item_dependencies_patched)]
 fn compile_and_run(
-    input: &SourceInput,
+    input: &TestInput,
     options: &CompilationOptions,
     artifact_name: &str,
 ) -> std::process::Output {
@@ -1899,13 +1748,46 @@ fn optimization_level_name(level: OptimizationLevel) -> &'static str {
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn input(source: &str, target: &str) -> SourceInput {
+struct TestInput {
+    source: String,
+    edition: Edition,
+    target: String,
+    input: SourceInput,
+}
+
+#[cfg(rust_item_dependencies_patched)]
+impl TestInput {
+    fn new(source: &str, target: &str, edition: Edition) -> Self {
+        Self {
+            source: source.to_owned(),
+            edition,
+            target: target.to_owned(),
+            input: SourceInput::binary(source.to_owned(), edition, target),
+        }
+    }
+
+    fn with_source(&self, source: &str) -> Self {
+        Self::new(source, &self.target, self.edition)
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+impl std::ops::Deref for TestInput {
+    type Target = SourceInput;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn input(source: &str, target: &str) -> TestInput {
     input_with_edition(source, target, Edition::Rust2024)
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn input_with_edition(source: &str, target: &str, edition: Edition) -> SourceInput {
-    SourceInput::binary(source.to_owned(), edition, target)
+fn input_with_edition(source: &str, target: &str, edition: Edition) -> TestInput {
+    TestInput::new(source, target, edition)
 }
 
 #[cfg(rust_item_dependencies_patched)]

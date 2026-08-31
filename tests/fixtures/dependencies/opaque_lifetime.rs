@@ -3,7 +3,6 @@ struct UnionFind {
 }
 
 impl UnionFind {
-    #[doc = "rust-item-dependencies:tag=opaque-lifetime"]
     fn roots(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.cells.len()).filter(|&index| self.cells[index] == index)
     }

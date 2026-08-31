@@ -1,20 +1,15 @@
-//! Public, read-only source analysis and source reduction API.
+//! Public source reduction API.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 #[cfg(all(test, rust_item_dependencies_patched))]
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::artifact::compiler_artifact;
-use crate::dependency_graph::{DependencyGraph, GraphNode, RootRecord};
-use crate::digest::sha256;
+use crate::artifact::compiler_sysroot;
 use crate::error::{
     AnalysisError, CompilerFailure, DecisionDifference, Diagnostic, DiagnosticBundle,
     DiagnosticLevel, ObservationGap, SnapshotDiff as PublicSnapshotDiff, SourceRewriteViolation,
 };
-use crate::external::ExternalArtifactKind;
-use crate::graph::DefinitionId;
 use crate::input::{
     CompilationContext, InputError, InspectedDependencies, InspectedReduction,
     PreparedCompilationOptions,
@@ -22,42 +17,20 @@ use crate::input::{
     inspect_source_with_reduction_in_context,
 };
 use crate::retention::external_compiler_outcome_difference;
-use crate::rewrite::{SourcePiece, SourceRewriteError};
+use crate::rewrite::SourceRewriteError;
 use crate::snapshot::{CompilerDecisionSnapshot, SnapshotDiff, SnapshotError};
-use crate::source::{SourceUnitId, WrittenUnit};
-use crate::tags::TagError;
 
-pub use crate::input::{
-    CompilationOptions, CrateType, Edition, EntryPoint, OptimizationLevel, SourceInput,
-};
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CompilerRecipeIdentity(pub [u8; 32]);
+pub use crate::input::{CompilationOptions, Edition, EntryPoint, OptimizationLevel, SourceInput};
 
 #[derive(Clone, Debug)]
 pub struct Analyzer {
     sysroot: PathBuf,
-    artifact_digest: [u8; 32],
     compilation: Arc<PreparedCompilationOptions>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Analysis {
-    recipe: CompilerRecipeIdentity,
-    source_digest: [u8; 32],
-    graph: DependencyGraph,
-    source_units: Vec<WrittenUnit>,
-    semantic_definitions: BTreeSet<DefinitionId>,
-    retained_source_units: BTreeSet<SourceUnitId>,
-    removed_source_units: BTreeSet<SourceUnitId>,
-    tags: BTreeSet<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Reduction {
-    original: Analysis,
     reduced_source: String,
-    pieces: Vec<SourcePiece>,
 }
 
 impl Analyzer {
@@ -69,16 +42,9 @@ impl Analyzer {
         artifact_context(options)
     }
 
-    pub fn analyze(&self, input: &SourceInput) -> Result<Analysis, AnalysisError> {
-        let context = self.compilation_context(input)?;
-        let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
-            .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
-        Ok(self.analysis(input, &context, &inspected))
-    }
-
     pub fn reduce(&self, input: &SourceInput) -> Result<Reduction, AnalysisError> {
         let context = self.compilation_context(input)?;
-        let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
+        let inspected = inspect_source_with_reduction_in_context(input.source(), &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
         let original_snapshot = CompilerDecisionSnapshot::original(
             &inspected.graph,
@@ -109,9 +75,7 @@ impl Analyzer {
             )));
         }
         Ok(Reduction {
-            original: self.analysis(input, &context, &inspected),
-            reduced_source: inspected.rewrite.source.clone(),
-            pieces: inspected.rewrite.pieces.clone(),
+            reduced_source: inspected.rewrite.source,
         })
     }
 
@@ -151,167 +115,21 @@ impl Analyzer {
         CompilationContext::new(input, &self.compilation, &self.sysroot)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))
     }
-
-    fn analysis(
-        &self,
-        input: &SourceInput,
-        context: &CompilationContext<'_>,
-        inspected: &InspectedReduction,
-    ) -> Analysis {
-        let semantic_definitions = inspected
-            .retention
-            .semantic_required
-            .iter()
-            .filter_map(|node| match node {
-                GraphNode::Definition(definition) => Some(*definition),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let all_source_units = inspected
-            .source
-            .units
-            .iter()
-            .map(|unit| unit.id)
-            .collect::<BTreeSet<_>>();
-        let removed_source_units = all_source_units
-            .difference(&inspected.retention.retained_units)
-            .copied()
-            .collect();
-        let tags = semantic_definitions
-            .iter()
-            .filter_map(|definition| inspected.tags.get(definition))
-            .flatten()
-            .cloned()
-            .collect();
-        Analysis {
-            recipe: recipe_identity(self.artifact_digest, context),
-            source_digest: sha256(input.source.as_bytes()),
-            graph: inspected.graph.clone(),
-            source_units: inspected.source.units.clone(),
-            semantic_definitions,
-            retained_source_units: inspected.retention.retained_units.clone(),
-            removed_source_units,
-            tags,
-        }
-    }
-}
-
-impl Analysis {
-    pub fn recipe(&self) -> CompilerRecipeIdentity {
-        self.recipe
-    }
-
-    pub fn source_digest(&self) -> [u8; 32] {
-        self.source_digest
-    }
-
-    pub fn graph(&self) -> &DependencyGraph {
-        &self.graph
-    }
-
-    pub fn roots(&self) -> &[RootRecord] {
-        &self.graph.roots
-    }
-
-    pub fn semantic_definitions(&self) -> &BTreeSet<DefinitionId> {
-        &self.semantic_definitions
-    }
-
-    pub fn source_units(&self) -> &[WrittenUnit] {
-        &self.source_units
-    }
-
-    pub fn retained_source_units(&self) -> &BTreeSet<SourceUnitId> {
-        &self.retained_source_units
-    }
-
-    pub fn removed_source_units(&self) -> &BTreeSet<SourceUnitId> {
-        &self.removed_source_units
-    }
-
-    pub fn tags(&self) -> &BTreeSet<String> {
-        &self.tags
-    }
 }
 
 impl Reduction {
-    pub fn original_analysis(&self) -> &Analysis {
-        &self.original
-    }
-
     pub fn reduced_source(&self) -> &str {
         &self.reduced_source
-    }
-
-    pub fn pieces(&self) -> &[SourcePiece] {
-        &self.pieces
     }
 }
 
 fn artifact_context(options: CompilationOptions) -> Result<Analyzer, AnalysisError> {
     let compilation = PreparedCompilationOptions::prepare(options)?;
-    let artifact = compiler_artifact().map_err(|_| AnalysisError::CompilerArtifactMismatch)?;
+    let sysroot = compiler_sysroot().map_err(|_| AnalysisError::CompilerArtifactMismatch)?;
     Ok(Analyzer {
-        sysroot: artifact.sysroot,
-        artifact_digest: artifact.identity,
+        sysroot,
         compilation: Arc::new(compilation),
     })
-}
-
-fn recipe_identity(artifact: [u8; 32], context: &CompilationContext<'_>) -> CompilerRecipeIdentity {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"rust-item-dependencies-recipe-v5\0");
-    bytes.extend_from_slice(&artifact);
-    append_recipe_bytes(&mut bytes, context.crate_type_argument().as_bytes());
-    append_recipe_bytes(&mut bytes, context.crate_name().as_bytes());
-    let entry_points = context
-        .entry_points()
-        .map(|entry| entry.path())
-        .collect::<BTreeSet<_>>();
-    bytes.extend_from_slice(&(entry_points.len() as u64).to_le_bytes());
-    for entry_point in entry_points {
-        append_recipe_bytes(&mut bytes, entry_point.as_bytes());
-    }
-    append_recipe_bytes(&mut bytes, context.edition_argument().as_bytes());
-    append_recipe_bytes(&mut bytes, context.target().as_bytes());
-    append_recipe_bytes(&mut bytes, context.optimization_level_argument().as_bytes());
-    bytes.extend_from_slice(&(context.cfgs().count() as u64).to_le_bytes());
-    for cfg in context.cfgs() {
-        append_recipe_bytes(&mut bytes, cfg.as_bytes());
-    }
-    let external_crates = context.external_crates();
-    bytes.extend_from_slice(&(external_crates.direct().len() as u64).to_le_bytes());
-    for external in external_crates.direct() {
-        append_external_artifact_kind(&mut bytes, external.kind());
-        append_recipe_bytes(&mut bytes, external.extern_name().as_bytes());
-        append_recipe_bytes(&mut bytes, external.file_name().as_bytes());
-        bytes.extend_from_slice(&external.digest());
-    }
-    bytes.extend_from_slice(&(external_crates.dependencies().len() as u64).to_le_bytes());
-    for dependency in external_crates.dependencies() {
-        append_external_artifact_kind(&mut bytes, dependency.kind());
-        append_recipe_bytes(&mut bytes, dependency.file_name().as_bytes());
-        bytes.extend_from_slice(&dependency.digest());
-    }
-    let proc_macro_execution_artifacts = external_crates.proc_macro_execution_artifacts();
-    bytes.extend_from_slice(&(proc_macro_execution_artifacts.len() as u64).to_le_bytes());
-    for artifact in proc_macro_execution_artifacts {
-        append_recipe_bytes(&mut bytes, artifact.file_name().as_bytes());
-        bytes.extend_from_slice(&artifact.digest());
-    }
-    CompilerRecipeIdentity(sha256(bytes))
-}
-
-fn append_external_artifact_kind(recipe: &mut Vec<u8>, kind: ExternalArtifactKind) {
-    recipe.push(match kind {
-        ExternalArtifactKind::Rlib => 0,
-        ExternalArtifactKind::HostDynamicLibrary => 1,
-    });
-}
-
-fn append_recipe_bytes(recipe: &mut Vec<u8>, value: &[u8]) {
-    recipe.extend_from_slice(&(value.len() as u64).to_le_bytes());
-    recipe.extend_from_slice(value);
 }
 
 #[derive(Clone, Copy)]
@@ -357,24 +175,6 @@ fn analysis_error(error: InputError, phase: CompilationPhase) -> AnalysisError {
             AnalysisError::CompilerFailure(CompilerFailure::DriverProtocol)
         }
         InputError::Rewrite(error) => rewrite_error(error),
-        InputError::Tag(TagError::InvalidTag(range)) => AnalysisError::InvalidTag { range },
-        InputError::Tag(TagError::InvalidSource) => {
-            AnalysisError::IncompleteObservation(ObservationGap {
-                phase: "tag collection".to_owned(),
-                fact: "definition source origin".to_owned(),
-                range: None,
-            })
-        }
-        InputError::Dependency(crate::input::DependencyError::Tag(TagError::InvalidTag(range))) => {
-            AnalysisError::InvalidTag { range }
-        }
-        InputError::Dependency(crate::input::DependencyError::Tag(TagError::InvalidSource)) => {
-            AnalysisError::IncompleteObservation(ObservationGap {
-                phase: "tag collection".to_owned(),
-                fact: "definition source origin".to_owned(),
-                range: None,
-            })
-        }
         other => AnalysisError::IncompleteObservation(ObservationGap {
             phase: match phase {
                 CompilationPhase::Original => "original analysis",
@@ -432,6 +232,20 @@ fn snapshot_difference(difference: SnapshotDiff) -> PublicSnapshotDiff {
     }])
 }
 
+#[cfg(all(test, rust_item_dependencies_patched))]
+fn host_target() -> String {
+    let version = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+        .arg("-Vv")
+        .output()
+        .unwrap();
+    String::from_utf8(version.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap()
+        .to_owned()
+}
+
 #[cfg(test)]
 mod compilation_options_tests {
     use super::*;
@@ -439,18 +253,44 @@ mod compilation_options_tests {
     #[cfg(rust_item_dependencies_patched)]
     #[test]
     fn new_with_options_accepts_supported_cfg_names_and_duplicates() {
-        let options = CompilationOptions::new()
-            .with_cfg("ONLINE_JUDGE")
-            .with_cfg("日本語")
-            .with_cfg("panic")
-            .with_cfg("target_arch")
-            .with_cfg("target_feature")
-            .with_cfg("test")
-            .with_cfg("ONLINE_JUDGE");
+        let ordered = [
+            "ONLINE_JUDGE",
+            "日本語",
+            "panic",
+            "target_arch",
+            "target_feature",
+            "test",
+        ]
+        .into_iter()
+        .fold(CompilationOptions::new(), CompilationOptions::with_cfg);
+        let reordered_with_duplicate = [
+            "test",
+            "target_feature",
+            "ONLINE_JUDGE",
+            "panic",
+            "日本語",
+            "target_arch",
+            "ONLINE_JUDGE",
+        ]
+        .into_iter()
+        .fold(CompilationOptions::new(), CompilationOptions::with_cfg);
+        let input = SourceInput::binary(
+            concat!(
+                "#[cfg(all(ONLINE_JUDGE, 日本語, panic, target_arch, target_feature, test))]\n",
+                "fn selected() {}\n",
+                "fn main() { selected(); }\n",
+            ),
+            Edition::Rust2024,
+            host_target(),
+        );
 
-        let result = Analyzer::new_with_options(options);
+        let ordered =
+            Analyzer::new_with_options(ordered).and_then(|analyzer| analyzer.reduce(&input));
+        let reordered = Analyzer::new_with_options(reordered_with_duplicate)
+            .and_then(|analyzer| analyzer.reduce(&input));
 
-        assert!(result.is_ok(), "{result:?}");
+        assert!(ordered.is_ok(), "{ordered:?}");
+        assert_eq!(reordered, ordered);
     }
 
     #[test]
@@ -508,7 +348,7 @@ mod compilation_options_tests {
 
         let result =
             Analyzer::new_with_options(CompilationOptions::new().with_cfg("debug_assertions"))
-                .and_then(|analyzer| analyzer.analyze(&input));
+                .and_then(|analyzer| analyzer.reduce(&input));
 
         assert_eq!(
             result,
@@ -556,19 +396,6 @@ mod error_mapping_tests {
 mod tests {
     use super::*;
 
-    fn host_target() -> String {
-        let version = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
-            .arg("-Vv")
-            .output()
-            .unwrap();
-        String::from_utf8(version.stdout)
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("host: "))
-            .unwrap()
-            .to_owned()
-    }
-
     #[test]
     fn plain_cfg_names_activate_plain_source_predicates() {
         let target = host_target();
@@ -590,7 +417,7 @@ mod tests {
             target,
         );
 
-        let result = analyzer.analyze(&input);
+        let result = analyzer.reduce(&input);
 
         assert!(result.is_ok(), "{result:?}");
     }
@@ -621,7 +448,7 @@ mod tests {
                 target.clone(),
             );
 
-            let result = analyzer.analyze(&input);
+            let result = analyzer.reduce(&input);
 
             assert!(result.is_ok(), "{edition:?}: {result:?}");
         }
@@ -734,8 +561,8 @@ mod tests {
             host_target(),
         );
 
-        let result = crate::input::with_one_missing_selected_impl_fact(&input.source, || {
-            analyzer.analyze(&input)
+        let result = crate::input::with_one_missing_selected_impl_fact(input.source(), || {
+            analyzer.reduce(&input)
         });
         let Err(AnalysisError::IncompleteObservation(gap)) = result else {
             panic!("a missing dependency fact must not produce a successful analysis")
@@ -760,7 +587,7 @@ mod tests {
             host_target(),
         );
 
-        let result = crate::input::with_one_missing_macro_rule_selection(&input.source, || {
+        let result = crate::input::with_one_missing_macro_rule_selection(input.source(), || {
             analyzer.reduce(&input)
         });
         let Err(AnalysisError::IncompleteObservation(gap)) = result else {

@@ -1,21 +1,31 @@
 #![feature(rustc_private)]
 
+extern crate rustc_data_structures;
+extern crate rustc_driver;
+extern crate rustc_feature;
+extern crate rustc_hir;
+extern crate rustc_interface;
+extern crate rustc_middle;
+extern crate rustc_span;
+
 #[cfg(rust_item_dependencies_patched)]
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg_attr(not(rust_item_dependencies_patched), allow(dead_code))]
+#[path = "support/qualification.rs"]
+mod qualification;
+
 #[cfg(rust_item_dependencies_patched)]
-use rust_item_dependencies::qualification::DeniedResourceProbe;
+use qualification::DeniedResourceProbe;
 #[cfg(rust_item_dependencies_patched)]
-use rust_item_dependencies::qualification::{
+use qualification::{
     ImportKindProbe, MacroInvocationProbe, MacroResolvedImportUseProbe, MonoProofKindProbe,
     MonoProofOriginProbe, MonoSiteProbe, MonoUseCauseProbe, QualificationReport,
     ResolvedImportUseProbe, probe_incremental_import_cache,
 };
-use rust_item_dependencies::qualification::{
-    ProbeCollection, ProbeConfig, ProbeError, probe_source,
-};
+use qualification::{ProbeCollection, ProbeConfig, ProbeError, probe_source};
 
 #[test]
 fn pinned_driver_exposes_entry_definitions_expansion_and_main_children() {
@@ -1190,9 +1200,9 @@ fn patched_driver_preserves_complete_macro_invocation_origins() {
     assert_eq!(forwarded.source_call_parent, None);
     assert_eq!(
         forwarded.discovered_in_kind,
-        Some(
-            rust_item_dependencies::qualification::ExpansionKindProbe::Macro("forward!".to_owned())
-        )
+        Some(qualification::ExpansionKindProbe::Macro(
+            "forward!".to_owned()
+        ))
     );
     assert_eq!(
         forwarded.source_node_range,
@@ -1218,9 +1228,9 @@ fn patched_driver_preserves_complete_macro_invocation_origins() {
     assert_eq!(late.discovered_in, Some(retry_concat.expansion));
     assert_eq!(
         late.discovered_in_kind,
-        Some(
-            rust_item_dependencies::qualification::ExpansionKindProbe::Macro("concat!".to_owned())
-        )
+        Some(qualification::ExpansionKindProbe::Macro(
+            "concat!".to_owned()
+        ))
     );
     assert_eq!(late.parent, None);
     assert_eq!(late.source_call_parent, None);
@@ -1244,9 +1254,9 @@ fn patched_driver_preserves_complete_macro_invocation_origins() {
     assert_eq!(line.source_call_parent, None);
     assert_eq!(
         line.discovered_in_kind,
-        Some(
-            rust_item_dependencies::qualification::ExpansionKindProbe::Macro("concat!".to_owned())
-        )
+        Some(qualification::ExpansionKindProbe::Macro(
+            "concat!".to_owned()
+        ))
     );
     assert_eq!(line.fragment_kind, "Expr");
     assert_eq!(line.implementation_kind, "Builtin");
@@ -1278,9 +1288,9 @@ fn patched_driver_preserves_complete_macro_invocation_origins() {
     assert_eq!(format_args.source_call_parent, Some(println.expansion));
     assert_eq!(
         format_args.discovered_in_kind,
-        Some(
-            rust_item_dependencies::qualification::ExpansionKindProbe::Macro("println!".to_owned())
-        )
+        Some(qualification::ExpansionKindProbe::Macro(
+            "println!".to_owned()
+        ))
     );
     assert_eq!(format_args.fragment_kind, "OptExpr");
     assert_eq!(format_args.implementation_kind, "Builtin");

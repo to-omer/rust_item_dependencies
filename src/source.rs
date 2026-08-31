@@ -3565,6 +3565,16 @@ mod tests {
     };
     use crate::rewrite::rewrite_source;
 
+    #[cfg(rust_item_dependencies_patched)]
+    fn inspect_reduction(source: String, target: String) -> crate::input::InspectedReduction {
+        let sysroot = crate::artifact::compiler_sysroot().unwrap();
+        crate::input::inspect_source_with_reduction(
+            &crate::SourceInput::binary(source, crate::Edition::Rust2024, target),
+            &sysroot,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn original_offsets_keep_distinct_left_and_right_preimages() {
         let source = "\u{feff}a\r\n日\r\n";
@@ -3942,23 +3952,18 @@ mod tests {
             .find_map(|line| line.strip_prefix("host: "))
             .unwrap()
             .to_owned();
-        let analysis = crate::Analyzer::new()
-            .unwrap()
-            .analyze(&crate::SourceInput::binary(
-                source,
-                crate::Edition::Rust2024,
-                target,
-            ))
-            .unwrap();
-        let direct = analysis
-            .source_units()
+        let inspected = inspect_reduction(source, target);
+        let direct = inspected
+            .source
+            .units
             .iter()
             .find(|unit| {
                 unit.kind == WrittenUnitKind::MacroInvocation && unit.full_range == direct_range
             })
             .expect("the directly parsed invocation must have an exact source unit");
-        let elements = analysis
-            .source_units()
+        let elements = inspected
+            .source
+            .units
             .iter()
             .filter(|unit| {
                 unit.kind == WrittenUnitKind::NestedItem && unit.parent == Some(direct.id)
@@ -3972,10 +3977,10 @@ mod tests {
         );
         assert_ne!(elements[0].atomic_group, elements[1].atomic_group);
 
-        assert!(!analysis.source_units().iter().any(|unit| {
+        assert!(!inspected.source.units.iter().any(|unit| {
             unit.kind == WrittenUnitKind::MacroInvocation && unit.full_range == late_range
         }));
-        assert!(!analysis.source_units().iter().any(|unit| {
+        assert!(!inspected.source.units.iter().any(|unit| {
             unit.kind == WrittenUnitKind::NestedItem && late_range.contains(unit.full_range)
         }));
     }
@@ -4005,13 +4010,14 @@ mod tests {
         let input =
             crate::SourceInput::binary(source.clone(), crate::Edition::Rust2024, target.clone());
         let analyzer = crate::Analyzer::new().unwrap();
-        let analysis = analyzer.analyze(&input).unwrap();
+        let inspected = inspect_reduction(source, target.clone());
 
-        assert!(!analysis.source_units().iter().any(|unit| {
+        assert!(!inspected.source.units.iter().any(|unit| {
             unit.kind == WrittenUnitKind::MacroInvocation && unit.full_range == nested_call
         }));
-        let anchors = analysis
-            .source_units()
+        let anchors = inspected
+            .source
+            .units
             .iter()
             .filter(|unit| {
                 unit.kind == WrittenUnitKind::MacroInvocation
@@ -4031,8 +4037,8 @@ mod tests {
         let [anchor] = smallest_anchors.as_slice() else {
             panic!("the nested call must have one indivisible outer source anchor")
         };
-        let expansion = analysis
-            .graph()
+        let expansion = inspected
+            .graph
             .expansions
             .iter()
             .find(|expansion| {
@@ -4044,7 +4050,7 @@ mod tests {
             })
             .expect("the local nested expansion must be observed");
         assert_eq!(expansion.written_invocation, Some(anchor.id));
-        assert!(analysis.source_units().iter().any(|unit| {
+        assert!(inspected.source.units.iter().any(|unit| {
             unit.kind == WrittenUnitKind::NestedItem && unit.full_range == removable
         }));
 
@@ -4085,17 +4091,10 @@ mod tests {
             .find_map(|line| line.strip_prefix("host: "))
             .unwrap()
             .to_owned();
-        let analysis = crate::Analyzer::new()
-            .unwrap()
-            .analyze(&crate::SourceInput::binary(
-                source,
-                crate::Edition::Rust2024,
-                target,
-            ))
-            .unwrap();
+        let inspected = inspect_reduction(source, target);
 
-        let construct = analysis
-            .graph()
+        let construct = inspected
+            .graph
             .expansions
             .iter()
             .find(|expansion| {
@@ -4106,8 +4105,8 @@ mod tests {
                 )
             })
             .expect("the written parent invocation must be observed");
-        let generated_child = analysis
-            .graph()
+        let generated_child = inspected
+            .graph
             .expansions
             .iter()
             .find(|expansion| {
@@ -4126,7 +4125,7 @@ mod tests {
         assert_eq!(generated_child.discovered_in, Some(construct.id));
         assert_eq!(generated_child.source_call_parent, Some(construct.id));
         assert_eq!(generated_child.written_invocation, None);
-        assert!(!analysis.source_units().iter().any(|unit| {
+        assert!(!inspected.source.units.iter().any(|unit| {
             unit.kind == WrittenUnitKind::MacroInvocation && unit.full_range == generated_call_range
         }));
     }
@@ -4159,10 +4158,10 @@ mod tests {
         let input =
             crate::SourceInput::binary(source.clone(), crate::Edition::Rust2024, target.clone());
         let analyzer = crate::Analyzer::new().unwrap();
-        let analysis = analyzer.analyze(&input).unwrap();
+        let inspected = inspect_reduction(source, target.clone());
 
-        let producers = analysis
-            .graph()
+        let producers = inspected
+            .graph
             .expansions
             .iter()
             .filter(|expansion| {
@@ -4179,10 +4178,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(producers.len(), 2);
         assert_ne!(producers[0].id, producers[1].id);
-        assert!(analysis.source_units().iter().any(|unit| {
+        assert!(inspected.source.units.iter().any(|unit| {
             unit.kind == WrittenUnitKind::NestedItem && unit.full_range == removable
         }));
-        assert!(!analysis.source_units().iter().any(|unit| {
+        assert!(!inspected.source.units.iter().any(|unit| {
             unit.kind == WrittenUnitKind::NestedItem && written_call.contains(unit.full_range)
         }));
 
@@ -4225,11 +4224,11 @@ mod tests {
             .to_owned();
         let input = crate::SourceInput::binary(source, crate::Edition::Rust2024, target.clone());
         let analyzer = crate::Analyzer::new().unwrap();
-        let analysis = analyzer.analyze(&input).unwrap();
+        let inspected = inspect_reduction(input.source().to_owned(), target.clone());
 
         assert_eq!(
-            analysis
-                .graph()
+            inspected
+                .graph
                 .expansions
                 .iter()
                 .filter(|expansion| matches!(
@@ -4240,7 +4239,7 @@ mod tests {
                 .count(),
             2
         );
-        assert!(analysis.source_units().iter().any(|unit| {
+        assert!(inspected.source.units.iter().any(|unit| {
             unit.kind == WrittenUnitKind::NestedItem && unit.full_range == must_stay
         }));
         let reduced = analyzer.reduce(&input).unwrap();

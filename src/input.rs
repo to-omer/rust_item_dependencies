@@ -68,7 +68,6 @@ use crate::source::{
     refine_attribute_macros_from_compiler, refine_derive_targets_from_compiler,
     refine_macro_rules_from_compiler,
 };
-use crate::tags::{DefinitionTags, TagError, collect_definition_tags};
 use crate::target_libraries::{
     TargetLibrarySource, select_ready_target_libraries, target_metadata_directory,
 };
@@ -84,7 +83,7 @@ pub enum Edition {
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
-pub enum CrateType {
+pub(crate) enum CrateType {
     #[default]
     Binary,
     Library,
@@ -298,12 +297,12 @@ impl CompilationOptions {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceInput {
-    pub source: String,
-    pub edition: Edition,
-    pub target: String,
-    pub crate_type: CrateType,
-    pub crate_name: String,
-    pub entry_points: Vec<EntryPoint>,
+    source: String,
+    edition: Edition,
+    target: String,
+    crate_type: CrateType,
+    crate_name: String,
+    entry_points: Vec<EntryPoint>,
 }
 
 impl SourceInput {
@@ -344,6 +343,10 @@ impl SourceInput {
     pub fn with_entry_point(mut self, entry_point: EntryPoint) -> Self {
         self.entry_points.push(entry_point);
         self
+    }
+
+    pub(crate) fn source(&self) -> &str {
+        &self.source
     }
 }
 
@@ -428,7 +431,6 @@ pub(crate) enum InputError {
     Definition(DefinitionError),
     Dependency(DependencyError),
     Rewrite(SourceRewriteError),
-    Tag(TagError),
 }
 
 #[derive(Clone, Debug)]
@@ -444,7 +446,6 @@ pub(crate) enum DependencyError {
     Monomorphization(MonomorphizationError),
     Retention(RetentionError),
     Graph(DependencyGraphError),
-    Tag(TagError),
     Rewrite(SourceRewriteError),
 }
 
@@ -520,18 +521,6 @@ impl From<SourceRewriteError> for InputError {
     }
 }
 
-impl From<TagError> for InputError {
-    fn from(error: TagError) -> Self {
-        Self::Tag(error)
-    }
-}
-
-impl From<TagError> for DependencyError {
-    fn from(error: TagError) -> Self {
-        Self::Tag(error)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InspectedSource {
     pub source: SourceInventory,
@@ -545,7 +534,6 @@ pub(crate) struct InspectedDependencies {
     pub constraints: SourceConstraints,
     pub complete_source_outputless_macro_expansions: Option<BTreeSet<ExpansionId>>,
     pub external_compiler: ExternalCompilerObservation,
-    pub tags: DefinitionTags,
     pub(crate) definition_identity_universe: DefinitionIdentityUniverse,
 }
 
@@ -557,7 +545,6 @@ pub(crate) struct InspectedReduction {
     pub retention: Retention,
     pub rewrite: SourceRewrite,
     pub external_compiler: ExternalCompilerExpectation,
-    pub tags: DefinitionTags,
     pub(crate) definition_identity_universe: DefinitionIdentityUniverse,
 }
 
@@ -794,7 +781,6 @@ fn inspect_source_with_dependencies_inner(
         complete_source_outputless_macro_expansions: dependencies
             .complete_source_outputless_macro_expansions,
         external_compiler,
-        tags: dependencies.tags,
         definition_identity_universe: dependencies.definition_identity_universe,
     })
 }
@@ -825,7 +811,6 @@ pub(crate) fn inspect_source_with_reduction_in_context(
         retention,
         rewrite,
         external_compiler,
-        tags: inspected.tags,
         definition_identity_universe: inspected.definition_identity_universe,
     })
 }
@@ -835,7 +820,6 @@ struct CollectedDependencies {
     graph: DependencyGraph,
     constraints: SourceConstraints,
     complete_source_outputless_macro_expansions: Option<BTreeSet<ExpansionId>>,
-    tags: DefinitionTags,
     definition_identity_universe: DefinitionIdentityUniverse,
 }
 
@@ -1070,18 +1054,6 @@ fn map_input_error(error: InputError, coordinates: Option<&SourceRewrite>) -> In
                 }
             }
             InputError::OriginalCompilationFailed(diagnostics)
-        }
-        InputError::Tag(TagError::InvalidTag(range)) => match map(range) {
-            Ok(range) => InputError::Tag(TagError::InvalidTag(range)),
-            Err(error) => InputError::Rewrite(error),
-        },
-        InputError::Dependency(DependencyError::Tag(TagError::InvalidTag(range))) => {
-            match map(range) {
-                Ok(range) => {
-                    InputError::Dependency(DependencyError::Tag(TagError::InvalidTag(range)))
-                }
-                Err(error) => InputError::Rewrite(error),
-            }
         }
         error => error,
     }
@@ -1665,7 +1637,6 @@ fn collect_dependency_graph(
         expected_identity,
     )?;
     let definition_identity_universe = definitions.identity_universe().clone();
-    let tags = collect_definition_tags(compiler, tcx, source, &definitions)?;
     // Source constraints join HIR definitions to the rewritten inventory, so
     // they must be collected before any identity is moved to original-source
     // coordinates. Preserve the established query order for original-source
@@ -1816,7 +1787,6 @@ fn collect_dependency_graph(
         graph,
         constraints,
         complete_source_outputless_macro_expansions,
-        tags,
         definition_identity_universe,
     })
 }

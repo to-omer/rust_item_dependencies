@@ -309,8 +309,8 @@ mod patched {
             "failed cargo rid left process snapshots behind: {new_snapshots:?}"
         );
 
-        let original_output = compile_and_run(&original.source, &artifacts, "original", false);
-        let reduced_output = compile_and_run(&reduced.source, &artifacts, "reduced", false);
+        let original_output = compile_and_run(INPUT_SOURCE, &artifacts, "original", false);
+        let reduced_output = compile_and_run(EXPECTED_SOURCE, &artifacts, "reduced", false);
         assert!(original_output.status.success());
         assert_eq!(original_output.stdout, b"42\n");
         assert_eq!(reduced_output.status, original_output.status);
@@ -667,7 +667,7 @@ mod patched {
             ),
         ] {
             let error = analyzer
-                .analyze(&input(source))
+                .reduce(&input(source))
                 .expect_err("an unpermitted macro must be rejected before execution");
             let AnalysisError::UnsupportedInput {
                 reason: UnsupportedReason::ProcMacro,
@@ -693,7 +693,7 @@ mod patched {
         let source = input("fn main() { let _ = proc_fixture::panic_bang!(); }\n");
 
         assert!(matches!(
-            analyzer.analyze(&source),
+            analyzer.reduce(&source),
             Err(AnalysisError::OriginalCompilationFailed(_))
         ));
     }
@@ -711,7 +711,7 @@ mod patched {
         let source = "fn main() { let _ = denied_fixture::panic_bang!(); }\n";
 
         assert!(matches!(
-            analyzer.analyze(&input(source)),
+            analyzer.reduce(&input(source)),
             Err(AnalysisError::UnsupportedInput {
                 reason: UnsupportedReason::ProcMacro,
                 ..
@@ -720,93 +720,15 @@ mod patched {
     }
 
     #[test]
-    fn proc_macro_recipe_normalizes_paths_and_order_and_tracks_roles_contents_and_permissions() {
-        let artifacts = ProcMacroArtifacts::build();
-        let copied_directory = TestDirectory::new();
-        let copied_direct = copied_directory
-            .path()
-            .join(artifacts.direct.file_name().unwrap());
-        let copied_denied = copied_directory
-            .path()
-            .join(artifacts.denied.file_name().unwrap());
-        fs::copy(&artifacts.direct, &copied_direct).unwrap();
-        fs::copy(&artifacts.denied, &copied_denied).unwrap();
-        let source = input("fn main() {}\n");
-        let expected = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("proc_fixture", &artifacts.direct)
-                .with_dependency_artifact(&artifacts.denied)
-                .allow_proc_macro_execution(&artifacts.direct)
-                .allow_proc_macro_execution(&artifacts.denied),
-        )
-        .unwrap()
-        .analyze(&source)
-        .unwrap()
-        .recipe();
-        let copied = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .allow_proc_macro_execution(&copied_denied)
-                .with_dependency_artifact(&copied_denied)
-                .allow_proc_macro_execution(&copied_direct)
-                .with_external_crate("proc_fixture", &copied_direct)
-                .allow_proc_macro_execution(&copied_direct)
-                .with_dependency_artifact(&copied_denied),
-        )
-        .unwrap()
-        .analyze(&source)
-        .unwrap()
-        .recipe();
-        assert_eq!(copied, expected);
-
-        let different_roles = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("proc_fixture", &artifacts.denied)
-                .with_dependency_artifact(&artifacts.direct)
-                .allow_proc_macro_execution(&artifacts.direct)
-                .allow_proc_macro_execution(&artifacts.denied),
-        )
-        .unwrap()
-        .analyze(&source)
-        .unwrap()
-        .recipe();
-        assert_ne!(different_roles, expected);
-
-        fs::copy(&artifacts.denied, &copied_direct).unwrap();
-        let different_contents = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("proc_fixture", &copied_direct)
-                .with_dependency_artifact(&copied_denied)
-                .allow_proc_macro_execution(&copied_direct)
-                .allow_proc_macro_execution(&copied_denied),
-        )
-        .unwrap()
-        .analyze(&source)
-        .unwrap()
-        .recipe();
-        assert_ne!(different_contents, expected);
-
-        let without_permission = Analyzer::new_with_options(
-            CompilationOptions::new()
-                .with_external_crate("proc_fixture", &artifacts.direct)
-                .with_dependency_artifact(&artifacts.denied),
-        )
-        .unwrap()
-        .analyze(&source)
-        .unwrap()
-        .recipe();
-        assert_ne!(without_permission, expected);
-    }
-
-    #[test]
     fn proc_macro_execution_uses_the_artifact_snapshot_owned_by_the_analyzer() {
         let artifacts = ProcMacroArtifacts::build();
         let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
         fs::write(&artifacts.direct, b"not a dynamic library").unwrap();
 
-        let source = input("fn main() { println!(\"{}\", proc_fixture::one!()); }\n");
-        let reduced = analyzer.reduce(&source).unwrap();
+        let source = "fn main() { println!(\"{}\", proc_fixture::one!()); }\n";
+        let reduced = analyzer.reduce(&input(source)).unwrap();
 
-        assert_eq!(reduced.reduced_source(), source.source);
+        assert_eq!(reduced.reduced_source(), source);
     }
 
     const SNAPSHOT_TEST_PHASE_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_TEST_PHASE";
@@ -921,9 +843,9 @@ mod patched {
             assert_eq!(macro_snapshot, dependency_snapshot);
         }
 
-        let source = input("fn main() { println!(\"{}\", lifetime_macros::from_support!()); }\n");
-        let reduction = analyzer.reduce(&source).unwrap();
-        assert_eq!(reduction.reduced_source(), source.source);
+        let source = "fn main() { println!(\"{}\", lifetime_macros::from_support!()); }\n";
+        let reduction = analyzer.reduce(&input(source)).unwrap();
+        assert_eq!(reduction.reduced_source(), source);
 
         let last_owner = analyzer.clone();
         drop(analyzer);
@@ -971,7 +893,7 @@ mod patched {
         let dependency_snapshot =
             unique_directory_containing(snapshot_parent, artifacts.dependency.file_name().unwrap());
         assert!(matches!(
-            analyzer.analyze(&input(
+            analyzer.reduce(&input(
                 "fn main() { let _ = lifetime_macros::panic_after_load!(); }\n"
             )),
             Err(AnalysisError::OriginalCompilationFailed(_))
