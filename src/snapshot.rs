@@ -10,23 +10,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compiler_terms::CanonicalCompilerTerm;
 use crate::dependency_graph::{
-    AllocationPathSite, AllocationRootKey, BuiltinTraitTarget, DefinitionReferenceKey,
-    DependencyGraph, DependencyKind, ExpansionId, ExpansionKey, ExpansionKeyPart, ExpansionKind,
-    GraphNode, MacroImplementationKind, MonoCollection, MonoId, MonoInstanceKey, MonoInstanceRole,
-    MonoKey, ObservationSite, ProjectionOutcome, ProjectionSourceKind, ProofId, ProofKey,
-    ProofNodeKind, ProofRelationKind, RootReason, SelectionSource, SelectionSourceKind,
-    SolverTracePayload, SpecializationNode, SpecializationNodeKind,
+    BuiltinTraitTarget, DefinitionReferenceKey, DependencyGraph, DependencyKind, ExpansionId,
+    ExpansionKey, ExpansionKeyPart, ExpansionKind, GraphNode, MacroImplementationKind,
+    MonoCollection, MonoId, MonoInstanceKey, MonoKey, ObservationSite, ProjectionOutcome,
+    ProjectionSourceKind, ProofId, ProofKey, ProofNodeKind, ProofRelationKind, RootReason,
+    SelectionSource, SelectionSourceKind, SolverTracePayload, SpecializationNode,
+    SpecializationNodeKind,
 };
-use crate::digest::sha256;
 use crate::graph::{
-    DefinitionId, DefinitionKey, DefinitionOriginKey, DefinitionTarget, ExternalDefinitionId,
-    ExternalDefinitionKey,
+    DefinitionId, DefinitionKey, DefinitionTarget, ExternalDefinitionId, ExternalDefinitionKey,
 };
 use crate::retention::{Retention, SourceSiteOwnerIndex, source_site_is_retained};
 use crate::rewrite::SourceRewrite;
 use crate::source::{ByteRange, SourceInventory};
-
-const SNAPSHOT_SCHEMA: u8 = 7;
 
 type SourceFilter<'a> = (
     &'a SourceSiteOwnerIndex,
@@ -322,27 +318,6 @@ impl CompilerDecisionSnapshot {
             }
         }
         Self::build(graph, &selected, None, outputless_macro_expansions)
-    }
-
-    pub(crate) fn hash(&self) -> [u8; 32] {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"RIDSNAP");
-        put_u8(&mut bytes, SNAPSHOT_SCHEMA);
-        put_len(&mut bytes, self.roots.len());
-        for root in &self.roots {
-            put_snapshot_root(&mut bytes, root);
-        }
-        put_len(&mut bytes, self.nodes.len());
-        for (key, decision) in &self.nodes {
-            put_snapshot_node_key(&mut bytes, key);
-            put_snapshot_node_decision(&mut bytes, decision);
-        }
-        put_len(&mut bytes, self.edges.len());
-        for edge in &self.edges {
-            put_snapshot_edge(&mut bytes, edge);
-        }
-
-        sha256(bytes)
     }
 
     pub(crate) fn first_difference(&self, reduced: &Self) -> Option<SnapshotDiff> {
@@ -1499,580 +1474,6 @@ fn first_map_difference<K: Clone + Ord, V: Clone + Eq>(
     }
 }
 
-fn put_snapshot_root(bytes: &mut Vec<u8>, root: &SnapshotRoot) {
-    put_snapshot_node_key(bytes, &root.node);
-    put_root_reason(bytes, root.reason);
-}
-
-fn put_root_reason(bytes: &mut Vec<u8>, reason: RootReason) {
-    let tag = match reason {
-        RootReason::Main => 0,
-        RootReason::ExplicitEntry => 1,
-        RootReason::DownstreamSelection => 2,
-        RootReason::StartInstance => 3,
-        RootReason::UsedAttribute => 4,
-        RootReason::ExternalSymbol => 5,
-        RootReason::NativeLink => 6,
-        RootReason::GlobalAssembly => 7,
-    };
-    put_u8(bytes, tag);
-}
-
-fn put_snapshot_node_key(bytes: &mut Vec<u8>, key: &SnapshotNodeKey) {
-    match key {
-        SnapshotNodeKey::Definition(key) => {
-            put_u8(bytes, 0);
-            put_definition_key(bytes, key);
-        }
-        SnapshotNodeKey::ExternalDefinition(key) => {
-            put_u8(bytes, 1);
-            put_external_definition_key(bytes, key);
-        }
-        SnapshotNodeKey::Expansion(key) => {
-            put_u8(bytes, 2);
-            put_expansion_key(bytes, key);
-        }
-        SnapshotNodeKey::Proof(key) => {
-            put_u8(bytes, 3);
-            put_proof_key(bytes, key);
-        }
-        SnapshotNodeKey::Mono(key) => {
-            put_u8(bytes, 4);
-            put_mono_key(bytes, key);
-        }
-    }
-}
-
-fn put_snapshot_node_decision(bytes: &mut Vec<u8>, decision: &SnapshotNodeDecision) {
-    match decision {
-        SnapshotNodeDecision::Definition => put_u8(bytes, 0),
-        SnapshotNodeDecision::ExternalDefinition => put_u8(bytes, 1),
-        SnapshotNodeDecision::Expansion(decision) => {
-            put_u8(bytes, 2);
-            put_expansion_kind(bytes, &decision.kind);
-            put_option(bytes, decision.fragment.as_ref(), |bytes, value| {
-                put_u8(bytes, *value as u8)
-            });
-            put_option(bytes, decision.implementation.as_ref(), |bytes, value| {
-                put_u8(bytes, *value as u8)
-            });
-            put_option(bytes, decision.discovered_in.as_ref(), put_expansion_key);
-            put_option(bytes, decision.semantic_parent.as_ref(), put_expansion_key);
-            put_option(
-                bytes,
-                decision.source_call_parent.as_ref(),
-                put_expansion_key,
-            );
-            put_option(bytes, decision.source_owner.as_ref(), put_definition_key);
-            put_option(
-                bytes,
-                decision.macro_definition.as_ref(),
-                put_definition_reference_key,
-            );
-        }
-        SnapshotNodeDecision::Proof(decision) => {
-            put_u8(bytes, 3);
-            put_proof_decision(bytes, decision);
-        }
-        SnapshotNodeDecision::Mono {
-            materialized_definition,
-        } => {
-            put_u8(bytes, 4);
-            put_option(
-                bytes,
-                materialized_definition.as_ref(),
-                put_definition_reference_key,
-            );
-        }
-    }
-}
-
-fn put_proof_decision(bytes: &mut Vec<u8>, decision: &SnapshotProofDecision) {
-    match decision {
-        SnapshotProofDecision::Obligation {
-            environment,
-            predicate,
-            source,
-            selection_nested,
-            fulfillment_nested,
-            query_trace,
-        } => {
-            put_u8(bytes, 0);
-            put_term(bytes, environment);
-            put_term(bytes, predicate);
-            put_option(bytes, source.as_ref(), put_selection_source);
-            put_option(bytes, selection_nested.as_ref(), |bytes, keys| {
-                put_proof_keys(bytes, keys)
-            });
-            put_option(bytes, fulfillment_nested.as_ref(), |bytes, keys| {
-                put_proof_keys(bytes, keys)
-            });
-            put_option(bytes, query_trace.as_ref(), put_solver_trace);
-        }
-        SnapshotProofDecision::Projection {
-            environment,
-            alias,
-            source_kind,
-            source,
-            outcome,
-            selected_trait,
-            selected_impl,
-            selected_item,
-            owners,
-            nested,
-            query_trace,
-            normalized_result,
-        } => {
-            put_u8(bytes, 1);
-            put_term(bytes, environment);
-            put_term(bytes, alias);
-            put_u8(bytes, *source_kind as u8);
-            put_term(bytes, source);
-            put_projection_outcome(bytes, outcome);
-            put_option(bytes, selected_trait.as_ref(), put_proof_key);
-            put_option(bytes, selected_impl.as_ref(), put_definition_reference_key);
-            put_option(bytes, selected_item.as_ref(), put_definition_reference_key);
-            put_proof_keys(bytes, owners);
-            put_proof_keys(bytes, nested);
-            put_option(bytes, query_trace.as_ref(), put_solver_trace);
-            put_option(bytes, normalized_result.as_ref(), put_term);
-        }
-        SnapshotProofDecision::AssociatedItem {
-            request,
-            raw_instance,
-            codegen_instance,
-            selection,
-            source_kind,
-            leaf,
-            defining_node,
-            finalizing_node,
-            ancestor_path,
-        } => {
-            put_u8(bytes, 2);
-            put_term(bytes, request);
-            put_mono_instance_key(bytes, raw_instance);
-            put_mono_instance_key(bytes, codegen_instance);
-            put_proof_key(bytes, selection);
-            put_u8(bytes, *source_kind as u8);
-            put_option(bytes, leaf.as_ref(), put_definition_reference_key);
-            put_option(bytes, defining_node.as_ref(), put_specialization_node);
-            put_option(bytes, finalizing_node.as_ref(), put_specialization_node);
-            put_len(bytes, ancestor_path.len());
-            for node in ancestor_path {
-                put_specialization_node(bytes, node);
-            }
-        }
-        SnapshotProofDecision::Cycle {
-            members,
-            coinductive,
-        } => {
-            put_u8(bytes, 3);
-            put_proof_keys(bytes, members);
-            put_bool(bytes, *coinductive);
-        }
-    }
-}
-
-fn put_selection_source(bytes: &mut Vec<u8>, source: &SnapshotSelectionSource) {
-    put_u8(bytes, source.kind as u8);
-    put_term(bytes, &source.term);
-    put_option(
-        bytes,
-        source.implementation.as_ref(),
-        put_definition_reference_key,
-    );
-    put_option(bytes, source.builtin_trait.as_ref(), |bytes, target| {
-        put_u8(bytes, target.kind as u8);
-        put_definition_reference_key(bytes, &target.target);
-    });
-}
-
-fn put_solver_trace(bytes: &mut Vec<u8>, trace: &SnapshotSolverTrace) {
-    put_proof_key(bytes, &trace.root);
-    put_proof_keys(bytes, &trace.obligations);
-    put_proof_keys(bytes, &trace.trait_selections);
-    put_proof_keys(bytes, &trace.projections);
-    put_proof_keys(bytes, &trace.fulfillments);
-    put_proof_keys(bytes, &trace.cycles);
-}
-
-fn put_specialization_node(bytes: &mut Vec<u8>, node: &SnapshotSpecializationNode) {
-    put_u8(bytes, node.kind as u8);
-    put_definition_reference_key(bytes, &node.target);
-}
-
-fn put_snapshot_edge(bytes: &mut Vec<u8>, edge: &SnapshotEdge) {
-    match &edge.from {
-        SnapshotEdgeFrom::Node(node) => {
-            put_u8(bytes, 0);
-            put_snapshot_node_key(bytes, node);
-        }
-        SnapshotEdgeFrom::SourceAssociatedItem => put_u8(bytes, 1),
-    }
-    put_snapshot_node_key(bytes, &edge.to);
-    put_dependency_kind(bytes, &edge.kind);
-    put_len(bytes, edge.sites.len());
-    for site in &edge.sites {
-        match site {
-            SnapshotObservationSite::Source(range) => {
-                put_u8(bytes, 0);
-                put_range(bytes, *range);
-            }
-            SnapshotObservationSite::ExternalSource => put_u8(bytes, 1),
-            SnapshotObservationSite::AllocationReference => put_u8(bytes, 2),
-            SnapshotObservationSite::VTableSlot(slot) => {
-                put_u8(bytes, 3);
-                put_u64(bytes, *slot);
-            }
-            SnapshotObservationSite::CompilerGenerated => put_u8(bytes, 4),
-        }
-    }
-}
-
-fn put_dependency_kind(bytes: &mut Vec<u8>, kind: &DependencyKind) {
-    match kind {
-        DependencyKind::Definition(kind) => {
-            put_u8(bytes, 0);
-            put_u8(bytes, *kind as u8);
-        }
-        DependencyKind::ExpansionDiscoveredIn => put_u8(bytes, 1),
-        DependencyKind::ExpansionSemanticParent => put_u8(bytes, 2),
-        DependencyKind::ExpansionSourceCallParent => put_u8(bytes, 3),
-        DependencyKind::MacroDefinition => put_u8(bytes, 4),
-        DependencyKind::ExpansionUse => put_u8(bytes, 5),
-        DependencyKind::GeneratedBy => put_u8(bytes, 6),
-        DependencyKind::SelectionProof {
-            relation,
-            collection,
-        } => {
-            put_u8(bytes, 7);
-            put_u8(bytes, *relation as u8);
-            put_u8(bytes, *collection as u8);
-        }
-        DependencyKind::ProofRelation { relation, ordinal } => {
-            put_u8(bytes, 8);
-            put_u8(bytes, *relation as u8);
-            put_u32(bytes, *ordinal);
-        }
-        DependencyKind::MaterializesDefinition => put_u8(bytes, 9),
-        DependencyKind::Mono {
-            relation,
-            collection,
-        } => {
-            put_u8(bytes, 10);
-            put_u8(bytes, *relation as u8);
-            put_u8(bytes, *collection as u8);
-        }
-    }
-}
-
-fn put_definition_key(bytes: &mut Vec<u8>, key: &DefinitionKey) {
-    put_len(bytes, key.0.len());
-    for part in &key.0 {
-        put_u8(bytes, part.kind.rank());
-        put_definition_origin_key(bytes, &part.origin);
-        put_option(bytes, part.name.as_ref(), |bytes, name| {
-            put_str(bytes, name)
-        });
-        put_u32(bytes, part.same_role_ordinal);
-    }
-}
-
-fn put_definition_origin_key(bytes: &mut Vec<u8>, origin: &DefinitionOriginKey) {
-    match origin {
-        DefinitionOriginKey::Written { anchor, unit_kind } => {
-            put_u8(bytes, 0);
-            put_range(bytes, *anchor);
-            put_u8(bytes, unit_kind.rank());
-        }
-        DefinitionOriginKey::Expanded {
-            invocation_range,
-            generated_role,
-        } => {
-            put_u8(bytes, 1);
-            put_range(bytes, *invocation_range);
-            put_option(bytes, generated_role.as_ref(), |bytes, role| {
-                put_u8(bytes, *role as u8)
-            });
-        }
-        DefinitionOriginKey::CompilerGenerated { role } => {
-            put_u8(bytes, 2);
-            put_u8(bytes, *role as u8);
-        }
-        DefinitionOriginKey::Injected { role } => {
-            put_u8(bytes, 3);
-            put_u8(bytes, *role as u8);
-        }
-    }
-}
-
-fn put_external_definition_key(bytes: &mut Vec<u8>, key: &ExternalDefinitionKey) {
-    put_u64(bytes, key.crate_identity);
-    put_str(bytes, &key.crate_name);
-    put_raw(bytes, &key.def_path_hash);
-}
-
-fn put_definition_reference_key(bytes: &mut Vec<u8>, key: &DefinitionReferenceKey) {
-    match key {
-        DefinitionReferenceKey::Local(key) => {
-            put_u8(bytes, 0);
-            put_definition_key(bytes, key);
-        }
-        DefinitionReferenceKey::External(key) => {
-            put_u8(bytes, 1);
-            put_external_definition_key(bytes, key);
-        }
-    }
-}
-
-fn put_expansion_key(bytes: &mut Vec<u8>, key: &ExpansionKey) {
-    put_len(bytes, key.0.len());
-    for part in &key.0 {
-        put_expansion_kind(bytes, &part.kind);
-        put_option(bytes, part.fragment.as_ref(), |bytes, fragment| {
-            put_u8(bytes, *fragment as u8)
-        });
-        put_option(
-            bytes,
-            part.implementation.as_ref(),
-            |bytes, implementation| put_u8(bytes, *implementation as u8),
-        );
-        put_option(bytes, part.invocation_range.as_ref(), |bytes, range| {
-            put_range(bytes, *range)
-        });
-        put_option(bytes, part.node_range.as_ref(), |bytes, range| {
-            put_range(bytes, *range)
-        });
-        put_option(bytes, part.target_range.as_ref(), |bytes, range| {
-            put_range(bytes, *range)
-        });
-        put_option(
-            bytes,
-            part.macro_definition.as_ref(),
-            put_definition_reference_key,
-        );
-        put_option(bytes, part.selected_macro_rule.as_ref(), |bytes, range| {
-            put_range(bytes, *range)
-        });
-        put_u32(bytes, part.same_role_ordinal);
-    }
-}
-
-fn put_expansion_kind(bytes: &mut Vec<u8>, kind: &ExpansionKind) {
-    match kind {
-        ExpansionKind::Macro { style, name } => {
-            put_u8(bytes, 0);
-            put_u8(bytes, *style as u8);
-            put_str(bytes, name);
-        }
-        ExpansionKind::AstPass(kind) => {
-            put_u8(bytes, 1);
-            put_u8(bytes, *kind as u8);
-        }
-        ExpansionKind::Desugaring(kind) => {
-            put_u8(bytes, 2);
-            put_u8(bytes, *kind as u8);
-        }
-    }
-}
-
-fn put_proof_keys(bytes: &mut Vec<u8>, keys: &[ProofKey]) {
-    put_len(bytes, keys.len());
-    for key in keys {
-        put_proof_key(bytes, key);
-    }
-}
-
-fn put_proof_key(bytes: &mut Vec<u8>, key: &ProofKey) {
-    match key {
-        ProofKey::Obligation {
-            environment,
-            predicate,
-        } => {
-            put_u8(bytes, 0);
-            put_term(bytes, environment);
-            put_term(bytes, predicate);
-        }
-        ProofKey::Projection { environment, alias } => {
-            put_u8(bytes, 1);
-            put_term(bytes, environment);
-            put_term(bytes, alias);
-        }
-        ProofKey::AssociatedItem {
-            request,
-            raw_instance,
-            codegen_instance,
-        } => {
-            put_u8(bytes, 2);
-            put_term(bytes, request);
-            put_mono_instance_key(bytes, raw_instance);
-            put_mono_instance_key(bytes, codegen_instance);
-        }
-        ProofKey::Cycle {
-            members,
-            coinductive,
-        } => {
-            put_u8(bytes, 3);
-            put_proof_keys(bytes, members);
-            put_bool(bytes, *coinductive);
-        }
-    }
-}
-
-fn put_mono_key(bytes: &mut Vec<u8>, key: &MonoKey) {
-    match key {
-        MonoKey::Instance { instance, role } => {
-            put_u8(bytes, 0);
-            put_mono_instance_key(bytes, instance);
-            put_mono_instance_role(bytes, *role);
-        }
-        MonoKey::Static { definition } => {
-            put_u8(bytes, 1);
-            put_definition_key(bytes, definition);
-        }
-        MonoKey::VTable {
-            concrete_type,
-            trait_reference,
-        } => {
-            put_u8(bytes, 2);
-            put_term(bytes, concrete_type);
-            put_option(bytes, trait_reference.as_ref(), put_term);
-        }
-        MonoKey::Allocation(allocation) => {
-            put_u8(bytes, 3);
-            put_allocation_root_key(bytes, &allocation.root);
-            put_len(bytes, allocation.path.len());
-            for part in &allocation.path {
-                put_u8(bytes, part.relation as u8);
-                put_u8(bytes, part.collection as u8);
-                put_allocation_path_site(bytes, part.site);
-                put_u32(bytes, part.same_role_ordinal);
-            }
-        }
-        MonoKey::GlobalAsm { definition } => {
-            put_u8(bytes, 4);
-            put_definition_key(bytes, definition);
-        }
-    }
-}
-
-fn put_mono_instance_key(bytes: &mut Vec<u8>, key: &MonoInstanceKey) {
-    put_definition_reference_key(bytes, &key.definition);
-    put_term(bytes, &key.arguments);
-    put_term(bytes, &key.kind);
-}
-
-fn put_mono_instance_role(bytes: &mut Vec<u8>, role: MonoInstanceRole) {
-    match role {
-        MonoInstanceRole::Callable => put_u8(bytes, 0),
-        MonoInstanceRole::Const { promoted } => {
-            put_u8(bytes, 1);
-            put_option(bytes, promoted.as_ref(), |bytes, value| {
-                put_u32(bytes, *value)
-            });
-        }
-    }
-}
-
-fn put_allocation_root_key(bytes: &mut Vec<u8>, root: &AllocationRootKey) {
-    match root {
-        AllocationRootKey::Instance { instance, role } => {
-            put_u8(bytes, 0);
-            put_mono_instance_key(bytes, instance);
-            put_mono_instance_role(bytes, *role);
-        }
-        AllocationRootKey::Static(definition) => {
-            put_u8(bytes, 1);
-            put_definition_key(bytes, definition);
-        }
-        AllocationRootKey::VTable {
-            concrete_type,
-            trait_reference,
-        } => {
-            put_u8(bytes, 2);
-            put_term(bytes, concrete_type);
-            put_option(bytes, trait_reference.as_ref(), put_term);
-        }
-    }
-}
-
-fn put_allocation_path_site(bytes: &mut Vec<u8>, site: AllocationPathSite) {
-    match site {
-        AllocationPathSite::Source(range) => {
-            put_u8(bytes, 0);
-            put_range(bytes, range);
-        }
-        AllocationPathSite::ExternalSource => put_u8(bytes, 1),
-        AllocationPathSite::AllocationReference => put_u8(bytes, 2),
-        AllocationPathSite::CompilerGenerated => put_u8(bytes, 3),
-    }
-}
-
-fn put_projection_outcome(bytes: &mut Vec<u8>, outcome: &ProjectionOutcome) {
-    match outcome {
-        ProjectionOutcome::Progress { raw_term } => {
-            put_u8(bytes, 0);
-            put_term(bytes, raw_term);
-        }
-        ProjectionOutcome::NoProgress { term } => {
-            put_u8(bytes, 1);
-            put_term(bytes, term);
-        }
-    }
-}
-
-fn put_term(bytes: &mut Vec<u8>, term: &CanonicalCompilerTerm) {
-    put_u32(bytes, term.schema_version);
-    put_raw(bytes, &term.bytes);
-}
-
-fn put_option<T>(bytes: &mut Vec<u8>, value: Option<&T>, put: impl FnOnce(&mut Vec<u8>, &T)) {
-    match value {
-        Some(value) => {
-            put_u8(bytes, 1);
-            put(bytes, value);
-        }
-        None => put_u8(bytes, 0),
-    }
-}
-
-fn put_range(bytes: &mut Vec<u8>, range: ByteRange) {
-    put_u32(bytes, range.start);
-    put_u32(bytes, range.end);
-}
-
-fn put_str(bytes: &mut Vec<u8>, value: &str) {
-    put_raw(bytes, value.as_bytes());
-}
-
-fn put_raw(bytes: &mut Vec<u8>, value: &[u8]) {
-    put_len(bytes, value.len());
-    bytes.extend_from_slice(value);
-}
-
-fn put_len(bytes: &mut Vec<u8>, value: usize) {
-    put_u64(
-        bytes,
-        u64::try_from(value).expect("owned compiler data length fits u64"),
-    );
-}
-
-fn put_bool(bytes: &mut Vec<u8>, value: bool) {
-    put_u8(bytes, u8::from(value));
-}
-
-fn put_u8(bytes: &mut Vec<u8>, value: u8) {
-    bytes.push(value);
-}
-
-fn put_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2084,7 +1485,7 @@ mod tests {
     };
     use crate::graph::{
         Definition, DefinitionGraph, DefinitionKeyPart, DefinitionKind, DefinitionOrigin,
-        ExternalDefinition,
+        DefinitionOriginKey, ExternalDefinition,
     };
     use crate::source::{
         AtomicGroupId, CfgState, OriginalOffsetMap, OwnedPiece, PieceKind, SourceUnitId,
@@ -3003,7 +2404,6 @@ mod tests {
                 .unwrap();
 
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
         assert_eq!(original.first_difference(&reduced), None);
     }
 
@@ -3015,7 +2415,6 @@ mod tests {
             CompilerDecisionSnapshot::reduced(&graph_with_trace_collection_order(true)).unwrap();
 
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
         assert_eq!(original.first_difference(&reduced), None);
     }
 
@@ -3373,7 +2772,6 @@ mod tests {
         let reduced = CompilerDecisionSnapshot::reduced(&reduced_graph).unwrap();
 
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
     }
 
     #[test]
@@ -3435,7 +2833,6 @@ mod tests {
 
         assert_eq!(original.roots, expected_roots);
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
     }
 
     #[test]
@@ -3655,7 +3052,6 @@ mod tests {
             );
         }
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
         assert_eq!(original.first_difference(&reduced), None);
     }
 
@@ -3786,7 +3182,6 @@ mod tests {
         let reduced = CompilerDecisionSnapshot::reduced(&reduced_graph).unwrap();
 
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
         assert_eq!(original.first_difference(&reduced), None);
     }
 
@@ -3804,7 +3199,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
         assert_eq!(original.first_difference(&reduced), None);
     }
 
@@ -3824,7 +3218,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
         assert_eq!(original.first_difference(&reduced), None);
     }
 
@@ -3848,7 +3241,6 @@ mod tests {
                 .unwrap();
 
             assert_ne!(original, reduced);
-            assert_ne!(original.hash(), reduced.hash());
             assert!(original.first_difference(&reduced).is_some());
         }
     }
@@ -3869,7 +3261,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
         assert_eq!(original.first_difference(&reduced), None);
     }
 
@@ -3889,7 +3280,6 @@ mod tests {
             .unwrap();
 
         assert_ne!(original, reduced);
-        assert_ne!(original.hash(), reduced.hash());
         assert!(original.first_difference(&reduced).is_some());
     }
 
@@ -3912,7 +3302,6 @@ mod tests {
         let reduced = CompilerDecisionSnapshot::reduced(&reduced).unwrap();
 
         assert_ne!(original, reduced);
-        assert_ne!(original.hash(), reduced.hash());
         assert!(original.first_difference(&reduced).is_some());
     }
 
@@ -3935,7 +3324,6 @@ mod tests {
         let reduced = CompilerDecisionSnapshot::reduced(&reduced).unwrap();
 
         assert_ne!(original, reduced);
-        assert_ne!(original.hash(), reduced.hash());
         assert!(original.first_difference(&reduced).is_some());
     }
 
@@ -3961,7 +3349,6 @@ mod tests {
         let reduced = CompilerDecisionSnapshot::reduced(&reduced_graph).unwrap();
 
         assert_ne!(original, reduced);
-        assert_ne!(original.hash(), reduced.hash());
         assert!(original.first_difference(&reduced).is_some());
     }
 
@@ -3979,7 +3366,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
         assert_eq!(original.first_difference(&reduced), None);
     }
 
@@ -4040,7 +3426,6 @@ mod tests {
         let reduced = CompilerDecisionSnapshot::reduced(&reduced_graph).unwrap();
 
         assert_ne!(original, reduced);
-        assert_ne!(original.hash(), reduced.hash());
         assert!(original.first_difference(&reduced).is_some());
     }
 
@@ -4173,18 +3558,7 @@ mod tests {
         .unwrap();
 
         assert_ne!(original, reduced);
-        assert_ne!(original.hash(), reduced.hash());
         assert!(original.first_difference(&reduced).is_some());
-    }
-
-    #[test]
-    fn equal_snapshots_have_the_same_sha256() {
-        let original = snapshot();
-        let reduced = snapshot();
-
-        assert_eq!(original, reduced);
-        assert_eq!(original.hash(), reduced.hash());
-        assert_eq!(original.first_difference(&reduced), None);
     }
 
     #[test]
@@ -4222,7 +3596,6 @@ mod tests {
             .pop_first()
             .expect("the fixture snapshot has one entry root");
 
-        assert_ne!(original.hash(), reduced.hash());
         assert_eq!(
             original.first_difference(&reduced),
             Some(SnapshotDiff::Root {
@@ -4243,7 +3616,6 @@ mod tests {
         root.reason = RootReason::ExternalSymbol;
         reduced.roots.insert(root);
 
-        assert_ne!(original.hash(), reduced.hash());
         assert!(matches!(
             original.first_difference(&reduced),
             Some(SnapshotDiff::Root { .. })
@@ -4275,7 +3647,6 @@ mod tests {
         original.edges.insert(original_edge.clone());
         reduced.edges.insert(reduced_edge.clone());
 
-        assert_ne!(original.hash(), reduced.hash());
         assert_eq!(
             original.first_difference(&reduced),
             Some(SnapshotDiff::Edge {

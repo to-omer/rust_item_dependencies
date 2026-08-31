@@ -4048,11 +4048,11 @@ mod tests {
             unit.kind == WrittenUnitKind::NestedItem && unit.full_range == removable
         }));
 
-        let reduced = analyzer.reduce_and_verify(&input).unwrap();
+        let reduced = analyzer.reduce(&input).unwrap();
         assert!(!reduced.reduced_source().contains("removable"));
         assert!(reduced.reduced_source().contains("component!()"));
         let fixed = analyzer
-            .reduce_and_verify(&crate::SourceInput::binary(
+            .reduce(&crate::SourceInput::binary(
                 reduced.reduced_source().to_owned(),
                 crate::Edition::Rust2024,
                 target,
@@ -4186,11 +4186,11 @@ mod tests {
             unit.kind == WrittenUnitKind::NestedItem && written_call.contains(unit.full_range)
         }));
 
-        let reduced = analyzer.reduce_and_verify(&input).unwrap();
+        let reduced = analyzer.reduce(&input).unwrap();
         assert!(!reduced.reduced_source().contains("removable"));
         assert!(reduced.reduced_source().contains("component!(tag)"));
         let fixed = analyzer
-            .reduce_and_verify(&crate::SourceInput::binary(
+            .reduce(&crate::SourceInput::binary(
                 reduced.reduced_source().to_owned(),
                 crate::Edition::Rust2024,
                 target,
@@ -4243,11 +4243,11 @@ mod tests {
         assert!(analysis.source_units().iter().any(|unit| {
             unit.kind == WrittenUnitKind::NestedItem && unit.full_range == must_stay
         }));
-        let reduced = analyzer.reduce_and_verify(&input).unwrap();
+        let reduced = analyzer.reduce(&input).unwrap();
         assert!(!reduced.reduced_source().contains("must_stay"));
         assert!(reduced.reduced_source().contains("$value"));
         let fixed = analyzer
-            .reduce_and_verify(&crate::SourceInput::binary(
+            .reduce(&crate::SourceInput::binary(
                 reduced.reduced_source().to_owned(),
                 crate::Edition::Rust2024,
                 target,

@@ -6,8 +6,8 @@ use rust_item_dependencies::dependency_graph::{
 };
 #[cfg(rust_item_dependencies_patched)]
 use rust_item_dependencies::{
-    AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel,
-    SourceInput, VerifiedReduction,
+    AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel, Reduction,
+    SourceInput,
 };
 #[cfg(rust_item_dependencies_patched)]
 use std::collections::BTreeSet;
@@ -151,10 +151,10 @@ fn complex_reductions_match_handwritten_sources() {
     let target = host_target();
 
     for &(case, source, expected) in CASES {
-        let verified = analyzer
-            .reduce_and_verify(&input(source, &target))
+        let reduction = analyzer
+            .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_verified(case, source, expected, &verified);
+        assert_reduction(case, source, expected, &reduction);
     }
 }
 
@@ -167,14 +167,14 @@ fn macro_component_reductions_preserve_execution_and_reach_a_fixed_point() {
 
     for &(case, source, expected, artifact) in MACRO_COMPONENT_CASES {
         let original_input = input(source, &target);
-        let verified = analyzer
-            .reduce_and_verify(&original_input)
+        let reduction = analyzer
+            .reduce(&original_input)
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_verified(case, source, expected, &verified);
+        assert_reduction(case, source, expected, &reduction);
 
         let reduced_input = input(expected, &target);
         let fixed = analyzer
-            .reduce_and_verify(&reduced_input)
+            .reduce(&reduced_input)
             .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
         assert_eq!(fixed.reduced_source(), expected, "{case} fixed point");
 
@@ -229,10 +229,10 @@ fn inlined_associated_selections_preserve_selected_overrides() {
         })
     }));
 
-    let verified = analyzer
-        .reduce_and_verify(&original_input)
+    let reduction = analyzer
+        .reduce(&original_input)
         .expect("the selected associated overrides must survive optimized MIR inlining");
-    let reduced = verified.reduced_source();
+    let reduced = reduction.reduced_source();
     assert!(!reduced.contains("Unused"));
     assert!(reduced.contains("impl<M: Transform> Storage for M"));
     assert!(reduced.contains("fn normalize(value: u32) -> u32"));
@@ -241,7 +241,7 @@ fn inlined_associated_selections_preserve_selected_overrides() {
     let mut reduced_input = original_input.clone();
     reduced_input.source = reduced.to_owned();
     let fixed = analyzer
-        .reduce_and_verify(&reduced_input)
+        .reduce(&reduced_input)
         .expect("the optimized reduction must reach a fixed point");
     assert_eq!(fixed.reduced_source(), reduced);
 
@@ -280,16 +280,16 @@ fn macro_product_identity_preserves_public_keys_across_reduction() {
         "fn main() { assert_eq!(Input::value(), 1); }\n",
     );
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("removing the first product must preserve the second product's public key");
-    assert!(!verified.reduced_source().contains("for Template"));
-    assert!(verified.reduced_source().contains("for Input"));
+    assert!(!reduction.reduced_source().contains("for Template"));
+    assert!(reduction.reduced_source().contains("for Input"));
 
     let fixed = analyzer
-        .reduce_and_verify(&input(verified.reduced_source(), &target))
+        .reduce(&input(reduction.reduced_source(), &target))
         .expect("the reduced public identity must remain stable");
-    assert_eq!(fixed.reduced_source(), verified.reduced_source());
+    assert_eq!(fixed.reduced_source(), reduction.reduced_source());
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -301,14 +301,14 @@ fn inactive_cfg_components_are_removed_across_stable_syntax() {
     let expected = include_str!("fixtures/retention/inactive_cfg_components.expected.rs");
     let original_input = input(source, &target);
 
-    let verified = analyzer
-        .reduce_and_verify(&original_input)
+    let reduction = analyzer
+        .reduce(&original_input)
         .expect("inactive cfg components must be reducible");
-    assert_verified("inactive cfg components", source, expected, &verified);
+    assert_reduction("inactive cfg components", source, expected, &reduction);
 
     let reduced_input = input(expected, &target);
     let fixed = analyzer
-        .reduce_and_verify(&reduced_input)
+        .reduce(&reduced_input)
         .expect("the inactive cfg reduction must be byte-idempotent");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -336,13 +336,13 @@ fn associated_struct_paths_keep_the_selected_impl_and_reach_a_fixed_point() {
     let source = include_str!("fixtures/retention/associated_struct_paths.input.rs");
     let expected = include_str!("fixtures/retention/associated_struct_paths.expected.rs");
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("associated struct expressions and patterns must be reducible");
-    assert_verified("associated struct paths", source, expected, &verified);
+    assert_reduction("associated struct paths", source, expected, &reduction);
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce(&input(expected, &target))
         .expect("the associated struct reduction must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 }
@@ -357,12 +357,12 @@ fn a_complex_macro_reduction_is_deterministic_and_byte_idempotent() {
         .find(|(case, _, _)| *case == "sysroot macro fixed point")
         .unwrap();
 
-    let first = analyzer.reduce_and_verify(&input(source, &target)).unwrap();
-    let second = analyzer.reduce_and_verify(&input(source, &target)).unwrap();
+    let first = analyzer.reduce(&input(source, &target)).unwrap();
+    let second = analyzer.reduce(&input(source, &target)).unwrap();
     assert_eq!(second, first);
 
     let fixed = analyzer
-        .reduce_and_verify(&input(first.reduced_source(), &target))
+        .reduce(&input(first.reduced_source(), &target))
         .unwrap();
     assert_eq!(fixed.reduced_source(), *expected);
     assert_eq!(fixed.reduced_source(), first.reduced_source());
@@ -382,24 +382,24 @@ fn compilation_context_is_shared_by_reduction_fixed_point_and_linking() {
     let expected = include_str!("fixtures/retention/compilation_context.expected.rs");
     let original_input = input(source, &target);
 
-    let verified = analyzer
-        .reduce_and_verify(&original_input)
+    let reduction = analyzer
+        .reduce(&original_input)
         .expect("the configured source must preserve compiler decisions");
-    assert_verified("shared compilation context", source, expected, &verified);
+    assert_reduction("shared compilation context", source, expected, &reduction);
 
     let mut reduced_input = original_input.clone();
-    reduced_input.source = verified.reduced_source().to_owned();
+    reduced_input.source = reduction.reduced_source().to_owned();
     let fixed = analyzer
-        .reduce_and_verify(&reduced_input)
+        .reduce(&reduced_input)
         .expect("the configured reduction must be byte-idempotent");
-    assert_eq!(fixed.reduced_source(), verified.reduced_source());
+    assert_eq!(fixed.reduced_source(), reduction.reduced_source());
     assert_eq!(
         fixed.original_analysis().recipe(),
-        verified.original_analysis().recipe()
+        reduction.original_analysis().recipe()
     );
     assert_ne!(
         fixed.original_analysis().source_digest(),
-        verified.original_analysis().source_digest()
+        reduction.original_analysis().source_digest()
     );
 
     let original_output =
@@ -436,14 +436,14 @@ fn crate_codegen_and_subsystem_attributes_survive_binary_reduction() {
     );
     let original_input = input(source, &target);
 
-    let verified = analyzer
-        .reduce_and_verify(&original_input)
+    let reduction = analyzer
+        .reduce(&original_input)
         .expect("crate codegen and subsystem attributes must be reducible");
-    assert_verified("crate attributes", source, expected, &verified);
+    assert_reduction("crate attributes", source, expected, &reduction);
 
     let reduced_input = input(expected, &target);
     let fixed = analyzer
-        .reduce_and_verify(&reduced_input)
+        .reduce(&reduced_input)
         .expect("the reduced crate attributes must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -509,19 +509,19 @@ fn no_main_uses_existing_external_symbol_roots_without_standard_entry_roots() {
     );
     let original_input = input(source, &target);
 
-    let verified = analyzer
-        .reduce_and_verify(&original_input)
+    let reduction = analyzer
+        .reduce(&original_input)
         .expect("the no_main program must preserve compiler decisions");
-    assert_verified("no_main external entry", source, expected, &verified);
+    assert_reduction("no_main external entry", source, expected, &reduction);
     assert!(
-        verified
+        reduction
             .original_analysis()
             .roots()
             .iter()
             .all(|root| !matches!(root.reason, RootReason::Main | RootReason::StartInstance))
     );
     assert_eq!(
-        verified
+        reduction
             .original_analysis()
             .roots()
             .iter()
@@ -532,7 +532,7 @@ fn no_main_uses_existing_external_symbol_roots_without_standard_entry_roots() {
 
     let reduced_input = input(expected, &target);
     let fixed = analyzer
-        .reduce_and_verify(&reduced_input)
+        .reduce(&reduced_input)
         .expect("the no_main reduction must be byte-idempotent");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -561,13 +561,13 @@ fn unreachable_inline_assembly_is_removed_with_its_owner() {
     );
     let expected = "\n\n\nfn main() { println!(\"7\"); }\n";
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("assembly in an unreachable owner must not block reduction");
-    assert_verified("unreachable inline assembly", source, expected, &verified);
+    assert_reduction("unreachable inline assembly", source, expected, &reduction);
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce(&input(expected, &target))
         .expect("the assembly-free reduction must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -648,12 +648,12 @@ fn required_assembly_preserves_every_active_source_unit() {
 
     for (case, artifact, source, expected_global_roots) in cases {
         let source_input = input(source, &target);
-        let verified = analyzer
-            .reduce_and_verify(&source_input)
+        let reduction = analyzer
+            .reduce(&source_input)
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_verified(case, source, source, &verified);
+        assert_reduction(case, source, source, &reduction);
         assert_eq!(
-            verified
+            reduction
                 .original_analysis()
                 .roots()
                 .iter()
@@ -664,7 +664,7 @@ fn required_assembly_preserves_every_active_source_unit() {
         );
 
         let fixed = analyzer
-            .reduce_and_verify(&source_input)
+            .reduce(&source_input)
             .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
         assert_eq!(fixed.reduced_source(), source, "{case}");
 
@@ -692,12 +692,12 @@ fn no_main_with_a_rust_entry_and_global_assembly_uses_the_same_roots() {
     );
     let source_input = input(source, &target);
 
-    let verified = analyzer
-        .reduce_and_verify(&source_input)
+    let reduction = analyzer
+        .reduce(&source_input)
         .expect("a Rust target entry may coexist with global assembly");
-    assert_verified("no_main with global assembly", source, source, &verified);
+    assert_reduction("no_main with global assembly", source, source, &reduction);
     assert_eq!(
-        verified
+        reduction
             .original_analysis()
             .roots()
             .iter()
@@ -706,7 +706,7 @@ fn no_main_with_a_rust_entry_and_global_assembly_uses_the_same_roots() {
         1,
     );
     assert_eq!(
-        verified
+        reduction
             .original_analysis()
             .roots()
             .iter()
@@ -803,14 +803,14 @@ fn main() {}
 
     for (case, artifact, source, expected) in cases {
         let original_input = input(source, &target);
-        let verified = analyzer
-            .reduce_and_verify(&original_input)
+        let reduction = analyzer
+            .reduce(&original_input)
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_verified(case, source, expected, &verified);
+        assert_reduction(case, source, expected, &reduction);
 
         let reduced_input = input(expected, &target);
         let fixed = analyzer
-            .reduce_and_verify(&reduced_input)
+            .reduce(&reduced_input)
             .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
         assert_eq!(fixed.reduced_source(), expected, "{case}");
 
@@ -850,13 +850,13 @@ fn external_symbol_roots_preserve_linked_entry_points() {
     let source = include_str!("fixtures/retention/external_symbol_roots.input.rs");
     let expected = include_str!("fixtures/retention/external_symbol_roots.expected.rs");
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("external symbols must be retained as compiler roots");
-    assert_verified("external symbol roots", source, expected, &verified);
+    assert_reduction("external symbol roots", source, expected, &reduction);
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce(&input(expected, &target))
         .expect("external symbol roots must be byte-idempotent");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -901,13 +901,13 @@ fn a_global_allocator_and_its_generated_entry_points_survive_reduction() {
         "fn main() { println!(\"{}\", Box::new(7)); }\n",
     );
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("a global allocator must be retained through its generated entry points");
-    assert_verified("global allocator", source, expected, &verified);
+    assert_reduction("global allocator", source, expected, &reduction);
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce(&input(expected, &target))
         .expect("a reduced global allocator must remain byte-idempotent");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -944,18 +944,18 @@ fn foreign_items_are_reduced_independently_and_preserve_linked_behavior() {
         ("2021", Edition::Rust2021),
         ("2024", Edition::Rust2024),
     ] {
-        let verified = analyzer
-            .reduce_and_verify(&input_with_edition(source, &target, edition))
+        let reduction = analyzer
+            .reduce(&input_with_edition(source, &target, edition))
             .unwrap_or_else(|error| panic!("Rust {edition_name}: {error:?}"));
-        assert_verified(
+        assert_reduction(
             &format!("foreign items in Rust {edition_name}"),
             source,
             expected,
-            &verified,
+            &reduction,
         );
 
         let fixed = analyzer
-            .reduce_and_verify(&input_with_edition(expected, &target, edition))
+            .reduce(&input_with_edition(expected, &target, edition))
             .unwrap_or_else(|error| panic!("Rust {edition_name} fixed point: {error:?}"));
         assert_eq!(fixed.reduced_source(), expected, "Rust {edition_name}");
     }
@@ -1015,11 +1015,11 @@ fn native_link_directives_are_roots_without_pinning_unused_declarations() {
         )
     );
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("an active native link directive must be reducible");
-    assert_verified("native link directive", source, &expected, &verified);
-    let roots = verified
+    assert_reduction("native link directive", source, &expected, &reduction);
+    let roots = reduction
         .original_analysis()
         .roots()
         .iter()
@@ -1029,7 +1029,7 @@ fn native_link_directives_are_roots_without_pinning_unused_declarations() {
     assert!(matches!(roots[0].node, GraphNode::Definition(_)));
 
     let fixed = analyzer
-        .reduce_and_verify(&input(&expected, &target))
+        .reduce(&input(&expected, &target))
         .expect("a reduced native link directive must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -1080,12 +1080,12 @@ fn native_link_and_explicit_library_roots_share_the_same_graph() {
     let input = SourceInput::library(source, Edition::Rust2024, target, "linked_library")
         .with_entry_point(EntryPoint::new("linked_library::entry"));
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("native links and explicit library entries must be reducible together");
-    assert_verified("native link library", source, &expected, &verified);
+    assert_reduction("native link library", source, &expected, &reduction);
     assert_eq!(
-        verified
+        reduction
             .original_analysis()
             .roots()
             .iter()
@@ -1097,7 +1097,7 @@ fn native_link_and_explicit_library_roots_share_the_same_graph() {
     let mut fixed_input = input;
     fixed_input.source = expected.to_owned();
     let fixed = analyzer
-        .reduce_and_verify(&fixed_input)
+        .reduce(&fixed_input)
         .expect("the reduced library must remain byte-identical");
     assert_eq!(fixed.reduced_source(), expected);
 }
@@ -1136,17 +1136,17 @@ fn a_macro_generated_native_link_directive_is_a_compiler_root() {
         "fn main() {}\n",
     );
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("a generated native link directive must be reducible");
-    assert_verified(
+    assert_reduction(
         "generated native link directive",
         source,
         expected,
-        &verified,
+        &reduction,
     );
     assert_eq!(
-        verified
+        reduction
             .original_analysis()
             .roots()
             .iter()
@@ -1156,7 +1156,7 @@ fn a_macro_generated_native_link_directive_is_a_compiler_root() {
     );
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce(&input(expected, &target))
         .expect("a reduced generated native link directive must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 }
@@ -1175,12 +1175,12 @@ fn an_unused_wasm_import_module_does_not_become_a_linker_root() {
     );
     let expected = "\nfn main() {}\n";
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("an unused wasm import module must be reducible");
-    assert_verified("unused wasm import module", source, expected, &verified);
+    assert_reduction("unused wasm import module", source, expected, &reduction);
     assert!(
-        verified
+        reduction
             .original_analysis()
             .roots()
             .iter()
@@ -1188,7 +1188,7 @@ fn an_unused_wasm_import_module_does_not_become_a_linker_root() {
     );
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce(&input(expected, &target))
         .expect("a reduced wasm import module input must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 }
@@ -1223,12 +1223,12 @@ fn raw_dylib_import_declarations_are_compiler_roots() {
         "fn main() {}\n",
     );
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("raw-dylib imports must be reducible without changing the import list");
-    assert_verified("raw-dylib imports", source, expected, &verified);
+    assert_reduction("raw-dylib imports", source, expected, &reduction);
     assert_eq!(
-        verified
+        reduction
             .original_analysis()
             .roots()
             .iter()
@@ -1238,7 +1238,7 @@ fn raw_dylib_import_declarations_are_compiler_roots() {
     );
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce(&input(expected, &target))
         .expect("reduced raw-dylib imports must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -1291,19 +1291,19 @@ fn a_macro_generated_foreign_function_block_is_reducible() {
         "fn main() { println!(\"{}\", unsafe { abs(-7) }); }\n",
     );
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("a generated foreign function declaration must be reducible");
 
-    assert_verified(
+    assert_reduction(
         "generated foreign function block",
         source,
         expected,
-        &verified,
+        &reduction,
     );
 
     let fixed = analyzer
-        .reduce_and_verify(&input(expected, &target))
+        .reduce(&input(expected, &target))
         .expect("a reduced generated foreign block must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 }
@@ -1421,13 +1421,13 @@ fn supported_ffi_constructs_follow_the_same_reduction_rules_as_rust_items() {
     ];
 
     for (case, source, expected) in cases {
-        let verified = analyzer
-            .reduce_and_verify(&input(source, &target))
+        let reduction = analyzer
+            .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_verified(case, source, expected, &verified);
+        assert_reduction(case, source, expected, &reduction);
 
         let fixed = analyzer
-            .reduce_and_verify(&input(expected, &target))
+            .reduce(&input(expected, &target))
             .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
         assert_eq!(fixed.reduced_source(), expected, "{case}");
     }
@@ -1518,13 +1518,13 @@ fn main() {
         expected = expected.replace(WINDOWS_INIT, "");
     }
 
-    let verified = analyzer
-        .reduce_and_verify(&input(source, &target))
+    let reduction = analyzer
+        .reduce(&input(source, &target))
         .expect("a used constructor static must be reducible");
-    assert_verified("used constructor static", source, &expected, &verified);
+    assert_reduction("used constructor static", source, &expected, &reduction);
 
     let fixed = analyzer
-        .reduce_and_verify(&input(&expected, &target))
+        .reduce(&input(&expected, &target))
         .expect("a reduced constructor static must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -1535,7 +1535,7 @@ fn main() {
         "constructor_static_original",
     );
     let reduced_output = compile_and_run(
-        &input(verified.reduced_source(), &target),
+        &input(reduction.reduced_source(), &target),
         &options,
         "constructor_static_reduced",
     );
@@ -1556,14 +1556,14 @@ fn builtin_derives_are_reduced_by_element_without_changing_compiler_behavior() {
     let expected = include_str!("fixtures/retention/builtin_derive_reduction.expected.rs");
     let original_input = input(source, &target);
 
-    let verified = analyzer
-        .reduce_and_verify(&original_input)
+    let reduction = analyzer
+        .reduce(&original_input)
         .expect("stable builtin derives must be reducible by element");
-    assert_verified("builtin derive elements", source, expected, &verified);
+    assert_reduction("builtin derive elements", source, expected, &reduction);
 
     let reduced_input = input(expected, &target);
     let fixed = analyzer
-        .reduce_and_verify(&reduced_input)
+        .reduce(&reduced_input)
         .expect("the builtin derive reduction must remain reducible");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -1590,14 +1590,14 @@ fn opaque_builtin_derive_boundaries_keep_their_written_source_units() {
     let expected = include_str!("fixtures/retention/builtin_derive_boundaries.expected.rs");
     let original_input = input(source, &target);
 
-    let verified = analyzer
-        .reduce_and_verify(&original_input)
+    let reduction = analyzer
+        .reduce(&original_input)
         .expect("opaque builtin derive inputs must remain reducible");
-    assert_verified("builtin derive boundaries", source, expected, &verified);
+    assert_reduction("builtin derive boundaries", source, expected, &reduction);
 
     let reduced_input = input(expected, &target);
     let fixed = analyzer
-        .reduce_and_verify(&reduced_input)
+        .reduce(&reduced_input)
         .expect("opaque builtin derive inputs must reach a fixed point");
     assert_eq!(fixed.reduced_source(), expected);
 
@@ -1659,13 +1659,13 @@ fn x86_sysroot_sources_are_not_treated_as_user_inputs() {
     let target = host_target();
 
     for (case, source, expected) in cases {
-        let verified = analyzer
-            .reduce_and_verify(&input(source, &target))
+        let reduction = analyzer
+            .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_verified(case, source, expected, &verified);
+        assert_reduction(case, source, expected, &reduction);
 
         let fixed = analyzer
-            .reduce_and_verify(&input(verified.reduced_source(), &target))
+            .reduce(&input(reduction.reduced_source(), &target))
             .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
         assert_eq!(fixed.reduced_source(), expected, "{case}");
     }
@@ -1695,15 +1695,15 @@ fn builtin_test_attributes_are_accepted_and_their_unreachable_items_are_removed(
     ];
 
     for (case, source, expected) in cases {
-        let verified = analyzer
-            .reduce_and_verify(&input(source, &target))
+        let reduction = analyzer
+            .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_verified(case, source, expected, &verified);
+        assert_reduction(case, source, expected, &reduction);
 
         let fixed = analyzer
-            .reduce_and_verify(&input(verified.reduced_source(), &target))
+            .reduce(&input(reduction.reduced_source(), &target))
             .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
-        assert_eq!(fixed.reduced_source(), verified.reduced_source(), "{case}");
+        assert_eq!(fixed.reduced_source(), reduction.reduced_source(), "{case}");
     }
 }
 
@@ -1773,13 +1773,13 @@ fn cfg_attr_wrapped_macro_invocations_resolve_their_written_source() {
     ];
 
     for (case, source, expected) in cases {
-        let verified = analyzer
-            .reduce_and_verify(&input(source, &target))
+        let reduction = analyzer
+            .reduce(&input(source, &target))
             .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-        assert_verified(case, source, expected, &verified);
+        assert_reduction(case, source, expected, &reduction);
 
         let fixed = analyzer
-            .reduce_and_verify(&input(verified.reduced_source(), &target))
+            .reduce(&input(reduction.reduced_source(), &target))
             .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
         assert_eq!(fixed.reduced_source(), expected, "{case}");
     }
@@ -1814,15 +1814,10 @@ fn an_edition_error_is_reported_before_the_recovery_ast_is_inspected() {
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn assert_verified(case: &str, original: &str, expected: &str, verified: &VerifiedReduction) {
-    assert_eq!(verified.reduced_source(), expected, "{case}");
+fn assert_reduction(case: &str, original: &str, expected: &str, reduction: &Reduction) {
+    assert_eq!(reduction.reduced_source(), expected, "{case}");
     assert_eq!(
-        verified.verification().original_snapshot_hash(),
-        verified.verification().reduced_snapshot_hash(),
-        "{case}"
-    );
-    assert_eq!(
-        verified
+        reduction
             .pieces()
             .iter()
             .map(|piece| {

@@ -19,7 +19,7 @@ fn stock_compiler_is_not_accepted_as_an_analyzer_artifact() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
-fn analysis_and_verified_reduction_are_owned_read_only_results() {
+fn analysis_and_reduction_are_owned_read_only_results() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();
     let source = concat!(
@@ -55,41 +55,37 @@ fn analysis_and_verified_reduction_are_owned_read_only_results() {
     assert!(analysis.graph().outgoing(main.node).next().is_some());
     assert_eq!(analyzer.analyze(&input).unwrap(), analysis);
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("the reduced compiler decisions must match");
-    assert!(!verified.reduced_source().contains("fn dead"));
-    assert!(verified.reduced_source().contains("fn main"));
+    assert!(!reduction.reduced_source().contains("fn dead"));
+    assert!(reduction.reduced_source().contains("fn main"));
     assert_eq!(
-        verified.verification().original_snapshot_hash(),
-        verified.verification().reduced_snapshot_hash()
-    );
-    assert_eq!(
-        verified.original_analysis().source_digest(),
+        reduction.original_analysis().source_digest(),
         analysis.source_digest()
     );
-    assert_eq!(verified.original_analysis().recipe(), analysis.recipe());
+    assert_eq!(reduction.original_analysis().recipe(), analysis.recipe());
     assert_eq!(
-        verified.pieces().last().unwrap().output_range.end as usize,
-        verified.reduced_source().len()
+        reduction.pieces().last().unwrap().output_range.end as usize,
+        reduction.reduced_source().len()
     );
-    let rebuilt = verified
+    let rebuilt = reduction
         .pieces()
         .iter()
         .map(|piece| {
             &source[piece.original_range.start as usize..piece.original_range.end as usize]
         })
         .collect::<String>();
-    assert_eq!(rebuilt, verified.reduced_source());
+    assert_eq!(rebuilt, reduction.reduced_source());
 
     let second = analyzer
-        .reduce_and_verify(&SourceInput::binary(
-            verified.reduced_source().to_owned(),
+        .reduce(&SourceInput::binary(
+            reduction.reduced_source().to_owned(),
             input.edition,
             input.target.clone(),
         ))
         .expect("an already reduced source must remain byte-identical");
-    assert_eq!(second.reduced_source(), verified.reduced_source());
+    assert_eq!(second.reduced_source(), reduction.reduced_source());
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -118,10 +114,10 @@ fn no_effect_cfg_attrs_are_typed_removed_source_units() {
             .is_some_and(|parent| analysis.retained_source_units().contains(&parent))
     );
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("removing the attribute must preserve compiler decisions");
-    assert_eq!(verified.reduced_source(), "fn main(){}");
+    assert_eq!(reduction.reduced_source(), "fn main(){}");
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -205,17 +201,13 @@ fn binary_exported_macros_remove_unselected_rules_and_dead_selected_components()
     let expected = include_str!("fixtures/compiler/macro_rule_reduction.expected.rs");
     let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("binary-local exported macros must be reducible");
-    assert_eq!(verified.reduced_source(), expected);
-    assert!(verified.reduced_source().len() < source.len());
-    assert_eq!(
-        verified.verification().original_snapshot_hash(),
-        verified.verification().reduced_snapshot_hash()
-    );
+    assert_eq!(reduction.reduced_source(), expected);
+    assert!(reduction.reduced_source().len() < source.len());
 
-    let analysis = verified.original_analysis();
+    let analysis = reduction.original_analysis();
     assert_eq!(
         analysis
             .source_units()
@@ -267,11 +259,11 @@ fn binary_exported_macros_remove_unselected_rules_and_dead_selected_components()
             .count(),
         4
     );
-    assert!(!verified.reduced_source().contains("selected_dead_local"));
-    assert!(!verified.reduced_source().contains("selected_dead_item"));
-    assert!(verified.reduced_source().contains("fn value"));
+    assert!(!reduction.reduced_source().contains("selected_dead_local"));
+    assert!(!reduction.reduced_source().contains("selected_dead_item"));
+    assert!(reduction.reduced_source().contains("fn value"));
     assert_eq!(
-        verified
+        reduction
             .pieces()
             .iter()
             .map(|piece| {
@@ -282,7 +274,7 @@ fn binary_exported_macros_remove_unselected_rules_and_dead_selected_components()
     );
 
     let second = analyzer
-        .reduce_and_verify(&SourceInput::binary(
+        .reduce(&SourceInput::binary(
             expected.to_owned(),
             input.edition,
             input.target,
@@ -299,14 +291,14 @@ fn unreachable_macro_expansions_and_their_selected_rules_are_removed_together() 
     let expected = include_str!("fixtures/compiler/macro_rule_expansion_retention.expected.rs");
     let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("an unreachable expansion and its private rule must be removed together");
-    assert_eq!(verified.reduced_source(), expected);
+    assert_eq!(reduction.reduced_source(), expected);
 
     let second = analyzer
-        .reduce_and_verify(&SourceInput::binary(
-            verified.reduced_source().to_owned(),
+        .reduce(&SourceInput::binary(
+            reduction.reduced_source().to_owned(),
             input.edition,
             input.target,
         ))
@@ -324,15 +316,11 @@ fn same_rule_expansion_subtrees_stabilize_repeated_identity() {
     let expected = include_str!("fixtures/compiler/macro_rule_expansion_identity.expected.rs");
     let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("deleting leading rules must not reorder repeated semantic expansions");
-    assert_eq!(verified.reduced_source(), expected);
-    assert_eq!(
-        verified.verification().original_snapshot_hash(),
-        verified.verification().reduced_snapshot_hash()
-    );
-    let analysis = verified.original_analysis();
+    assert_eq!(reduction.reduced_source(), expected);
+    let analysis = reduction.original_analysis();
     let removed = analysis
         .source_units()
         .iter()
@@ -381,17 +369,13 @@ fn same_rule_expansion_subtrees_stabilize_repeated_identity() {
     );
 
     let second = analyzer
-        .reduce_and_verify(&SourceInput::binary(
+        .reduce(&SourceInput::binary(
             expected.to_owned(),
             input.edition,
             input.target,
         ))
         .expect("an already reduced same-rule fixture must remain byte-identical");
     assert_eq!(second.reduced_source(), expected);
-    assert_eq!(
-        second.verification().original_snapshot_hash(),
-        second.verification().reduced_snapshot_hash()
-    );
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -466,7 +450,9 @@ fn runtime_location_changes_do_not_change_the_decision_snapshot() {
     let analyzer = Analyzer::new().unwrap();
     let input = SourceInput::binary(
         concat!(
-            "fn dead() {}\n",
+            "fn dead() {\n",
+            "    let _ = 0;\n",
+            "}\n",
             "#[track_caller] fn caller() -> (&'static str, u32, u32, u32) {\n",
             "    let location = std::panic::Location::caller();\n",
             "    (file!(), line!(), column!(), location.line())\n",
@@ -478,11 +464,18 @@ fn runtime_location_changes_do_not_change_the_decision_snapshot() {
         host_target(),
     );
 
-    let verified = analyzer.reduce_and_verify(&input).unwrap();
-    assert!(!verified.reduced_source().contains("fn dead"));
-    assert_eq!(
-        verified.verification().original_snapshot_hash(),
-        verified.verification().reduced_snapshot_hash()
+    let reduction = analyzer.reduce(&input).unwrap();
+    assert!(!reduction.reduced_source().contains("fn dead"));
+    let line_number = |source: &str| {
+        source[..source.find("line!()").unwrap()]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1
+    };
+    assert_ne!(
+        line_number(&input.source),
+        line_number(reduction.reduced_source())
     );
 }
 
@@ -502,7 +495,7 @@ fn compiler_decision_changes_caused_by_line_are_rejected() {
         )
         .to_owned(), Edition::Rust2024, host_target());
 
-    let result = analyzer.reduce_and_verify(&input);
+    let result = analyzer.reduce(&input);
     let Err(AnalysisError::DecisionMismatch(difference)) = result else {
         panic!("expected a compiler-decision mismatch: {result:?}");
     };
@@ -525,16 +518,12 @@ fn deleted_nested_use_prefix_is_not_a_compiler_decision_mismatch() {
         host_target(),
     );
 
-    let verified = analyzer
-        .reduce_and_verify(&input)
+    let reduction = analyzer
+        .reduce(&input)
         .expect("deleting an unused nested import must preserve compiler decisions");
-    assert!(!verified.reduced_source().contains("fmt::{Debug}"));
-    assert!(!verified.reduced_source().contains("collections::HashMap"));
-    assert!(verified.reduced_source().contains("marker::{PhantomData}"));
-    assert_eq!(
-        verified.verification().original_snapshot_hash(),
-        verified.verification().reduced_snapshot_hash()
-    );
+    assert!(!reduction.reduced_source().contains("fmt::{Debug}"));
+    assert!(!reduction.reduced_source().contains("collections::HashMap"));
+    assert!(reduction.reduced_source().contains("marker::{PhantomData}"));
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -641,8 +630,7 @@ fn reduced_compiler_diagnostics_use_original_source_coordinates() {
     );
     let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
-    let AnalysisError::ReducedCompilationFailed(diagnostics) =
-        analyzer.reduce_and_verify(&input).unwrap_err()
+    let AnalysisError::ReducedCompilationFailed(diagnostics) = analyzer.reduce(&input).unwrap_err()
     else {
         panic!("the location-dependent reduced source must fail compilation");
     };

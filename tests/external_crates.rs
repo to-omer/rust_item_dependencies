@@ -10,8 +10,7 @@ mod patched {
 
     use rust_item_dependencies::{
         AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel,
-        SourceInput, UnsupportedReason, VerifiedReduction, error::DiagnosticLevel,
-        source::ByteRange,
+        Reduction, SourceInput, UnsupportedReason, error::DiagnosticLevel, source::ByteRange,
     };
 
     const LEAF_SOURCE: &str = include_str!("fixtures/external_crates/leaf.rs");
@@ -143,18 +142,18 @@ mod patched {
 
         for case in CASES {
             let original = input(case.source, case.edition, &target);
-            let verified = analyzer
-                .reduce_and_verify(&original)
+            let reduction = analyzer
+                .reduce(&original)
                 .unwrap_or_else(|error| panic!("{}: {error:?}", case.name));
-            assert_verified(case, &verified);
+            assert_reduction(case, &reduction);
 
-            let reduced = input(verified.reduced_source(), case.edition, &target);
+            let reduced = input(reduction.reduced_source(), case.edition, &target);
             let fixed = analyzer
-                .reduce_and_verify(&reduced)
+                .reduce(&reduced)
                 .unwrap_or_else(|error| panic!("{} fixed point: {error:?}", case.name));
             assert_eq!(
                 fixed.reduced_source(),
-                verified.reduced_source(),
+                reduction.reduced_source(),
                 "{}",
                 case.name
             );
@@ -212,17 +211,17 @@ mod patched {
         );
         let original = input(source, Edition::Rust2021, &target);
 
-        let verified = analyzer
-            .reduce_and_verify(&original)
+        let reduction = analyzer
+            .reduce(&original)
             .expect("the external associated selection must survive inlining");
-        assert!(!verified.reduced_source().contains("fn unused"));
-        assert!(verified.reduced_source().contains("fn normalize"));
+        assert!(!reduction.reduced_source().contains("fn unused"));
+        assert!(reduction.reduced_source().contains("fn normalize"));
 
-        let reduced = input(verified.reduced_source(), Edition::Rust2021, &target);
+        let reduced = input(reduction.reduced_source(), Edition::Rust2021, &target);
         let fixed = analyzer
-            .reduce_and_verify(&reduced)
+            .reduce(&reduced)
             .expect("the external associated selection must reach a fixed point");
-        assert_eq!(fixed.reduced_source(), verified.reduced_source());
+        assert_eq!(fixed.reduced_source(), reduction.reduced_source());
 
         let original_output = compile_and_run(&original, &artifacts, "external_inline_original");
         let reduced_output = compile_and_run(&reduced, &artifacts, "external_inline_reduced");
@@ -251,16 +250,11 @@ mod patched {
             ),
         ] {
             let original = input(source, edition, &target);
-            let verified = analyzer.reduce_and_verify(&original).unwrap();
-            assert_eq!(verified.reduced_source(), expected, "{name}");
-            assert_eq!(
-                verified.verification().original_snapshot_hash(),
-                verified.verification().reduced_snapshot_hash(),
-                "{name}"
-            );
+            let reduction = analyzer.reduce(&original).unwrap();
+            assert_eq!(reduction.reduced_source(), expected, "{name}");
 
             let reduced = input(expected, edition, &target);
-            let fixed = analyzer.reduce_and_verify(&reduced).unwrap();
+            let fixed = analyzer.reduce(&reduced).unwrap();
             assert_eq!(fixed.reduced_source(), expected, "{name}");
 
             let original_output =
@@ -449,25 +443,25 @@ mod patched {
                 "runtime_input",
             )
             .with_entry_point(EntryPoint::new("runtime_input::entry"));
-            let verified = analyzer
-                .reduce_and_verify(&input)
+            let reduction = analyzer
+                .reduce(&input)
                 .unwrap_or_else(|error| panic!("{}: {error:?}", case.name));
             assert!(
-                verified.reduced_source().contains(case.kept),
+                reduction.reduced_source().contains(case.kept),
                 "{}: {}",
                 case.name,
-                verified.reduced_source()
+                reduction.reduced_source()
             );
-            assert!(!verified.reduced_source().contains("long_activation"));
+            assert!(!reduction.reduced_source().contains("long_activation"));
 
             let mut fixed_input = input.clone();
-            fixed_input.source = verified.reduced_source().to_owned();
-            let fixed = analyzer.reduce_and_verify(&fixed_input).unwrap();
-            assert_eq!(fixed.reduced_source(), verified.reduced_source());
+            fixed_input.source = reduction.reduced_source().to_owned();
+            let fixed = analyzer.reduce(&fixed_input).unwrap();
+            assert_eq!(fixed.reduced_source(), reduction.reduced_source());
 
             for (variant, source) in [
                 ("original", case.source),
-                ("reduced", verified.reduced_source()),
+                ("reduced", reduction.reduced_source()),
             ] {
                 let source_path = directory
                     .path()
@@ -970,16 +964,10 @@ mod patched {
             .expect("the linked program must start")
     }
 
-    fn assert_verified(case: &Case, verified: &VerifiedReduction) {
-        assert_eq!(verified.reduced_source(), case.expected, "{}", case.name);
+    fn assert_reduction(case: &Case, reduction: &Reduction) {
+        assert_eq!(reduction.reduced_source(), case.expected, "{}", case.name);
         assert_eq!(
-            verified.verification().original_snapshot_hash(),
-            verified.verification().reduced_snapshot_hash(),
-            "{}",
-            case.name
-        );
-        assert_eq!(
-            verified
+            reduction
                 .pieces()
                 .iter()
                 .map(|piece| {

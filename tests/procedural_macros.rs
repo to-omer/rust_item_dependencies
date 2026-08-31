@@ -226,16 +226,12 @@ mod patched {
         let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
         let original = input(INPUT_SOURCE);
 
-        let verified = analyzer.reduce_and_verify(&original).unwrap();
-        assert_eq!(verified.reduced_source(), EXPECTED_SOURCE);
-        assert_eq!(
-            verified.verification().original_snapshot_hash(),
-            verified.verification().reduced_snapshot_hash()
-        );
+        let reduction = analyzer.reduce(&original).unwrap();
+        assert_eq!(reduction.reduced_source(), EXPECTED_SOURCE);
 
-        let reduced = input(verified.reduced_source());
-        let fixed = analyzer.reduce_and_verify(&reduced).unwrap();
-        assert_eq!(fixed.reduced_source(), verified.reduced_source());
+        let reduced = input(reduction.reduced_source());
+        let fixed = analyzer.reduce(&reduced).unwrap();
+        assert_eq!(fixed.reduced_source(), reduction.reduced_source());
 
         let cli_input = artifacts.directory().join("cli-input.rs");
         let cli_output = artifacts.directory().join("cli-output.rs");
@@ -332,12 +328,10 @@ mod patched {
             "fn main() { generated_assembly(); println!(\"ok\"); }\n",
         );
 
-        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
-        assert_eq!(verified.reduced_source(), source);
+        let reduction = analyzer.reduce(&input(source)).unwrap();
+        assert_eq!(reduction.reduced_source(), source);
 
-        let fixed = analyzer
-            .reduce_and_verify(&input(verified.reduced_source()))
-            .unwrap();
+        let fixed = analyzer.reduce(&input(reduction.reduced_source())).unwrap();
         assert_eq!(fixed.reduced_source(), source);
 
         let output = compile_and_run(source, &artifacts, "proc_macro_assembly", false);
@@ -353,14 +347,10 @@ mod patched {
         let source = "proc_fixture::empty!();fn main(){println!(\"ok\");}";
         let expected = "fn main(){println!(\"ok\");}";
 
-        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
-        assert_eq!(verified.reduced_source(), expected);
-        assert_eq!(
-            verified.verification().original_snapshot_hash(),
-            verified.verification().reduced_snapshot_hash()
-        );
+        let reduction = analyzer.reduce(&input(source)).unwrap();
+        assert_eq!(reduction.reduced_source(), expected);
 
-        let fixed = analyzer.reduce_and_verify(&input(expected)).unwrap();
+        let fixed = analyzer.reduce(&input(expected)).unwrap();
         assert_eq!(fixed.reduced_source(), expected);
 
         let original_output = compile_and_run(source, &artifacts, "empty_original", false);
@@ -382,14 +372,10 @@ mod patched {
         );
         let expected = "fn main(){println!(\"ok\");}";
 
-        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
-        assert_eq!(verified.reduced_source(), expected);
-        assert_eq!(
-            verified.verification().original_snapshot_hash(),
-            verified.verification().reduced_snapshot_hash()
-        );
+        let reduction = analyzer.reduce(&input(source)).unwrap();
+        assert_eq!(reduction.reduced_source(), expected);
 
-        let fixed = analyzer.reduce_and_verify(&input(expected)).unwrap();
+        let fixed = analyzer.reduce(&input(expected)).unwrap();
         assert_eq!(fixed.reduced_source(), expected);
 
         let original_output =
@@ -422,11 +408,9 @@ mod patched {
         ];
 
         for source in cases {
-            let reduced = analyzer.reduce_and_verify(&input(source)).unwrap();
+            let reduced = analyzer.reduce(&input(source)).unwrap();
             assert_eq!(reduced.reduced_source(), source);
-            let fixed = analyzer
-                .reduce_and_verify(&input(reduced.reduced_source()))
-                .unwrap();
+            let fixed = analyzer.reduce(&input(reduced.reduced_source())).unwrap();
             assert_eq!(fixed.reduced_source(), source);
         }
     }
@@ -445,7 +429,7 @@ mod patched {
             "fn main() { let _ = Attributed; println!(\"{}\", bang() + Marker::answer()); }\n",
         );
 
-        let generated_reduction = analyzer.reduce_and_verify(&input(generated)).unwrap();
+        let generated_reduction = analyzer.reduce(&input(generated)).unwrap();
         assert_eq!(generated_reduction.reduced_source(), generated);
         let generated_output = compile_and_run(
             generated_reduction.reduced_source(),
@@ -463,7 +447,7 @@ mod patched {
             "struct Marker;\n",
             "fn main() { println!(\"{}\", Marker::answer()); }\n",
         );
-        let stacked_reduction = analyzer.reduce_and_verify(&input(stacked)).unwrap();
+        let stacked_reduction = analyzer.reduce(&input(stacked)).unwrap();
         assert_eq!(stacked_reduction.reduced_source(), stacked);
         let stacked_output = compile_and_run(
             stacked_reduction.reduced_source(),
@@ -541,18 +525,13 @@ mod patched {
         ];
 
         for (case, source, expected) in cases {
-            let verified = analyzer
-                .reduce_and_verify(&input(source))
+            let reduction = analyzer
+                .reduce(&input(source))
                 .unwrap_or_else(|error| panic!("{case}: {error:?}"));
-            assert_eq!(verified.reduced_source(), expected, "{case}");
-            assert_eq!(
-                verified.verification().original_snapshot_hash(),
-                verified.verification().reduced_snapshot_hash(),
-                "{case}",
-            );
+            assert_eq!(reduction.reduced_source(), expected, "{case}");
 
             let fixed = analyzer
-                .reduce_and_verify(&input(expected))
+                .reduce(&input(expected))
                 .unwrap_or_else(|error| panic!("{case} fixed point: {error:?}"));
             assert_eq!(fixed.reduced_source(), expected, "{case}");
         }
@@ -569,12 +548,10 @@ mod patched {
             "fn main(){assert_eq!(Subject{live:1,tail:[]}.live,1)}",
         );
 
-        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
-        assert_eq!(verified.reduced_source(), source);
+        let reduction = analyzer.reduce(&input(source)).unwrap();
+        assert_eq!(reduction.reduced_source(), source);
 
-        let fixed = analyzer
-            .reduce_and_verify(&input(verified.reduced_source()))
-            .unwrap();
+        let fixed = analyzer.reduce(&input(reduction.reduced_source())).unwrap();
         assert_eq!(fixed.reduced_source(), source);
     }
 
@@ -627,15 +604,15 @@ mod patched {
             "fn main() { println!(\"{} {} {}\", kept_tt(), kept_expr(), kept_prefix()); }",
         );
 
-        let verified = analyzer.reduce_and_verify(&input(source)).unwrap();
-        assert_eq!(verified.reduced_source(), expected);
+        let reduction = analyzer.reduce(&input(source)).unwrap();
+        assert_eq!(reduction.reduced_source(), expected);
 
-        let fixed = analyzer.reduce_and_verify(&input(expected)).unwrap();
+        let fixed = analyzer.reduce(&input(expected)).unwrap();
         assert_eq!(fixed.reduced_source(), expected);
 
         let original = compile_and_run(source, &artifacts, "spacing_original", false);
         let reduced = compile_and_run(
-            verified.reduced_source(),
+            reduction.reduced_source(),
             &artifacts,
             "spacing_reduced",
             false,
@@ -656,7 +633,7 @@ mod patched {
             "fn main() { println!(\"7\"); }\n",
         );
 
-        let reduced = analyzer.reduce_and_verify(&input(source)).unwrap();
+        let reduced = analyzer.reduce(&input(source)).unwrap();
         assert_eq!(reduced.reduced_source(), source);
         let output = compile_and_run(reduced.reduced_source(), &artifacts, "transitive", true);
         assert!(output.status.success());
@@ -827,7 +804,7 @@ mod patched {
         fs::write(&artifacts.direct, b"not a dynamic library").unwrap();
 
         let source = input("fn main() { println!(\"{}\", proc_fixture::one!()); }\n");
-        let reduced = analyzer.reduce_and_verify(&source).unwrap();
+        let reduced = analyzer.reduce(&source).unwrap();
 
         assert_eq!(reduced.reduced_source(), source.source);
     }
@@ -945,8 +922,8 @@ mod patched {
         }
 
         let source = input("fn main() { println!(\"{}\", lifetime_macros::from_support!()); }\n");
-        let verified = analyzer.reduce_and_verify(&source).unwrap();
-        assert_eq!(verified.reduced_source(), source.source);
+        let reduction = analyzer.reduce(&source).unwrap();
+        assert_eq!(reduction.reduced_source(), source.source);
 
         let last_owner = analyzer.clone();
         drop(analyzer);
