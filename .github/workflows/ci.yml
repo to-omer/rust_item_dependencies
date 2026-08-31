@@ -73,7 +73,7 @@ jobs:
           test -n "$host"
           stage2="$PWD/target/rid/rustc/build/$host/stage2"
           bash scripts/check-acceptance.sh "$stage2"
-      - name: Remove generated directory links before caching
+      - name: Remove materialized Windows outputs before caching
         if: runner.os == 'Windows' && steps.patched-compiler-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
@@ -86,6 +86,20 @@ jobs:
           $remaining = @(Get-ChildItem -LiteralPath target/rid/rustc/build -Recurse -Force -Attributes Directory+ReparsePoint)
           if ($remaining.Count -ne 0) {
             throw "Generated directory links remain in the patched compiler build"
+          }
+          $hostTriple = rustc -Vv |
+            Select-String -Pattern '^host: ' |
+            ForEach-Object { $_.Line.Substring(6).Trim() }
+          if ([string]::IsNullOrWhiteSpace($hostTriple)) {
+            throw 'rustc did not report its host'
+          }
+          $buildRoot = (Resolve-Path -LiteralPath target/rid/rustc/build).Path
+          foreach ($stage in @('stage1', 'stage2')) {
+            $sysroot = Join-Path $buildRoot "$hostTriple/$stage"
+            if (-not [System.IO.Directory]::Exists($sysroot)) {
+              throw "Materialized sysroot is missing: $sysroot"
+            }
+            [System.IO.Directory]::Delete($sysroot, $true)
           }
       - name: Save patched compiler
         if: github.ref == 'refs/heads/main' && steps.patched-compiler-cache.outputs.cache-hit != 'true'
