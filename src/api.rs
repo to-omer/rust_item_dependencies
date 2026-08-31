@@ -70,14 +70,14 @@ impl Analyzer {
     }
 
     pub fn analyze(&self, input: &SourceInput) -> Result<Analysis, AnalysisError> {
-        let context = self.compilation_context(input);
+        let context = self.compilation_context(input)?;
         let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
         Ok(self.analysis(input, &context, &inspected))
     }
 
     pub fn reduce(&self, input: &SourceInput) -> Result<Reduction, AnalysisError> {
-        let context = self.compilation_context(input);
+        let context = self.compilation_context(input)?;
         let inspected = inspect_source_with_reduction_in_context(&input.source, &context)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
         let original_snapshot = CompilerDecisionSnapshot::original(
@@ -144,8 +144,12 @@ impl Analyzer {
         Ok(reduced)
     }
 
-    fn compilation_context<'a>(&'a self, input: &'a SourceInput) -> CompilationContext<'a> {
+    fn compilation_context<'a>(
+        &'a self,
+        input: &'a SourceInput,
+    ) -> Result<CompilationContext<'a>, AnalysisError> {
         CompilationContext::new(input, &self.compilation, &self.sysroot)
+            .map_err(|error| analysis_error(error, CompilationPhase::Original))
     }
 
     fn analysis(

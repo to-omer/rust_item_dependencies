@@ -53,6 +53,7 @@ pub(crate) mod snapshot;
 pub mod source;
 #[allow(dead_code)]
 pub(crate) mod tags;
+pub(crate) mod target_libraries;
 
 pub use api::{
     Analysis, Analyzer, CompilationOptions, CompilerRecipeIdentity, CrateType, Edition, EntryPoint,

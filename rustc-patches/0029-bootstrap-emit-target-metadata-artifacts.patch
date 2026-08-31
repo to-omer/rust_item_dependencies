@@ -1,0 +1,542 @@
+From b7ddddadf6222e766c27be824989763b59cc8e2d Mon Sep 17 00:00:00 2001
+From: rust-item-dependencies <rust-item-dependencies@invalid.example>
+Date: Mon, 31 Aug 2026 11:35:50 +0900
+Subject: [PATCH] bootstrap: emit target metadata artifacts
+
+---
+ src/bootstrap/src/core/build_steps/check.rs   | 124 ++++++++++++++--
+ src/bootstrap/src/core/build_steps/compile.rs |   2 +-
+ src/bootstrap/src/core/builder/cargo.rs       | 138 +++++++++++++-----
+ src/bootstrap/src/core/builder/mod.rs         |   1 +
+ src/bootstrap/src/core/builder/tests.rs       |  54 ++++++-
+ 5 files changed, 271 insertions(+), 48 deletions(-)
+
+diff --git a/src/bootstrap/src/core/build_steps/check.rs b/src/bootstrap/src/core/build_steps/check.rs
+index f3bc9840f..4c25ac20e 100644
+--- a/src/bootstrap/src/core/build_steps/check.rs
++++ b/src/bootstrap/src/core/build_steps/check.rs
+@@ -18,7 +18,8 @@
+ };
+ use crate::core::config::TargetSelection;
+ use crate::utils::build_stamp::{self, BuildStamp};
+-use crate::{CodegenBackendKind, Compiler, Mode, Subcommand, t};
++use crate::utils::helpers::exe;
++use crate::{CodegenBackendKind, Compiler, Mode, t};
+ 
+ /// Allows individual check-step instances to keep track of whether they
+ /// represent `cargo check` or `cargo fix`, independently of [`Builder::kind`].
+@@ -37,6 +38,14 @@ fn to_kind(self) -> Kind {
+     }
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++enum StdCheckMode {
++    Regular,
++    TargetMetadata { compiler_sysroot: PathBuf },
++}
++
++const TARGET_METADATA_COMPLETE_FILE: &str = ".rust-item-dependencies-complete";
++
+ #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+ pub struct Std {
+     /// Compiler that will check this std.
+@@ -48,6 +57,7 @@ pub struct Std {
+     ///
+     /// [`compile::Rustc`]: crate::core::build_steps::compile::Rustc
+     crates: Vec<String>,
++    mode: StdCheckMode,
+ }
+ 
+ impl Std {
+@@ -92,38 +102,60 @@ fn make_run(run: RunConfig<'_>) {
+                 .build_compiler(),
+             target: run.target,
+             crates,
++            mode: StdCheckMode::Regular,
+         });
+     }
+ 
+     fn run(self, builder: &Builder<'_>) -> Self::Output {
+         let build_compiler = self.build_compiler;
+         let target = self.target;
++        let kind = match &self.mode {
++            StdCheckMode::Regular => builder.kind,
++            StdCheckMode::TargetMetadata { .. } => Kind::Check,
++        };
+ 
+-        let mut cargo = builder::Cargo::new(
+-            builder,
+-            build_compiler,
+-            Mode::Std,
+-            SourceType::InTree,
+-            target,
+-            builder.kind,
+-        );
++        let mut cargo = match &self.mode {
++            StdCheckMode::Regular => builder::Cargo::new(
++                builder,
++                build_compiler,
++                Mode::Std,
++                SourceType::InTree,
++                target,
++                kind,
++            ),
++            StdCheckMode::TargetMetadata { compiler_sysroot } => {
++                builder::Cargo::new_for_std_check_with_existing_sysroot(
++                    builder,
++                    build_compiler,
++                    target,
++                    compiler_sysroot,
++                )
++            }
++        };
+ 
+         std_cargo(builder, target, &mut cargo, &self.crates);
+-        if matches!(builder.config.cmd, Subcommand::Fix) {
++        if matches!(&self.mode, StdCheckMode::TargetMetadata { .. }) {
++            cargo.rustflag("-Zalways-encode-mir");
++        }
++        if kind == Kind::Fix {
+             // By default, cargo tries to fix all targets. Tell it not to fix tests until we've added `test` to the sysroot.
+             cargo.arg("--lib");
+         }
+ 
+         let _guard = builder.msg(
+-            builder.kind,
++            kind,
+             format_args!("library artifacts{}", crate_description(&self.crates)),
+             Mode::Std,
+             build_compiler,
+             target,
+         );
+ 
++        let stamp_prefix = match &self.mode {
++            StdCheckMode::Regular => "check",
++            StdCheckMode::TargetMetadata { .. } => "rid-target-metadata",
++        };
+         let check_stamp =
+-            build_stamp::libstd_stamp(builder, build_compiler, target).with_prefix("check");
++            build_stamp::libstd_stamp(builder, build_compiler, target).with_prefix(stamp_prefix);
+         run_cargo(
+             builder,
+             cargo,
+@@ -182,6 +214,73 @@ fn metadata(&self) -> Option<StepMetadata> {
+     }
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
++pub struct TargetMetadata {
++    build_compiler: Compiler,
++    compiler_sysroot: PathBuf,
++    target: TargetSelection,
++}
++
++impl CommandLineStep for TargetMetadata {
++    type Output = ();
++
++    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
++        run.alias("rid-target-metadata")
++    }
++
++    fn is_default_step(_builder: &Builder<'_>) -> bool {
++        false
++    }
++
++    fn make_run(run: RunConfig<'_>) {
++        assert_eq!(
++            run.builder.kind,
++            Kind::Check,
++            "`rid-target-metadata` is only available with `x check`"
++        );
++        assert_eq!(run.builder.top_stage, 2, "`rid-target-metadata` requires `--stage 2`");
++        let build_compiler = Compiler::new(run.builder.top_stage, run.builder.host_target);
++        let compiler_sysroot = run
++            .builder
++            .out
++            .join(build_compiler.host)
++            .join(format!("stage{}", build_compiler.stage));
++        if !run.builder.config.dry_run() {
++            let rustc = compiler_sysroot.join("bin").join(exe("rustc", build_compiler.host));
++            assert!(
++                rustc.is_file(),
++                "`rid-target-metadata` requires an existing stage 2 compiler at {}",
++                rustc.display()
++            );
++        }
++        run.builder.ensure(TargetMetadata { build_compiler, compiler_sysroot, target: run.target });
++    }
++
++    fn run(self, builder: &Builder<'_>) {
++        let stamp = builder.ensure(Std {
++            build_compiler: self.build_compiler,
++            target: self.target,
++            crates: vec![],
++            mode: StdCheckMode::TargetMetadata { compiler_sysroot: self.compiler_sysroot.clone() },
++        });
++        let directory = builder
++            .out
++            .join(self.build_compiler.host)
++            .join(format!("stage{}-rid-target-metadata-artifacts", self.build_compiler.stage))
++            .join(self.target);
++        let sysroot = RmetaSysroot::from_stamp(builder, stamp, self.target, &directory);
++        t!(fs::write(sysroot.target_dir.join(TARGET_METADATA_COMPLETE_FILE), b""));
++    }
++
++    fn metadata(&self) -> Option<StepMetadata> {
++        Some(
++            StepMetadata::check("rid-target-metadata", self.target)
++                .built_by(self.build_compiler)
++                .stage(self.build_compiler.stage),
++        )
++    }
++}
++
+ /// Represents a proof that rustc was **checked**.
+ /// Contains directories with .rmeta files generated by checking rustc for a specific
+ /// target.
+@@ -282,6 +381,7 @@ fn run(self, builder: &Builder<'_>) -> Self::Output {
+             build_compiler: self.build_compiler,
+             target: self.target,
+             crates: vec![],
++            mode: StdCheckMode::Regular,
+         });
+ 
+         // Copy the generated rmeta artifacts to a separate directory
+diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
+index 315662b18..10047f2f0 100644
+--- a/src/bootstrap/src/core/build_steps/compile.rs
++++ b/src/bootstrap/src/core/build_steps/compile.rs
+@@ -551,7 +551,7 @@ pub fn std_cargo(
+         // Query rustc for the deployment target, and the associated env var.
+         // The env var is one of the standard `*_DEPLOYMENT_TARGET` vars, i.e.
+         // `MACOSX_DEPLOYMENT_TARGET`, `IPHONEOS_DEPLOYMENT_TARGET`, etc.
+-        let mut cmd = builder.rustc_cmd(cargo.compiler());
++        let mut cmd = cargo.rustc_cmd(builder);
+         cmd.arg("--target").arg(target.rustc_target_arg());
+         // FIXME(#152709): -Zunstable-options is to handle JSON targets.
+         // Remove when JSON targets are stabilized.
+diff --git a/src/bootstrap/src/core/builder/cargo.rs b/src/bootstrap/src/core/builder/cargo.rs
+index 3a1e4299b..5854e506f 100644
+--- a/src/bootstrap/src/core/builder/cargo.rs
++++ b/src/bootstrap/src/core/builder/cargo.rs
+@@ -1,6 +1,6 @@
+-use std::env;
+ use std::ffi::{OsStr, OsString};
+ use std::path::{Path, PathBuf};
++use std::{env, fs};
+ 
+ use super::{Builder, Kind};
+ use crate::core::build_steps::test;
+@@ -9,7 +9,7 @@
+ use crate::core::config::toml::pgo::PgoConfig;
+ use crate::core::config::{CompressDebuginfo, SplitDebuginfo};
+ use crate::utils::build_stamp;
+-use crate::utils::helpers::{self, LldThreads, check_cfg_arg, linker_flags};
++use crate::utils::helpers::{self, LldThreads, check_cfg_arg, exe, linker_flags};
+ use crate::{
+     BootstrapCommand, CLang, Compiler, Config, DryRun, EXTRA_CHECK_CFGS, GitRepo, Mode,
+     RemapScheme, TargetSelection, command, prepare_behaviour_dump_dir, t,
+@@ -127,6 +127,8 @@ pub struct Cargo {
+     command: BootstrapCommand,
+     args: Vec<OsString>,
+     compiler: Compiler,
++    rustc: PathBuf,
++    rustc_libdir: PathBuf,
+     mode: Mode,
+     target: TargetSelection,
+     rustflags: Rustflags,
+@@ -150,7 +152,41 @@ pub fn new(
+         target: TargetSelection,
+         cmd_kind: Kind,
+     ) -> Cargo {
+-        let mut cargo = builder.cargo(compiler, mode, source_type, target, cmd_kind);
++        Self::new_inner(builder, compiler, mode, source_type, target, cmd_kind, None)
++    }
++
++    /// Prepares a Cargo invocation with a compiler sysroot that was assembled by an earlier
++    /// bootstrap process. The existing sysroot is borrowed read-only and is not registered as a
++    /// bootstrap build step.
++    #[track_caller]
++    pub(crate) fn new_for_std_check_with_existing_sysroot(
++        builder: &Builder<'_>,
++        compiler: Compiler,
++        target: TargetSelection,
++        sysroot: &Path,
++    ) -> Cargo {
++        Self::new_inner(
++            builder,
++            compiler,
++            Mode::Std,
++            SourceType::InTree,
++            target,
++            Kind::Check,
++            Some(sysroot),
++        )
++    }
++
++    fn new_inner(
++        builder: &Builder<'_>,
++        compiler: Compiler,
++        mode: Mode,
++        source_type: SourceType,
++        target: TargetSelection,
++        cmd_kind: Kind,
++        existing_sysroot: Option<&Path>,
++    ) -> Cargo {
++        let mut cargo =
++            builder.cargo(compiler, mode, source_type, target, cmd_kind, existing_sysroot);
+         if target.synthetic {
+             cargo.arg("-Zjson-target-spec");
+         }
+@@ -178,6 +214,19 @@ pub fn compiler(&self) -> Compiler {
+         self.compiler
+     }
+ 
++    /// Gets a command for the compiler configured for this Cargo invocation.
++    pub fn rustc_cmd(&self, builder: &Builder<'_>) -> BootstrapCommand {
++        let mut command = command(&self.rustc);
++        if !cfg!(any(windows, target_os = "cygwin")) {
++            let mut dylib_dirs = vec![self.rustc_libdir.clone()];
++            if builder.config.llvm_from_ci {
++                dylib_dirs.push(builder.out.join(self.compiler.host).join("ci-llvm").join("lib"));
++            }
++            helpers::add_dylib_path(dylib_dirs, &mut command);
++        }
++        command
++    }
++
+     pub fn mode(&self) -> Mode {
+         self.mode
+     }
+@@ -197,7 +246,7 @@ pub fn new_for_mir_opt_tests(
+         target: TargetSelection,
+         cmd_kind: Kind,
+     ) -> Cargo {
+-        let mut cargo = builder.cargo(compiler, mode, source_type, target, cmd_kind);
++        let mut cargo = builder.cargo(compiler, mode, source_type, target, cmd_kind, None);
+         if target.synthetic {
+             cargo.arg("-Zjson-target-spec");
+         }
+@@ -644,17 +693,61 @@ fn cargo(
+         source_type: SourceType,
+         target: TargetSelection,
+         cmd_kind: Kind,
++        existing_sysroot: Option<&Path>,
+     ) -> Cargo {
+         let mut cargo = self.bare_cargo(compiler, mode, target, cmd_kind);
+         let out_dir = self.stage_out(compiler, mode);
+ 
+         let mut hostflags = HostFlags::default();
+ 
++        let build_compiler_stage = if compiler.stage == 0 && self.local_rebuild {
++            // Assume the local-rebuild rustc already has stage1 features.
++            1
++        } else {
++            compiler.stage
++        };
++
++        // We synthetically interpret a stage0 compiler used to build tools as a
++        // "raw" compiler in that it's the exact snapshot we download. For things like
++        // ToolRustcPrivate, we would have to use the artificial stage0-sysroot compiler instead.
++        let use_snapshot =
++            mode == Mode::ToolBootstrap || (mode == Mode::ToolTarget && build_compiler_stage == 0);
++        assert!(!use_snapshot || build_compiler_stage == 0 || self.local_rebuild);
++
++        let (sysroot, libdir, rustc, codegen_backends) = if let Some(sysroot) = existing_sysroot {
++            assert!(!use_snapshot);
++            let sysroot = sysroot.to_path_buf();
++            let libdir = sysroot.join(self.libdir_relative(compiler));
++            let rustc = sysroot.join("bin").join(exe("rustc", compiler.host));
++            let codegen_backend_dir = sysroot
++                .join(self.sysroot_libdir_relative(compiler))
++                .join("rustlib")
++                .join(compiler.host)
++                .join("codegen-backends");
++            let codegen_backends = fs::read_dir(codegen_backend_dir)
++                .into_iter()
++                .flatten()
++                .filter_map(Result::ok)
++                .map(|entry| entry.path())
++                .collect::<Vec<_>>();
++            (sysroot, libdir, rustc, codegen_backends)
++        } else {
++            let sysroot = if use_snapshot {
++                self.rustc_snapshot_sysroot().to_path_buf()
++            } else {
++                self.sysroot(compiler)
++            };
++            let libdir = self.rustc_libdir(compiler);
++            let rustc = self.rustc(compiler);
++            let codegen_backends = self.codegen_backends(compiler).collect();
++            (sysroot, libdir, rustc, codegen_backends)
++        };
++
+         cargo.env("CARGO_UNSTABLE_BUILD_DIR_NEW_LAYOUT", "true");
+ 
+         // Codegen backends are not yet tracked by -Zbinary-dep-depinfo,
+         // so we need to explicitly clear out if they've been updated.
+-        for backend in self.codegen_backends(compiler) {
++        for backend in codegen_backends {
+             build_stamp::clear_if_dirty(self, &out_dir, &backend);
+         }
+ 
+@@ -706,27 +799,6 @@ fn cargo(
+             }
+         }
+ 
+-        let build_compiler_stage = if compiler.stage == 0 && self.local_rebuild {
+-            // Assume the local-rebuild rustc already has stage1 features.
+-            1
+-        } else {
+-            compiler.stage
+-        };
+-
+-        // We synthetically interpret a stage0 compiler used to build tools as a
+-        // "raw" compiler in that it's the exact snapshot we download. For things like
+-        // ToolRustcPrivate, we would have to use the artificial stage0-sysroot compiler instead.
+-        let use_snapshot =
+-            mode == Mode::ToolBootstrap || (mode == Mode::ToolTarget && build_compiler_stage == 0);
+-        assert!(!use_snapshot || build_compiler_stage == 0 || self.local_rebuild);
+-
+-        let sysroot = if use_snapshot {
+-            self.rustc_snapshot_sysroot().to_path_buf()
+-        } else {
+-            self.sysroot(compiler)
+-        };
+-        let libdir = self.rustc_libdir(compiler);
+-
+         let sysroot_str = sysroot.as_os_str().to_str().expect("sysroot should be UTF-8");
+         if self.is_verbose() && !matches!(self.config.get_dry_run(), DryRun::SelfCheck) {
+             println!("using sysroot {sysroot_str}");
+@@ -969,7 +1041,7 @@ fn cargo(
+         // Only clear out the directory if we're compiling std; otherwise, we
+         // should let Cargo take care of things for us (via depdep info)
+         if !self.config.dry_run() && mode == Mode::Std && cmd_kind == Kind::Build {
+-            build_stamp::clear_if_dirty(self, &out_dir, &self.rustc(compiler));
++            build_stamp::clear_if_dirty(self, &out_dir, &rustc);
+         }
+ 
+         let rustdoc_path = match cmd_kind {
+@@ -988,11 +1060,11 @@ fn cargo(
+         // src/bootstrap/bin/{rustc.rs,rustdoc.rs}
+         cargo
+             .env("RUSTBUILD_NATIVE_DIR", self.native_dir(target))
+-            .env("RUSTC_REAL", self.rustc(compiler))
++            .env("RUSTC_REAL", &rustc)
+             .env("RUSTC_STAGE", build_compiler_stage.to_string())
+-            .env("RUSTC_SYSROOT", sysroot)
++            .env("RUSTC_SYSROOT", &sysroot)
+             .env("RUSTC_LIBDIR", &libdir)
+-            .env("RUSTDOC_LIBDIR", libdir)
++            .env("RUSTDOC_LIBDIR", &libdir)
+             .env("RUSTDOC", self.bootstrap_out.join("rustdoc"))
+             .env("RUSTDOC_REAL", rustdoc_path)
+             .env("RUSTC_ERROR_METADATA_DST", self.extended_error_dir());
+@@ -1234,9 +1306,7 @@ fn cargo(
+                 .env("RUSTC_SNAPSHOT", &self.initial_rustc)
+                 .env("RUSTC_SNAPSHOT_LIBDIR", self.rustc_snapshot_libdir());
+         } else {
+-            cargo
+-                .env("RUSTC_SNAPSHOT", self.rustc(compiler))
+-                .env("RUSTC_SNAPSHOT_LIBDIR", self.rustc_libdir(compiler));
++            cargo.env("RUSTC_SNAPSHOT", &rustc).env("RUSTC_SNAPSHOT_LIBDIR", &libdir);
+         }
+ 
+         // Tools that use compiler libraries may inherit the `-lLLVM` link
+@@ -1511,6 +1581,8 @@ fn cargo(
+             command: cargo,
+             args: vec![],
+             compiler,
++            rustc,
++            rustc_libdir: libdir,
+             mode,
+             target,
+             rustflags,
+diff --git a/src/bootstrap/src/core/builder/mod.rs b/src/bootstrap/src/core/builder/mod.rs
+index 91fa2604d..2d518b20f 100644
+--- a/src/bootstrap/src/core/builder/mod.rs
++++ b/src/bootstrap/src/core/builder/mod.rs
+@@ -871,6 +871,7 @@ macro_rules! describe {
+                 // FIXME: This also helps bootstrap to not interfere with stage 0 builds. We should probably fix
+                 // that issue somewhere else, but we still want to keep `check::Std` at the end so that the
+                 // quicker steps run before this.
++                check::TargetMetadata,
+                 check::Std,
+             ),
+             Kind::Test => describe!(
+diff --git a/src/bootstrap/src/core/builder/tests.rs b/src/bootstrap/src/core/builder/tests.rs
+index 79b6e86e9..c67b0440f 100644
+--- a/src/bootstrap/src/core/builder/tests.rs
++++ b/src/bootstrap/src/core/builder/tests.rs
+@@ -428,9 +428,9 @@ struct MyStruct {
+ /// See bootstrap's README on how to bless the snapshots.
+ mod snapshot {
+     use crate::Compiler;
+-    use crate::core::build_steps::test;
++    use crate::core::build_steps::{compile, test};
+     use crate::core::builder::tests::{RenderConfig, TEST_TRIPLE_1, TEST_TRIPLE_2, host_target};
+-    use crate::core::builder::{Kind, StepMetadata};
++    use crate::core::builder::{Kind, Libdir, StepMetadata};
+     use crate::core::config::TargetSelection;
+     use crate::core::config::toml::target::{
+         DefaultLinuxLinkerOverride, with_default_linux_linker_overrides,
+@@ -1865,6 +1865,56 @@ fn check_library_cross_compile() {
+         ");
+     }
+ 
++    #[test]
++    fn check_target_metadata_stage_2_cross_compile() {
++        let ctx = TestCtx::new();
++        insta::assert_snapshot!(
++            ctx.config("check")
++                .path("rid-target-metadata")
++                .stage(2)
++                .targets(&[TEST_TRIPLE_1])
++                .render_steps(), @r"
++        [check] rustc 2 <host> -> std 2 <target1>
++        [check] rustc 2 <host> -> rid-target-metadata 2 <target1>
++        ");
++    }
++
++    #[test]
++    fn check_target_metadata_does_not_materialize_the_borrowed_sysroot() {
++        let ctx = TestCtx::new();
++        let cache = ctx
++            .config("check")
++            .path("rid-target-metadata")
++            .stage(2)
++            .targets(&[TEST_TRIPLE_1])
++            .run();
++
++        assert!(cache.inspect_all_steps_of_type::<compile::Sysroot, _>(|_, _| ()).is_empty());
++        assert!(cache.inspect_all_steps_of_type::<Libdir, _>(|_, _| ()).is_empty());
++    }
++
++    #[test]
++    #[should_panic(expected = "`rid-target-metadata` requires `--stage 2`")]
++    fn check_target_metadata_rejects_other_stages() {
++        let ctx = TestCtx::new();
++        ctx.config("check").path("rid-target-metadata").stage(1).targets(&[TEST_TRIPLE_1]).run();
++    }
++
++    #[test]
++    fn check_target_metadata_full_bootstrap_uses_existing_compiler() {
++        let ctx = TestCtx::new();
++        insta::assert_snapshot!(
++            ctx.config("check")
++                .path("rid-target-metadata")
++                .stage(2)
++                .targets(&[TEST_TRIPLE_1])
++                .args(&["--set", "build.full-bootstrap=true"])
++                .render_steps(), @r"
++        [check] rustc 2 <host> -> std 2 <target1>
++        [check] rustc 2 <host> -> rid-target-metadata 2 <target1>
++        ");
++    }
++
+     /// Make sure that we don't check library when download-rustc is disabled
+     /// when `--skip-std-check-if-no-download-rustc` was passed.
+     #[test]
+-- 
+2.55.0
+

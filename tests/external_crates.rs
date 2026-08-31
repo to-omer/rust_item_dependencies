@@ -832,6 +832,213 @@ mod patched {
         assert!(output.stderr.is_empty());
     }
 
+    #[test]
+    fn cargo_rid_reduces_std_and_no_std_sources_for_a_cross_target() {
+        let directory = TestDirectory::new();
+        let target = "wasm32-unknown-unknown";
+        let installed_before = installed_target_libraries(target);
+
+        let std_source = directory.path().join("cross_std.rs");
+        let std_reduced = directory.path().join("cross_std_reduced.rs");
+        let std_fixed = directory.path().join("cross_std_fixed.rs");
+        let std_rlib = directory.path().join("libcross_std.rlib");
+        fs::write(
+            &std_source,
+            concat!(
+                "pub fn entry() -> usize {\n",
+                "    [\"metadata\"].into_iter().map(String::from).map(|value| value.len()).sum()\n",
+                "}\n",
+                "fn unused() -> usize { 100 }\n",
+            ),
+        )
+        .unwrap();
+        let std_library_arguments = [
+            OsString::from("--crate-type"),
+            OsString::from("lib"),
+            OsString::from("--crate-name"),
+            OsString::from("cross_std"),
+            OsString::from("--entry"),
+            OsString::from("cross_std::entry"),
+        ];
+        let std_reduction = reduce_cross_to_fixed_point(
+            &std_source,
+            &std_reduced,
+            &std_fixed,
+            target,
+            &std_library_arguments,
+        );
+        assert!(!std_reduction.contains("unused"));
+
+        let host_source = directory.path().join("host_after_cross_preparation.rs");
+        let host_rlib = directory
+            .path()
+            .join("libhost_after_cross_preparation.rlib");
+        fs::write(
+            &host_source,
+            "pub fn entry() -> usize { String::from(\"host\").len() }\n",
+        )
+        .unwrap();
+        assert_command_success(
+            cargo_rid([
+                OsString::from("rustc"),
+                OsString::from("--target"),
+                OsString::from(host_target()),
+                host_source.into_os_string(),
+                OsString::from("--crate-name=host_after_cross_preparation"),
+                OsString::from("--crate-type=rlib"),
+                OsString::from("--edition=2024"),
+                OsString::from("-Awarnings"),
+                OsString::from("-o"),
+                host_rlib.into_os_string(),
+            ]),
+            "building a host std rlib after cross-target preparation",
+        );
+
+        assert_command_success(
+            cargo_rid([
+                OsString::from("rustc"),
+                OsString::from("--target"),
+                OsString::from(target),
+                std_reduced.clone().into_os_string(),
+                OsString::from("--crate-name=cross_std"),
+                OsString::from("--crate-type=rlib"),
+                OsString::from("--edition=2024"),
+                OsString::from("-Awarnings"),
+                OsString::from("-o"),
+                std_rlib.as_os_str().to_owned(),
+            ]),
+            "building a cross-target std rlib through cargo rid rustc",
+        );
+
+        let consumer_source = directory.path().join("cross_consumer.rs");
+        let consumer_reduced = directory.path().join("cross_consumer_reduced.rs");
+        let consumer_fixed = directory.path().join("cross_consumer_fixed.rs");
+        fs::write(
+            &consumer_source,
+            concat!(
+                "fn unused() -> usize { 100 }\n",
+                "fn main() { core::hint::black_box(cross_std::entry()); }\n",
+            ),
+        )
+        .unwrap();
+        let consumer_arguments = [
+            OsString::from("--extern"),
+            prefixed_path("cross_std=", &std_rlib),
+        ];
+        let consumer_reduction = reduce_cross_to_fixed_point(
+            &consumer_source,
+            &consumer_reduced,
+            &consumer_fixed,
+            target,
+            &consumer_arguments,
+        );
+        assert!(!consumer_reduction.contains("unused"));
+
+        let no_std_source = directory.path().join("cross_no_std.rs");
+        let no_std_reduced = directory.path().join("cross_no_std_reduced.rs");
+        let no_std_fixed = directory.path().join("cross_no_std_fixed.rs");
+        let no_std_rlib = directory.path().join("libcross_no_std.rlib");
+        fs::write(
+            &no_std_source,
+            concat!(
+                "#![no_std]\n",
+                "pub fn entry() -> usize { core::mem::size_of::<usize>() }\n",
+                "fn unused() -> usize { 100 }\n",
+            ),
+        )
+        .unwrap();
+        let library_arguments = [
+            OsString::from("--crate-type"),
+            OsString::from("lib"),
+            OsString::from("--crate-name"),
+            OsString::from("cross_no_std"),
+            OsString::from("--entry"),
+            OsString::from("cross_no_std::entry"),
+        ];
+        let no_std_reduction = reduce_cross_to_fixed_point(
+            &no_std_source,
+            &no_std_reduced,
+            &no_std_fixed,
+            target,
+            &library_arguments,
+        );
+        assert!(!no_std_reduction.contains("unused"));
+        assert_command_success(
+            cargo_rid([
+                OsString::from("rustc"),
+                OsString::from("--target=wasm32-unknown-unknown"),
+                no_std_reduced.into_os_string(),
+                OsString::from("--crate-name=cross_no_std"),
+                OsString::from("--crate-type=rlib"),
+                OsString::from("--edition=2024"),
+                OsString::from("-Awarnings"),
+                OsString::from("-o"),
+                no_std_rlib.into_os_string(),
+            ]),
+            "building a reduced cross-target no_std rlib through cargo rid rustc",
+        );
+        assert_eq!(installed_target_libraries(target), installed_before);
+    }
+
+    #[test]
+    fn cargo_rid_prepares_apple_target_metadata_without_installing_target_libraries() {
+        let directory = TestDirectory::new();
+        let target = "aarch64-apple-ios";
+        let installed_before = installed_target_libraries(target);
+        let source = directory.path().join("apple_library.rs");
+        let artifact = directory.path().join("libapple_library.rlib");
+        fs::write(
+            &source,
+            "pub fn entry() -> usize { String::from(\"apple\").len() }\n",
+        )
+        .unwrap();
+
+        assert_command_success(
+            cargo_rid([
+                OsString::from("rustc"),
+                OsString::from("--target"),
+                OsString::from(target),
+                source.into_os_string(),
+                OsString::from("--crate-name=apple_library"),
+                OsString::from("--crate-type=rlib"),
+                OsString::from("--edition=2024"),
+                OsString::from("-Awarnings"),
+                OsString::from("-o"),
+                artifact.into_os_string(),
+            ]),
+            "building an Apple-target rlib from generated metadata",
+        );
+        assert_eq!(installed_target_libraries(target), installed_before);
+    }
+
+    fn reduce_cross_source(
+        input: &Path,
+        output: &Path,
+        target: &str,
+        extra_arguments: &[OsString],
+    ) {
+        let mut arguments = vec![OsString::from("--target"), OsString::from(target)];
+        arguments.extend_from_slice(extra_arguments);
+        arguments.push(input.as_os_str().to_owned());
+        arguments.push(OsString::from("-o"));
+        arguments.push(output.as_os_str().to_owned());
+        assert_command_success(cargo_rid(arguments), "reducing a cross-target source");
+    }
+
+    fn reduce_cross_to_fixed_point(
+        input: &Path,
+        reduced: &Path,
+        fixed: &Path,
+        target: &str,
+        extra_arguments: &[OsString],
+    ) -> String {
+        reduce_cross_source(input, reduced, target, extra_arguments);
+        reduce_cross_source(reduced, fixed, target, extra_arguments);
+        let reduced = fs::read_to_string(reduced).unwrap();
+        assert_eq!(reduced, fs::read_to_string(fixed).unwrap());
+        reduced
+    }
+
     fn compile_library(crate_name: &str, source: &Path, artifact: &Path, extra_args: &[String]) {
         compile_library_with_edition(crate_name, source, artifact, "2021", extra_args);
     }
@@ -912,6 +1119,29 @@ mod patched {
             .args(arguments)
             .output()
             .expect("cargo rid must finish")
+    }
+
+    fn installed_target_libraries(target: &str) -> Option<Vec<OsString>> {
+        let output = Command::new(compiler())
+            .args(["--target", target, "--print", "target-libdir"])
+            .output()
+            .expect("rustc --print target-libdir must finish");
+        assert!(output.status.success());
+        let directory = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .expect("the target library path must be UTF-8")
+                .trim(),
+        );
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("the target library directory must be readable: {error}"),
+        };
+        let mut entries = entries
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        Some(entries)
     }
 
     fn assert_command_success(output: Output, action: &str) {
