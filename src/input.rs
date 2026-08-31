@@ -69,6 +69,9 @@ use crate::source::{
     refine_macro_rules_from_compiler,
 };
 use crate::tags::{DefinitionTags, TagError, collect_definition_tags};
+use crate::target_libraries::{
+    TargetLibrarySource, select_ready_target_libraries, target_metadata_directory,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -348,6 +351,7 @@ pub(crate) struct CompilationContext<'a> {
     input: &'a SourceInput,
     compilation: &'a PreparedCompilationOptions,
     sysroot: &'a Path,
+    target_libraries: TargetLibrarySource,
 }
 
 impl<'a> CompilationContext<'a> {
@@ -355,12 +359,15 @@ impl<'a> CompilationContext<'a> {
         input: &'a SourceInput,
         compilation: &'a PreparedCompilationOptions,
         sysroot: &'a Path,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, InputError> {
+        validate_crate_configuration(input)?;
+        let target_libraries = select_target_libraries(sysroot, &input.target)?;
+        Ok(Self {
             input,
             compilation,
             sysroot,
-        }
+            target_libraries,
+        })
     }
 
     pub(crate) fn edition_argument(&self) -> &'static str {
@@ -667,7 +674,7 @@ pub(crate) fn inspect_source(
     sysroot: &Path,
 ) -> Result<SourceInventory, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(input, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot)?;
     inspect_source_in_context(&input.source, &context)
 }
 
@@ -685,7 +692,7 @@ pub(crate) fn inspect_source_with_definitions(
     sysroot: &Path,
 ) -> Result<InspectedSource, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(input, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot)?;
     inspect_source_with_definitions_in_context(&input.source, &context)
 }
 
@@ -709,7 +716,7 @@ pub(crate) fn inspect_source_with_dependencies(
     sysroot: &Path,
 ) -> Result<InspectedDependencies, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(input, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot)?;
     inspect_source_with_dependencies_inner(&input.source, &context, None, None)
 }
 
@@ -723,7 +730,7 @@ pub(crate) fn inspect_source_with_dependencies_at_original_coordinates(
     coordinates: &SourceRewrite,
 ) -> Result<InspectedDependencies, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(input, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot)?;
     inspect_source_with_dependencies_at_original_coordinates_in_context(
         &input.source,
         &context,
@@ -798,7 +805,7 @@ pub(crate) fn inspect_source_with_reduction(
     sysroot: &Path,
 ) -> Result<InspectedReduction, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(input, &compilation, sysroot);
+    let context = CompilationContext::new(input, &compilation, sysroot)?;
     inspect_source_with_reduction_in_context(&input.source, &context)
 }
 
@@ -857,8 +864,6 @@ fn run_inspection(
 ) -> Result<CompilerInspection, InputError> {
     #[cfg(test)]
     INSPECTION_COUNT.set(INSPECTION_COUNT.get() + 1);
-    validate_crate_configuration(context)?;
-    validate_target(context.sysroot, context.target())?;
 
     let result = Arc::new(Mutex::new(None));
     let diagnostics = Arc::new(Mutex::new(DiagnosticState::default()));
@@ -1110,11 +1115,15 @@ fn compiler_arguments(context: &CompilationContext<'_>) -> Vec<String> {
         arguments.push("-L".to_owned());
         arguments.push(format!("crate={directory}"));
     }
+    for (kind, directory) in context.target_libraries.search_paths() {
+        arguments.push("-L".to_owned());
+        arguments.push(format!("{kind}={}", directory.to_string_lossy()));
+    }
     arguments
 }
 
-fn validate_crate_configuration(context: &CompilationContext<'_>) -> Result<(), InputError> {
-    let crate_name = context.crate_name();
+fn validate_crate_configuration(input: &SourceInput) -> Result<(), InputError> {
+    let crate_name = &input.crate_name;
     if crate_name.is_empty()
         || crate_name
             .chars()
@@ -1124,35 +1133,35 @@ fn validate_crate_configuration(context: &CompilationContext<'_>) -> Result<(), 
             name: crate_name.to_owned(),
         });
     }
-    if context.crate_type() == CrateType::Library && context.entry_points().next().is_none() {
+    if input.crate_type == CrateType::Library && input.entry_points.is_empty() {
         return Err(InputError::MissingLibraryEntryPoint);
     }
     Ok(())
 }
 
-fn validate_target(sysroot: &Path, target: &str) -> Result<(), InputError> {
+fn select_target_libraries(
+    sysroot: &Path,
+    target: &str,
+) -> Result<TargetLibrarySource, InputError> {
     if !TARGETS.contains(&target) {
-        return Err(InputError::UnsupportedInput {
-            reason: UnsupportedReason::UnsupportedTarget,
-            range: None,
-        });
+        return Err(unsupported_target());
     }
     let installed = rustc_session::filesearch::make_target_lib_path(sysroot, target);
-    let has_std = installed
-        .read_dir()
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .any(|name| name.starts_with("libstd-") && name.ends_with(".rlib"));
-    if !has_std {
-        return Err(InputError::UnsupportedInput {
-            reason: UnsupportedReason::UnsupportedTarget,
-            range: None,
-        });
+    let generated = target_metadata_directory(sysroot, target).ok_or_else(unsupported_target)?;
+    select_ready_target_libraries(
+        &installed,
+        &generated,
+        target == rustc_session::config::host_tuple(),
+    )
+    .map_err(|_| unsupported_target())?
+    .ok_or_else(unsupported_target)
+}
+
+fn unsupported_target() -> InputError {
+    InputError::UnsupportedInput {
+        reason: UnsupportedReason::UnsupportedTarget,
+        range: None,
     }
-    Ok(())
 }
 
 struct InputCallbacks {
@@ -3416,20 +3425,6 @@ mod tests {
             })
         );
         assert!(!target.is_empty());
-        assert_eq!(
-            inspect_source(
-                &SourceInput::binary(
-                    "fn main() {}\n".to_owned(),
-                    Edition::Rust2024,
-                    "thumbv7em-none-eabi".to_owned()
-                ),
-                &sysroot,
-            ),
-            Err(InputError::UnsupportedInput {
-                reason: UnsupportedReason::UnsupportedTarget,
-                range: None,
-            })
-        );
     }
 
     #[cfg(rust_item_dependencies_patched)]

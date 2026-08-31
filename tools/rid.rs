@@ -5,13 +5,18 @@ edition = "2024"
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 
 mod cli;
+#[path = "../src/target_libraries.rs"]
+mod target_libraries;
 
 use cli::{Parsed, parse_arguments, reducer_usage, render_path, validate_output};
+use target_libraries::{
+    TargetLibrarySource, select_ready_target_libraries, target_metadata_directory,
+};
 
 const RUST_REPOSITORY: &str = "https://github.com/rust-lang/rust.git";
 const USAGE_COMMAND: &str =
@@ -61,21 +66,23 @@ enum RunOutcome {
 
 fn run() -> Result<RunOutcome, String> {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
-    let rustc_arguments = if arguments
+    let (rustc_arguments, reducer_target) = if arguments
         .first()
         .is_some_and(|argument| argument == "rustc")
     {
-        Some(arguments[1..].to_vec())
+        (Some(arguments[1..].to_vec()), None)
     } else {
         let usage = reducer_usage(USAGE_COMMAND);
         match parse_arguments(arguments.iter().cloned(), &usage)? {
-            Parsed::Run(cli) => validate_output(&cli)?,
+            Parsed::Run(cli) => {
+                validate_output(&cli)?;
+                (None, cli.target.clone())
+            }
             Parsed::Help => {
                 println!("{usage}");
                 return Ok(RunOutcome::Success);
             }
         }
-        None
     };
 
     let tools_directory = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -87,6 +94,7 @@ fn run() -> Result<RunOutcome, String> {
     fs::create_dir_all(&generated)
         .map_err(|error| format!("cannot create {}: {error}", render_path(&generated)))?;
 
+    let preparation_lock = lock_exclusive(&generated.join("preparation.lock"))?;
     ensure_patched_checkout(repository_root, &rust_source)?;
     let host = active_host()?;
     let stage2 = rust_source.join("build").join(&host).join("stage2");
@@ -97,12 +105,46 @@ fn run() -> Result<RunOutcome, String> {
         build_compiler(repository_root, &rust_source)?;
     }
     if let Some(arguments) = rustc_arguments {
-        let status = Command::new(&stage2_rustc)
-            .args(arguments)
+        let target = match direct_builtin_target_candidate(&arguments) {
+            Some(target) if is_builtin_target(&stage2_rustc, target)? => Some(target),
+            _ => None,
+        };
+        let target_libraries = match target {
+            Some(target) => Some(prepare_target_libraries(
+                repository_root,
+                &rust_source,
+                &stage2,
+                &stage2_rustc,
+                &host,
+                target,
+            )?),
+            None => None,
+        };
+        drop(preparation_lock);
+        let mut command = Command::new(&stage2_rustc);
+        command
+            .args(target_library_search_arguments(target_libraries.as_ref()))
+            .args(arguments);
+        let status = command
             .status()
             .map_err(|error| format!("cannot start the configured rustc: {error}"))?;
         return Ok(RunOutcome::Rustc(status));
     }
+
+    if let Some(target) = reducer_target {
+        if !is_builtin_target(&stage2_rustc, &target)? {
+            return Err(format!("unsupported Rust target: {target}"));
+        }
+        prepare_target_libraries(
+            repository_root,
+            &rust_source,
+            &stage2,
+            &stage2_rustc,
+            &host,
+            &target,
+        )?;
+    }
+    drop(preparation_lock);
     let (rustc, compiler_library, compiler_metadata, rustc_driver) = compiler_paths(&stage2)?;
     run_reducer(
         repository_root,
@@ -114,6 +156,107 @@ fn run() -> Result<RunOutcome, String> {
         &arguments,
     )?;
     Ok(RunOutcome::Success)
+}
+
+fn direct_builtin_target_candidate(arguments: &[OsString]) -> Option<&str> {
+    let arguments = arguments
+        .iter()
+        .map(|argument| argument.to_str())
+        .collect::<Option<Vec<_>>>()?;
+    if arguments.iter().any(|argument| {
+        *argument == "--"
+            || argument.starts_with('@')
+            || *argument == "--sysroot"
+            || argument.starts_with("--sysroot=")
+    }) {
+        return None;
+    }
+    let (target, remaining) = match arguments.as_slice() {
+        ["--target", target, remaining @ ..] if !target.is_empty() => (*target, remaining),
+        [first, remaining @ ..] => (first.strip_prefix("--target=")?, remaining),
+        [] => return None,
+    };
+    if target.is_empty()
+        || remaining
+            .iter()
+            .any(|argument| *argument == "--target" || argument.starts_with("--target="))
+    {
+        return None;
+    }
+    Some(target)
+}
+
+fn is_builtin_target(rustc: &Path, target: &str) -> Result<bool, String> {
+    let targets = command_output(
+        Command::new(rustc).args(["--print", "target-list"]),
+        "query built-in Rust targets",
+    )?;
+    Ok(targets.lines().any(|candidate| candidate == target))
+}
+
+fn prepare_target_libraries(
+    repository_root: &Path,
+    rust_source: &Path,
+    stage2: &Path,
+    stage2_rustc: &Path,
+    host: &str,
+    target: &str,
+) -> Result<TargetLibrarySource, String> {
+    let installed = target_library_directory(stage2_rustc, target)?;
+    let generated = target_metadata_directory(stage2, target)
+        .ok_or_else(|| "stage2 has no build directory".to_owned())?;
+    if let Some(source) = select_ready_target_libraries(&installed, &generated, target == host)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(source);
+    }
+    prepare_target_metadata(repository_root, rust_source, target)?;
+    match select_ready_target_libraries(&installed, &generated, target == host)
+        .map_err(|error| error.to_string())?
+    {
+        Some(source) => Ok(source),
+        None => Err(format!(
+            "target metadata is missing after preparation: {}",
+            render_path(&generated)
+        )),
+    }
+}
+
+fn target_library_directory(rustc: &Path, target: &str) -> Result<PathBuf, String> {
+    let output = command_output(
+        Command::new(rustc).args(["--target", target, "--print", "target-libdir"]),
+        "query the target library directory",
+    )?;
+    let path = output.trim_end_matches(['\r', '\n']);
+    if path.is_empty() {
+        return Err("rustc reported an empty target library directory".to_owned());
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn lock_exclusive(path: &Path) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| format!("cannot open {}: {error}", render_path(path)))?;
+    file.lock()
+        .map_err(|error| format!("cannot lock {}: {error}", render_path(path)))?;
+    Ok(file)
+}
+
+fn target_library_search_arguments(source: Option<&TargetLibrarySource>) -> Vec<OsString> {
+    let mut arguments = Vec::new();
+    for (kind, directory) in source
+        .into_iter()
+        .flat_map(TargetLibrarySource::search_paths)
+    {
+        arguments.push(OsString::from("-L"));
+        arguments.push(prefixed_path(&format!("{kind}="), directory));
+    }
+    arguments
 }
 
 fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result<(), String> {
@@ -238,25 +381,51 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
 
 fn build_compiler(repository_root: &Path, rust_source: &Path) -> Result<(), String> {
     eprintln!("Preparing the patched Rust compiler. This takes a while on the first run.");
+    let mut command = bootstrap_command(repository_root, rust_source)?;
+    command.args([
+        "build",
+        "--ci=false",
+        "--stage",
+        "2",
+        "compiler/rustc",
+        "library",
+    ]);
+    run_command(&mut command, "build the patched Rust compiler")
+}
+
+fn prepare_target_metadata(
+    repository_root: &Path,
+    rust_source: &Path,
+    target: &str,
+) -> Result<(), String> {
+    eprintln!("Preparing Rust metadata for {target}.");
+    let mut command = bootstrap_command(repository_root, rust_source)?;
+    command
+        .args([
+            "check",
+            "--ci=false",
+            "--stage",
+            "2",
+            "--target",
+            target,
+            "rid-target-metadata",
+        ])
+        .stdin(Stdio::null());
+    run_command(&mut command, &format!("prepare Rust metadata for {target}"))
+}
+
+fn bootstrap_command(repository_root: &Path, rust_source: &Path) -> Result<Command, String> {
     let queue_digest = read_trimmed(repository_root.join("rustc-patches/queue-digest"))?;
     let (python, prefix_arguments) = find_python()?;
     let mut command = Command::new(python);
     command
         .args(prefix_arguments)
         .arg(rust_source.join("x.py"))
-        .args([
-            "build",
-            "--ci=false",
-            "--stage",
-            "2",
-            "compiler/rustc",
-            "library",
-        ])
         .current_dir(rust_source)
         .env("RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST", queue_digest)
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
-    run_command(&mut command, "build the patched Rust compiler")
+    Ok(command)
 }
 
 fn find_python() -> Result<(OsString, Vec<OsString>), String> {
@@ -429,7 +598,7 @@ fn unique_snapshot_owner(parent: &Path) -> Result<String, String> {
 
 fn remove_reducer_snapshot(parent: &Path, owner: &str) -> Result<(), String> {
     #[cfg(windows)]
-    let _parent_lock = lock_snapshot_parent(parent)?;
+    let _parent_lock = lock_exclusive(&parent.join(SNAPSHOT_PARENT_LOCK_FILE))?;
     let root = parent.join(format!("{PROCESS_ROOT_PREFIX}{owner}"));
     let owner = parent.join(format!("{PROCESS_OWNER_PREFIX}{owner}"));
     #[cfg(windows)]
@@ -469,17 +638,96 @@ fn remove_snapshot_path(path: &Path, directory: bool) -> Result<(), String> {
     }
 }
 
-#[cfg(windows)]
-fn lock_snapshot_parent(parent: &Path) -> Result<fs::File, String> {
-    let path = parent.join(SNAPSHOT_PARENT_LOCK_FILE);
-    let mut options = fs::OpenOptions::new();
-    options.read(true).write(true).create(true);
-    let file = options
-        .open(&path)
-        .map_err(|error| format!("cannot open {}: {error}", render_path(&path)))?;
-    file.lock()
-        .map_err(|error| format!("cannot lock {}: {error}", render_path(&path)))?;
-    Ok(file)
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn direct_target_requires_an_unambiguous_leading_argument() {
+        assert_eq!(
+            direct_builtin_target_candidate(&arguments(&[
+                "--target",
+                "wasm32-unknown-unknown",
+                "input.rs",
+            ])),
+            Some("wasm32-unknown-unknown")
+        );
+        assert_eq!(
+            direct_builtin_target_candidate(&arguments(&["--target=wasm32-unknown-unknown", "-",])),
+            Some("wasm32-unknown-unknown")
+        );
+
+        for rejected in [
+            arguments(&["input.rs", "--target", "wasm32-unknown-unknown"]),
+            arguments(&["--crate-name", "--target=wasm32-unknown-unknown"]),
+            arguments(&["--target"]),
+            arguments(&["--target", ""]),
+            arguments(&["--target="]),
+            arguments(&[
+                "--target=wasm32-unknown-unknown",
+                "--target=wasm32-unknown-unknown",
+            ]),
+            arguments(&[
+                "--target",
+                "wasm32-unknown-unknown",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+            ]),
+            arguments(&["--target=wasm32-unknown-unknown", "@arguments"]),
+            arguments(&["--target=wasm32-unknown-unknown", "--sysroot", "custom"]),
+            arguments(&["--target=wasm32-unknown-unknown", "--sysroot=custom"]),
+            arguments(&["--target=wasm32-unknown-unknown", "--", "input.rs"]),
+        ] {
+            assert_eq!(direct_builtin_target_candidate(&rejected), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_rustc_arguments_are_not_rewritten() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let arguments = vec![
+            OsString::from("--target=wasm32-unknown-unknown"),
+            OsString::from_vec(vec![0xff]),
+        ];
+        assert_eq!(direct_builtin_target_candidate(&arguments), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_utf8_rustc_arguments_are_not_rewritten() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let arguments = vec![
+            OsString::from("--target=wasm32-unknown-unknown"),
+            OsString::from_wide(&[0xd800]),
+        ];
+        assert_eq!(direct_builtin_target_candidate(&arguments), None);
+    }
+
+    #[test]
+    fn target_search_paths_do_not_enable_native_library_search() {
+        let source = TargetLibrarySource::GeneratedMetadata(PathBuf::from("metadata"));
+        assert_eq!(
+            target_library_search_arguments(Some(&source)),
+            vec![
+                OsString::from("-L"),
+                OsString::from("crate=metadata"),
+                OsString::from("-L"),
+                OsString::from("dependency=metadata"),
+            ]
+        );
+        assert!(
+            target_library_search_arguments(Some(&TargetLibrarySource::InstalledSysroot))
+                .is_empty()
+        );
+        assert!(target_library_search_arguments(None).is_empty());
+    }
+
+    fn arguments(arguments: &[&str]) -> Vec<OsString> {
+        arguments.iter().map(OsString::from).collect()
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -548,36 +796,39 @@ mod snapshot_tests {
             "only the parent lock file may remain"
         );
     }
+}
 
-    struct TestDirectory(PathBuf);
+#[cfg(all(test, windows))]
+struct TestDirectory(PathBuf);
 
-    impl TestDirectory {
-        fn new() -> Self {
-            let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .join("target/rid-tool-tests");
-            fs::create_dir_all(&parent).unwrap();
-            for nonce in 0..SNAPSHOT_OWNER_ATTEMPTS {
-                let path = parent.join(format!("{}-{nonce}", std::process::id()));
-                match fs::create_dir(&path) {
-                    Ok(()) => return Self(path),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => panic!("cannot create test directory: {error}"),
-                }
+#[cfg(all(test, windows))]
+impl TestDirectory {
+    fn new() -> Self {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("target/rid-tool-tests");
+        fs::create_dir_all(&parent).unwrap();
+        for nonce in 0..SNAPSHOT_OWNER_ATTEMPTS {
+            let path = parent.join(format!("{}-{nonce}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("cannot create test directory: {error}"),
             }
-            panic!("cannot allocate test directory")
         }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
+        panic!("cannot allocate test directory")
     }
 
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(all(test, windows))]
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 

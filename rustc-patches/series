@@ -27,3 +27,4 @@
 0026-rustc-preserve-associated-selections-across-mir-inlining.patch
 0027-rustc-observe-successful-proc-macro-library-loads.patch
 0028-rustc-expose-discarded-declarative-output-ranges.patch
+0029-bootstrap-emit-target-metadata-artifacts.patch

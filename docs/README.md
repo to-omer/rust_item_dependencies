@@ -38,7 +38,9 @@ cargo rid --crate-type lib --crate-name my_library --entry my_library::solve lib
 cargo rid --edition 2021 input.rs -o reduced.rs
 ```
 
-`--target`ではコンパイル対象を指定します。省略時は、現在のホストと同じコンパイル対象を使います。指定先の標準ライブラリが、ツールのコンパイラに導入されている必要があります。
+`--target`では、Rustコンパイラに組み込まれたコンパイル対象を指定します。省略時は、現在のホストと同じコンパイル対象を使います。指定先の標準ライブラリが導入されていない場合は、解析に必要な情報を初回利用時に自動で用意します。
+
+この自動準備だけでは、削減後のコードを実行ファイルとしてリンクできるとは限りません。実行ファイルを作る場合は、コンパイル対象に応じたリンカーやネイティブライブラリを別途用意してください。
 
 `--crate-type`では`bin`または`lib`を指定します。省略時は`bin`です。`--crate-name`では入力のクレート名を指定し、省略時は`main`です。`lib`では`--entry`を1つ以上指定する必要があります。
 
@@ -56,7 +58,7 @@ cargo rid rustc wrapper.rs --crate-name wrapper --crate-type rlib --edition 2024
 cargo rid --extern wrapper=target/libwrapper.rlib --dependency-artifact target/libleaf.rlib input.rs -o reduced.rs
 ```
 
-`cargo rid rustc`の後ろに指定した引数は、削減に使う専用コンパイラへそのまま渡されます。別のコンパイル対象を指定する場合は、依存クレートのビルドと削減のすべてに同じ`--target`を指定してください。このツールは`Cargo.toml`を読まず、依存クレートや`build.rs`を自動ではビルドしません。
+`cargo rid rustc`の後ろに指定した引数は、削減に使う専用コンパイラへそのまま渡されます。別のコンパイル対象に必要な情報を自動で用意する場合は、`cargo rid rustc --target TRIPLE ...`の順で指定してください。依存クレートのビルドと削減には、すべて同じ`--target`を指定します。このツールは`Cargo.toml`を読まず、依存クレートや`build.rs`を自動ではビルドしません。
 
 ### 手続きマクロ
 

@@ -54,6 +54,12 @@ RUSTFMT="$rustfmt" \
 "$rustfmt" --edition 2024 --check "$repository_root/tools/rid.rs"
 git -C "$repository_root" diff --check
 
+echo "==> bootstrap"
+(
+    cd "$rustc_source"
+    "$rustc_source/x" test --ci=false bootstrap
+)
+
 echo "==> stock compiler boundary"
 "$repository_root/scripts/check-compiler-qualification.sh"
 
