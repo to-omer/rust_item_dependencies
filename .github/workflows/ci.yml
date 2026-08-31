@@ -54,13 +54,14 @@ jobs:
       - name: Identify runner image
         id: runner-image
         shell: bash
-        run: printf 'name=%s-%s\n' "${ImageOS:?}" "${ImageVersion:?}" >> "$GITHUB_OUTPUT"
+        run: printf 'name=%s\n' "${ImageOS:?}" >> "$GITHUB_OUTPUT"
       - name: Restore patched compiler
         id: patched-compiler-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/rid/rustc
-          key: rid-rustc-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('.github/workflows/ci.yml', '.cargo/config.toml', 'rust-toolchain.toml', 'tools/*.rs', 'scripts/check-acceptance.sh', 'rustc-patches/base-revision', 'rustc-patches/patch-abi', 'rustc-patches/series', 'rustc-patches/patched-revision', 'rustc-patches/queue-digest', 'rustc-patches/*.patch') }}
+          # Bump v3 when compiler build inputs or the cached layout become incompatible.
+          key: rid-rustc-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('rustc-patches/queue-digest') }}-${{ hashFiles('rustc-patches/patched-revision') }}
       - name: Bootstrap patched compiler through cargo rid
         run: >-
           cargo rid tests/fixtures/compiler/driver_smoke.rs
