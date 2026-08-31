@@ -31,8 +31,7 @@ const SNAPSHOT_OWNER_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_OWNER";
 const PROCESS_OWNER_PREFIX: &str = ".rust-item-dependencies-owner-";
 const PROCESS_ROOT_PREFIX: &str = "rust-item-dependencies-process-";
 const SNAPSHOT_OWNER_ATTEMPTS: u64 = 1_024;
-const BOOTSTRAP_CARGO_FLAGS: &str = "-Zchecksum-freshness";
-const COMPILER_BUILD_IDENTITY_FILE: &str = ".rust-item-dependencies-build-identity-v1";
+const COMPILER_BUILD_IDENTITY_FILE: &str = ".rust-item-dependencies-build-identity-v2";
 #[cfg(windows)]
 const SNAPSHOT_PARENT_LOCK_FILE: &str = ".rust-item-dependencies-parent-lock";
 const RUSTC_PRIVATE_CRATES: &[&str] = &[
@@ -117,7 +116,11 @@ fn run() -> Result<RunOutcome, String> {
         .join("bin")
         .join(format!("rustc{}", env::consts::EXE_SUFFIX));
     if !stage2_rustc.is_file() || !build_identity_matches {
-        remove_compiler_build_identity(&rust_source)?;
+        if build_identity_matches {
+            remove_compiler_build_identity(&rust_source)?;
+        } else {
+            remove_incompatible_compiler_build(&rust_source)?;
+        }
         build_compiler(repository_root, &rust_source)?;
         record_compiler_build_identity(repository_root, &rust_source)?;
     }
@@ -479,6 +482,15 @@ fn remove_compiler_build_identity(rust_source: &Path) -> Result<(), String> {
     }
 }
 
+fn remove_incompatible_compiler_build(rust_source: &Path) -> Result<(), String> {
+    let path = rust_source.join("build");
+    match fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot remove {}: {error}", render_path(&path))),
+    }
+}
+
 fn set_modified_to_epoch(path: &Path) -> Result<(), String> {
     fs::set_times(path, FileTimes::new().set_modified(SystemTime::UNIX_EPOCH)).map_err(|error| {
         format!(
@@ -532,7 +544,7 @@ fn bootstrap_command(repository_root: &Path, rust_source: &Path) -> Result<Comma
         .arg(rust_source.join("x.py"))
         .current_dir(rust_source)
         .env("RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST", queue_digest)
-        .env("CARGOFLAGS", BOOTSTRAP_CARGO_FLAGS)
+        .env_remove("CARGOFLAGS")
         .env_remove("CARGOFLAGS_BOOTSTRAP")
         .env_remove("CARGOFLAGS_NOT_BOOTSTRAP")
         .env_remove("RUSTFLAGS")
@@ -797,6 +809,35 @@ mod target_tests {
     }
 
     #[test]
+    fn incompatible_compiler_build_removal_preserves_the_checkout() {
+        let directory = TestDirectory::new();
+        let rust_source = directory.path().join("rust-source");
+        fs::create_dir_all(rust_source.join("build/artifacts")).unwrap();
+        fs::write(rust_source.join("build/artifacts/compiler"), "cached").unwrap();
+        fs::write(rust_source.join("source.rs"), "fn main() {}\n").unwrap();
+
+        remove_incompatible_compiler_build(&rust_source).unwrap();
+
+        assert!(!rust_source.join("build").exists());
+        assert!(rust_source.join("source.rs").is_file());
+    }
+
+    #[test]
+    fn bootstrap_uses_default_cargo_freshness() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let command = bootstrap_command(repository_root, Path::new("rust-source")).unwrap();
+        let configured = command.get_envs().collect::<Vec<_>>();
+
+        for variable in [
+            "CARGOFLAGS",
+            "CARGOFLAGS_BOOTSTRAP",
+            "CARGOFLAGS_NOT_BOOTSTRAP",
+        ] {
+            assert!(configured.contains(&(OsStr::new(variable), None)));
+        }
+    }
+
+    #[test]
     fn cached_build_normalizes_tracked_files_and_ancestor_directories() {
         let directory = TestDirectory::new();
         run_command(
@@ -854,20 +895,6 @@ mod target_tests {
                 untracked_time
             );
         }
-    }
-
-    #[test]
-    fn bootstrap_uses_checksum_freshness_without_inherited_cargo_flags() {
-        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let command = bootstrap_command(repository_root, Path::new("rust-source")).unwrap();
-        let configured = command.get_envs().collect::<Vec<_>>();
-
-        assert!(configured.contains(&(
-            OsStr::new("CARGOFLAGS"),
-            Some(OsStr::new(BOOTSTRAP_CARGO_FLAGS)),
-        )));
-        assert!(configured.contains(&(OsStr::new("CARGOFLAGS_BOOTSTRAP"), None)));
-        assert!(configured.contains(&(OsStr::new("CARGOFLAGS_NOT_BOOTSTRAP"), None)));
     }
 
     #[test]

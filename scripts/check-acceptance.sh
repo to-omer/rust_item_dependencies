@@ -24,6 +24,7 @@ if [ "${RUSTFLAGS+x}" = x ] || [ "${CARGO_ENCODED_RUSTFLAGS+x}" = x ]; then
     echo "acceptance checks control rustc flags; unset RUSTFLAGS and CARGO_ENCODED_RUSTFLAGS" >&2
     exit 1
 fi
+unset CARGOFLAGS CARGOFLAGS_BOOTSTRAP CARGOFLAGS_NOT_BOOTSTRAP
 
 if [ ! -x "$stage2_rustc" ] \
     || [ ! -x "$rustc_source/x.py" ] \
@@ -95,6 +96,14 @@ echo "==> patched compiler observer fixtures"
 )
 
 echo "==> owned graph, reduction, and verification"
+# The observer tests rebuild rustc_private artifacts in place. Cargo does not track changes to
+# explicit --extern files, so reducer and qualification artifacts must be rebuilt against them.
+cargo clean \
+    --manifest-path "$repository_root/Cargo.toml" \
+    --target-dir "$repository_root/target/rid/cargo"
+cargo clean \
+    --manifest-path "$repository_root/Cargo.toml" \
+    --target-dir "$repository_root/target/rid/tests"
 "$repository_root/scripts/check-compiler-qualification.sh" "$stage2_sysroot"
 
 echo "acceptance checks passed"

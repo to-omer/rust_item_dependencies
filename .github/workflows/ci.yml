@@ -67,7 +67,7 @@ jobs:
         with:
           path: target/rid/rustc/build
           # Bump the version when compiler build inputs or the cached layout become incompatible.
-          key: rid-rustc-v4-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('rustc-patches/queue-digest') }}-${{ hashFiles('rustc-patches/patched-revision') }}
+          key: rid-rustc-v5-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('rustc-patches/queue-digest') }}-${{ hashFiles('rustc-patches/patched-revision') }}
       - name: Bootstrap patched compiler through cargo rid
         run: >-
           cargo rid tests/fixtures/compiler/driver_smoke.rs
