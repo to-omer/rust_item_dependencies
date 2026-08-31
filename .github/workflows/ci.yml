@@ -17,13 +17,19 @@ jobs:
   full:
     name: Full acceptance (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout }}
     env:
       CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            timeout: 60
+          - os: macos-latest
+            timeout: 60
+          - os: windows-latest
+            timeout: 75
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -59,9 +65,9 @@ jobs:
         id: patched-compiler-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: target/rid/rustc
-          # Bump v3 when compiler build inputs or the cached layout become incompatible.
-          key: rid-rustc-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('rustc-patches/queue-digest') }}-${{ hashFiles('rustc-patches/patched-revision') }}
+          path: target/rid/rustc/build
+          # Bump the version when compiler build inputs or the cached layout become incompatible.
+          key: rid-rustc-v4-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('rustc-patches/queue-digest') }}-${{ hashFiles('rustc-patches/patched-revision') }}
       - name: Bootstrap patched compiler through cargo rid
         run: >-
           cargo rid tests/fixtures/compiler/driver_smoke.rs
@@ -106,5 +112,5 @@ jobs:
         if: github.ref == 'refs/heads/main' && steps.patched-compiler-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: target/rid/rustc
+          path: target/rid/rustc/build
           key: ${{ steps.patched-compiler-cache.outputs.cache-primary-key }}
