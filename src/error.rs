@@ -4,7 +4,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use crate::source::{ByteRange, SourceUnitId};
+use crate::source::ByteRange;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
@@ -75,15 +75,9 @@ pub enum AnalysisError {
         reason: UnsupportedReason,
         range: Option<ByteRange>,
     },
-    InvalidTag {
-        range: ByteRange,
-    },
     OriginalCompilationFailed(DiagnosticBundle),
     CompilerArtifactMismatch,
-    UnsupportedCompilerRevision,
     IncompleteObservation(ObservationGap),
-    AmbiguousSourceOrigin,
-    UneditableSourceUnit(SourceUnitId),
     SourceRewriteInvariantViolation(SourceRewriteViolation),
     ReducedCompilationFailed(DiagnosticBundle),
     DecisionMismatch(SnapshotDiff),
@@ -91,6 +85,7 @@ pub enum AnalysisError {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct DiagnosticBundle {
     diagnostics: Vec<Diagnostic>,
 }
@@ -106,6 +101,7 @@ impl DiagnosticBundle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Diagnostic {
     pub level: DiagnosticLevel,
     pub message: String,
@@ -122,6 +118,7 @@ pub enum DiagnosticLevel {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct ObservationGap {
     pub phase: String,
     pub fact: String,
@@ -129,12 +126,14 @@ pub struct ObservationGap {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct SourceRewriteViolation {
     pub message: String,
     pub range: Option<ByteRange>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct SnapshotDiff {
     differences: Vec<DecisionDifference>,
 }
@@ -150,6 +149,7 @@ impl SnapshotDiff {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct DecisionDifference {
     pub kind: String,
     pub original: String,
@@ -191,15 +191,11 @@ impl fmt::Display for AnalysisError {
                 "the external crate snapshot could not be prepared"
             }
             Self::UnsupportedInput { .. } => "the input is outside the supported source boundary",
-            Self::InvalidTag { .. } => "a dependency tag has an empty name",
             Self::OriginalCompilationFailed(_) => "the original source did not compile",
             Self::CompilerArtifactMismatch => {
                 "the configured compiler is not compatible with this build"
             }
-            Self::UnsupportedCompilerRevision => "the compiler revision is not supported",
             Self::IncompleteObservation(_) => "a required compiler observation is incomplete",
-            Self::AmbiguousSourceOrigin => "a compiler fact has no unique source origin",
-            Self::UneditableSourceUnit(_) => "a required source unit cannot be edited safely",
             Self::SourceRewriteInvariantViolation(_) => "the source rewrite violated an invariant",
             Self::ReducedCompilationFailed(_) => "the reduced source did not compile",
             Self::DecisionMismatch(_) => "the reduced compiler decisions differ from the original",

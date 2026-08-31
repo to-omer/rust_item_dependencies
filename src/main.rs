@@ -136,7 +136,7 @@ fn render_analysis_error(error: AnalysisError) -> String {
     rendered
 }
 
-fn append_range(output: &mut String, range: Option<rust_item_dependencies::source::ByteRange>) {
+fn append_range(output: &mut String, range: Option<rust_item_dependencies::ByteRange>) {
     if let Some(range) = range {
         output.push_str(&format!(" at bytes {}..{}", range.start, range.end));
     }
@@ -194,7 +194,7 @@ fn host_target() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_item_dependencies::{EntryPointError, UnsupportedReason, source::ByteRange};
+    use rust_item_dependencies::{ByteRange, EntryPointError, UnsupportedReason};
 
     fn parse(arguments: &[&str]) -> Result<Parsed, String> {
         parse_arguments(

@@ -19,11 +19,11 @@ mod api;
 #[allow(dead_code)]
 pub(crate) mod artifact;
 #[allow(dead_code)]
-pub mod compiler_terms;
+pub(crate) mod compiler_terms;
 #[allow(dead_code)]
 pub(crate) mod definitions;
 #[allow(dead_code)]
-pub mod dependency_graph;
+pub(crate) mod dependency_graph;
 #[allow(dead_code)]
 pub(crate) mod digest;
 #[allow(dead_code)]
@@ -33,14 +33,13 @@ pub(crate) mod expansions;
 #[allow(dead_code)]
 pub(crate) mod external;
 #[allow(dead_code)]
-pub mod graph;
+pub(crate) mod graph;
 #[allow(dead_code)]
 pub(crate) mod input;
 #[allow(dead_code)]
 pub(crate) mod macro_output;
 #[allow(dead_code)]
 pub(crate) mod monomorphization;
-pub mod qualification;
 #[allow(dead_code)]
 pub(crate) mod retention;
 #[allow(dead_code)]
@@ -50,14 +49,11 @@ pub(crate) mod selection;
 #[allow(dead_code)]
 pub(crate) mod snapshot;
 #[allow(dead_code)]
-pub mod source;
-#[allow(dead_code)]
-pub(crate) mod tags;
+pub(crate) mod source;
 pub(crate) mod target_libraries;
 
 pub use api::{
-    Analysis, Analyzer, CompilationOptions, CompilerRecipeIdentity, CrateType, Edition, EntryPoint,
-    OptimizationLevel, Reduction, SourceInput,
+    Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel, Reduction, SourceInput,
 };
 pub use error::{AnalysisError, EntryPointError, UnsupportedReason};
-pub use rewrite::SourcePiece;
+pub use source::ByteRange;

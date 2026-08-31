@@ -12,8 +12,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(rust_item_dependencies_patched)]
-use rust_item_dependencies::dependency_graph::RootReason;
-#[cfg(rust_item_dependencies_patched)]
 use rust_item_dependencies::{
     AnalysisError, Analyzer, Edition, EntryPoint, EntryPointError, SourceInput,
 };
@@ -32,7 +30,7 @@ fn library_configuration_failures_are_typed() {
     )
     .with_entry_point(EntryPoint::new("invalid-name::entry"));
     assert_eq!(
-        analyzer.analyze(&invalid_name).unwrap_err(),
+        analyzer.reduce(&invalid_name).unwrap_err(),
         AnalysisError::InvalidCrateName {
             name: "invalid-name".to_owned(),
         }
@@ -45,7 +43,7 @@ fn library_configuration_failures_are_typed() {
         "typed_errors",
     );
     assert_eq!(
-        analyzer.analyze(&missing_entry).unwrap_err(),
+        analyzer.reduce(&missing_entry).unwrap_err(),
         AnalysisError::MissingLibraryEntryPoint
     );
 
@@ -78,7 +76,7 @@ fn library_configuration_failures_are_typed() {
         let input = SourceInput::library(source, Edition::Rust2024, target.clone(), "typed_errors")
             .with_entry_point(EntryPoint::new(path));
         assert_eq!(
-            analyzer.analyze(&input).unwrap_err(),
+            analyzer.reduce(&input).unwrap_err(),
             AnalysisError::InvalidEntryPoint {
                 path: path.to_owned(),
                 reason,
@@ -114,7 +112,12 @@ fn multiple_function_and_static_entries_remove_unrelated_items() {
             "pub static rid_static: u32 = 9;",
         ])
     );
-    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+    assert_library_fixed_point(
+        &analyzer,
+        reduction.reduced_source(),
+        "multiple_roots",
+        ["multiple_roots::rid_static", "multiple_roots::rid_function"],
+    );
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -145,7 +148,12 @@ pub fn entry(value: u8) -> u8 { value.saturating_add(helper()) }
         .reduce(&input)
         .expect("the no_std library must preserve its explicit entry and core dependencies");
     assert_eq!(reduction.reduced_source(), expected);
-    assert_fixed_point(&analyzer, &input, expected);
+    assert_library_fixed_point(
+        &analyzer,
+        expected,
+        "no_std_library",
+        ["no_std_library::entry"],
+    );
 
     let downstream = concat!(
         "use no_std_library::entry;\n",
@@ -205,7 +213,12 @@ fn exported_library_macros_remain_whole_for_downstream_rule_selection() {
         .reduce(&input)
         .expect("a downstream-visible exported macro must remain whole");
     assert_eq!(reduction.reduced_source(), source);
-    assert_fixed_point(&analyzer, &input, source);
+    assert_library_fixed_point(
+        &analyzer,
+        source,
+        "exported_macro_library",
+        ["exported_macro_library::entry"],
+    );
 
     let downstream = concat!(
         "exported_macro_library::exported!(downstream_value);\n",
@@ -254,7 +267,12 @@ fn an_unused_alloc_import_preserves_the_downstream_allocator_requirement() {
         .reduce(&input)
         .expect("the public reduction path must preserve external compiler requirements");
     assert!(reduction.reduced_source().contains("extern crate alloc;"));
-    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+    assert_library_fixed_point(
+        &analyzer,
+        reduction.reduced_source(),
+        "allocator_requirement",
+        ["allocator_requirement::entry"],
+    );
 
     let directory = TestDirectory::new("allocator-requirement");
     let original = compile_library(
@@ -353,16 +371,12 @@ pub fn entry() -> u8 { 7 }
         .reduce(&input)
         .expect("the generated panic handler must be retained as a compiler root");
     assert_eq!(reduction.reduced_source(), expected);
-    assert_eq!(
-        reduction
-            .original_analysis()
-            .roots()
-            .iter()
-            .filter(|root| root.reason == RootReason::ExternalSymbol)
-            .count(),
-        1
+    assert_library_fixed_point(
+        &analyzer,
+        expected,
+        "panic_handler_library",
+        ["panic_handler_library::entry"],
     );
-    assert_fixed_point(&analyzer, &input, expected);
 
     let directory = TestDirectory::new("panic-handler-library");
     let _ = compile_library(
@@ -452,7 +466,17 @@ fn explicit_reexport_paths_keep_their_complete_alias_chains_only() {
             "pub use super::rid_chain_source::rid_chain_target as rid_chain_step;",
         ])
     );
-    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+    assert_library_fixed_point(
+        &analyzer,
+        reduction.reduced_source(),
+        "reexports",
+        [
+            "reexports::rid_direct_api",
+            "reexports::rid_chain_api",
+            "reexports::rid_module_alias::rid_module_target",
+            "reexports::rid_glob_target",
+        ],
+    );
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -512,7 +536,15 @@ fn a_generic_definition_entry_preserves_downstream_trait_selection() {
             "type Output;",
         ])
     );
-    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+    assert_library_fixed_point(
+        &analyzer,
+        reduction.reduced_source(),
+        "generic_definition",
+        [
+            "generic_definition::entry",
+            "generic_definition::const_entry",
+        ],
+    );
 
     let downstream = concat!(
         "use generic_definition::{const_entry, entry, Local, Marker};\n",
@@ -597,7 +629,12 @@ fn downstream_codegen_assembly_preserves_the_active_library_source() {
             .reduce(&input)
             .unwrap_or_else(|error| panic!("{crate_name}: {error:?}"));
         assert_eq!(reduction.reduced_source(), source, "{crate_name}");
-        assert_fixed_point(&analyzer, &input, source);
+        assert_library_fixed_point(
+            &analyzer,
+            source,
+            crate_name,
+            [format!("{crate_name}::entry")],
+        );
 
         let directory = TestDirectory::new(crate_name);
         let original = compile_library_and_run_downstream(
@@ -654,7 +691,12 @@ fn a_local_type_in_an_entry_signature_preserves_its_downstream_value_semantics()
             "unsafe impl Send for Value {}",
         ])
     );
-    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+    assert_library_fixed_point(
+        &analyzer,
+        reduction.reduced_source(),
+        "exposed_value",
+        ["exposed_value::entry"],
+    );
 
     let downstream = concat!(
         "use exposed_value::entry;\n",
@@ -719,7 +761,12 @@ fn derived_impls_follow_the_same_downstream_selection_contract() {
             .contains("pub struct DerivedValue(pub u8);")
     );
     assert!(!reduction.reduced_source().contains("unrelated"));
-    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+    assert_library_fixed_point(
+        &analyzer,
+        reduction.reduced_source(),
+        "derived_value",
+        ["derived_value::entry"],
+    );
 
     let private_source = concat!(
         "#[derive(Clone)]\n",
@@ -742,10 +789,11 @@ fn derived_impls_follow_the_same_downstream_selection_contract() {
             .reduced_source()
             .contains("struct Private;")
     );
-    assert_fixed_point(
+    assert_library_fixed_point(
         &analyzer,
-        &private_input,
         private_reduction.reduced_source(),
+        "private_derive",
+        ["private_derive::entry"],
     );
 
     let downstream = concat!(
@@ -874,7 +922,12 @@ fn entry_type_surfaces_and_bounds_preserve_downstream_trait_semantics() {
         );
         assert!(!reduction.reduced_source().contains("pub fn unrelated"));
         assert!(!reduction.reduced_source().contains("IrrelevantTrait"));
-        assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+        assert_library_fixed_point(
+            &analyzer,
+            reduction.reduced_source(),
+            crate_name,
+            [format!("{crate_name}::{entry_name}")],
+        );
 
         let downstream = format!(
             "use {crate_name}::{entry_name};\nfn require_send<T: Send>(_: T) {{}}\nfn main() {{ require_send({entry_expression}); println!(\"ok\"); }}\n"
@@ -926,7 +979,12 @@ fn a_binary_can_add_an_explicit_entry_without_losing_main() {
         BTreeSet::from(["pub fn rid_exported() -> u8 { 7 }"])
     );
     assert!(reduction.reduced_source().contains("fn main()"));
-    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+    assert_binary_fixed_point(
+        &analyzer,
+        reduction.reduced_source(),
+        "binary_entries",
+        ["binary_entries::rid_exported"],
+    );
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -957,64 +1015,45 @@ fn external_only_entry_types_do_not_retain_unrelated_trait_implementations() {
             "pub fn outlives_entry() where LocalType: 'static {}",
         ])
     );
-    assert_fixed_point(&analyzer, &input, reduction.reduced_source());
+    assert_library_fixed_point(
+        &analyzer,
+        reduction.reduced_source(),
+        "lifetime_definition",
+        [
+            "lifetime_definition::lifetime_entry",
+            "lifetime_definition::array_entry",
+            "lifetime_definition::outlives_entry",
+        ],
+    );
 }
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
-fn recipe_normalizes_entries_and_identifies_the_library_contract() {
+fn entry_order_and_duplicates_do_not_change_library_reduction() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();
     let source = "pub fn first() {}\npub fn second() {}\nfn main() {}\n";
-    let ordered = SourceInput::library(source, Edition::Rust2024, target.clone(), "recipe")
-        .with_entry_point(EntryPoint::new("recipe::first"))
-        .with_entry_point(EntryPoint::new("recipe::second"));
+    let expected = "pub fn first() {}\npub fn second() {}\n\n";
+    let ordered = SourceInput::library(source, Edition::Rust2024, target.clone(), "entries")
+        .with_entry_point(EntryPoint::new("entries::first"))
+        .with_entry_point(EntryPoint::new("entries::second"));
     let reordered_with_duplicate =
-        SourceInput::library(source, Edition::Rust2024, target.clone(), "recipe")
-            .with_entry_point(EntryPoint::new("recipe::second"))
-            .with_entry_point(EntryPoint::new("recipe::first"))
-            .with_entry_point(EntryPoint::new("recipe::second"));
-    let one_entry = SourceInput::library(source, Edition::Rust2024, target.clone(), "recipe")
-        .with_entry_point(EntryPoint::new("recipe::first"));
-    let renamed = SourceInput::library(source, Edition::Rust2024, target.clone(), "renamed_recipe")
-        .with_entry_point(EntryPoint::new("renamed_recipe::first"))
-        .with_entry_point(EntryPoint::new("renamed_recipe::second"));
-    let binary = SourceInput::binary(source, Edition::Rust2024, target)
-        .with_crate_name("recipe")
-        .with_entry_point(EntryPoint::new("recipe::first"))
-        .with_entry_point(EntryPoint::new("recipe::second"));
+        SourceInput::library(source, Edition::Rust2024, target, "entries")
+            .with_entry_point(EntryPoint::new("entries::second"))
+            .with_entry_point(EntryPoint::new("entries::first"))
+            .with_entry_point(EntryPoint::new("entries::second"));
 
-    let ordered_recipe = analyzer
-        .analyze(&ordered)
-        .expect("the library must compile")
-        .recipe();
-    assert_eq!(
-        analyzer
-            .analyze(&reordered_with_duplicate)
-            .expect("entry order and duplicates must not affect compilation")
-            .recipe(),
-        ordered_recipe
-    );
-    assert_ne!(
-        analyzer
-            .analyze(&one_entry)
-            .expect("a smaller entry set must compile")
-            .recipe(),
-        ordered_recipe
-    );
-    assert_ne!(
-        analyzer
-            .analyze(&renamed)
-            .expect("the renamed library must compile")
-            .recipe(),
-        ordered_recipe
-    );
-    assert_ne!(
-        analyzer
-            .analyze(&binary)
-            .expect("the binary input must compile")
-            .recipe(),
-        ordered_recipe
+    for input in [&ordered, &reordered_with_duplicate] {
+        let reduction = analyzer
+            .reduce(input)
+            .expect("entry order and duplicates must not affect reduction");
+        assert_eq!(reduction.reduced_source(), expected);
+    }
+    assert_library_fixed_point(
+        &analyzer,
+        expected,
+        "entries",
+        ["entries::first", "entries::second"],
     );
 }
 
@@ -1024,12 +1063,44 @@ fn library_input(source: &str, crate_name: &str) -> SourceInput {
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn assert_fixed_point(analyzer: &Analyzer, input: &SourceInput, reduced_source: &str) {
-    let mut reduced_input = input.clone();
-    reduced_input.source = reduced_source.to_owned();
+fn assert_library_fixed_point<I, S>(
+    analyzer: &Analyzer,
+    reduced_source: &str,
+    crate_name: &str,
+    entries: I,
+) where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut reduced_input =
+        SourceInput::library(reduced_source, Edition::Rust2024, host_target(), crate_name);
+    for entry in entries {
+        reduced_input = reduced_input.with_entry_point(EntryPoint::new(entry));
+    }
     let fixed = analyzer
         .reduce(&reduced_input)
         .expect("an already reduced library must remain reducible");
+    assert_eq!(fixed.reduced_source(), reduced_source);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+fn assert_binary_fixed_point<I, S>(
+    analyzer: &Analyzer,
+    reduced_source: &str,
+    crate_name: &str,
+    entries: I,
+) where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut reduced_input = SourceInput::binary(reduced_source, Edition::Rust2024, host_target())
+        .with_crate_name(crate_name);
+    for entry in entries {
+        reduced_input = reduced_input.with_entry_point(EntryPoint::new(entry));
+    }
+    let fixed = analyzer
+        .reduce(&reduced_input)
+        .expect("an already reduced binary must remain reducible");
     assert_eq!(fixed.reduced_source(), reduced_source);
 }
 

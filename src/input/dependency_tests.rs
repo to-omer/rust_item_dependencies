@@ -22,8 +22,10 @@ use crate::source::ByteRange;
 
 const FIXTURE: &str = include_str!("../../tests/fixtures/dependencies/mono_graph.rs");
 const CONST_FIXTURE: &str = include_str!("../../tests/fixtures/compiler/const_trait_function.rs");
-const OPAQUE_LIFETIME_TAG_FIXTURE: &str =
-    include_str!("../../tests/fixtures/dependencies/opaque_lifetime_tag.rs");
+const OPAQUE_LIFETIME_FIXTURE: &str =
+    include_str!("../../tests/fixtures/dependencies/opaque_lifetime.rs");
+const FULFILLMENT_ORDER_FIXTURE: &str =
+    include_str!("../../tests/fixtures/compiler/fulfillment_order.rs");
 const MACRO_ASSOCIATED_CALL: &str = r#"
 struct Reader;
 
@@ -108,6 +110,62 @@ fn dependency_collection_preserves_the_exact_mono_and_proof_graph() {
     assert_allocations(&graph);
     assert_mono_edges(&graph);
     assert_proofs(&graph);
+}
+
+#[test]
+fn fulfillment_dependencies_are_canonical_across_codegen_queries() {
+    let graph = inspect_source(FULFILLMENT_ORDER_FIXTURE);
+    assert_eq!(inspect_source(FULFILLMENT_ORDER_FIXTURE), graph);
+
+    let candidates = graph
+        .proofs
+        .iter()
+        .filter(|proof| {
+            matches!(
+                &proof.kind,
+                ProofNodeKind::Obligation {
+                    fulfillment_nested: Some(nested),
+                    ..
+                } if nested.len() == 8
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), 4);
+    for owner in candidates {
+        let ProofNodeKind::Obligation {
+            fulfillment_nested: Some(nested),
+            ..
+        } = &owner.kind
+        else {
+            unreachable!()
+        };
+        assert!(nested.windows(2).all(|pair| {
+            graph.proofs[pair[0].0 as usize].key < graph.proofs[pair[1].0 as usize].key
+        }));
+
+        let mut relations = graph
+            .edges
+            .iter()
+            .filter_map(|edge| match &edge.kind {
+                DependencyKind::ProofRelation {
+                    relation: ProofRelationKind::FulfillmentNested,
+                    ordinal,
+                } if edge.from == GraphNode::Proof(owner.id) => Some((*ordinal, edge.to)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        relations.sort_by_key(|(ordinal, _)| *ordinal);
+        assert_eq!(
+            relations,
+            nested
+                .iter()
+                .enumerate()
+                .map(|(ordinal, &target)| {
+                    (u32::try_from(ordinal).unwrap(), GraphNode::Proof(target))
+                })
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]
@@ -409,10 +467,10 @@ fn a_remaining_full_range_item_is_not_mistaken_for_the_crate_root() {
 }
 
 #[test]
-fn hirless_opaque_lifetime_keeps_its_graph_node_without_breaking_tag_collection() {
+fn hirless_opaque_lifetime_keeps_its_graph_node() {
     let (sysroot, target) = compiler_context();
     let input = SourceInput::binary(
-        OPAQUE_LIFETIME_TAG_FIXTURE.to_owned(),
+        OPAQUE_LIFETIME_FIXTURE.to_owned(),
         Edition::Rust2024,
         target,
     );
@@ -423,26 +481,25 @@ fn hirless_opaque_lifetime_keeps_its_graph_node_without_breaking_tag_collection(
         .expect("repeated opaque-lifetime analysis must succeed");
 
     assert_eq!(second, first);
-    assert_eq!(first.tags.len(), 1);
-    let (&tagged_definition, tags) = first
-        .tags
-        .first_key_value()
-        .expect("the roots definition must keep its tag");
-    assert_eq!(
-        tags,
-        &std::collections::BTreeSet::from(["opaque-lifetime".to_owned()])
-    );
+    let roots = first
+        .graph
+        .definitions
+        .definitions
+        .iter()
+        .find(|definition| {
+            definition
+                .key
+                .0
+                .last()
+                .and_then(|part| part.name.as_deref())
+                == Some("roots")
+        })
+        .expect("the used roots method must be observed");
     assert!(
         first
             .retention
             .semantic_required
-            .contains(&GraphNode::Definition(tagged_definition))
-    );
-    assert!(
-        first
-            .rewrite
-            .source
-            .contains("rust-item-dependencies:tag=opaque-lifetime")
+            .contains(&GraphNode::Definition(roots.id))
     );
     let opaque_lifetimes = first
         .graph
@@ -461,6 +518,11 @@ fn hirless_opaque_lifetime_keeps_its_graph_node_without_breaking_tag_collection(
         .collect::<Vec<_>>();
     assert_eq!(opaque_lifetimes.len(), 1);
     assert!(opaque_lifetimes[0].parent.is_some());
+}
+
+#[test]
+fn doc_comments_resembling_dependency_tags_have_no_product_semantics() {
+    inspect_source("/// rust-item-dependencies:tag=\nfn main() {}\n");
 }
 
 fn inspect_source(source: &str) -> DependencyGraph {

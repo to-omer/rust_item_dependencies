@@ -69,7 +69,6 @@ impl ExternalCrate {
 #[derive(Debug, Default)]
 pub(crate) struct PreparedExternalCrates {
     direct: Vec<PreparedExternalCrate>,
-    dependencies: Vec<PreparedDependencyArtifact>,
     proc_macro_execution_artifacts: Vec<PreparedProcMacroExecutionArtifact>,
     snapshot: Option<SnapshotDirectory>,
 }
@@ -77,10 +76,6 @@ pub(crate) struct PreparedExternalCrates {
 impl PreparedExternalCrates {
     pub(crate) fn direct(&self) -> &[PreparedExternalCrate] {
         &self.direct
-    }
-
-    pub(crate) fn dependencies(&self) -> &[PreparedDependencyArtifact] {
-        &self.dependencies
     }
 
     pub(crate) fn proc_macro_execution_artifacts(&self) -> &[PreparedProcMacroExecutionArtifact] {
@@ -171,10 +166,7 @@ pub(crate) enum ExternalArtifactKind {
 #[derive(Debug)]
 pub(crate) struct PreparedExternalCrate {
     extern_name: String,
-    file_name: String,
     artifact: PathBuf,
-    digest: [u8; 32],
-    kind: ExternalArtifactKind,
 }
 
 impl PreparedExternalCrate {
@@ -182,76 +174,23 @@ impl PreparedExternalCrate {
         &self.extern_name
     }
 
-    pub(crate) fn file_name(&self) -> &str {
-        &self.file_name
-    }
-
     pub(crate) fn artifact_argument(&self) -> &str {
         self.artifact
             .to_str()
             .expect("prepared external artifact paths are UTF-8")
     }
-
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        self.digest
-    }
-
-    pub(crate) fn kind(&self) -> ExternalArtifactKind {
-        self.kind
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct PreparedDependencyArtifact {
-    file_name: String,
-    digest: [u8; 32],
-    kind: ExternalArtifactKind,
-}
-
-impl PreparedDependencyArtifact {
-    pub(crate) fn file_name(&self) -> &str {
-        &self.file_name
-    }
-
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        self.digest
-    }
-
-    pub(crate) fn kind(&self) -> ExternalArtifactKind {
-        self.kind
-    }
 }
 
 #[derive(Debug)]
 pub(crate) struct PreparedProcMacroExecutionArtifact {
-    file_name: String,
     artifact: PathBuf,
-    digest: [u8; 32],
     #[cfg(windows)]
     snapshot: ProcessSnapshot,
 }
 
-impl PartialEq for PreparedProcMacroExecutionArtifact {
-    fn eq(&self, other: &Self) -> bool {
-        self.file_name == other.file_name
-            && self.artifact == other.artifact
-            && self.digest == other.digest
-    }
-}
-
-impl Eq for PreparedProcMacroExecutionArtifact {}
-
 impl PreparedProcMacroExecutionArtifact {
-    pub(crate) fn file_name(&self) -> &str {
-        &self.file_name
-    }
-
     pub(crate) fn artifact(&self) -> &Path {
         &self.artifact
-    }
-
-    pub(crate) fn digest(&self) -> [u8; 32] {
-        self.digest
     }
 }
 
@@ -788,47 +727,33 @@ pub(crate) fn prepare_external_crates<'a>(
     )?;
     let snapshots = prepare_snapshots(&snapshot_parent, &staged, &proc_macro_execution_artifacts)?;
 
-    let mut direct = direct_requests
+    direct_requests.sort_by(|(left_name, left), (right_name, right)| {
+        (left_name, left.kind, &left.file_name, left.loaded.digest).cmp(&(
+            right_name,
+            right.kind,
+            &right.file_name,
+            right.loaded.digest,
+        ))
+    });
+    direct_requests.dedup_by(|(left_name, left), (right_name, right)| {
+        left_name == right_name
+            && left.kind == right.kind
+            && left.file_name == right.file_name
+            && left.loaded.digest == right.loaded.digest
+    });
+    let direct = direct_requests
         .into_iter()
         .map(|(extern_name, artifact)| PreparedExternalCrate {
             artifact: snapshots.artifact_path(&artifact),
             extern_name,
-            file_name: artifact.file_name,
-            digest: artifact.loaded.digest,
-            kind: artifact.kind,
         })
         .collect::<Vec<_>>();
-    direct.sort_by(|left, right| {
-        (&left.extern_name, left.kind, &left.file_name, left.digest).cmp(&(
-            &right.extern_name,
-            right.kind,
-            &right.file_name,
-            right.digest,
-        ))
-    });
-    direct.dedup_by(|left, right| {
-        left.extern_name == right.extern_name
-            && left.kind == right.kind
-            && left.file_name == right.file_name
-            && left.digest == right.digest
-    });
-
-    let mut dependencies = dependency_requests
-        .into_iter()
-        .map(|artifact| PreparedDependencyArtifact {
-            file_name: artifact.file_name,
-            digest: artifact.loaded.digest,
-            kind: artifact.kind,
-        })
-        .collect::<Vec<_>>();
-    dependencies.sort_by(|left, right| {
-        (left.kind, &left.file_name, left.digest).cmp(&(right.kind, &right.file_name, right.digest))
-    });
-    dependencies.dedup();
 
     let proc_macro_execution_artifacts = proc_macro_execution_artifacts
         .into_iter()
         .map(|(file_name, digest)| {
+            #[cfg(not(windows))]
+            let _ = digest;
             #[cfg(windows)]
             let snapshot = snapshots
                 .proc_macros
@@ -852,8 +777,6 @@ pub(crate) fn prepare_external_crates<'a>(
             };
             PreparedProcMacroExecutionArtifact {
                 artifact,
-                file_name,
-                digest,
                 #[cfg(windows)]
                 snapshot,
             }
@@ -862,7 +785,6 @@ pub(crate) fn prepare_external_crates<'a>(
 
     Ok(PreparedExternalCrates {
         direct,
-        dependencies,
         proc_macro_execution_artifacts,
         snapshot: snapshots.analyzer,
     })
@@ -1316,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn preparation_classifies_rlibs_and_host_dynamic_libraries_for_both_roles() {
+    fn preparation_accepts_rlibs_and_host_dynamic_libraries_for_both_roles() {
         let directory = TestDirectory::new();
         let direct_rlib = directory.artifact("libdirect.rlib", b"direct");
         let direct_dynamic = directory.host_dynamic_library("", "direct_macros", b"direct macros");
@@ -1334,26 +1256,18 @@ mod tests {
             prepared
                 .direct()
                 .iter()
-                .map(|artifact| (artifact.extern_name(), artifact.kind()))
+                .map(PreparedExternalCrate::extern_name)
                 .collect::<Vec<_>>(),
-            vec![
-                ("direct", ExternalArtifactKind::Rlib),
-                ("direct_macros", ExternalArtifactKind::HostDynamicLibrary,),
-            ]
+            vec!["direct", "direct_macros"]
+        );
+        let snapshot = Path::new(prepared.search_directories().next().unwrap());
+        assert_eq!(
+            fs::read(snapshot.join("libdependency.rlib")).unwrap(),
+            [AR_MAGIC, b"dependency"].concat()
         );
         assert_eq!(
-            prepared
-                .dependencies()
-                .iter()
-                .map(|artifact| (artifact.file_name(), artifact.kind()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("libdependency.rlib", ExternalArtifactKind::Rlib),
-                (
-                    dependency_dynamic.file_name().unwrap().to_str().unwrap(),
-                    ExternalArtifactKind::HostDynamicLibrary,
-                ),
-            ]
+            fs::read(snapshot.join(dependency_dynamic.file_name().unwrap())).unwrap(),
+            b"dependency macros"
         );
         assert!(prepared.proc_macro_execution_artifacts().is_empty());
     }
@@ -1368,11 +1282,6 @@ mod tests {
         let permissions = prepared.proc_macro_execution_artifacts();
 
         assert_eq!(permissions.len(), 1);
-        assert_eq!(
-            permissions[0].file_name(),
-            dynamic.file_name().unwrap().to_str().unwrap()
-        );
-        assert_eq!(permissions[0].digest(), sha256(b"trusted native code"));
         assert_eq!(
             fs::read(permissions[0].artifact()).unwrap(),
             b"trusted native code"
@@ -1462,7 +1371,13 @@ mod tests {
             prepared
                 .proc_macro_execution_artifacts()
                 .iter()
-                .find(|artifact| artifact.file_name() == name)
+                .find(|artifact| {
+                    artifact
+                        .artifact()
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        == Some(name)
+                })
                 .unwrap()
                 .artifact()
                 .to_owned()
@@ -1638,11 +1553,6 @@ mod tests {
 
         let prepared = prepare_with_permissions(&[], &[&dynamic], &[&dynamic]).unwrap();
 
-        assert_eq!(prepared.dependencies().len(), 1);
-        assert_eq!(
-            prepared.dependencies()[0].kind(),
-            ExternalArtifactKind::HostDynamicLibrary
-        );
         assert_eq!(prepared.proc_macro_execution_artifacts().len(), 1);
         assert_eq!(
             fs::read(prepared.proc_macro_execution_artifacts()[0].artifact()).unwrap(),
@@ -1685,13 +1595,11 @@ mod tests {
         let prepared = prepare(&[("direct", &artifact)], &[&artifact]).unwrap();
 
         assert_eq!(prepared.direct().len(), 1);
-        assert!(prepared.dependencies().is_empty());
 
         let non_searchable_name = directory.artifact("lib-.rlib", b"direct");
         let prepared = prepare(&[("direct", &non_searchable_name)], &[&non_searchable_name])
             .expect("a repeated direct artifact adds no search input");
         assert_eq!(prepared.direct().len(), 1);
-        assert!(prepared.dependencies().is_empty());
 
         let direct_only_dynamic = directory.host_dynamic_library("", "-", b"dynamic");
         let prepared = prepare(
@@ -1700,7 +1608,6 @@ mod tests {
         )
         .expect("a repeated direct dynamic library adds no search input");
         assert_eq!(prepared.direct().len(), 1);
-        assert!(prepared.dependencies().is_empty());
         assert!(matches!(
             prepare(&[], &[&direct_only_dynamic]),
             Err(AnalysisError::UnsupportedExternalCrateArtifact { .. })
