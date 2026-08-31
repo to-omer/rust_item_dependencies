@@ -95,15 +95,14 @@ echo "==> patched compiler observer fixtures"
         tests/ui/resolve/error-recovery-import-observer.rs
 )
 
+echo "==> restore patched compiler"
+(
+    cd "$rustc_source"
+    RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$queue_digest" \
+        "$rustc_source/x" build --ci=false --stage 2 compiler/rustc library
+)
+
 echo "==> owned graph, reduction, and verification"
-# The observer tests rebuild rustc_private artifacts in place. Cargo does not track changes to
-# explicit --extern files, so reducer and qualification artifacts must be rebuilt against them.
-cargo clean \
-    --manifest-path "$repository_root/Cargo.toml" \
-    --target-dir "$repository_root/target/rid/cargo"
-cargo clean \
-    --manifest-path "$repository_root/Cargo.toml" \
-    --target-dir "$repository_root/target/rid/tests"
 "$repository_root/scripts/check-compiler-qualification.sh" "$stage2_sysroot"
 
 echo "acceptance checks passed"
