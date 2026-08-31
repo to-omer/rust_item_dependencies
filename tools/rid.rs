@@ -3,11 +3,16 @@
 edition = "2024"
 ---
 
+#![feature(fs_set_times)]
+
+use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, FileTimes, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::time::SystemTime;
 
 mod cli;
 #[path = "../src/target_libraries.rs"]
@@ -26,6 +31,7 @@ const SNAPSHOT_OWNER_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_OWNER";
 const PROCESS_OWNER_PREFIX: &str = ".rust-item-dependencies-owner-";
 const PROCESS_ROOT_PREFIX: &str = "rust-item-dependencies-process-";
 const SNAPSHOT_OWNER_ATTEMPTS: u64 = 1_024;
+const COMPILER_BUILD_IDENTITY_FILE: &str = ".rust-item-dependencies-build-identity-v2";
 #[cfg(windows)]
 const SNAPSHOT_PARENT_LOCK_FILE: &str = ".rust-item-dependencies-parent-lock";
 const RUSTC_PRIVATE_CRATES: &[&str] = &[
@@ -91,18 +97,32 @@ fn run() -> Result<RunOutcome, String> {
         .ok_or_else(|| "cannot locate the repository root".to_owned())?;
     let generated = repository_root.join("target/rid");
     let rust_source = generated.join("rustc");
+    let restored_build_without_checkout =
+        rust_source.join("build").is_dir() && !rust_source.join(".git").exists();
     fs::create_dir_all(&generated)
         .map_err(|error| format!("cannot create {}: {error}", render_path(&generated)))?;
 
     let preparation_lock = lock_exclusive(&generated.join("preparation.lock"))?;
     ensure_patched_checkout(repository_root, &rust_source)?;
+    let build_identity_matches = compiler_build_identity_matches(repository_root, &rust_source)?;
+    if restored_build_without_checkout && build_identity_matches {
+        // Cached Cargo outputs predate this checkout. Validate its contents first, then restore
+        // the source-time ordering expected by Cargo and native build scripts.
+        normalize_tracked_source_mtimes(&rust_source)?;
+    }
     let host = active_host()?;
     let stage2 = rust_source.join("build").join(&host).join("stage2");
     let stage2_rustc = stage2
         .join("bin")
         .join(format!("rustc{}", env::consts::EXE_SUFFIX));
-    if !stage2_rustc.is_file() {
+    if !stage2_rustc.is_file() || !build_identity_matches {
+        if build_identity_matches {
+            remove_compiler_build_identity(&rust_source)?;
+        } else {
+            remove_incompatible_compiler_build(&rust_source)?;
+        }
         build_compiler(repository_root, &rust_source)?;
+        record_compiler_build_identity(repository_root, &rust_source)?;
     }
     if let Some(arguments) = rustc_arguments {
         let target = match direct_builtin_target_candidate(&arguments) {
@@ -379,6 +399,107 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
     Ok(())
 }
 
+fn normalize_tracked_source_mtimes(rust_source: &Path) -> Result<(), String> {
+    let tracked = command_output(
+        Command::new("git")
+            .args(["-C"])
+            .arg(rust_source)
+            .args(["ls-files", "-z"]),
+        "list tracked Rust source files",
+    )?;
+    let mut directories = BTreeSet::new();
+    for relative in tracked.split('\0').filter(|relative| !relative.is_empty()) {
+        let relative = Path::new(relative);
+        let path = rust_source.join(relative);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!("cannot inspect {}: {error}", render_path(&path)));
+            }
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        set_modified_to_epoch(&path)?;
+        directories.extend(relative.ancestors().skip(1).map(Path::to_path_buf));
+    }
+    let mut directories = directories.into_iter().collect::<Vec<_>>();
+    directories.sort_by_key(|path| Reverse(path.components().count()));
+    for relative in directories {
+        let path = rust_source.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => set_modified_to_epoch(&path)?,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("cannot inspect {}: {error}", render_path(&path)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compiler_build_identity(
+    repository_root: &Path,
+    rust_source: &Path,
+) -> Result<(PathBuf, String), String> {
+    let patched_revision = read_trimmed(repository_root.join("rustc-patches/patched-revision"))?;
+    let queue_digest = read_trimmed(repository_root.join("rustc-patches/queue-digest"))?;
+    Ok((
+        rust_source.join("build").join(COMPILER_BUILD_IDENTITY_FILE),
+        format!("{patched_revision}\n{queue_digest}\n"),
+    ))
+}
+
+fn compiler_build_identity_matches(
+    repository_root: &Path,
+    rust_source: &Path,
+) -> Result<bool, String> {
+    let (path, expected) = compiler_build_identity(repository_root, rust_source)?;
+    match fs::read_to_string(&path) {
+        Ok(actual) => Ok(actual == expected),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("cannot read {}: {error}", render_path(&path))),
+    }
+}
+
+fn record_compiler_build_identity(
+    repository_root: &Path,
+    rust_source: &Path,
+) -> Result<(), String> {
+    let (path, identity) = compiler_build_identity(repository_root, rust_source)?;
+    fs::write(&path, identity)
+        .map_err(|error| format!("cannot write {}: {error}", render_path(&path)))
+}
+
+fn remove_compiler_build_identity(rust_source: &Path) -> Result<(), String> {
+    let path = rust_source.join("build").join(COMPILER_BUILD_IDENTITY_FILE);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot remove {}: {error}", render_path(&path))),
+    }
+}
+
+fn remove_incompatible_compiler_build(rust_source: &Path) -> Result<(), String> {
+    let path = rust_source.join("build");
+    match fs::remove_dir_all(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot remove {}: {error}", render_path(&path))),
+    }
+}
+
+fn set_modified_to_epoch(path: &Path) -> Result<(), String> {
+    fs::set_times(path, FileTimes::new().set_modified(SystemTime::UNIX_EPOCH)).map_err(|error| {
+        format!(
+            "cannot normalize the modification time of {}: {error}",
+            render_path(path)
+        )
+    })
+}
+
 fn build_compiler(repository_root: &Path, rust_source: &Path) -> Result<(), String> {
     eprintln!("Preparing the patched Rust compiler. This takes a while on the first run.");
     let mut command = bootstrap_command(repository_root, rust_source)?;
@@ -423,6 +544,9 @@ fn bootstrap_command(repository_root: &Path, rust_source: &Path) -> Result<Comma
         .arg(rust_source.join("x.py"))
         .current_dir(rust_source)
         .env("RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST", queue_digest)
+        .env_remove("CARGOFLAGS")
+        .env_remove("CARGOFLAGS_BOOTSTRAP")
+        .env_remove("CARGOFLAGS_NOT_BOOTSTRAP")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
     Ok(command)
@@ -643,6 +767,137 @@ mod target_tests {
     use super::*;
 
     #[test]
+    fn compiler_build_identity_must_match_both_patch_inputs() {
+        let directory = TestDirectory::new();
+        let repository_root = directory.path();
+        let rust_source = repository_root.join("rust-source");
+        fs::create_dir_all(repository_root.join("rustc-patches")).unwrap();
+        fs::create_dir_all(rust_source.join("build")).unwrap();
+        fs::write(
+            repository_root.join("rustc-patches/patched-revision"),
+            "revision\n",
+        )
+        .unwrap();
+        fs::write(
+            repository_root.join("rustc-patches/queue-digest"),
+            "digest\n",
+        )
+        .unwrap();
+
+        assert!(!compiler_build_identity_matches(repository_root, &rust_source).unwrap());
+        record_compiler_build_identity(repository_root, &rust_source).unwrap();
+        assert!(compiler_build_identity_matches(repository_root, &rust_source).unwrap());
+
+        fs::write(
+            repository_root.join("rustc-patches/queue-digest"),
+            "changed\n",
+        )
+        .unwrap();
+        assert!(!compiler_build_identity_matches(repository_root, &rust_source).unwrap());
+
+        fs::write(
+            repository_root.join("rustc-patches/queue-digest"),
+            "digest\n",
+        )
+        .unwrap();
+        fs::write(
+            repository_root.join("rustc-patches/patched-revision"),
+            "changed\n",
+        )
+        .unwrap();
+        assert!(!compiler_build_identity_matches(repository_root, &rust_source).unwrap());
+    }
+
+    #[test]
+    fn incompatible_compiler_build_removal_preserves_the_checkout() {
+        let directory = TestDirectory::new();
+        let rust_source = directory.path().join("rust-source");
+        fs::create_dir_all(rust_source.join("build/artifacts")).unwrap();
+        fs::write(rust_source.join("build/artifacts/compiler"), "cached").unwrap();
+        fs::write(rust_source.join("source.rs"), "fn main() {}\n").unwrap();
+
+        remove_incompatible_compiler_build(&rust_source).unwrap();
+
+        assert!(!rust_source.join("build").exists());
+        assert!(rust_source.join("source.rs").is_file());
+    }
+
+    #[test]
+    fn bootstrap_uses_default_cargo_freshness() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let command = bootstrap_command(repository_root, Path::new("rust-source")).unwrap();
+        let configured = command.get_envs().collect::<Vec<_>>();
+
+        for variable in [
+            "CARGOFLAGS",
+            "CARGOFLAGS_BOOTSTRAP",
+            "CARGOFLAGS_NOT_BOOTSTRAP",
+        ] {
+            assert!(configured.contains(&(OsStr::new(variable), None)));
+        }
+    }
+
+    #[test]
+    fn cached_build_normalizes_tracked_files_and_ancestor_directories() {
+        let directory = TestDirectory::new();
+        run_command(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(directory.path()),
+            "initialize test repository",
+        )
+        .unwrap();
+        let tracked_directory = directory.path().join("crate/src");
+        let untracked_directory = directory.path().join("untracked");
+        fs::create_dir_all(&tracked_directory).unwrap();
+        fs::create_dir(&untracked_directory).unwrap();
+        let crate_directory = directory.path().join("crate");
+        let tracked = tracked_directory.join("lib.rs");
+        let untracked = untracked_directory.join("data.rs");
+        fs::write(&tracked, "pub fn tracked() {}\n").unwrap();
+        fs::write(&untracked, "pub fn untracked() {}\n").unwrap();
+        run_command(
+            Command::new("git")
+                .args(["-C"])
+                .arg(directory.path())
+                .args(["add", "crate/src/lib.rs"]),
+            "index test source",
+        )
+        .unwrap();
+        let untracked_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        for path in [
+            directory.path(),
+            crate_directory.as_path(),
+            tracked_directory.as_path(),
+            tracked.as_path(),
+            untracked_directory.as_path(),
+            untracked.as_path(),
+        ] {
+            fs::set_times(path, FileTimes::new().set_modified(untracked_time)).unwrap();
+        }
+
+        normalize_tracked_source_mtimes(directory.path()).unwrap();
+
+        for path in [
+            directory.path(),
+            crate_directory.as_path(),
+            tracked_directory.as_path(),
+            tracked.as_path(),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().modified().unwrap(),
+                SystemTime::UNIX_EPOCH
+            );
+        }
+        for path in [untracked_directory.as_path(), untracked.as_path()] {
+            assert_eq!(
+                fs::metadata(path).unwrap().modified().unwrap(),
+                untracked_time
+            );
+        }
+    }
+
+    #[test]
     fn direct_target_requires_an_unambiguous_leading_argument() {
         assert_eq!(
             direct_builtin_target_candidate(&arguments(&[
@@ -798,10 +1053,10 @@ mod snapshot_tests {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 struct TestDirectory(PathBuf);
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 impl TestDirectory {
     fn new() -> Self {
         let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -825,7 +1080,7 @@ impl TestDirectory {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
