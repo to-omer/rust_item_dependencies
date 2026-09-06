@@ -43,7 +43,8 @@ use crate::source::{ByteRange, MacroProductSource, SourceUnitIdentityKind};
 use crate::source::{
     DeclarativeContributorParent, DeclarativeGenerationParentState, EditableMacroSource,
     EditableMacroSourceResolver, EditableMacroSourceRole, MacroRuleSelectionIndex, SourceError,
-    declarative_generation_parent, original_span_range, resolve_declarative_contributor_parent,
+    declarative_generation_parent, normalized_input_span_range, original_span_range,
+    resolve_declarative_contributor_parent,
 };
 
 use super::ExpansionError;
@@ -4663,11 +4664,10 @@ fn source_range(
     if start.sf.start_pos != end.sf.start_pos {
         return Err(ExpansionError::InvalidSpan);
     }
-    if start.sf.name.short().to_string() != "main.rs" {
-        return Ok(None);
-    }
-    original_span_range(compiler, &source.offsets, span)
-        .map(Some)
+    let input_name = compiler.sess.io.input.file_name(&compiler.sess);
+    normalized_input_span_range(source_map, &input_name, span)
+        .map(|range| source.offsets.original_range(range))
+        .transpose()
         .map_err(|_| ExpansionError::InvalidSpan)
 }
 

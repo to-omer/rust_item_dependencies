@@ -46,7 +46,7 @@ use crate::graph::{DefinitionKind, DefinitionTarget};
 #[cfg(rust_item_dependencies_patched)]
 use crate::selection::{SelectionCollectionError, SelectionCollector};
 #[cfg(rust_item_dependencies_patched)]
-use crate::source::original_span_range;
+use crate::source::normalized_input_span_range;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CollectedMonomorphization {
@@ -1495,9 +1495,12 @@ fn observation_site(
             if start.sf.start_pos != end.sf.start_pos {
                 return Err(MonomorphizationError::InvalidEdge);
             }
-            if start.sf.name.short().to_string() == "main.rs" {
+            let input_name = compiler.sess.io.input.file_name(&compiler.sess);
+            if let Some(range) = normalized_input_span_range(map, &input_name, span) {
                 ObservationSite::Source(
-                    original_span_range(compiler, &source.offsets, span)
+                    source
+                        .offsets
+                        .original_range(range)
                         .map_err(|_| MonomorphizationError::InvalidEdge)?,
                 )
             } else {

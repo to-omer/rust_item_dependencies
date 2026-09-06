@@ -54,7 +54,7 @@ impl Analyzer {
         )
         .map_err(snapshot_error)?;
 
-        let reduced = self.inspect_reduced(&context, &inspected)?;
+        let reduced = self.inspect_reduced(&context.for_reduced_source(), &inspected)?;
         let reduced_outputless = reduced
             .complete_source_outputless_macro_expansions
             .as_ref()

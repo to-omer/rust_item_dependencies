@@ -44,7 +44,8 @@ use rustc_lexer::{FrontmatterAllowed, TokenKind, strip_shebang, tokenize};
 use rustc_middle::ty::{MacroImplementationKind, MacroInvocationOrigin, TyCtxt};
 #[cfg(rust_item_dependencies_patched)]
 use rustc_span::hygiene::{ExpnId, ExpnKind, MacroKind};
-use rustc_span::{SourceFile, Span, Symbol, sym};
+use rustc_span::source_map::SourceMap;
+use rustc_span::{FileName, SourceFile, Span, Symbol, sym};
 
 #[cfg(rust_item_dependencies_patched)]
 use crate::macro_output::ValidatedDeclarativeOutputs;
@@ -1322,7 +1323,10 @@ pub(crate) fn collect_source(
     original: Arc<str>,
 ) -> Result<SourceInventory, SourceError> {
     let (normalized, offsets) = OriginalOffsetMap::from_source(&original)?;
-    let source_file = main_source_file(compiler, krate)?;
+    let source_file = compiler
+        .sess
+        .source_map()
+        .lookup_source_file(krate.spans.inner_span.lo());
     offsets.validate_source_file(&source_file)?;
     if source_file.src.as_deref().map(String::as_str) != Some(normalized.as_str()) {
         return Err(SourceError::NormalizationMismatch);
@@ -2289,31 +2293,29 @@ pub(crate) fn original_span_range(
     offsets: &OriginalOffsetMap,
     span: Span,
 ) -> Result<ByteRange, SourceError> {
-    if span.is_dummy() {
-        return Err(SourceError::InvalidSpan);
-    }
-    let source_map = compiler.sess.source_map();
-    let start = source_map.lookup_byte_offset(span.lo());
-    let end = source_map.lookup_byte_offset(span.hi());
-    if start.sf.start_pos != end.sf.start_pos || start.sf.name.short().to_string() != "main.rs" {
-        return Err(SourceError::InvalidSpan);
-    }
-    offsets.original_range(ByteRange {
-        start: start.pos.0,
-        end: end.pos.0,
-    })
+    let input_name = compiler.sess.io.input.file_name(&compiler.sess);
+    let range = normalized_input_span_range(compiler.sess.source_map(), &input_name, span)
+        .ok_or(SourceError::InvalidSpan)?;
+    offsets.original_range(range)
 }
 
-fn main_source_file(
-    compiler: &Compiler,
-    krate: &ast::Crate,
-) -> Result<Arc<SourceFile>, SourceError> {
-    let source_map = compiler.sess.source_map();
-    let source_file = source_map.lookup_source_file(krate.spans.inner_span.lo());
-    if source_file.name.short().to_string() != "main.rs" {
-        return Err(SourceError::InvalidSpan);
+pub(crate) fn normalized_input_span_range(
+    source_map: &SourceMap,
+    input_name: &FileName,
+    span: Span,
+) -> Option<ByteRange> {
+    if span.is_dummy() {
+        return None;
     }
-    Ok(source_file)
+    let start = source_map.lookup_byte_offset(span.lo());
+    let end = source_map.lookup_byte_offset(span.hi());
+    (start.sf.start_pos == end.sf.start_pos
+        && !start.sf.is_imported()
+        && start.sf.name == *input_name)
+        .then_some(ByteRange {
+            start: start.pos.0,
+            end: end.pos.0,
+        })
 }
 
 struct UnitCollector<'a> {
@@ -3564,6 +3566,63 @@ mod tests {
         resolve_procedural_macro_anchors, validate_macro_rule_facts,
     };
     use crate::rewrite::rewrite_source;
+
+    #[test]
+    fn input_spans_exclude_other_files_and_imported_files_with_the_same_name() {
+        use rustc_data_structures::sync::FreezeLock;
+        use rustc_span::def_id::{CrateNum, StableCrateId};
+        use rustc_span::source_map::{FilePathMapping, SourceMap};
+        use rustc_span::{BytePos, FileName, RealFileName, Span, StableSourceFileId, Symbol};
+        use std::path::Path;
+
+        rustc_span::create_default_session_globals_then(|| {
+            let map = SourceMap::new(FilePathMapping::empty());
+            let name = |path: &str| {
+                FileName::Real(
+                    map.path_mapping()
+                        .to_real_filename(&RealFileName::empty(), Path::new(path)),
+                )
+            };
+            let input = map.new_source_file(name("input/main.rs"), "input".to_owned());
+            let other = map.new_source_file(name("other/main.rs"), "other".to_owned());
+            let imported_id = StableSourceFileId::from_filename_for_export(
+                &input.name,
+                StableCrateId::new(Symbol::intern("external"), false, Vec::new(), "test"),
+            );
+            let imported = map.new_imported_source_file(
+                input.name.clone(),
+                input.src_hash,
+                input.checksum_hash,
+                imported_id,
+                input.normalized_source_len.0,
+                input.unnormalized_source_len,
+                CrateNum::new(1),
+                FreezeLock::new(input.lines.read().clone()),
+                input.multibyte_chars.clone(),
+                input.normalized_pos.clone(),
+                0,
+            );
+            assert_ne!(input.start_pos, imported.start_pos);
+            assert_eq!(input.name, imported.name);
+            let range = |start, end| {
+                super::normalized_input_span_range(
+                    &map,
+                    &input.name,
+                    Span::with_root_ctxt(start, end),
+                )
+            };
+            assert_eq!(
+                range(input.start_pos, input.start_pos + BytePos(5)),
+                Some(ByteRange { start: 0, end: 5 })
+            );
+            assert_eq!(range(other.start_pos, other.start_pos + BytePos(5)), None);
+            assert_eq!(
+                range(imported.start_pos, imported.start_pos + BytePos(5)),
+                None
+            );
+            assert_eq!(range(input.start_pos, other.start_pos), None);
+        });
+    }
 
     #[cfg(rust_item_dependencies_patched)]
     fn inspect_reduction(source: String, target: String) -> crate::input::InspectedReduction {
