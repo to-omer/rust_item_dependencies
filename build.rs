@@ -36,10 +36,8 @@ fn main() {
             "cargo:rustc-env=RUST_ITEM_DEPENDENCIES_BUILD_SYSROOT={}",
             sysroot.display()
         );
-        println!(
-            "cargo:rustc-link-search=dependency={}",
-            compiler_library_directory.display()
-        );
+        // The runtime directory also contains rustc_driver, but its Windows
+        // import library is only present alongside the compiler metadata.
         println!(
             "cargo:rustc-link-search=dependency={}",
             compiler_metadata.display()

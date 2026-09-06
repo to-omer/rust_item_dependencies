@@ -6,15 +6,15 @@ Rust、Cargo、Git、Pythonと、Rustコンパイラをビルドできる環境�
 
 ## 実行プログラムを削減する
 
-入力ファイルと出力先を指定して、リポジトリのルートで実行します。
+対象のファイルを指定して、リポジトリのルートで実行します。
 
 ```console
-cargo rid input.rs -o reduced.rs
+cargo rid input.rs
 ```
 
 初回は、このツールが利用するRustコンパイラを取得してビルドします。2回目以降は同じコンパイラを再利用します。
 
-入力ファイルと同じパスや、すでに存在するファイルを出力先に指定することはできません。
+コンパイルと削減結果の検証に成功すると、入力ファイルを更新します。結果が同じならファイルは変更しません。削減後は、同じパスを使ってビルドや動作確認を行えます。通常のコンパイルで無効な`#[cfg(test)]`のテストコードは削除されるため、削減後のテスト件数だけでは動作を確認できません。
 
 `#![no_main]`を使う実行プログラムも同じコマンドで削減できます。入力ソースには、コンパイル対象が要求するエントリシンボルを`no_mangle`や`export_name`で公開したRust関数が必要です。削減前のコードが、指定したコンパイル対象の通常のリンク環境で成立している必要があります。本ツールは、エントリ関数のABIやシグネチャを検査しません。
 
@@ -23,19 +23,19 @@ cargo rid input.rs -o reduced.rs
 ライブラリでは、クレート名と残す関数または静的変数を指定します。
 
 ```console
-cargo rid --crate-type lib --crate-name my_library --entry my_library::solve library.rs -o reduced.rs
+cargo rid --crate-type lib --crate-name my_library --entry my_library::solve library.rs
 ```
 
 起点はクレート名から始まる完全修飾名で指定します。複数残す場合は`--entry`を繰り返します。モジュール内の項目、`pub use`などで再公開された名前、型引数やconst引数を持つ自由関数も指定できます。ジェネリック関数や、公開される型に入力クレートの型関係を含む起点では、下流で使われる可能性があるtraitと`impl`も残します。関連関数、型、trait、定数は起点にできません。
 
 ## オプション
 
-`-o`では出力先を指定します。この指定は必須です。
+元のファイルを残す場合は、`-o reduced.rs`で別の出力先を指定します。入力と同じファイルや、すでに存在するファイルは指定できません。
 
 `--edition`ではRustのエディションを指定します。省略時は2024です。
 
 ```console
-cargo rid --edition 2021 input.rs -o reduced.rs
+cargo rid --edition 2021 input.rs
 ```
 
 `--target`では、Rustコンパイラに組み込まれたコンパイル対象を指定します。省略時は、現在のホストと同じコンパイル対象を使います。指定先の標準ライブラリが導入されていない場合は、解析に必要な情報を初回利用時に自動で用意します。
@@ -55,7 +55,7 @@ cargo rid --edition 2021 input.rs -o reduced.rs
 ```console
 cargo rid rustc leaf.rs --crate-name leaf --crate-type rlib --edition 2024 -o target/libleaf.rlib
 cargo rid rustc wrapper.rs --crate-name wrapper --crate-type rlib --edition 2024 --extern leaf=target/libleaf.rlib -o target/libwrapper.rlib
-cargo rid --extern wrapper=target/libwrapper.rlib --dependency-artifact target/libleaf.rlib input.rs -o reduced.rs
+cargo rid --extern wrapper=target/libwrapper.rlib --dependency-artifact target/libleaf.rlib input.rs
 ```
 
 `cargo rid rustc`の後ろに指定した引数は、削減に使う専用コンパイラへそのまま渡されます。別のコンパイル対象に必要な情報を自動で用意する場合は、`cargo rid rustc --target TRIPLE ...`の順で指定してください。依存クレートのビルドと削減には、すべて同じ`--target`を指定します。このツールは`Cargo.toml`を読まず、依存クレートや`build.rs`を自動ではビルドしません。
@@ -65,7 +65,7 @@ cargo rid --extern wrapper=target/libwrapper.rlib --dependency-artifact target/l
 手続きマクロを使う場合は、コンパイラを実行するホスト向けにビルドした動的ライブラリを指定します。入力から直接参照する場合は`--extern`、別のクレートから再公開される場合は`--dependency-artifact`へ指定してください。さらに、同じ成果物を`--allow-proc-macro`で明示的に許可します。
 
 ```console
-cargo rid --extern my_macro=PATH_TO_PROC_MACRO --allow-proc-macro PATH_TO_PROC_MACRO input.rs -o reduced.rs
+cargo rid --extern my_macro=PATH_TO_PROC_MACRO --allow-proc-macro PATH_TO_PROC_MACRO input.rs
 ```
 
 `PATH_TO_PROC_MACRO`には、専用コンパイラと互換性のある手続きマクロ成果物のパスを指定します。手続きマクロは`cargo rid rustc macro.rs --crate-name my_macro --crate-type proc-macro -o PATH_TO_PROC_MACRO`でビルドできます。手続きマクロはホストで実行するため、このビルドには入力プログラム用の`--target`を指定しません。
