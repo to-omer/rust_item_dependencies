@@ -6,7 +6,7 @@ pub fn reducer_usage(command: &str) -> String {
         r#"{command}
 
 Options:
-  -o, --output OUTPUT    Write reduced source to OUTPUT
+  -o, --output OUTPUT    Write to a new file instead of updating INPUT.rs
       --edition YEAR     Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]
       --target TRIPLE    Compilation target [default: compiler host]
       --crate-type TYPE  Crate type: bin or lib [default: bin]
@@ -57,7 +57,7 @@ pub struct CliExternalCrate {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Cli {
     pub input: PathBuf,
-    pub output: PathBuf,
+    pub output: Option<PathBuf>,
     pub edition: CliEdition,
     pub target: Option<String>,
     pub crate_type: CliCrateType,
@@ -180,7 +180,6 @@ pub fn parse_arguments(
     }
 
     let input = input.ok_or_else(|| format!("missing input file\n\n{usage}"))?;
-    let output = output.ok_or_else(|| format!("missing --output\n\n{usage}"))?;
     Ok(Parsed::Run(Box::new(Cli {
         input,
         output,
@@ -198,18 +197,18 @@ pub fn parse_arguments(
 }
 
 pub fn validate_output(cli: &Cli) -> Result<(), String> {
-    if same_file(&cli.input, &cli.output) {
+    let Some(output) = &cli.output else {
+        return Ok(());
+    };
+    if same_file(&cli.input, output) {
         return Err("input and output must be different files".to_owned());
     }
-    match std::fs::symlink_metadata(&cli.output) {
-        Ok(_) => Err(format!(
-            "output already exists: {}",
-            render_path(&cli.output)
-        )),
+    match std::fs::symlink_metadata(output) {
+        Ok(_) => Err(format!("output already exists: {}", render_path(output))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
             "cannot inspect output {}: {error}",
-            render_path(&cli.output)
+            render_path(output)
         )),
     }
 }

@@ -1,8 +1,8 @@
 #![feature(rustc_private)]
+#![cfg_attr(windows, feature(windows_by_handle))]
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
-use std::io::Write;
+#[cfg(test)]
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
@@ -13,6 +13,9 @@ use rust_item_dependencies::{
 
 #[path = "../tools/cli.rs"]
 mod cli;
+mod file_output;
+
+use file_output::{SourceFile, write_new as write_output};
 
 #[cfg(test)]
 use cli::Cli;
@@ -44,8 +47,20 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     };
     validate_output(&cli)?;
 
-    let source = std::fs::read_to_string(&cli.input)
+    let original = cli
+        .output
+        .is_none()
+        .then(|| SourceFile::read(&cli.input))
+        .transpose()
+        .map_err(|error| format!("cannot update {}: {error}", render_path(&cli.input)))?;
+    let source = original
+        .as_ref()
+        .map_or_else(
+            || std::fs::read_to_string(&cli.input),
+            |input| Ok(input.source().to_owned()),
+        )
         .map_err(|error| format!("cannot read {}: {error}", render_path(&cli.input)))?;
+    let output = cli.output.as_deref().unwrap_or(&cli.input);
     let target = cli.target.map_or_else(host_target, Ok)?;
     let mut options = cli.cfg_names.into_iter().fold(
         CompilationOptions::new().with_optimization_level(cli.optimization_level.into()),
@@ -68,15 +83,18 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             SourceInput::library(source, cli.edition.into(), target, cli.crate_name)
         }
     };
-    let input = input.with_source_paths(&cli.input, &cli.output);
+    let input = input.with_source_paths(&cli.input, output);
     let input = cli.entry_points.into_iter().fold(input, |input, path| {
         input.with_entry_point(EntryPoint::new(path))
     });
     let analyzer = Analyzer::new_with_options(options).map_err(render_analysis_error)?;
     let reduction = analyzer.reduce(&input).map_err(render_analysis_error)?;
 
-    write_output(&cli.output, reduction.reduced_source())
-        .map_err(|error| format!("cannot write {}: {error}", render_path(&cli.output)))
+    match original {
+        Some(original) => original.replace(reduction.reduced_source()),
+        None => write_output(output, reduction.reduced_source()),
+    }
+    .map_err(|error| format!("cannot write {}: {error}", render_path(output)))
 }
 
 fn render_analysis_error(error: AnalysisError) -> String {
@@ -143,14 +161,6 @@ fn append_range(output: &mut String, range: Option<rust_item_dependencies::ByteR
     }
 }
 
-fn write_output(path: &Path, source: &str) -> std::io::Result<()> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?
-        .write_all(source.as_bytes())
-}
-
 impl From<CliEdition> for Edition {
     fn from(edition: CliEdition) -> Self {
         match edition {
@@ -206,14 +216,14 @@ mod tests {
 
     #[test]
     fn parses_the_public_options_and_defaults() {
-        let Parsed::Run(defaults) = parse(&["input.rs", "-o", "output.rs"]).unwrap() else {
+        let Parsed::Run(defaults) = parse(&["input.rs"]).unwrap() else {
             panic!("input must run the reducer")
         };
         assert_eq!(
             *defaults,
             Cli {
                 input: "input.rs".into(),
-                output: "output.rs".into(),
+                output: None,
                 edition: CliEdition::Rust2024,
                 target: None,
                 crate_type: CliCrateType::Binary,
@@ -240,7 +250,7 @@ mod tests {
             panic!("valid options must run the reducer")
         };
         assert_eq!(explicit.input, Path::new("input.rs"));
-        assert_eq!(explicit.output, Path::new("output.rs"));
+        assert_eq!(explicit.output.as_deref(), Some(Path::new("output.rs")));
         assert_eq!(explicit.edition, CliEdition::Rust2021);
         assert_eq!(explicit.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
         assert_eq!(explicit.crate_type, CliCrateType::Binary);
@@ -446,10 +456,6 @@ mod tests {
             format!("missing input file\n\n{}", reducer_usage(USAGE_COMMAND))
         );
         assert_eq!(
-            parse(&["input.rs"]).unwrap_err(),
-            format!("missing --output\n\n{}", reducer_usage(USAGE_COMMAND))
-        );
-        assert_eq!(
             parse(&["first.rs", "second.rs"]).unwrap_err(),
             format!(
                 "expected exactly one input file\n\n{}",
@@ -626,7 +632,7 @@ mod tests {
         write_output(&path, "first").unwrap();
         let cli = Cli {
             input: path.with_extension("input.rs"),
-            output: path.clone(),
+            output: Some(path.clone()),
             edition: CliEdition::Rust2024,
             target: None,
             crate_type: CliCrateType::Binary,
