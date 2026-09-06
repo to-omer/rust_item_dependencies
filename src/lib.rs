@@ -36,6 +36,7 @@ pub(crate) mod external;
 pub(crate) mod graph;
 #[allow(dead_code)]
 pub(crate) mod input;
+mod invocation;
 #[allow(dead_code)]
 pub(crate) mod macro_output;
 #[allow(dead_code)]
@@ -56,4 +57,5 @@ pub use api::{
     Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel, Reduction, SourceInput,
 };
 pub use error::{AnalysisError, EntryPointError, UnsupportedReason};
+pub use invocation::CompilerInvocation;
 pub use source::ByteRange;

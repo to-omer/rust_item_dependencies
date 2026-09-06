@@ -1,2 +1,2 @@
 [alias]
-rid = "--config build.build-dir='target/rid/launcher' -Zscript tools/rid.rs"
+rid = "run --manifest-path tools/Cargo.toml --target-dir target/rid/launcher --quiet --bin cargo-rid -- rid"

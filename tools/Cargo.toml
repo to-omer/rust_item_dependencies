@@ -1,0 +1,11 @@
+[package]
+name = "cargo-rid"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "cargo-rid"
+path = "rid.rs"
+
+[workspace]

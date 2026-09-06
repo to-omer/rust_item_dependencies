@@ -44,68 +44,7 @@ impl Analyzer {
 
     pub fn reduce(&self, input: &SourceInput) -> Result<Reduction, AnalysisError> {
         let context = self.compilation_context(input)?;
-        let inspected = inspect_source_with_reduction_in_context(input.source(), &context)
-            .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
-        let original_snapshot = CompilerDecisionSnapshot::original(
-            &inspected.graph,
-            &inspected.source,
-            &inspected.retention,
-            &inspected.rewrite,
-        )
-        .map_err(snapshot_error)?;
-
-        let reduced = self.inspect_reduced(&context.for_reduced_source(), &inspected)?;
-        let reduced_outputless = reduced
-            .complete_source_outputless_macro_expansions
-            .as_ref()
-            .ok_or_else(|| {
-                analysis_error(
-                    InputError::CompilerProtocolFailure,
-                    CompilationPhase::Reduced,
-                )
-            })?;
-        let reduced_snapshot = CompilerDecisionSnapshot::reduced_excluding_outputless_macros(
-            &reduced.graph,
-            reduced_outputless,
-        )
-        .map_err(snapshot_error)?;
-        if let Some(difference) = original_snapshot.first_difference(&reduced_snapshot) {
-            return Err(AnalysisError::DecisionMismatch(snapshot_difference(
-                difference,
-            )));
-        }
-        Ok(Reduction {
-            reduced_source: inspected.rewrite.source,
-        })
-    }
-
-    fn inspect_reduced(
-        &self,
-        context: &CompilationContext<'_>,
-        original: &InspectedReduction,
-    ) -> Result<InspectedDependencies, AnalysisError> {
-        let reduced =
-            inspect_source_with_dependencies_at_original_coordinates_and_identity_in_context(
-                &original.rewrite.source,
-                context,
-                &original.rewrite,
-                &original.definition_identity_universe,
-            )
-            .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
-        if let Some(difference) = external_compiler_outcome_difference(
-            &original.external_compiler,
-            &reduced.external_compiler,
-        ) {
-            return Err(AnalysisError::DecisionMismatch(PublicSnapshotDiff::new(
-                vec![DecisionDifference {
-                    kind: difference.kind().to_owned(),
-                    original: difference.original(),
-                    reduced: difference.reduced(),
-                    range: None,
-                }],
-            )));
-        }
-        Ok(reduced)
+        reduce_in_context(input.source(), context)
     }
 
     fn compilation_context<'a>(
@@ -115,6 +54,72 @@ impl Analyzer {
         CompilationContext::new(input, &self.compilation, &self.sysroot)
             .map_err(|error| analysis_error(error, CompilationPhase::Original))
     }
+}
+
+pub(crate) fn reduce_in_context(
+    source: &str,
+    context: CompilationContext<'_>,
+) -> Result<Reduction, AnalysisError> {
+    let inspected = inspect_source_with_reduction_in_context(source, &context)
+        .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
+    let original_snapshot = CompilerDecisionSnapshot::original(
+        &inspected.graph,
+        &inspected.source,
+        &inspected.retention,
+        &inspected.rewrite,
+    )
+    .map_err(snapshot_error)?;
+
+    let reduced = inspect_reduced(&context.for_reduced_source(), &inspected)?;
+    let reduced_outputless = reduced
+        .complete_source_outputless_macro_expansions
+        .as_ref()
+        .ok_or_else(|| {
+            analysis_error(
+                InputError::CompilerProtocolFailure,
+                CompilationPhase::Reduced,
+            )
+        })?;
+    let reduced_snapshot = CompilerDecisionSnapshot::reduced_excluding_outputless_macros(
+        &reduced.graph,
+        reduced_outputless,
+    )
+    .map_err(snapshot_error)?;
+    if let Some(difference) = original_snapshot.first_difference(&reduced_snapshot) {
+        return Err(AnalysisError::DecisionMismatch(snapshot_difference(
+            difference,
+        )));
+    }
+    Ok(Reduction {
+        reduced_source: inspected.rewrite.source,
+    })
+}
+
+fn inspect_reduced(
+    context: &CompilationContext<'_>,
+    original: &InspectedReduction,
+) -> Result<InspectedDependencies, AnalysisError> {
+    let reduced = inspect_source_with_dependencies_at_original_coordinates_and_identity_in_context(
+        &original.rewrite.source,
+        context,
+        &original.rewrite,
+        &original.definition_identity_universe,
+    )
+    .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
+    if let Some(difference) = external_compiler_outcome_difference(
+        &original.external_compiler,
+        &reduced.external_compiler,
+    ) {
+        return Err(AnalysisError::DecisionMismatch(PublicSnapshotDiff::new(
+            vec![DecisionDifference {
+                kind: difference.kind().to_owned(),
+                original: difference.original(),
+                reduced: difference.reduced(),
+                range: None,
+            }],
+        )));
+    }
+    Ok(reduced)
 }
 
 impl Reduction {

@@ -4,9 +4,35 @@
 
 Rust、Cargo、Git、Pythonと、Rustコンパイラをビルドできる環境が必要です。初回はRustのソースコードを取得するため、ネットワークへ接続します。ホストのOSとCPUは自動で判定されるため、実行するコマンドは共通です。
 
-## 実行プログラムを削減する
+## インストール
 
-対象のファイルを指定して、リポジトリのルートで実行します。
+このリポジトリのルートで次のコマンドを実行すると、別のディレクトリからも`cargo rid`を使えます。
+
+```console
+cargo install --path tools --locked
+```
+
+インストール先の`bin`を`PATH`に含めてください。実行時にもこのリポジトリと`target/`配下の専用コンパイラを使うため、checkoutを移動・削除せずに保持します。
+
+## Cargoプロジェクトの実行プログラムを削減する
+
+対象のプロジェクトで実行します。
+
+```console
+cargo rid
+```
+
+Cargoの既定のworkspace memberから、1つのバイナリを選びます。候補が複数ある場合は、`--package PACKAGE`と`--bin NAME`で対象を指定します。`--manifest-path`で別のmanifestも指定できます。削減する対象は1ファイルのバイナリで、依存クレートのソースは変更しません。
+
+エディション、feature、profile、コンパイル対象、依存関係、`build.rs`が設定する`cfg`と環境変数は、Cargoが実際に使うコンパイル条件を引き継ぎます。依存クレートと手続きマクロは専用コンパイラでビルドします。たとえば`cargo rid --release --features submission`では、その条件で不要なコードを削除します。別のfeatureやprofileでの動作は保証しません。
+
+`--locked`、`--offline`、`--frozen`、`--target-dir`、`--config`、`--jobs`もCargoへ渡せます。テスト・ベンチマーク用のターゲットや`test`・`bench`・`check` profileは削減対象にできません。
+
+初回は、このツールが利用するRustコンパイラを取得してビルドします。2回目以降は同じコンパイラを再利用します。検証に成功するとソースファイルを更新し、結果が同じなら書き込みません。通常のビルドで無効なテストコードも削除されます。
+
+## 独立したソースファイルを削減する
+
+対象のファイルを指定して実行します。相対パスは、コマンドを実行したディレクトリを基準にします。
 
 ```console
 cargo rid input.rs
@@ -28,7 +54,7 @@ cargo rid --crate-type lib --crate-name my_library --entry my_library::solve lib
 
 起点はクレート名から始まる完全修飾名で指定します。複数残す場合は`--entry`を繰り返します。モジュール内の項目、`pub use`などで再公開された名前、型引数やconst引数を持つ自由関数も指定できます。ジェネリック関数や、公開される型に入力クレートの型関係を含む起点では、下流で使われる可能性があるtraitと`impl`も残します。関連関数、型、trait、定数は起点にできません。
 
-## オプション
+## 単一ファイルのオプション
 
 元のファイルを残す場合は、`-o reduced.rs`で別の出力先を指定します。入力と同じファイルや、すでに存在するファイルは指定できません。
 
@@ -58,11 +84,11 @@ cargo rid rustc wrapper.rs --crate-name wrapper --crate-type rlib --edition 2024
 cargo rid --extern wrapper=target/libwrapper.rlib --dependency-artifact target/libleaf.rlib input.rs
 ```
 
-`cargo rid rustc`の後ろに指定した引数は、削減に使う専用コンパイラへそのまま渡されます。別のコンパイル対象に必要な情報を自動で用意する場合は、`cargo rid rustc --target TRIPLE ...`の順で指定してください。依存クレートのビルドと削減には、すべて同じ`--target`を指定します。このツールは`Cargo.toml`を読まず、依存クレートや`build.rs`を自動ではビルドしません。
+`cargo rid rustc`の後ろに指定した引数は、削減に使う専用コンパイラへそのまま渡されます。別のコンパイル対象に必要な情報を自動で用意する場合は、`cargo rid rustc --target TRIPLE ...`の順で指定してください。依存クレートのビルドと削減には、すべて同じ`--target`を指定します。この単一ファイル形式では、依存成果物を明示して指定します。
 
 ### 手続きマクロ
 
-手続きマクロを使う場合は、コンパイラを実行するホスト向けにビルドした動的ライブラリを指定します。入力から直接参照する場合は`--extern`、別のクレートから再公開される場合は`--dependency-artifact`へ指定してください。さらに、同じ成果物を`--allow-proc-macro`で明示的に許可します。
+Cargoプロジェクトでは、通常のビルドと同じく、コンパイラ入力から解決された手続きマクロを実行します。単一ファイル形式で手続きマクロを使う場合は、コンパイラを実行するホスト向けにビルドした動的ライブラリを指定します。入力から直接参照する場合は`--extern`、別のクレートから再公開される場合は`--dependency-artifact`へ指定してください。さらに、同じ成果物を`--allow-proc-macro`で明示的に許可します。
 
 ```console
 cargo rid --extern my_macro=PATH_TO_PROC_MACRO --allow-proc-macro PATH_TO_PROC_MACRO input.rs

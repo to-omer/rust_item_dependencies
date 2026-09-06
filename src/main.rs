@@ -1,6 +1,10 @@
 #![feature(rustc_private)]
 #![cfg_attr(windows, feature(windows_by_handle))]
 
+extern crate rustc_driver;
+extern crate rustc_interface;
+extern crate rustc_session;
+
 use std::ffi::OsString;
 #[cfg(test)]
 use std::path::Path;
@@ -11,9 +15,12 @@ use rust_item_dependencies::{
     SourceInput,
 };
 
+mod cargo_project;
 #[path = "../tools/cli.rs"]
 mod cli;
 mod file_output;
+#[path = "target_libraries.rs"]
+mod target_libraries;
 
 use file_output::{SourceFile, write_new as write_output};
 
@@ -24,7 +31,7 @@ use cli::{
     render_path, validate_output,
 };
 
-const USAGE_COMMAND: &str = "Usage: rust-item-dependencies [OPTIONS] INPUT.rs";
+const USAGE_COMMAND: &str = "Usage: rust-item-dependencies [CARGO_OPTIONS]\n       rust-item-dependencies [OPTIONS] INPUT.rs";
 
 fn main() -> ExitCode {
     match run(std::env::args_os().skip(1)) {
@@ -37,9 +44,14 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    if let Some(result) = cargo_project::run_internal(&arguments) {
+        return result;
+    }
     let usage = reducer_usage(USAGE_COMMAND);
     let cli = match parse_arguments(arguments, &usage)? {
         Parsed::Run(cli) => cli,
+        Parsed::Project(cli) => return cargo_project::reduce(cli),
         Parsed::Help => {
             println!("{usage}");
             return Ok(());
@@ -451,10 +463,7 @@ mod tests {
 
     #[test]
     fn rejects_ambiguous_or_destructive_arguments() {
-        assert_eq!(
-            parse(&[]).unwrap_err(),
-            format!("missing input file\n\n{}", reducer_usage(USAGE_COMMAND))
-        );
+        assert!(matches!(parse(&[]).unwrap(), Parsed::Project(_)));
         assert_eq!(
             parse(&["first.rs", "second.rs"]).unwrap_err(),
             format!(

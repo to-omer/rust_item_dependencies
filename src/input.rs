@@ -165,7 +165,10 @@ pub(crate) struct PreparedCompilationOptions {
 }
 
 impl PreparedCompilationOptions {
-    fn new(options: CompilationOptions, external_crates: PreparedExternalCrates) -> Self {
+    pub(crate) fn new(
+        options: CompilationOptions,
+        external_crates: PreparedExternalCrates,
+    ) -> Self {
         Self {
             optimization_level: options.optimization_level,
             explicit_cfgs: options.explicit_cfgs,
@@ -377,6 +380,7 @@ pub(crate) struct CompilationContext<'a> {
     compilation: &'a PreparedCompilationOptions,
     sysroot: &'a Path,
     target_libraries: TargetLibrarySource,
+    invocation: Option<&'a crate::invocation::InvocationSettings>,
 }
 
 impl<'a> CompilationContext<'a> {
@@ -393,7 +397,16 @@ impl<'a> CompilationContext<'a> {
             compilation,
             sysroot,
             target_libraries,
+            invocation: None,
         })
+    }
+
+    pub(crate) fn with_invocation(
+        mut self,
+        invocation: &'a crate::invocation::InvocationSettings,
+    ) -> Self {
+        self.invocation = Some(invocation);
+        self
     }
 
     pub(crate) fn for_reduced_source(mut self) -> Self {
@@ -921,6 +934,7 @@ fn run_inspection(
         crate_type: context.crate_type(),
         crate_name: context.crate_name().to_owned(),
         entry_points: context.entry_points().cloned().collect(),
+        invocation: context.invocation.cloned(),
     };
 
     let arguments = compiler_arguments(context);
@@ -1089,6 +1103,11 @@ fn map_input_error(error: InputError, coordinates: Option<&SourceRewrite>) -> In
 }
 
 fn compiler_arguments(context: &CompilationContext<'_>) -> Vec<String> {
+    if context.invocation.is_some() {
+        // The callback installs the parsed invocation. Passing its expanded
+        // tokens through the driver would expand response files a second time.
+        return vec!["rust-item-dependencies".into(), "main.rs".into()];
+    }
     let mut arguments = vec![
         "rust-item-dependencies".to_owned(),
         // InputCallbacks replaces this placeholder before rustc reads the input.
@@ -1100,7 +1119,7 @@ fn compiler_arguments(context: &CompilationContext<'_>) -> Vec<String> {
         format!("-Copt-level={}", context.optimization_level_argument()),
         "--sysroot".to_owned(),
         context.sysroot.to_string_lossy().into_owned(),
-        "--emit=metadata=-".to_owned(),
+        "--emit=link".to_owned(),
     ];
     arguments.extend(context.cfgs().map(|cfg| format!("--cfg=r#{cfg}")));
     for external in context.external_crates().direct() {
@@ -1141,7 +1160,7 @@ fn validate_crate_configuration(input: &SourceInput) -> Result<(), InputError> {
     Ok(())
 }
 
-fn select_target_libraries(
+pub(crate) fn select_target_libraries(
     sysroot: &Path,
     target: &str,
 ) -> Result<TargetLibrarySource, InputError> {
@@ -1167,6 +1186,7 @@ fn unsupported_target() -> InputError {
 }
 
 struct InputCallbacks {
+    invocation: Option<crate::invocation::InvocationSettings>,
     original: Arc<str>,
     source_path: PathBuf,
     offsets: OriginalOffsetMap,
@@ -1348,6 +1368,9 @@ fn parse_entry_point_path(
 
 impl Callbacks for InputCallbacks {
     fn config(&mut self, config: &mut Config) {
+        if let Some(invocation) = &self.invocation {
+            invocation.configure(config);
+        }
         config.opts.unstable_features = UnstableFeatures::Disallow;
         let name = FileName::Real(
             config
@@ -1379,14 +1402,16 @@ impl Callbacks for InputCallbacks {
         {
             config.observe_declarative_macro_expansions = true;
             let denied_resources = Arc::clone(&self.denied_resources);
-            config.external_resource_guard =
-                Some(rustc_driver::ExternalResourceGuard::new(move |resource| {
-                    let span = resource.span.source_callsite();
-                    denied_resources
-                        .lock()
-                        .expect("external resource mutex is poisoned")
-                        .push(span);
-                }));
+            if self.invocation.is_none() {
+                config.external_resource_guard =
+                    Some(rustc_driver::ExternalResourceGuard::new(move |resource| {
+                        let span = resource.span.source_callsite();
+                        denied_resources
+                            .lock()
+                            .expect("external resource mutex is poisoned")
+                            .push(span);
+                    }));
+            }
 
             let load_state = self.proc_macro_load_state.clone();
             let load_observer = load_state.clone();
@@ -1443,9 +1468,14 @@ impl Callbacks for InputCallbacks {
             Ok(inventory) => inventory,
             Err(error) => return self.finish(Err(error.into())),
         };
-        if let Err(error) =
-            validate_unexpanded(compiler, krate, &inventory, &self.direct_external_crates)
-        {
+        if let Err(error) = validate_unexpanded(
+            compiler,
+            krate,
+            &inventory,
+            self.invocation
+                .is_none()
+                .then_some(&self.direct_external_crates),
+        ) {
             return self.finish(Err(error));
         }
         self.inventory = Some(inventory);
@@ -1471,7 +1501,9 @@ impl Callbacks for InputCallbacks {
                 self.inventory
                     .as_ref()
                     .expect("source inventory must be collected before expansion"),
-                &self.direct_external_crates,
+                self.invocation
+                    .is_none()
+                    .then_some(&self.direct_external_crates),
             ) {
                 return self.finish(Err(error));
             }
@@ -2049,7 +2081,7 @@ fn validate_unexpanded(
     compiler: &Compiler,
     krate: &ast::Crate,
     inventory: &SourceInventory,
-    direct_external_crates: &BTreeSet<String>,
+    direct_external_crates: Option<&BTreeSet<String>>,
 ) -> Result<(), InputError> {
     let configured_attrs = pre_configure_attrs(&compiler.sess, &krate.attrs);
     if let Some(attribute) = configured_attrs
@@ -2110,7 +2142,7 @@ struct UnexpandedValidator<'a> {
     inventory: &'a SourceInventory,
     features: Features,
     active_stack: Vec<bool>,
-    direct_external_crates: &'a BTreeSet<String>,
+    direct_external_crates: Option<&'a BTreeSet<String>>,
     errors: Vec<InputError>,
 }
 
@@ -2287,7 +2319,7 @@ fn validate_expanded(
     compiler: &Compiler,
     krate: &ast::Crate,
     inventory: &SourceInventory,
-    direct_external_crates: &BTreeSet<String>,
+    direct_external_crates: Option<&BTreeSet<String>>,
 ) -> Result<(), InputError> {
     let mut validator = ExpandedValidator {
         compiler,
@@ -2308,7 +2340,7 @@ fn validate_expanded(
 struct ExpandedValidator<'a> {
     compiler: &'a Compiler,
     inventory: &'a SourceInventory,
-    direct_external_crates: &'a BTreeSet<String>,
+    direct_external_crates: Option<&'a BTreeSet<String>>,
     errors: Vec<InputError>,
 }
 
@@ -2391,8 +2423,11 @@ fn external_crate_reason(name: Symbol) -> UnsupportedReason {
     }
 }
 
-fn supported_external_crate(name: Symbol, direct_external_crates: &BTreeSet<String>) -> bool {
-    supported_external_crate_name(name.as_str(), direct_external_crates)
+fn supported_external_crate(
+    name: Symbol,
+    direct_external_crates: Option<&BTreeSet<String>>,
+) -> bool {
+    direct_external_crates.is_none_or(|direct| supported_external_crate_name(name.as_str(), direct))
 }
 
 fn supported_external_crate_name(name: &str, direct_external_crates: &BTreeSet<String>) -> bool {

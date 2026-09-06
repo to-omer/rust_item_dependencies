@@ -5,7 +5,15 @@ pub fn reducer_usage(command: &str) -> String {
     format!(
         r#"{command}
 
-Options:
+Cargo project options (when INPUT.rs is omitted):
+  -p, --package SPEC      Select a workspace package
+      --bin NAME         Select a binary target
+      --manifest-path PATH
+      --features FEATURES, --all-features, --no-default-features
+      --release, --profile NAME, --target TRIPLE, --target-dir PATH
+      --locked, --offline, --frozen, --config KEY=VALUE, --jobs N
+
+Standalone file options:
   -o, --output OUTPUT    Write to a new file instead of updating INPUT.rs
       --edition YEAR     Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]
       --target TRIPLE    Compilation target [default: compiler host]
@@ -73,18 +81,37 @@ pub struct Cli {
 #[derive(Debug)]
 pub enum Parsed {
     Run(Box<Cli>),
+    // The launcher validates this variant; only the reducer consumes the payload.
+    #[allow(dead_code)]
+    Project(ProjectCli),
     Help,
+}
+
+#[derive(Debug, Default)]
+pub struct ProjectCli {
+    pub manifest: Option<PathBuf>,
+    pub package: Option<OsString>,
+    pub bin: Option<OsString>,
+    pub cargo_options: Vec<OsString>,
+    pub metadata_options: Vec<OsString>,
+    pub common_options: Vec<OsString>,
+    pub target_directory: Option<PathBuf>,
 }
 
 pub fn parse_arguments(
     arguments: impl IntoIterator<Item = OsString>,
     usage: &str,
 ) -> Result<Parsed, String> {
-    let mut arguments = arguments.into_iter();
+    let mut arguments: Box<dyn Iterator<Item = OsString>> =
+        Box::new(arguments.into_iter().collect::<Vec<_>>().into_iter());
+    let mut project = ProjectCli::default();
+    let mut standalone_option = false;
+    let mut project_option = false;
     let mut input = None;
     let mut output = None;
     let mut edition = CliEdition::Rust2024;
     let mut target = None;
+    let mut repeated_target = false;
     let mut crate_type = CliCrateType::Binary;
     let mut crate_name = "main".to_owned();
     let mut entry_points = Vec::new();
@@ -95,8 +122,91 @@ pub fn parse_arguments(
     let mut allowed_proc_macro_artifacts = Vec::new();
     let mut positional_only = false;
 
-    while let Some(argument) = arguments.next() {
+    while let Some(mut argument) = arguments.next() {
         if !positional_only {
+            if let Some((name, value)) = argument
+                .to_str()
+                .filter(|value| value.starts_with("--"))
+                .and_then(|value| value.split_once('='))
+            {
+                let name = OsString::from(name);
+                let value = OsString::from(value);
+                arguments = Box::new(std::iter::once(value).chain(arguments));
+                argument = name;
+            }
+            if let Some(name) = argument.to_str() {
+                match name {
+                    "--manifest-path" | "-p" | "--package" | "--bin" => {
+                        project_option = true;
+                        let value = next_value(&mut arguments, name)?;
+                        let previous = match name {
+                            "--manifest-path" => project.manifest.replace(value.into()).is_some(),
+                            "--bin" => project.bin.replace(value).is_some(),
+                            _ => project.package.replace(value).is_some(),
+                        };
+                        if previous {
+                            return Err(format!("{name} may only be specified once"));
+                        }
+                        continue;
+                    }
+                    "--features" | "-F" | "--profile" | "--target-dir" | "--config" | "-j"
+                    | "--jobs" => {
+                        project_option = true;
+                        let value = next_value(&mut arguments, name)?;
+                        if name == "--profile"
+                            && ["test", "bench", "check"]
+                                .iter()
+                                .any(|profile| value == *profile)
+                        {
+                            return Err("cargo rid reduces ordinary binaries; test, bench, and check profiles are unsupported".to_owned());
+                        }
+                        if name == "--target-dir"
+                            && project
+                                .target_directory
+                                .replace(PathBuf::from(&value))
+                                .is_some()
+                        {
+                            return Err("--target-dir may only be specified once".to_owned());
+                        }
+                        if name == "--config" {
+                            project.common_options.extend([argument, value]);
+                            continue;
+                        }
+                        if matches!(name, "--features" | "-F") {
+                            project
+                                .metadata_options
+                                .extend([argument.clone(), value.clone()]);
+                        }
+                        project.cargo_options.extend([argument, value]);
+                        continue;
+                    }
+                    "--all-features"
+                    | "--no-default-features"
+                    | "--locked"
+                    | "--offline"
+                    | "--frozen"
+                    | "--release"
+                    | "-r"
+                    | "--verbose"
+                    | "-v"
+                    | "--quiet"
+                    | "-q" => {
+                        project_option = true;
+                        if matches!(name, "--locked" | "--offline" | "--frozen") {
+                            project.common_options.push(argument);
+                            continue;
+                        }
+                        if matches!(name, "--all-features" | "--no-default-features") {
+                            project.metadata_options.push(argument.clone());
+                        }
+                        project.cargo_options.push(argument);
+                        continue;
+                    }
+                    "--target" | "-h" | "--help" | "--" => {}
+                    _ if name.starts_with('-') => standalone_option = true,
+                    _ => {}
+                }
+            }
             match argument.to_str() {
                 Some("-h" | "--help") => return Ok(Parsed::Help),
                 Some("--") => {
@@ -116,7 +226,7 @@ pub fn parse_arguments(
                     if value.is_empty() {
                         return Err("--target requires a nonempty value".to_owned());
                     }
-                    target = Some(value);
+                    repeated_target |= target.replace(value).is_some();
                     continue;
                 }
                 Some("--crate-type") => {
@@ -179,7 +289,27 @@ pub fn parse_arguments(
         }
     }
 
-    let input = input.ok_or_else(|| format!("missing input file\n\n{usage}"))?;
+    let Some(input) = input else {
+        if repeated_target {
+            return Err("cargo rid requires a single --target".to_owned());
+        }
+        if standalone_option {
+            return Err(format!(
+                "standalone compiler options require an input file\n\n{usage}"
+            ));
+        }
+        if let Some(target) = target {
+            project
+                .cargo_options
+                .extend(["--target".into(), target.into()]);
+        }
+        return Ok(Parsed::Project(project));
+    };
+    if project_option {
+        return Err(
+            "Cargo project options cannot be combined with a standalone input file".to_owned(),
+        );
+    }
     Ok(Parsed::Run(Box::new(Cli {
         input,
         output,

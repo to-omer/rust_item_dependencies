@@ -33,6 +33,9 @@ pub enum EntryPointError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum AnalysisError {
+    InvalidCompilerInvocation {
+        message: String,
+    },
     InvalidCrateName {
         name: String,
     },
@@ -167,6 +170,7 @@ pub enum CompilerFailure {
 impl fmt::Display for AnalysisError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
+            Self::InvalidCompilerInvocation { message } => return formatter.write_str(message),
             Self::InvalidCrateName { .. } => "the crate name is invalid",
             Self::MissingLibraryEntryPoint => "a library input requires at least one entry point",
             Self::InvalidEntryPoint { .. } => "an explicit entry point is invalid",
