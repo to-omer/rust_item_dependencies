@@ -364,20 +364,10 @@ fn cli_uses_given_source_paths_for_reduction_and_verification() {
         .join("target/tests")
         .join(format!("source-filenames-{}-{nonce}", std::process::id()));
     std::fs::create_dir_all(&work).unwrap();
-    let paths = vec![
+    let paths = [
         (PathBuf::from("named.rs"), PathBuf::from("reduced.rs")),
         (work.join("absolute.rs"), work.join("absolute-reduced.rs")),
     ];
-    #[cfg(target_os = "linux")]
-    let paths = {
-        use std::os::unix::ffi::OsStringExt;
-        let mut paths = paths;
-        paths.push((
-            std::ffi::OsString::from_vec(b"named-\xff.rs".to_vec()).into(),
-            std::ffi::OsString::from_vec(b"reduced-\xfe.rs".to_vec()).into(),
-        ));
-        paths
-    };
     for (case, (input, reduced)) in paths.iter().enumerate() {
         std::fs::write(
             work.join(input),
@@ -440,6 +430,50 @@ fn cli_uses_given_source_paths_for_reduction_and_verification() {
             text
         );
     }
+    std::fs::remove_dir_all(work).unwrap();
+}
+
+#[cfg(all(rust_item_dependencies_patched, target_os = "linux"))]
+#[test]
+fn cli_reads_and_writes_non_utf8_source_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let work = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/tests")
+        .join(format!(
+            "non-utf8-source-paths-{}-{nonce}",
+            std::process::id()
+        ));
+    std::fs::create_dir_all(&work).unwrap();
+    let input = work.join(std::ffi::OsString::from_vec(b"named-\xff.rs".to_vec()));
+    let reduced = work.join(std::ffi::OsString::from_vec(b"output-\xfe.rs".to_vec()));
+    let second = work.join("second.rs");
+    let original = include_str!("fixtures/compiler/source_filename.rs");
+    std::fs::write(&input, original).unwrap();
+
+    // The normal reduction validates both sources with rustc's driver. The
+    // standalone rustc executable requires UTF-8 arguments for its input path.
+    let result = run_cli(&input, &reduced);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let source = std::fs::read_to_string(&reduced).unwrap();
+    assert!(source.contains("impl Pick for Flag<false>"));
+    assert!(!source.contains("impl Pick for Flag<true>"));
+    assert_eq!(std::fs::read_to_string(&input).unwrap(), original);
+    let result = run_cli(&reduced, &second);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(second).unwrap(), source);
     std::fs::remove_dir_all(work).unwrap();
 }
 
