@@ -58,6 +58,8 @@ impl SourceFile {
             .set_permissions(self.metadata.permissions())?;
         replacement.as_file().sync_all()?;
         self.check_unchanged()?;
+        // Windows persistence requires the destination's handles to be closed.
+        drop(self.file);
         replacement.persist(&self.path).map_err(io::Error::from)?;
         Ok(())
     }
