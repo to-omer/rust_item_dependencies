@@ -61,7 +61,8 @@ use crate::retention::{
 };
 use crate::rewrite::{SourceRewrite, SourceRewriteError, rewrite_source};
 use crate::source::{
-    ByteRange, OriginalOffsetMap, SourceError, SourceInventory, collect_source, original_span_range,
+    ByteRange, OriginalOffsetMap, SourceError, SourceInventory, collect_source,
+    normalized_input_span_range, original_span_range,
 };
 #[cfg(rust_item_dependencies_patched)]
 use crate::source::{
@@ -298,6 +299,8 @@ impl CompilationOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceInput {
     source: String,
+    original_path: PathBuf,
+    reduced_path: PathBuf,
     edition: Edition,
     target: String,
     crate_type: CrateType,
@@ -309,6 +312,8 @@ impl SourceInput {
     pub fn binary(source: impl Into<String>, edition: Edition, target: impl Into<String>) -> Self {
         Self {
             source: source.into(),
+            original_path: PathBuf::from("main.rs"),
+            reduced_path: PathBuf::from("main.rs"),
             edition,
             target: target.into(),
             crate_type: CrateType::Binary,
@@ -325,12 +330,28 @@ impl SourceInput {
     ) -> Self {
         Self {
             source: source.into(),
+            original_path: PathBuf::from("main.rs"),
+            reduced_path: PathBuf::from("main.rs"),
             edition,
             target: target.into(),
             crate_type: CrateType::Library,
             crate_name: crate_name.into(),
             entry_points: Vec::new(),
         }
+    }
+
+    /// Sets the filenames used to compile the original and reduced sources.
+    /// Both default to `main.rs`. These paths affect `file!()` and compiler
+    /// decisions, but do not read or write files. Relative paths are kept as given.
+    #[must_use]
+    pub fn with_source_paths(
+        mut self,
+        original_path: impl Into<PathBuf>,
+        reduced_path: impl Into<PathBuf>,
+    ) -> Self {
+        self.original_path = original_path.into();
+        self.reduced_path = reduced_path.into();
+        self
     }
 
     #[must_use]
@@ -352,6 +373,7 @@ impl SourceInput {
 
 pub(crate) struct CompilationContext<'a> {
     input: &'a SourceInput,
+    source_path: &'a Path,
     compilation: &'a PreparedCompilationOptions,
     sysroot: &'a Path,
     target_libraries: TargetLibrarySource,
@@ -367,10 +389,16 @@ impl<'a> CompilationContext<'a> {
         let target_libraries = select_target_libraries(sysroot, &input.target)?;
         Ok(Self {
             input,
+            source_path: &input.original_path,
             compilation,
             sysroot,
             target_libraries,
         })
+    }
+
+    pub(crate) fn for_reduced_source(mut self) -> Self {
+        self.source_path = &self.input.reduced_path;
+        self
     }
 
     pub(crate) fn edition_argument(&self) -> &'static str {
@@ -717,7 +745,7 @@ pub(crate) fn inspect_source_with_dependencies_at_original_coordinates(
     coordinates: &SourceRewrite,
 ) -> Result<InspectedDependencies, InputError> {
     let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(input, &compilation, sysroot)?;
+    let context = CompilationContext::new(input, &compilation, sysroot)?.for_reduced_source();
     inspect_source_with_dependencies_at_original_coordinates_in_context(
         &input.source,
         &context,
@@ -861,6 +889,7 @@ fn run_inspection(
     let (_, offsets) = OriginalOffsetMap::from_source(&original)?;
     let mut callbacks = InputCallbacks {
         original: Arc::clone(&original),
+        source_path: context.source_path.to_owned(),
         offsets,
         working_directory: PathBuf::new(),
         denied_file: Arc::clone(&denied_file),
@@ -1062,6 +1091,7 @@ fn map_input_error(error: InputError, coordinates: Option<&SourceRewrite>) -> In
 fn compiler_arguments(context: &CompilationContext<'_>) -> Vec<String> {
     let mut arguments = vec![
         "rust-item-dependencies".to_owned(),
+        // InputCallbacks replaces this placeholder before rustc reads the input.
         "main.rs".to_owned(),
         format!("--crate-name={}", context.crate_name()),
         format!("--crate-type={}", context.crate_type_argument()),
@@ -1138,6 +1168,7 @@ fn unsupported_target() -> InputError {
 
 struct InputCallbacks {
     original: Arc<str>,
+    source_path: PathBuf,
     offsets: OriginalOffsetMap,
     working_directory: PathBuf,
     denied_file: Arc<Mutex<Option<DeniedFile>>>,
@@ -1318,12 +1349,14 @@ fn parse_entry_point_path(
 impl Callbacks for InputCallbacks {
     fn config(&mut self, config: &mut Config) {
         config.opts.unstable_features = UnstableFeatures::Disallow;
-        let name = config
-            .opts
-            .file_path_mapping()
-            .to_real_filename(&RealFileName::empty(), Path::new("main.rs"));
+        let name = FileName::Real(
+            config
+                .opts
+                .file_path_mapping()
+                .to_real_filename(&RealFileName::empty(), self.source_path.as_path()),
+        );
         config.input = Input::Str {
-            name: FileName::Real(name),
+            name: name.clone(),
             input: self.original.to_string(),
         };
         config.file_loader = Some(Box::new(DenyExternalFiles {
@@ -1337,6 +1370,7 @@ impl Callbacks for InputCallbacks {
             let source_map = parse_session.clone_source_map();
             parse_session.dcx().set_emitter(Box::new(CapturingEmitter {
                 source_map,
+                input_name: name,
                 diagnostics,
             }));
         }));
@@ -1986,7 +2020,8 @@ fn validate_attribute_expansions(
                 unsupported_resolved_attribute(origin.implementation_kind, canonical_name)?;
             let raw = expansion.expn_data().call_site;
             let source_map = tcx.sess.source_map();
-            let range = original_diagnostic_range_from_span(source_map, offsets, raw);
+            let input_name = tcx.sess.io.input.file_name(tcx.sess);
+            let range = original_diagnostic_range_from_span(source_map, &input_name, offsets, raw);
             Some((range.ok(), reason))
         })
         .min();
@@ -2395,6 +2430,7 @@ struct DiagnosticState {
 
 struct CapturingEmitter {
     source_map: Arc<SourceMap>,
+    input_name: FileName,
     diagnostics: Arc<Mutex<DiagnosticState>>,
 }
 
@@ -2403,10 +2439,9 @@ impl Emitter for CapturingEmitter {
         if !diagnostic.is_error() {
             return;
         }
-        let normalized_range = diagnostic
-            .span
-            .primary_span()
-            .and_then(|span| normalized_span_range(&self.source_map, span.source_callsite()));
+        let normalized_range = diagnostic.span.primary_span().and_then(|span| {
+            normalized_input_span_range(&self.source_map, &self.input_name, span.source_callsite())
+        });
         self.diagnostics
             .lock()
             .expect("diagnostic state mutex is poisoned")
@@ -2422,19 +2457,6 @@ impl Emitter for CapturingEmitter {
     fn source_map(&self) -> Option<&SourceMap> {
         None
     }
-}
-
-fn normalized_span_range(source_map: &SourceMap, span: Span) -> Option<ByteRange> {
-    if span.is_dummy() {
-        return None;
-    }
-    let start = source_map.lookup_byte_offset(span.lo());
-    let end = source_map.lookup_byte_offset(span.hi());
-    (start.sf.start_pos == end.sf.start_pos && start.sf.name.short().to_string() == "main.rs")
-        .then_some(ByteRange {
-            start: start.pos.0,
-            end: end.pos.0,
-        })
 }
 
 fn original_diagnostic_range(
@@ -2467,10 +2489,11 @@ fn original_diagnostic_range(
 #[cfg(rust_item_dependencies_patched)]
 fn original_diagnostic_range_from_span(
     source_map: &SourceMap,
+    input_name: &FileName,
     offsets: &OriginalOffsetMap,
     span: Span,
 ) -> Result<ByteRange, InputError> {
-    let normalized = normalized_span_range(source_map, span.source_callsite())
+    let normalized = normalized_input_span_range(source_map, input_name, span.source_callsite())
         .ok_or(InputError::Source(SourceError::InvalidSpan))?;
     Ok(offsets.original_range(normalized)?)
 }

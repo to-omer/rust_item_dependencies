@@ -173,7 +173,8 @@ fn runtime_location_changes_do_not_change_the_decision_snapshot() {
         "}\n",
         "fn main() { let _ = caller(); }\n",
     );
-    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
+    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target())
+        .with_source_paths("original.rs", "reduced.rs");
 
     let reduction = analyzer.reduce(&input).unwrap();
     assert!(!reduction.reduced_source().contains("fn dead"));
@@ -185,6 +186,119 @@ fn runtime_location_changes_do_not_change_the_decision_snapshot() {
             + 1
     };
     assert_ne!(line_number(source), line_number(reduction.reduced_source()));
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn virtual_source_paths_determine_compiler_decisions() {
+    let analyzer = Analyzer::new().unwrap();
+    let target = host_target();
+    let source = include_str!("fixtures/compiler/source_filename.rs");
+    for (name, kept, removed) in [
+        ("main.rs", "true", "false"),
+        ("virtual.rs", "false", "true"),
+    ] {
+        let input =
+            SourceInput::binary(source, Edition::Rust2024, &target).with_source_paths(name, name);
+        let reduction = analyzer.reduce(&input).unwrap();
+        assert!(
+            reduction
+                .reduced_source()
+                .contains(&format!("impl Pick for Flag<{kept}>"))
+        );
+        assert!(
+            !reduction
+                .reduced_source()
+                .contains(&format!("impl Pick for Flag<{removed}>"))
+        );
+        let second = analyzer
+            .reduce(
+                &SourceInput::binary(reduction.reduced_source(), Edition::Rust2024, &target)
+                    .with_source_paths(name, name),
+            )
+            .unwrap();
+        assert_eq!(second.reduced_source(), reduction.reduced_source());
+    }
+
+    let source = source.replace(
+        "fn main() {",
+        "fn main() { let _ = (<Flag<true> as Pick>::value, <Flag<false> as Pick>::value);",
+    );
+    let input = SourceInput::binary(source, Edition::Rust2024, target)
+        .with_source_paths("main.rs", "virtual.rs");
+    assert!(matches!(
+        analyzer.reduce(&input),
+        Err(AnalysisError::DecisionMismatch(_))
+    ));
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn named_source_diagnostics_survive_parsing_and_offset_normalization() {
+    let analyzer = Analyzer::new().unwrap();
+    let target = host_target();
+    for (body, marker) in [
+        ("fn main() { let broken: = 0; }\n", "="),
+        ("fn main() { let _: u32 = \"型エラー\"; }\n", "\"型エラー\""),
+    ] {
+        for source in [
+            format!("// 日本語\n{body}"),
+            format!("\u{feff}// 日本語\r\n{}", body.replace('\n', "\r\n")),
+        ] {
+            let input = SourceInput::binary(&source, Edition::Rust2024, &target)
+                .with_source_paths("virtual/input.rs", "virtual/output.rs");
+            let result = analyzer.reduce(&input);
+            let Err(AnalysisError::OriginalCompilationFailed(diagnostics)) = result else {
+                panic!("expected original diagnostics: {result:?}");
+            };
+            assert!(
+                diagnostics
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.range.is_some_and(|range| &source
+                        [range.start as usize..range.end as usize]
+                        == marker)),
+                "{diagnostics:?}"
+            );
+        }
+    }
+}
+
+#[cfg(all(rust_item_dependencies_patched, unix))]
+#[test]
+fn non_utf8_virtual_source_paths_are_kept_as_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let analyzer = Analyzer::new().unwrap();
+    let target = host_target();
+    let original =
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(b"named-\xff.rs".to_vec()));
+    let reduced =
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(b"output-\xfe.rs".to_vec()));
+    let input = SourceInput::binary(
+        include_str!("fixtures/compiler/source_filename.rs"),
+        Edition::Rust2024,
+        &target,
+    )
+    .with_source_paths(&original, &reduced);
+    let reduction = analyzer.reduce(&input).unwrap();
+    assert!(
+        reduction
+            .reduced_source()
+            .contains("impl Pick for Flag<false>")
+    );
+    assert!(
+        !reduction
+            .reduced_source()
+            .contains("impl Pick for Flag<true>")
+    );
+    let second = analyzer
+        .reduce(
+            &SourceInput::binary(reduction.reduced_source(), Edition::Rust2024, target)
+                .with_source_paths(&reduced, &reduced),
+        )
+        .unwrap();
+    assert_eq!(second.reduced_source(), reduction.reduced_source());
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -320,7 +434,9 @@ fn reduced_compiler_diagnostics_use_original_source_coordinates() {
         "fn require<T: Pick>() {}\n",
         "fn main() { require::<Line<{ line!() }>>(); }\n",
     );
-    let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
+    let source = format!("\u{feff}{}", source.replace('\n', "\r\n"));
+    let input = SourceInput::binary(&source, Edition::Rust2024, host_target())
+        .with_source_paths("virtual/input.rs", "virtual/output.rs");
 
     let AnalysisError::ReducedCompilationFailed(diagnostics) = analyzer.reduce(&input).unwrap_err()
     else {

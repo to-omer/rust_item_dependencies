@@ -349,3 +349,141 @@ fn run_cli(input: &std::path::Path, output: &std::path::Path) -> std::process::O
         .output()
         .unwrap()
 }
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn cli_uses_given_source_paths_for_reduction_and_verification() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let work = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/tests")
+        .join(format!("source-filenames-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&work).unwrap();
+    let paths = vec![
+        (PathBuf::from("named.rs"), PathBuf::from("reduced.rs")),
+        (work.join("absolute.rs"), work.join("absolute-reduced.rs")),
+    ];
+    #[cfg(target_os = "linux")]
+    let paths = {
+        use std::os::unix::ffi::OsStringExt;
+        let mut paths = paths;
+        paths.push((
+            std::ffi::OsString::from_vec(b"named-\xff.rs".to_vec()).into(),
+            std::ffi::OsString::from_vec(b"reduced-\xfe.rs".to_vec()).into(),
+        ));
+        paths
+    };
+    for (case, (input, reduced)) in paths.iter().enumerate() {
+        std::fs::write(
+            work.join(input),
+            include_str!("fixtures/compiler/source_filename.rs"),
+        )
+        .unwrap();
+        let reduction = Command::new(env!("CARGO_BIN_EXE_rust-item-dependencies"))
+            .current_dir(&work)
+            .arg(input)
+            .arg("-o")
+            .arg(reduced)
+            .output()
+            .unwrap();
+        assert!(
+            reduction.status.success(),
+            "case {case}: {}",
+            String::from_utf8_lossy(&reduction.stderr)
+        );
+        let text = std::fs::read_to_string(work.join(reduced)).unwrap();
+        assert!(text.contains("impl Pick for Flag<false>"));
+        assert!(!text.contains("impl Pick for Flag<true>"));
+
+        for source_path in [input, reduced] {
+            let binary = work.join(format!("program{case}{}", std::env::consts::EXE_SUFFIX));
+            let compilation = Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+                .current_dir(&work)
+                .args(["--edition=2024", "--crate-name=main"])
+                .arg(source_path)
+                .arg("-o")
+                .arg(&binary)
+                .output()
+                .unwrap();
+            assert!(
+                compilation.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compilation.stderr)
+            );
+            let execution = Command::new(&binary).output().unwrap();
+            assert!(execution.status.success());
+            assert_eq!(
+                String::from_utf8(execution.stdout).unwrap(),
+                format!("2 {}\n", source_path.display())
+            );
+        }
+
+        let second_path = format!("again{case}.rs");
+        let second = Command::new(env!("CARGO_BIN_EXE_rust-item-dependencies"))
+            .current_dir(&work)
+            .arg(reduced)
+            .args(["-o", &second_path])
+            .output()
+            .unwrap();
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join(second_path)).unwrap(),
+            text
+        );
+    }
+    std::fs::remove_dir_all(work).unwrap();
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn cli_rejects_output_filenames_that_change_required_impls() {
+    use std::process::Command;
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let work = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/tests")
+        .join(format!(
+            "source-filename-errors-{}-{nonce}",
+            std::process::id()
+        ));
+    std::fs::create_dir_all(&work).unwrap();
+    let source = include_str!("fixtures/compiler/source_filename.rs");
+    for keep_both in [false, true] {
+        let source = if keep_both {
+            source.replace(
+                "fn main() {",
+                "fn main() { let _ = (<Flag<true> as Pick>::value, <Flag<false> as Pick>::value);",
+            )
+        } else {
+            source.to_owned()
+        };
+        std::fs::write(work.join("main.rs"), source).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_rust-item-dependencies"))
+            .current_dir(&work)
+            .args(["main.rs", "-o", "other.rs"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!work.join("other.rs").exists());
+        let error = String::from_utf8(output.stderr).unwrap();
+        let expected = if keep_both {
+            "the reduced compiler decisions differ from the original"
+        } else {
+            "the reduced source did not compile"
+        };
+        assert!(error.contains(expected), "{error}");
+    }
+    std::fs::remove_dir_all(work).unwrap();
+}

@@ -68,6 +68,7 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
             SourceInput::library(source, cli.edition.into(), target, cli.crate_name)
         }
     };
+    let input = input.with_source_paths(&cli.input, &cli.output);
     let input = cli.entry_points.into_iter().fold(input, |input, path| {
         input.with_entry_point(EntryPoint::new(path))
     });
