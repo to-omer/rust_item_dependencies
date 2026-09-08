@@ -3480,11 +3480,7 @@ fn unit_depths(units: &[WrittenUnit]) -> Result<Vec<u32>, SourceError> {
         .collect()
 }
 
-fn validate_inventory(
-    original: &str,
-    units: &[WrittenUnit],
-    pieces: &[OwnedPiece],
-) -> Result<(), SourceError> {
+pub(crate) fn validate_units(original: &str, units: &[WrittenUnit]) -> Result<(), SourceError> {
     let original_len = u32::try_from(original.len()).map_err(|_| SourceError::SourceTooLarge)?;
     let roots = units
         .iter()
@@ -3528,6 +3524,16 @@ fn validate_inventory(
     }
     let _ = unit_depths(units)?;
 
+    Ok(())
+}
+
+pub(crate) fn validate_inventory(
+    original: &str,
+    units: &[WrittenUnit],
+    pieces: &[OwnedPiece],
+) -> Result<(), SourceError> {
+    validate_units(original, units)?;
+    let original_len = u32::try_from(original.len()).map_err(|_| SourceError::SourceTooLarge)?;
     let mut cursor = 0_u32;
     for piece in pieces {
         if piece.range.start != cursor
@@ -3625,9 +3631,9 @@ mod tests {
     }
 
     #[cfg(rust_item_dependencies_patched)]
-    fn inspect_reduction(source: String, target: String) -> crate::input::InspectedReduction {
+    fn inspect_reduction(source: String, target: String) -> crate::api::ReductionPlan {
         let sysroot = crate::artifact::compiler_sysroot().unwrap();
-        crate::input::inspect_source_with_reduction(
+        crate::api::inspect_source_with_reduction(
             &crate::SourceInput::binary(source, crate::Edition::Rust2024, target),
             &sysroot,
         )
@@ -3841,19 +3847,19 @@ mod tests {
         let retained = BTreeSet::from([SourceUnitId(0), *facts_definition, rules[0]]);
         let rewrite = rewrite_source(&inventory, &retained).unwrap();
         assert_eq!(
-            rewrite.source,
+            rewrite.source(),
             "macro_rules! m { () => { 1 };  }\nfn main(){let _=m!();}\n"
         );
-        assert!(rewrite.source.len() < source.len());
+        assert!(rewrite.source().len() < source.len());
         assert_eq!(
             rewrite
-                .pieces
+                .pieces()
                 .iter()
                 .map(|piece| {
                     &source[piece.original_range.start as usize..piece.original_range.end as usize]
                 })
                 .collect::<String>(),
-            rewrite.source
+            rewrite.source()
         );
 
         refine_macro_rules(
@@ -4707,6 +4713,61 @@ mod tests {
             macro_repetitions: Vec::new(),
             ownerless_attribute_invocations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn shared_unit_validation_rejects_invalid_structure() {
+        let source = "éabc";
+        let full_range = ByteRange { start: 0, end: 5 };
+        let units = vec![
+            unit(0, WrittenUnitKind::CrateRoot, full_range, None, 0),
+            unit(1, WrittenUnitKind::Item, full_range, Some(0), 1),
+            unit(
+                2,
+                WrittenUnitKind::Item,
+                ByteRange { start: 2, end: 5 },
+                Some(1),
+                2,
+            ),
+        ];
+        assert_eq!(super::validate_units(source, &units), Ok(()));
+        let mutations: &[fn(&mut Vec<WrittenUnit>)] = &[
+            |units| units.clear(),
+            |units| units[0].kind = WrittenUnitKind::Item,
+            |units| units[0].full_range.end = 4,
+            |units| units[1].parent = None,
+            |units| units[1].id = SourceUnitId(9),
+            |units| units[1].parent = Some(SourceUnitId(9)),
+            |units| units[1].parent = Some(SourceUnitId(1)),
+            |units| {
+                units[1].parent = Some(SourceUnitId(2));
+                units[2].full_range = units[1].full_range;
+            },
+            |units| units[2].full_range.end = 6,
+            |units| units[2].full_range.start = 1,
+            |units| units[2].full_range.start = 6,
+            |units| units[1].full_range.start = 3,
+            |units| units[1].cfg_state = CfgState::Inactive,
+            |units| units[2].kind = WrittenUnitKind::InactiveCfgComponent,
+            |units| {
+                units[1].cfg_state = CfgState::Inactive;
+                units[2].cfg_state = CfgState::Inactive;
+                units[2].kind = WrittenUnitKind::InactiveCfgComponent;
+            },
+        ];
+        for (index, mutate) in mutations.iter().enumerate() {
+            let mut invalid = units.clone();
+            mutate(&mut invalid);
+            assert_eq!(
+                super::validate_units(source, &invalid),
+                Err(SourceError::InvalidInventory),
+                "mutation {index}"
+            );
+        }
+        let mut inactive_component = units;
+        inactive_component[2].kind = WrittenUnitKind::InactiveCfgComponent;
+        inactive_component[2].cfg_state = CfgState::Inactive;
+        assert_eq!(super::validate_units(source, &inactive_component), Ok(()));
     }
 
     fn marker(source: &str, text: &str) -> ByteRange {

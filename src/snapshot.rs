@@ -233,7 +233,7 @@ impl CompilerDecisionSnapshot {
                 {
                     return Ok(None);
                 }
-                selected_node_survives_rewrite(graph, &rewrite.pieces, &surviving_expansions, node)
+                selected_node_survives_rewrite(graph, rewrite.pieces(), &surviving_expansions, node)
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()

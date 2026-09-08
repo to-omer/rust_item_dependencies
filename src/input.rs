@@ -35,8 +35,8 @@ use crate::definitions::{
     collect_definitions_with_identity, normalize_definition_key,
 };
 use crate::dependency_graph::{
-    AllocationPathSite, DependencyEdge, DependencyGraph, DependencyGraphError, ExpansionId,
-    ExpansionNode, GraphNode, MonoKey, MonoNode, ObservationSite, RootReason, RootRecord,
+    AllocationPathSite, DependencyEdge, DependencyGraph, DependencyGraphError, ExpansionNode,
+    GraphNode, MonoKey, MonoNode, ObservationSite, RootReason, RootRecord,
     is_downstream_selection_candidate,
 };
 #[cfg(all(test, rust_item_dependencies_patched))]
@@ -54,12 +54,10 @@ use crate::monomorphization::{
     CollectedMonomorphization, MonomorphizationError, collect_monomorphization,
 };
 use crate::retention::{
-    ExternalCompilerExpectation, ExternalCompilerObservation, Retention, RetentionError,
-    SourceConstraints, collect_declarative_macro_constraints, collect_source_constraints,
-    compute_retention, external_compiler_expectation, external_compiler_observation,
-    outputless_macro_expansions_in_complete_source,
+    RetentionError, SourceConstraints, collect_declarative_macro_constraints,
+    collect_source_constraints,
 };
-use crate::rewrite::{SourceRewrite, SourceRewriteError, rewrite_source};
+use crate::rewrite::{SourceRewrite, SourceRewriteError};
 use crate::source::{
     ByteRange, OriginalOffsetMap, SourceError, SourceInventory, collect_source,
     normalized_input_span_range, original_span_range,
@@ -187,7 +185,7 @@ impl PreparedCompilationOptions {
     }
 
     #[cfg(test)]
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self::new(
             CompilationOptions::default(),
             PreparedExternalCrates::default(),
@@ -573,20 +571,39 @@ pub(crate) struct InspectedDependencies {
     pub source: SourceInventory,
     pub graph: DependencyGraph,
     pub constraints: SourceConstraints,
-    pub complete_source_outputless_macro_expansions: Option<BTreeSet<ExpansionId>>,
-    pub external_compiler: ExternalCompilerObservation,
     pub(crate) definition_identity_universe: DefinitionIdentityUniverse,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct InspectedReduction {
-    pub source: SourceInventory,
-    pub graph: DependencyGraph,
-    pub constraints: SourceConstraints,
-    pub retention: Retention,
-    pub rewrite: SourceRewrite,
-    pub external_compiler: ExternalCompilerExpectation,
-    pub(crate) definition_identity_universe: DefinitionIdentityUniverse,
+#[derive(Clone, Copy)]
+pub(crate) enum InspectionSource<'a> {
+    Original(&'a str),
+    Rewritten {
+        rewrite: &'a SourceRewrite,
+        identity: &'a DefinitionIdentityUniverse,
+    },
+}
+
+impl<'a> InspectionSource<'a> {
+    fn source(self) -> &'a str {
+        match self {
+            Self::Original(source) => source,
+            Self::Rewritten { rewrite, .. } => rewrite.source(),
+        }
+    }
+
+    fn coordinates(self) -> Option<&'a SourceRewrite> {
+        match self {
+            Self::Original(_) => None,
+            Self::Rewritten { rewrite, .. } => Some(rewrite),
+        }
+    }
+
+    fn identity(self) -> Option<&'a DefinitionIdentityUniverse> {
+        match self {
+            Self::Original(_) => None,
+            Self::Rewritten { identity, .. } => Some(identity),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -710,8 +727,12 @@ pub(crate) fn inspect_source_in_context(
     source: &str,
     context: &CompilationContext<'_>,
 ) -> Result<SourceInventory, InputError> {
-    run_inspection(source, context, CollectionMode::Source, None, None)
-        .map(|inspection| inspection.source)
+    run_inspection(
+        InspectionSource::Original(source),
+        context,
+        CollectionMode::Source,
+    )
+    .map(|inspection| inspection.source)
 }
 
 #[cfg(test)]
@@ -729,7 +750,11 @@ fn inspect_source_with_definitions_in_context(
     source: &str,
     context: &CompilationContext<'_>,
 ) -> Result<InspectedSource, InputError> {
-    let inspection = run_inspection(source, context, CollectionMode::Definitions, None, None)?;
+    let inspection = run_inspection(
+        InspectionSource::Original(source),
+        context,
+        CollectionMode::Definitions,
+    )?;
     Ok(InspectedSource {
         source: inspection.source,
         definitions: inspection
@@ -745,114 +770,22 @@ pub(crate) fn inspect_source_with_dependencies(
 ) -> Result<InspectedDependencies, InputError> {
     let compilation = PreparedCompilationOptions::empty();
     let context = CompilationContext::new(input, &compilation, sysroot)?;
-    inspect_source_with_dependencies_inner(&input.source, &context, None, None)
+    inspect_dependencies(InspectionSource::Original(&input.source), &context)
 }
 
-/// Inspects a rewritten source while expressing every compiler-decision
-/// identity and source observation in the coordinates of its original source.
-/// `coordinates` must be the piece map that produced `input.source`.
-#[cfg(test)]
-pub(crate) fn inspect_source_with_dependencies_at_original_coordinates(
-    input: &SourceInput,
-    sysroot: &Path,
-    coordinates: &SourceRewrite,
-) -> Result<InspectedDependencies, InputError> {
-    let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(input, &compilation, sysroot)?.for_reduced_source();
-    inspect_source_with_dependencies_at_original_coordinates_in_context(
-        &input.source,
-        &context,
-        coordinates,
-    )
-}
-
-pub(crate) fn inspect_source_with_dependencies_at_original_coordinates_in_context(
-    source: &str,
+pub(crate) fn inspect_dependencies(
+    input: InspectionSource<'_>,
     context: &CompilationContext<'_>,
-    coordinates: &SourceRewrite,
 ) -> Result<InspectedDependencies, InputError> {
-    inspect_source_with_dependencies_inner(source, context, Some(coordinates), None)
-}
-
-pub(crate) fn inspect_source_with_dependencies_at_original_coordinates_and_identity_in_context(
-    source: &str,
-    context: &CompilationContext<'_>,
-    coordinates: &SourceRewrite,
-    expected_identity: &DefinitionIdentityUniverse,
-) -> Result<InspectedDependencies, InputError> {
-    inspect_source_with_dependencies_inner(
-        source,
-        context,
-        Some(coordinates),
-        Some(expected_identity),
-    )
-}
-
-fn inspect_source_with_dependencies_inner(
-    source: &str,
-    context: &CompilationContext<'_>,
-    coordinates: Option<&SourceRewrite>,
-    expected_identity: Option<&DefinitionIdentityUniverse>,
-) -> Result<InspectedDependencies, InputError> {
-    if let Some(coordinates) = coordinates {
-        if coordinates.source != source {
-            return Err(InputError::Rewrite(SourceRewriteError::InvalidInventory));
-        }
-        coordinates.original_crate_range(ByteRange {
-            start: 0,
-            end: u32::try_from(source.len())
-                .map_err(|_| InputError::Rewrite(SourceRewriteError::InvalidInventory))?,
-        })?;
-    }
-    let inspection = run_inspection(
-        source,
-        context,
-        CollectionMode::Dependencies,
-        coordinates,
-        expected_identity,
-    )?;
+    let inspection = run_inspection(input, context, CollectionMode::Dependencies)?;
     let dependencies = inspection
         .dependencies
         .ok_or(InputError::CompilerProtocolFailure)?;
-    let external_compiler = external_compiler_observation(&dependencies.constraints)?;
     Ok(InspectedDependencies {
         source: inspection.source,
         graph: dependencies.graph,
         constraints: dependencies.constraints,
-        complete_source_outputless_macro_expansions: dependencies
-            .complete_source_outputless_macro_expansions,
-        external_compiler,
         definition_identity_universe: dependencies.definition_identity_universe,
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn inspect_source_with_reduction(
-    input: &SourceInput,
-    sysroot: &Path,
-) -> Result<InspectedReduction, InputError> {
-    let compilation = PreparedCompilationOptions::empty();
-    let context = CompilationContext::new(input, &compilation, sysroot)?;
-    inspect_source_with_reduction_in_context(&input.source, &context)
-}
-
-pub(crate) fn inspect_source_with_reduction_in_context(
-    source: &str,
-    context: &CompilationContext<'_>,
-) -> Result<InspectedReduction, InputError> {
-    let inspected = inspect_source_with_dependencies_inner(source, context, None, None)?;
-    let retention = compute_retention(&inspected.source, &inspected.graph, &inspected.constraints)?;
-    let external_compiler =
-        external_compiler_expectation(&inspected.graph, &inspected.constraints, &retention)?;
-    let rewrite = rewrite_source(&inspected.source, &retention.retained_units)?;
-    Ok(InspectedReduction {
-        source: inspected.source,
-        graph: inspected.graph,
-        constraints: inspected.constraints,
-        retention,
-        rewrite,
-        external_compiler,
-        definition_identity_universe: inspected.definition_identity_universe,
     })
 }
 
@@ -860,15 +793,13 @@ pub(crate) fn inspect_source_with_reduction_in_context(
 struct CollectedDependencies {
     graph: DependencyGraph,
     constraints: SourceConstraints,
-    complete_source_outputless_macro_expansions: Option<BTreeSet<ExpansionId>>,
     definition_identity_universe: DefinitionIdentityUniverse,
 }
 
 struct DependencyCollectionInput<'a> {
     inventory: &'a SourceInventory,
     declarative_outputs: &'a ValidatedDeclarativeOutputs,
-    coordinates: Option<&'a SourceRewrite>,
-    expected_definition_identity: Option<&'a DefinitionIdentityUniverse>,
+    input: InspectionSource<'a>,
     external_artifact_directories: &'a [PathBuf],
     crate_type: CrateType,
     entry_points: &'a [ResolvedEntryPoint],
@@ -881,12 +812,12 @@ struct CompilerInspection {
 }
 
 fn run_inspection(
-    source: &str,
+    input: InspectionSource<'_>,
     context: &CompilationContext<'_>,
     collection_mode: CollectionMode,
-    coordinates: Option<&SourceRewrite>,
-    expected_identity: Option<&DefinitionIdentityUniverse>,
 ) -> Result<CompilerInspection, InputError> {
+    let source = input.source();
+    let coordinates = input.coordinates();
     #[cfg(test)]
     INSPECTION_COUNT.set(INSPECTION_COUNT.get() + 1);
 
@@ -918,8 +849,7 @@ fn run_inspection(
         inventory: None,
         declarative_outputs: None,
         collection_mode,
-        coordinates: coordinates.cloned(),
-        expected_definition_identity: expected_identity.cloned(),
+        input,
         direct_external_crates: context
             .external_crates()
             .direct()
@@ -1185,7 +1115,7 @@ fn unsupported_target() -> InputError {
     }
 }
 
-struct InputCallbacks {
+struct InputCallbacks<'a> {
     invocation: Option<crate::invocation::InvocationSettings>,
     original: Arc<str>,
     source_path: PathBuf,
@@ -1204,8 +1134,7 @@ struct InputCallbacks {
     inventory: Option<SourceInventory>,
     declarative_outputs: Option<ValidatedDeclarativeOutputs>,
     collection_mode: CollectionMode,
-    coordinates: Option<SourceRewrite>,
-    expected_definition_identity: Option<DefinitionIdentityUniverse>,
+    input: InspectionSource<'a>,
     direct_external_crates: BTreeSet<String>,
     external_artifact_directories: Vec<PathBuf>,
     crate_type: CrateType,
@@ -1213,7 +1142,7 @@ struct InputCallbacks {
     entry_points: Vec<EntryPoint>,
 }
 
-impl InputCallbacks {
+impl InputCallbacks<'_> {
     fn finish(&self, result: Result<CompilerInspection, InputError>) -> Compilation {
         *self
             .result
@@ -1366,7 +1295,7 @@ fn parse_entry_point_path(
         .collect()
 }
 
-impl Callbacks for InputCallbacks {
+impl Callbacks for InputCallbacks<'_> {
     fn config(&mut self, config: &mut Config) {
         if let Some(invocation) = &self.invocation {
             invocation.configure(config);
@@ -1607,8 +1536,7 @@ impl Callbacks for InputCallbacks {
                     DependencyCollectionInput {
                         inventory,
                         declarative_outputs,
-                        coordinates: self.coordinates.as_ref(),
-                        expected_definition_identity: self.expected_definition_identity.as_ref(),
+                        input: self.input,
                         external_artifact_directories: &self.external_artifact_directories,
                         crate_type: self.crate_type,
                         entry_points: &entry_points,
@@ -1687,12 +1615,13 @@ fn collect_dependency_graph(
     let DependencyCollectionInput {
         inventory: source,
         declarative_outputs: outputs,
-        coordinates,
-        expected_definition_identity: expected_identity,
+        input,
         external_artifact_directories,
         crate_type,
         entry_points,
     } = input;
+    let coordinates = input.coordinates();
+    let expected_identity = input.identity();
     let provenance = collect_macro_provenance(compiler, tcx, source, outputs)?;
     let mut definitions = collect_definitions_with_identity(
         compiler,
@@ -1846,13 +1775,9 @@ fn collect_dependency_graph(
         edges,
         roots,
     )?;
-    let complete_source_outputless_macro_expansions = coordinates
-        .map(|_| outputless_macro_expansions_in_complete_source(&graph, &constraints))
-        .transpose()?;
     Ok(CollectedDependencies {
         graph,
         constraints,
-        complete_source_outputless_macro_expansions,
         definition_identity_universe,
     })
 }
