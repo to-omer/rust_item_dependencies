@@ -1,15 +1,12 @@
-#![feature(fs_set_times)]
-
-use std::cmp::Reverse;
-use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, FileTimes, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
-use std::time::SystemTime;
 
 mod cli;
+#[cfg(test)]
+mod compiler_cache_tests;
 #[path = "../src/target_libraries.rs"]
 mod target_libraries;
 
@@ -106,33 +103,17 @@ fn run() -> Result<RunOutcome, String> {
         .ok_or_else(|| "cannot locate the repository root".to_owned())?;
     let generated = repository_root.join("target/rid");
     let rust_source = generated.join("rustc");
-    let restored_build_without_checkout =
-        rust_source.join("build").is_dir() && !rust_source.join(".git").exists();
     fs::create_dir_all(&generated)
         .map_err(|error| format!("cannot create {}: {error}", render_path(&generated)))?;
 
     let preparation_lock = lock_exclusive(&generated.join("preparation.lock"))?;
     ensure_patched_checkout(repository_root, &rust_source)?;
-    let build_identity_matches = compiler_build_identity_matches(repository_root, &rust_source)?;
-    if restored_build_without_checkout && build_identity_matches {
-        // Cached Cargo outputs predate this checkout. Validate its contents first, then restore
-        // the source-time ordering expected by Cargo and native build scripts.
-        normalize_tracked_source_mtimes(&rust_source)?;
-    }
     let host = compiler_host(Path::new("rustc"))?;
+    prepare_compiler(repository_root, &rust_source, &host)?;
     let stage2 = rust_source.join("build").join(&host).join("stage2");
     let stage2_rustc = stage2
         .join("bin")
         .join(format!("rustc{}", env::consts::EXE_SUFFIX));
-    if !stage2_rustc.is_file() || !build_identity_matches {
-        if build_identity_matches {
-            remove_compiler_build_identity(&rust_source)?;
-        } else {
-            remove_incompatible_compiler_build(&rust_source)?;
-        }
-        build_compiler(repository_root, &rust_source)?;
-        record_compiler_build_identity(repository_root, &rust_source)?;
-    }
     if let Some(arguments) = rustc_arguments {
         let target = match direct_builtin_target_candidate(&arguments) {
             Some(target) if is_builtin_target(&stage2_rustc, target)? => Some(target),
@@ -411,47 +392,6 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
     Ok(())
 }
 
-fn normalize_tracked_source_mtimes(rust_source: &Path) -> Result<(), String> {
-    let tracked = command_output(
-        Command::new("git")
-            .args(["-C"])
-            .arg(rust_source)
-            .args(["ls-files", "-z"]),
-        "list tracked Rust source files",
-    )?;
-    let mut directories = BTreeSet::new();
-    for relative in tracked.split('\0').filter(|relative| !relative.is_empty()) {
-        let relative = Path::new(relative);
-        let path = rust_source.join(relative);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!("cannot inspect {}: {error}", render_path(&path)));
-            }
-        };
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        set_modified_to_epoch(&path)?;
-        directories.extend(relative.ancestors().skip(1).map(Path::to_path_buf));
-    }
-    let mut directories = directories.into_iter().collect::<Vec<_>>();
-    directories.sort_by_key(|path| Reverse(path.components().count()));
-    for relative in directories {
-        let path = rust_source.join(relative);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_dir() => set_modified_to_epoch(&path)?,
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!("cannot inspect {}: {error}", render_path(&path)));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn compiler_build_identity(
     repository_root: &Path,
     rust_source: &Path,
@@ -503,17 +443,31 @@ fn remove_incompatible_compiler_build(rust_source: &Path) -> Result<(), String> 
     }
 }
 
-fn set_modified_to_epoch(path: &Path) -> Result<(), String> {
-    fs::set_times(path, FileTimes::new().set_modified(SystemTime::UNIX_EPOCH)).map_err(|error| {
-        format!(
-            "cannot normalize the modification time of {}: {error}",
-            render_path(path)
-        )
-    })
-}
+fn prepare_compiler(repository_root: &Path, rust_source: &Path, host: &str) -> Result<(), String> {
+    let build_identity_matches = compiler_build_identity_matches(repository_root, rust_source)?;
+    let sysroots_ready = ["stage1", "stage2"].iter().all(|stage| {
+        rust_source
+            .join("build")
+            .join(host)
+            .join(stage)
+            .join("bin")
+            .join(format!("rustc{}", env::consts::EXE_SUFFIX))
+            .is_file()
+    });
+    if build_identity_matches && sysroots_ready {
+        return Ok(());
+    }
 
-fn build_compiler(repository_root: &Path, rust_source: &Path) -> Result<(), String> {
-    eprintln!("Preparing the patched Rust compiler. This takes a while on the first run.");
+    let action = if build_identity_matches {
+        // Only a completed build for this verified checkout can supply both compiler stages.
+        // Invalidate it before bootstrap so an interrupted assembly cannot be reused.
+        remove_compiler_build_identity(rust_source)?;
+        "assemble the cached Rust compiler"
+    } else {
+        remove_incompatible_compiler_build(rust_source)?;
+        "build the patched Rust compiler"
+    };
+    eprintln!("Preparing to {action}.");
     let mut command = bootstrap_command(repository_root, rust_source)?;
     command.args([
         "build",
@@ -523,7 +477,12 @@ fn build_compiler(repository_root: &Path, rust_source: &Path) -> Result<(), Stri
         "compiler/rustc",
         "library",
     ]);
-    run_command(&mut command, "build the patched Rust compiler")
+    if build_identity_matches {
+        // Let bootstrap select and copy its stamped artifacts without rerunning Cargo.
+        command.args(["--keep-stage", "0", "--keep-stage", "1"]);
+    }
+    run_command(&mut command, action)?;
+    record_compiler_build_identity(repository_root, rust_source)
 }
 
 fn prepare_target_metadata(
@@ -986,64 +945,91 @@ mod target_tests {
         }
     }
 
-    #[test]
-    fn cached_build_normalizes_tracked_files_and_ancestor_directories() {
+    fn compiler_cache_fixture() -> (TestDirectory, PathBuf) {
         let directory = TestDirectory::new();
-        run_command(
-            Command::new("git")
-                .args(["init", "-q"])
-                .arg(directory.path()),
-            "initialize test repository",
+        let repository_root = directory.path();
+        let rust_source = repository_root.join("rust-source");
+        fs::create_dir(repository_root.join("rustc-patches")).unwrap();
+        fs::write(
+            repository_root.join("rustc-patches/patched-revision"),
+            "revision\n",
         )
         .unwrap();
-        let tracked_directory = directory.path().join("crate/src");
-        let untracked_directory = directory.path().join("untracked");
-        fs::create_dir_all(&tracked_directory).unwrap();
-        fs::create_dir(&untracked_directory).unwrap();
-        let crate_directory = directory.path().join("crate");
-        let tracked = tracked_directory.join("lib.rs");
-        let untracked = untracked_directory.join("data.rs");
-        fs::write(&tracked, "pub fn tracked() {}\n").unwrap();
-        fs::write(&untracked, "pub fn untracked() {}\n").unwrap();
-        run_command(
-            Command::new("git")
-                .args(["-C"])
-                .arg(directory.path())
-                .args(["add", "crate/src/lib.rs"]),
-            "index test source",
+        fs::write(
+            repository_root.join("rustc-patches/queue-digest"),
+            "digest\n",
         )
         .unwrap();
-        let untracked_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
-        for path in [
-            directory.path(),
-            crate_directory.as_path(),
-            tracked_directory.as_path(),
-            tracked.as_path(),
-            untracked_directory.as_path(),
-            untracked.as_path(),
-        ] {
-            fs::set_times(path, FileTimes::new().set_modified(untracked_time)).unwrap();
+        for stage in ["stage1", "stage2"] {
+            let bin = rust_source.join("build/host").join(stage).join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            fs::write(
+                bin.join(format!("rustc{}", env::consts::EXE_SUFFIX)),
+                "cached",
+            )
+            .unwrap();
         }
+        fs::write(rust_source.join("build/artifact"), "intermediate output").unwrap();
+        record_compiler_build_identity(repository_root, &rust_source).unwrap();
+        (directory, rust_source)
+    }
 
-        normalize_tracked_source_mtimes(directory.path()).unwrap();
+    #[test]
+    fn completed_compiler_cache_needs_no_bootstrap() {
+        let (directory, rust_source) = compiler_cache_fixture();
+        assert!(!rust_source.join("x.py").exists());
 
-        for path in [
-            directory.path(),
-            crate_directory.as_path(),
-            tracked_directory.as_path(),
-            tracked.as_path(),
-        ] {
+        prepare_compiler(directory.path(), &rust_source, "host").unwrap();
+
+        assert!(compiler_build_identity_matches(directory.path(), &rust_source).unwrap());
+        assert_eq!(
+            fs::read(rust_source.join("build/artifact")).unwrap(),
+            b"intermediate output"
+        );
+    }
+
+    #[test]
+    fn either_missing_sysroot_requires_assembly_and_failure_invalidates_the_cache() {
+        for stage in ["stage1", "stage2"] {
+            let (directory, rust_source) = compiler_cache_fixture();
+            fs::remove_dir_all(rust_source.join("build/host").join(stage)).unwrap();
+            assert!(compiler_build_identity_matches(directory.path(), &rust_source).unwrap());
+            assert!(!rust_source.join("x.py").exists());
+
+            let error = prepare_compiler(directory.path(), &rust_source, "host").unwrap_err();
+
+            assert!(
+                error.contains("cannot assemble the cached Rust compiler"),
+                "{error}"
+            );
+            assert!(!compiler_build_identity_matches(directory.path(), &rust_source).unwrap());
             assert_eq!(
-                fs::metadata(path).unwrap().modified().unwrap(),
-                SystemTime::UNIX_EPOCH
+                fs::read(rust_source.join("build/artifact")).unwrap(),
+                b"intermediate output"
             );
         }
-        for path in [untracked_directory.as_path(), untracked.as_path()] {
-            assert_eq!(
-                fs::metadata(path).unwrap().modified().unwrap(),
-                untracked_time
-            );
-        }
+    }
+
+    #[test]
+    fn incompatible_completed_sysroots_cannot_bypass_a_fresh_build() {
+        let (directory, rust_source) = compiler_cache_fixture();
+        fs::write(
+            directory.path().join("rustc-patches/queue-digest"),
+            "changed\n",
+        )
+        .unwrap();
+        assert!(rust_source.join("build/host/stage2/bin").is_dir());
+        assert!(rust_source.join("build/artifact").is_file());
+
+        let error = prepare_compiler(directory.path(), &rust_source, "host").unwrap_err();
+
+        assert!(
+            error.contains("cannot build the patched Rust compiler"),
+            "{error}"
+        );
+        assert!(!rust_source.join("build").exists());
+        assert!(rust_source.is_dir());
+        assert!(!compiler_build_identity_matches(directory.path(), &rust_source).unwrap());
     }
 
     #[test]
