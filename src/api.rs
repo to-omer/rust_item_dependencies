@@ -12,8 +12,8 @@ use crate::artifact::compiler_sysroot;
 use crate::definitions::DefinitionIdentityUniverse;
 use crate::dependency_graph::DependencyGraph;
 use crate::error::{
-    AnalysisError, CompilerFailure, DecisionDifference, Diagnostic, DiagnosticBundle,
-    DiagnosticLevel, ObservationGap, SnapshotDiff as PublicSnapshotDiff, SourceRewriteViolation,
+    AnalysisError, CompilerFailure, DecisionDifference, DiagnosticBundle, ObservationGap,
+    SnapshotDiff as PublicSnapshotDiff, SourceRewriteViolation,
 };
 use crate::input::{
     CompilationContext, InputError, InspectionSource, PreparedCompilationOptions,
@@ -235,16 +235,7 @@ fn analysis_error(error: InputError, phase: CompilationPhase) -> AnalysisError {
             range: None,
         },
         InputError::OriginalCompilationFailed(diagnostics) => {
-            let diagnostics = DiagnosticBundle::new(
-                diagnostics
-                    .into_iter()
-                    .map(|diagnostic| Diagnostic {
-                        level: DiagnosticLevel::Error,
-                        message: diagnostic.message,
-                        range: diagnostic.range,
-                    })
-                    .collect(),
-            );
+            let diagnostics = DiagnosticBundle::new(diagnostics);
             match phase {
                 CompilationPhase::Original => AnalysisError::OriginalCompilationFailed(diagnostics),
                 CompilationPhase::Reduced => AnalysisError::ReducedCompilationFailed(diagnostics),

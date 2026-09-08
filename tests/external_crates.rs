@@ -553,7 +553,12 @@ mod patched {
         let AnalysisError::OriginalCompilationFailed(diagnostics) = error else {
             panic!("unexpected error: {error:?}")
         };
-        let [resolution, abort] = diagnostics.diagnostics() else {
+        let errors: Vec<_> = diagnostics
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .collect();
+        let [resolution, abort] = errors.as_slice() else {
             panic!("unexpected compiler diagnostics: {diagnostics:?}")
         };
         assert_eq!(resolution.level, DiagnosticLevel::Error);

@@ -1,5 +1,7 @@
 #![feature(rustc_private)]
 
+#[cfg(rust_item_dependencies_patched)]
+use rust_item_dependencies::error::DiagnosticLevel;
 use rust_item_dependencies::{AnalysisError, Analyzer};
 #[cfg(rust_item_dependencies_patched)]
 use rust_item_dependencies::{CompilationOptions, Edition, OptimizationLevel, SourceInput};
@@ -356,7 +358,7 @@ fn deleted_nested_use_prefix_is_not_a_compiler_decision_mismatch() {
 #[test]
 fn original_compiler_diagnostics_are_owned_and_source_anchored() {
     let analyzer = Analyzer::new().unwrap();
-    let source = "fn main() { let value: u32 = \"not a number\"; }\n";
+    let source = "\u{feff}// 日本語\r\nfn main() { let value: u32 = \"not a number\"; let flag: bool = 0; }\r\n";
     let input = SourceInput::binary(source.to_owned(), Edition::Rust2024, host_target());
 
     let AnalysisError::OriginalCompilationFailed(diagnostics) =
@@ -376,6 +378,83 @@ fn original_compiler_diagnostics_are_owned_and_source_anchored() {
             &source[range.start as usize..range.end as usize] == "\"not a number\""
         })
     }));
+    assert_eq!(
+        diagnostics
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.level == DiagnosticLevel::Error
+                    && diagnostic.message == "mismatched types"
+            })
+            .count(),
+        2,
+    );
+    for (message, text) in [
+        ("expected `u32`, found `&str`", "\"not a number\""),
+        ("expected due to this", "u32"),
+        ("expected `bool`, found integer", "0"),
+    ] {
+        assert!(
+            diagnostics.diagnostics().iter().any(|diagnostic| {
+                diagnostic.level == DiagnosticLevel::Note
+                    && diagnostic.message == message
+                    && diagnostic.range.is_some_and(|range| {
+                        &source[range.start as usize..range.end as usize] == text
+                    })
+            }),
+            "missing {message}: {diagnostics:?}"
+        );
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn compiler_notes_and_suggestion_help_reach_the_public_api() {
+    let analyzer = Analyzer::new().unwrap();
+    let cases = [
+        (
+            "trait Mark {}\nfn need<T: Mark>(_: T) {}\nfn main() { need(1u8); }\n",
+            "required by a bound in `need`",
+            DiagnosticLevel::Note,
+            "Mark",
+            "T: ",
+        ),
+        (
+            "trait Mark {}\nfn need<T: Mark>(_: T) {}\nfn main() { need(1u8); }\n",
+            "this trait has no implementations, consider adding one",
+            DiagnosticLevel::Help,
+            "trait Mark",
+            "",
+        ),
+        (
+            "fn consume(_: &str) {}\nfn main() { let value = String::new(); consume(value); }\n",
+            "consider borrowing here",
+            DiagnosticLevel::Help,
+            "",
+            "consume(",
+        ),
+    ];
+    for (source, message, level, text, prefix) in cases {
+        let input = SourceInput::binary(source, Edition::Rust2024, host_target());
+        let AnalysisError::OriginalCompilationFailed(diagnostics) =
+            analyzer.reduce(&input).unwrap_err()
+        else {
+            panic!("invalid input must return compiler diagnostics");
+        };
+        let position = source.rfind(&format!("{prefix}{text}")).unwrap() + prefix.len();
+        assert!(
+            diagnostics.diagnostics().iter().any(|diagnostic| {
+                diagnostic.level == level
+                    && diagnostic.message == message
+                    && diagnostic.range
+                        == Some(rust_item_dependencies::ByteRange {
+                            start: position as u32,
+                            end: (position + text.len()) as u32,
+                        })
+            }),
+            "missing {message}: {diagnostics:?}"
+        );
+    }
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -448,6 +527,19 @@ fn reduced_compiler_diagnostics_use_original_source_coordinates() {
             .range
             .is_some_and(|range| range.start >= main_start && range.end as usize <= source.len())
     }));
+    let bound = source.find("T: Pick").unwrap() + "T: ".len();
+    assert!(
+        diagnostics.diagnostics().iter().any(|diagnostic| {
+            diagnostic.level == DiagnosticLevel::Note
+                && diagnostic.message == "required by a bound in `require`"
+                && diagnostic.range
+                    == Some(rust_item_dependencies::ByteRange {
+                        start: bound as u32,
+                        end: (bound + "Pick".len()) as u32,
+                    })
+        }),
+        "{diagnostics:?}"
+    );
 }
 
 #[cfg(rust_item_dependencies_patched)]

@@ -354,6 +354,12 @@ fn cli_failures_report_reasons_ranges_and_all_compiler_diagnostics() {
         "{invalid_error}"
     );
     assert_eq!(invalid_error.matches("mismatched types").count(), 2);
+    for message in [
+        "note: expected `u32`, found `&str`",
+        "note: expected `bool`, found integer",
+    ] {
+        assert!(invalid_error.contains(message), "{invalid_error}");
+    }
     for marker in ["\"first\"", "0"] {
         let start = invalid_source.find(marker).unwrap();
         assert!(
@@ -361,6 +367,21 @@ fn cli_failures_report_reasons_ranges_and_all_compiler_diagnostics() {
             "{invalid_error}"
         );
     }
+
+    let borrowing_source =
+        "fn consume(_: &str) {}\nfn main() { let value = String::new(); consume(value); }\n";
+    std::fs::write(&invalid_input, borrowing_source).unwrap();
+    let borrowing = run_cli(&invalid_input, &invalid_output);
+    assert!(!borrowing.status.success());
+    assert!(!invalid_output.exists());
+    let borrowing_error = String::from_utf8(borrowing.stderr).unwrap();
+    let position = borrowing_source.rfind("value").unwrap();
+    assert!(
+        borrowing_error.contains(&format!(
+            "help: consider borrowing here at bytes {position}..{position}"
+        )),
+        "{borrowing_error}"
+    );
 
     std::fs::remove_dir_all(work).unwrap();
 }
@@ -543,6 +564,11 @@ fn cli_rejects_output_filenames_that_change_required_impls() {
             "the reduced source did not compile"
         };
         assert!(error.contains(expected), "{error}");
+        if keep_both {
+            for detail in ["original:", "reduced:"] {
+                assert!(error.contains(detail), "{error}");
+            }
+        }
     }
     std::fs::remove_dir_all(work).unwrap();
 }
