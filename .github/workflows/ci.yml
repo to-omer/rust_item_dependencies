@@ -44,19 +44,26 @@ jobs:
           --component rust-src
           --component rustfmt
       - name: Build
-        run: cargo build --locked --all-targets
+        shell: bash
+        run: |
+          cargo build --locked --all-targets
+          cargo build --locked --manifest-path tools/Cargo.toml --target-dir target/rid-tool-tests --all-targets
       - name: Check formatting
+        shell: bash
         run: |
           cargo fmt --all -- --check
-          rustfmt --edition 2024 --check tools/rid.rs
+          cargo fmt --manifest-path tools/Cargo.toml --all -- --check
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        shell: bash
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tools/Cargo.toml --target-dir target/rid-tool-tests --all-targets -- -D warnings
       - name: Run tests
         run: cargo test --locked --all-targets
       - name: Run cargo rid tests
         env:
           CARGO_TARGET_DIR: target/rid-tool-tests
-        run: cargo -Zscript test --manifest-path tools/rid.rs
+        run: cargo test --locked --manifest-path tools/Cargo.toml
       - name: Identify runner image
         id: runner-image
         shell: bash

@@ -71,6 +71,7 @@ pub(crate) struct PreparedExternalCrates {
     direct: Vec<PreparedExternalCrate>,
     proc_macro_execution_artifacts: Vec<PreparedProcMacroExecutionArtifact>,
     snapshot: Option<SnapshotDirectory>,
+    invocation_snapshots: Vec<SnapshotDirectory>,
 }
 
 impl PreparedExternalCrates {
@@ -99,7 +100,11 @@ impl PreparedExternalCrates {
     }
 
     pub(crate) fn artifact_directories(&self) -> impl Iterator<Item = &Path> {
-        let analyzer = self.snapshot.iter().map(SnapshotDirectory::path);
+        let analyzer = self
+            .snapshot
+            .iter()
+            .chain(&self.invocation_snapshots)
+            .map(SnapshotDirectory::path);
         #[cfg(windows)]
         {
             analyzer.chain(
@@ -337,7 +342,7 @@ struct ProcessStoreKey {
 struct ProcessExternalArtifactStore {
     root: PathBuf,
     _owner: File,
-    snapshots: BTreeMap<ArtifactKey, Weak<SnapshotDirectory>>,
+    snapshots: BTreeMap<Vec<ArtifactKey>, Weak<SnapshotDirectory>>,
     loaded: Vec<Arc<SnapshotDirectory>>,
 }
 
@@ -422,13 +427,16 @@ impl ProcessExternalArtifactStore {
 
     fn snapshot(
         &mut self,
-        artifact: &RequestedArtifact,
+        artifacts: &[&RequestedArtifact],
     ) -> Result<Arc<SnapshotDirectory>, AnalysisError> {
-        let key = ArtifactKey {
-            file_name: artifact.file_name.clone(),
-            kind: artifact.kind,
-            digest: artifact.loaded.digest,
-        };
+        let key = artifacts
+            .iter()
+            .map(|artifact| ArtifactKey {
+                file_name: artifact.file_name.clone(),
+                kind: artifact.kind,
+                digest: artifact.loaded.digest,
+            })
+            .collect::<Vec<_>>();
         if let Some(snapshot) = self.snapshots.get(&key).and_then(Weak::upgrade) {
             return Ok(snapshot);
         }
@@ -437,9 +445,11 @@ impl ProcessExternalArtifactStore {
             &self.root,
             PROCESS_SNAPSHOT_PREFIX,
         )?);
-        write_snapshot_artifact(&snapshot, artifact).map_err(|error| {
-            snapshot_failure(snapshot.path().join(&artifact.file_name), error.kind())
-        })?;
+        for artifact in artifacts {
+            write_snapshot_artifact(&snapshot, artifact).map_err(|error| {
+                snapshot_failure(snapshot.path().join(&artifact.file_name), error.kind())
+            })?;
+        }
         self.snapshots.insert(key, Arc::downgrade(&snapshot));
         Ok(snapshot)
     }
@@ -496,7 +506,7 @@ fn reap_stale_process_stores(
 #[cfg(windows)]
 fn process_snapshot(
     key: &ProcessStoreKey,
-    artifact: &RequestedArtifact,
+    artifacts: &[&RequestedArtifact],
     parent_lock: &SnapshotParentLock,
 ) -> Result<ProcessSnapshot, AnalysisError> {
     let stores = PROCESS_EXTERNAL_STORES.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -512,7 +522,7 @@ fn process_snapshot(
     let snapshot = stores
         .get_mut(key)
         .expect("process external artifact store must exist")
-        .snapshot(artifact)?;
+        .snapshot(artifacts)?;
     Ok(ProcessSnapshot {
         store: key.clone(),
         snapshot,
@@ -616,7 +626,7 @@ fn prepare_snapshots(
             proc_macro_execution_artifacts
                 .contains(&(artifact.file_name.clone(), artifact.loaded.digest))
         }) {
-            let snapshot = process_snapshot(&key, artifact, &parent_lock)?;
+            let snapshot = process_snapshot(&key, &[artifact], &parent_lock)?;
             proc_macros.insert(
                 (artifact.file_name.clone(), artifact.loaded.digest),
                 snapshot,
@@ -787,7 +797,210 @@ pub(crate) fn prepare_external_crates<'a>(
         direct,
         proc_macro_execution_artifacts,
         snapshot: snapshots.analyzer,
+        invocation_snapshots: Vec::new(),
     })
+}
+
+/// Preserve each compiler search directory as a separate candidate population.
+/// As with rustc, an invocation permits the procedural macros it resolves.
+pub(crate) fn prepare_invocation_external_crates(
+    options: &mut rustc_session::config::Options,
+    trusted_directories: &[PathBuf],
+) -> Result<PreparedExternalCrates, AnalysisError> {
+    use rustc_session::config::{ExternLocation, Externs};
+    use rustc_session::search_paths::PathKind;
+    use rustc_session::utils::CanonicalizedPath;
+
+    let target = rustc_target::spec::Target::expect_builtin(&options.target_triple);
+    let host = rustc_target::spec::Target::expect_builtin(
+        &rustc_target::spec::TargetTuple::from_tuple(rustc_session::config::host_tuple()),
+    );
+    let candidates = |name: &str| {
+        (name.starts_with("lib")
+            && (name.ends_with(".rlib") || name.ends_with(".rmeta") || name.ends_with(".rs")))
+            || [&target, &host].iter().any(|target| {
+                name.starts_with(target.dll_prefix.as_ref())
+                    && name.ends_with(target.dll_suffix.as_ref())
+            })
+    };
+    let parent = snapshot_parent()?;
+    reap_snapshot_parent(&parent)?;
+    let mut prepared = PreparedExternalCrates::default();
+    let mut mapped_directories = BTreeMap::<PathBuf, PathBuf>::new();
+    let mut mapped_files = BTreeMap::<PathBuf, PathBuf>::new();
+    let mut original_names = BTreeSet::<PathBuf>::new();
+    for search in &mut options.search_paths {
+        match search.kind {
+            PathKind::Native => continue,
+            PathKind::All | PathKind::Framework => {
+                return Err(crate::invocation::invalid(format!(
+                    "unsupported compiler search path kind {:?}: {}; use crate=, dependency=, or native= paths",
+                    search.kind,
+                    search.dir.display()
+                )));
+            }
+            PathKind::Crate | PathKind::Dependency => {}
+        }
+        let original = match fs::canonicalize(&search.dir) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                std::path::absolute(&search.dir)
+                    .map_err(|error| artifact_unreadable(&search.dir, error.kind()))?
+            }
+            Err(error) => return Err(artifact_unreadable(&search.dir, error.kind())),
+        };
+        if trusted_directories
+            .iter()
+            .any(|directory| fs::canonicalize(directory).ok().as_ref() == Some(&original))
+        {
+            continue;
+        }
+        if let Some(mapped) = mapped_directories.get(&original) {
+            search.dir = mapped.clone().into();
+            continue;
+        }
+        let entries = match fs::read_dir(&original) {
+            Ok(entries) => Some(entries),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(artifact_unreadable(&original, error.kind())),
+        };
+        let mut staged = BTreeMap::new();
+        for entry in entries.into_iter().flatten() {
+            let entry = entry.map_err(|error| artifact_unreadable(&original, error.kind()))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // rustc considers Rust archives, metadata and host/target dylibs.
+            // Keep malformed candidates too: discarding them can change errors.
+            if !candidates(name) {
+                continue;
+            }
+            let request = load_invocation_artifact(&entry.path())?;
+            if !original_names.insert(request.canonical_path.clone()) {
+                return Err(crate::invocation::invalid(format!(
+                    "aliased compiler artifact candidates are unsupported: {}",
+                    entry.path().display()
+                )));
+            }
+            staged.insert(name.to_owned(), request);
+        }
+        let mapped = snapshot_invocation_group(&parent, &staged, &mut prepared)?;
+        for artifact in staged.values() {
+            mapped_files.insert(
+                artifact.canonical_path.clone(),
+                mapped.join(&artifact.file_name),
+            );
+        }
+        mapped_directories.insert(original, mapped.clone());
+        search.dir = mapped.into();
+    }
+    let mut externs = BTreeMap::new();
+    for (name, entry) in options.externs.iter() {
+        let mut entry = entry.clone();
+        if let ExternLocation::ExactPaths(paths) = &mut entry.location {
+            let mut mapped = BTreeSet::new();
+            for path in paths.iter() {
+                let original = path.original();
+                let canonical = fs::canonicalize(original)
+                    .map_err(|error| artifact_unreadable(original, error.kind()))?;
+                let destination = if let Some(destination) = mapped_files.get(&canonical) {
+                    if destination.file_name() != original.file_name() {
+                        return Err(crate::invocation::invalid(format!(
+                            "aliased extern artifact names are unsupported: {}",
+                            original.display()
+                        )));
+                    }
+                    destination.clone()
+                } else {
+                    let artifact = load_invocation_artifact(original)?;
+                    let staged = BTreeMap::from([(artifact.file_name.clone(), artifact)]);
+                    let directory = snapshot_invocation_group(&parent, &staged, &mut prepared)?;
+                    let destination = directory.join(original.file_name().ok_or_else(|| {
+                        crate::invocation::invalid("extern path has no filename")
+                    })?);
+                    mapped_files.insert(canonical, destination.clone());
+                    destination
+                };
+                mapped.insert(CanonicalizedPath::new(destination));
+            }
+            *paths = mapped;
+        }
+        externs.insert(name.clone(), entry);
+    }
+    options.externs = Externs::new(externs);
+    Ok(prepared)
+}
+
+fn load_invocation_artifact(path: &Path) -> Result<RequestedArtifact, AnalysisError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| artifact_unreadable(path, io::ErrorKind::InvalidInput))?
+        .to_owned();
+    if file_name.ends_with(".rs") {
+        return Err(crate::invocation::invalid(format!(
+            "source dylib interfaces are unsupported compiler inputs: {}",
+            path.display()
+        )));
+    }
+    let canonical_path =
+        fs::canonicalize(path).map_err(|error| artifact_unreadable(path, error.kind()))?;
+    let loaded = read_artifact(path, &canonical_path)?;
+    Ok(RequestedArtifact {
+        original_path: path.to_owned(),
+        canonical_path,
+        file_name,
+        loaded,
+        // This discriminator is only used by the process snapshot identity here;
+        // rustc, rather than the standalone artifact validator, checks the format.
+        kind: ExternalArtifactKind::Rlib,
+    })
+}
+
+fn snapshot_invocation_group(
+    parent: &Path,
+    staged: &BTreeMap<String, RequestedArtifact>,
+    prepared: &mut PreparedExternalCrates,
+) -> Result<PathBuf, AnalysisError> {
+    #[cfg(windows)]
+    if staged.values().any(|artifact| {
+        artifact_kind(&artifact.file_name) == Some(ExternalArtifactKind::HostDynamicLibrary)
+    }) {
+        let parent_lock = SnapshotParentLock::acquire(parent)?;
+        let key = ProcessStoreKey {
+            parent: parent.to_owned(),
+            token: configured_process_store_token()?,
+        };
+        let root = process_store_root(&key, &parent_lock)?;
+        validate_snapshot_file_names(&root, staged)?;
+        let snapshot = process_snapshot(&key, &staged.values().collect::<Vec<_>>(), &parent_lock)?;
+        for artifact in staged.values().filter(|artifact| {
+            artifact_kind(&artifact.file_name) == Some(ExternalArtifactKind::HostDynamicLibrary)
+        }) {
+            prepared
+                .proc_macro_execution_artifacts
+                .push(PreparedProcMacroExecutionArtifact {
+                    artifact: snapshot.path().join(&artifact.file_name),
+                    snapshot: snapshot.clone(),
+                });
+        }
+        return Ok(snapshot.path().to_owned());
+    }
+    validate_snapshot_file_names(parent, staged)?;
+    let snapshot = SnapshotDirectory::create(parent, ANALYZER_SNAPSHOT_PREFIX)?;
+    stage_artifacts(&snapshot, staged)?;
+    #[cfg(not(windows))]
+    for artifact in staged.values().filter(|artifact| {
+        artifact_kind(&artifact.file_name) == Some(ExternalArtifactKind::HostDynamicLibrary)
+    }) {
+        prepared
+            .proc_macro_execution_artifacts
+            .push(PreparedProcMacroExecutionArtifact {
+                artifact: snapshot.path().join(&artifact.file_name),
+            });
+    }
+    let directory = snapshot.path().to_owned();
+    prepared.invocation_snapshots.push(snapshot);
+    Ok(directory)
 }
 
 fn validate_extern_name(name: &str) -> Result<(), AnalysisError> {
@@ -1528,7 +1741,7 @@ mod tests {
         };
         let prepare = |key: &ProcessStoreKey| {
             let parent_lock = SnapshotParentLock::acquire(&key.parent).unwrap();
-            process_snapshot(key, &artifact, &parent_lock).unwrap()
+            process_snapshot(key, &[&artifact], &parent_lock).unwrap()
         };
 
         let first = prepare(&first_key);

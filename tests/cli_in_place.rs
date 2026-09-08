@@ -42,6 +42,148 @@ fn compile(path: &Path, binary: &Path) {
 }
 
 #[test]
+fn installed_launcher_updates_relative_inputs_from_an_independent_directory() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let install = work();
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    success(
+        Command::new(&cargo)
+            .current_dir(repository)
+            .args([
+                "install",
+                "--offline",
+                "--locked",
+                "--path",
+                "tools",
+                "--root",
+            ])
+            .arg(install.path())
+            .arg("--target-dir")
+            .arg(repository.join("target/rid-tool-install"))
+            .env_remove("RUSTC")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .output()
+            .unwrap(),
+    );
+
+    // Cargo searches ancestor directories for aliases. Keep this fixture
+    // outside the checkout so it must find the installed subcommand.
+    let parent = std::env::temp_dir().join("rust-item-dependencies/target");
+    fs::create_dir_all(&parent).unwrap();
+    let project = tempfile::Builder::new()
+        .prefix("cargo-rid-external-")
+        .tempdir_in(parent)
+        .unwrap();
+    let source = "fn dead() {}\nfn main() { println!(\"{}\", file!()); }\n";
+    let input = project.path().join("input.rs");
+    fs::write(&input, source).unwrap();
+    let inherited_path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(install.path().join("bin")).chain(std::env::split_paths(&inherited_path)),
+    )
+    .unwrap();
+    let reduce = || {
+        Command::new(&cargo)
+            .current_dir(project.path())
+            .args(["rid", "input.rs"])
+            .env("PATH", &path)
+            .env("RUSTFLAGS", "--must-not-apply-to-the-reducer-build")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("CARGO_BUILD_TARGET", "wasm32-unknown-unknown")
+            .output()
+            .unwrap()
+    };
+    success(reduce());
+    let reduced = fs::read_to_string(&input).unwrap();
+    assert!(!reduced.contains("fn dead"));
+    assert!(reduced.contains("fn main"));
+    let modified = fs::metadata(&input).unwrap().modified().unwrap();
+    success(reduce());
+    assert_eq!(fs::read_to_string(&input).unwrap(), reduced);
+    assert_eq!(fs::metadata(&input).unwrap().modified().unwrap(), modified);
+
+    let binary = project
+        .path()
+        .join(format!("program{}", std::env::consts::EXE_SUFFIX));
+    success(
+        Command::new(env!("RUST_ITEM_DEPENDENCIES_BUILD_RUSTC"))
+            .current_dir(project.path())
+            .args(["--edition=2024", "input.rs", "-o"])
+            .arg(&binary)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        success(Command::new(binary).output().unwrap()).stdout,
+        b"input.rs\n"
+    );
+
+    fs::write(&input, "fn main() { let _: u8 = false; }\n").unwrap();
+    let original = fs::read(&input).unwrap();
+    assert!(!reduce().status.success());
+    assert_eq!(fs::read(&input).unwrap(), original);
+
+    fs::create_dir_all(project.path().join("src")).unwrap();
+    fs::create_dir_all(project.path().join("helper/src")).unwrap();
+    fs::create_dir_all(project.path().join(".cargo")).unwrap();
+    fs::write(project.path().join("Cargo.toml"), "[package]\nname='cross-project'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nhelper={path='helper'}\n[workspace]\n").unwrap();
+    fs::write(
+        project.path().join("helper/Cargo.toml"),
+        "[package]\nname='helper'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("helper/src/lib.rs"),
+        "pub fn value() -> usize { vec![1u8, 2, 3].len() }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("build.rs"),
+        "fn main() { println!(\"cargo::rustc-env=HOST_BUILD_VALUE=5\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join(".cargo/config.toml"),
+        "[build]\ntarget='wasm32-unknown-unknown'\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("src/main.rs"),
+        r#"
+#[cfg(not(target_arch = "wasm32"))] compile_error!("lost configured target");
+const _: [(); 4] = [(); core::mem::size_of::<usize>()];
+const _: [(); 5] = [(); (env!("HOST_BUILD_VALUE").as_bytes()[0] - b'0') as usize];
+fn dead() {}
+fn main() { core::hint::black_box(helper::value()); }
+"#,
+    )
+    .unwrap();
+    let reduce_project = || {
+        Command::new(&cargo)
+            .current_dir(project.path())
+            .args(["rid", "--offline"])
+            .env("PATH", &path)
+            .env_remove("RUSTC")
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET")
+            .output()
+            .unwrap()
+    };
+    success(reduce_project());
+    let reduced = fs::read_to_string(project.path().join("src/main.rs")).unwrap();
+    assert!(!reduced.contains("fn dead"));
+    assert!(reduced.contains("helper::value"));
+    success(reduce_project());
+    assert_eq!(
+        fs::read_to_string(project.path().join("src/main.rs")).unwrap(),
+        reduced
+    );
+}
+
+#[test]
 fn updates_the_input_compiles_and_reaches_a_fixed_point() {
     let work = work();
     let path = work.path().join("input.rs");

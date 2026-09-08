@@ -1,8 +1,3 @@
----cargo
-[package]
-edition = "2024"
----
-
 #![feature(fs_set_times)]
 
 use std::cmp::Reverse;
@@ -24,8 +19,7 @@ use target_libraries::{
 };
 
 const RUST_REPOSITORY: &str = "https://github.com/rust-lang/rust.git";
-const USAGE_COMMAND: &str =
-    "Usage: cargo rid [OPTIONS] INPUT.rs\n       cargo rid rustc [RUSTC_OPTIONS]...";
+const USAGE_COMMAND: &str = "Usage: cargo rid [CARGO_OPTIONS]\n       cargo rid [OPTIONS] INPUT.rs\n       cargo rid rustc [RUSTC_OPTIONS]...";
 const SNAPSHOT_PARENT_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_PARENT";
 const SNAPSHOT_OWNER_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_OWNER";
 const PROCESS_OWNER_PREFIX: &str = ".rust-item-dependencies-owner-";
@@ -71,19 +65,34 @@ enum RunOutcome {
 }
 
 fn run() -> Result<RunOutcome, String> {
-    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
-    let (rustc_arguments, reducer_target) = if arguments
+    let mut arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments.first().is_some_and(|argument| argument == "rid") {
+        arguments.remove(0);
+    }
+    let preparation_only = arguments
+        .first()
+        .is_some_and(|argument| argument == "--rust-item-dependencies-prepare-target");
+    let (rustc_arguments, reducer_target) = if preparation_only {
+        let [_, target] = arguments.as_slice() else {
+            return Err("target preparation requires one target".to_owned());
+        };
+        (
+            None,
+            Some(target.to_str().ok_or("target is not Unicode")?.to_owned()),
+        )
+    } else if arguments
         .first()
         .is_some_and(|argument| argument == "rustc")
     {
         (Some(arguments[1..].to_vec()), None)
     } else {
         let usage = reducer_usage(USAGE_COMMAND);
-        match parse_arguments(arguments.iter().cloned(), &usage)? {
+        match parse_arguments(arguments.iter().cloned(), USAGE_COMMAND)? {
             Parsed::Run(cli) => {
                 validate_output(&cli)?;
                 (None, cli.target.clone())
             }
+            Parsed::Project(_) => (None, None),
             Parsed::Help => {
                 println!("{usage}");
                 return Ok(RunOutcome::Success);
@@ -110,7 +119,7 @@ fn run() -> Result<RunOutcome, String> {
         // the source-time ordering expected by Cargo and native build scripts.
         normalize_tracked_source_mtimes(&rust_source)?;
     }
-    let host = active_host()?;
+    let host = compiler_host(Path::new("rustc"))?;
     let stage2 = rust_source.join("build").join(&host).join("stage2");
     let stage2_rustc = stage2
         .join("bin")
@@ -165,6 +174,9 @@ fn run() -> Result<RunOutcome, String> {
         )?;
     }
     drop(preparation_lock);
+    if preparation_only {
+        return Ok(RunOutcome::Success);
+    }
     let (rustc, compiler_library, compiler_metadata, rustc_driver) = compiler_paths(&stage2)?;
     run_reducer(
         repository_root,
@@ -547,6 +559,12 @@ fn bootstrap_command(repository_root: &Path, rust_source: &Path) -> Result<Comma
         .env_remove("CARGOFLAGS")
         .env_remove("CARGOFLAGS_BOOTSTRAP")
         .env_remove("CARGOFLAGS_NOT_BOOTSTRAP")
+        .env_remove("CARGO_BUILD_TARGET")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .env("RUSTC_WRAPPER", "")
+        .env_remove("RUSTC_WRAPPER_REAL")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS");
     Ok(command)
@@ -576,8 +594,8 @@ fn find_python() -> Result<(OsString, Vec<OsString>), String> {
     Err("Python 3 is required to build the patched Rust compiler".to_owned())
 }
 
-fn active_host() -> Result<String, String> {
-    let version = command_output(Command::new("rustc").arg("-Vv"), "query the Rust host")?;
+fn compiler_host(rustc: &Path) -> Result<String, String> {
+    let version = command_output(Command::new(rustc).arg("-Vv"), "query the Rust host")?;
     version
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
@@ -592,11 +610,7 @@ fn compiler_paths(stage2: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf),
     if !rustc.is_file() {
         return Err(format!("stage2 rustc is missing: {}", render_path(&rustc)));
     }
-    let version = command_output(Command::new(&rustc).arg("-Vv"), "query stage2 rustc")?;
-    let host = version
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .ok_or_else(|| "stage2 rustc did not report its host".to_owned())?;
+    let host = compiler_host(&rustc)?;
     let compiler_library = if host.contains("windows") {
         stage2.join("bin")
     } else {
@@ -606,7 +620,7 @@ fn compiler_paths(stage2: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf),
         .parent()
         .ok_or_else(|| "stage2 has no build directory".to_owned())?
         .join("stage1/lib/rustlib")
-        .join(host)
+        .join(&host)
         .join("lib");
     if !compiler_metadata.is_dir() {
         return Err(format!(
@@ -659,24 +673,44 @@ fn run_reducer(
     }
 
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let mut command = Command::new(cargo);
-    command
+    let host = compiler_host(rustc)?;
+    let mut build = Command::new(cargo);
+    build
         .current_dir(repository_root)
         .env("RUSTC", rustc)
         .env("CARGO_ENCODED_RUSTFLAGS", encoded)
         .env("CARGO_TARGET_DIR", generated.join("cargo"))
-        .env(SNAPSHOT_PARENT_ENV, &snapshot_parent)
-        .env(SNAPSHOT_OWNER_ENV, &snapshot_owner)
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
         .env_remove("RUSTFLAGS")
         .args([
-            "run",
+            "build",
             "--quiet",
             "--release",
             "--locked",
+            "--target",
+            &host,
             "--bin",
             "rust-item-dependencies",
-            "--",
-        ])
+        ]);
+    if cfg!(windows) {
+        prepend_path(&mut build, compiler_library)?;
+    }
+    run_command(&mut build, "build rust-item-dependencies")?;
+
+    let executable = generated
+        .join("cargo")
+        .join(host)
+        .join("release")
+        .join(format!("rust-item-dependencies{}", env::consts::EXE_SUFFIX));
+    let mut command = Command::new(executable);
+    command.env(
+        "RUST_ITEM_DEPENDENCIES_LAUNCHER",
+        env::current_exe().map_err(|error| error.to_string())?,
+    );
+    command
+        .env(SNAPSHOT_PARENT_ENV, &snapshot_parent)
+        .env(SNAPSHOT_OWNER_ENV, &snapshot_owner)
         .args(arguments);
     if cfg!(windows) {
         prepend_path(&mut command, compiler_library)?;
@@ -759,6 +793,121 @@ fn remove_snapshot_path(path: &Path, directory: bool) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("cannot remove {}: {error}", render_path(path))),
+    }
+}
+
+fn prefixed_path(prefix: &str, path: &Path) -> OsString {
+    let mut value = OsString::from(prefix);
+    value.push(path);
+    value
+}
+
+fn prepend_path(command: &mut Command, directory: &Path) -> Result<(), String> {
+    let inherited = env::var_os("PATH");
+    let paths = std::iter::once(directory.to_path_buf()).chain(
+        inherited
+            .as_deref()
+            .map(env::split_paths)
+            .into_iter()
+            .flatten(),
+    );
+    let path = env::join_paths(paths).map_err(|error| format!("cannot update PATH: {error}"))?;
+    command.env("PATH", path);
+    Ok(())
+}
+
+fn unique_file(directory: &Path, predicate: impl Fn(&str) -> bool) -> Result<PathBuf, String> {
+    let mut matches = fs::read_dir(directory)
+        .map_err(|error| format!("cannot read {}: {error}", render_path(directory)))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(&predicate)
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    if matches.len() != 1 {
+        return Err(format!(
+            "expected exactly one compiler artifact in {}",
+            render_path(directory)
+        ));
+    }
+    Ok(matches.remove(0))
+}
+
+fn read_trimmed(path: PathBuf) -> Result<String, String> {
+    fs::read_to_string(&path)
+        .map(|value| value.trim().to_owned())
+        .map_err(|error| format!("cannot read {}: {error}", render_path(&path)))
+}
+
+fn git_output(repository: &Path, arguments: &[&str]) -> Result<String, String> {
+    command_output(
+        Command::new("git")
+            .args(["-C"])
+            .arg(repository)
+            .args(arguments),
+        "query the Rust checkout",
+    )
+    .map(|output| output.trim().to_owned())
+}
+
+fn command_output(command: &mut Command, action: &str) -> Result<String, String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("cannot {action}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot {action}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|_| format!("cannot {action}: non-UTF-8 output"))
+}
+
+fn run_command(command: &mut Command, action: &str) -> Result<(), String> {
+    let status = command
+        .status()
+        .map_err(|error| format!("cannot {action}: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("cannot {action}: process exited with {status}"))
+}
+
+#[cfg(test)]
+struct TestDirectory(PathBuf);
+
+#[cfg(test)]
+impl TestDirectory {
+    fn new() -> Self {
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("target/rid-tool-tests");
+        fs::create_dir_all(&parent).unwrap();
+        for nonce in 0..SNAPSHOT_OWNER_ATTEMPTS {
+            let path = parent.join(format!("{}-{nonce}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("cannot create test directory: {error}"),
+            }
+        }
+        panic!("cannot allocate test directory")
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -1051,119 +1200,4 @@ mod snapshot_tests {
             "only the parent lock file may remain"
         );
     }
-}
-
-#[cfg(test)]
-struct TestDirectory(PathBuf);
-
-#[cfg(test)]
-impl TestDirectory {
-    fn new() -> Self {
-        let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("target/rid-tool-tests");
-        fs::create_dir_all(&parent).unwrap();
-        for nonce in 0..SNAPSHOT_OWNER_ATTEMPTS {
-            let path = parent.join(format!("{}-{nonce}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => return Self(path),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => panic!("cannot create test directory: {error}"),
-            }
-        }
-        panic!("cannot allocate test directory")
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-#[cfg(test)]
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn prefixed_path(prefix: &str, path: &Path) -> OsString {
-    let mut value = OsString::from(prefix);
-    value.push(path);
-    value
-}
-
-fn prepend_path(command: &mut Command, directory: &Path) -> Result<(), String> {
-    let inherited = env::var_os("PATH");
-    let paths = std::iter::once(directory.to_path_buf()).chain(
-        inherited
-            .as_deref()
-            .map(env::split_paths)
-            .into_iter()
-            .flatten(),
-    );
-    let path = env::join_paths(paths).map_err(|error| format!("cannot update PATH: {error}"))?;
-    command.env("PATH", path);
-    Ok(())
-}
-
-fn unique_file(directory: &Path, predicate: impl Fn(&str) -> bool) -> Result<PathBuf, String> {
-    let mut matches = fs::read_dir(directory)
-        .map_err(|error| format!("cannot read {}: {error}", render_path(directory)))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(OsStr::to_str)
-                .is_some_and(&predicate)
-        })
-        .collect::<Vec<_>>();
-    matches.sort();
-    if matches.len() != 1 {
-        return Err(format!(
-            "expected exactly one compiler artifact in {}",
-            render_path(directory)
-        ));
-    }
-    Ok(matches.remove(0))
-}
-
-fn read_trimmed(path: PathBuf) -> Result<String, String> {
-    fs::read_to_string(&path)
-        .map(|value| value.trim().to_owned())
-        .map_err(|error| format!("cannot read {}: {error}", render_path(&path)))
-}
-
-fn git_output(repository: &Path, arguments: &[&str]) -> Result<String, String> {
-    command_output(
-        Command::new("git")
-            .args(["-C"])
-            .arg(repository)
-            .args(arguments),
-        "query the Rust checkout",
-    )
-    .map(|output| output.trim().to_owned())
-}
-
-fn command_output(command: &mut Command, action: &str) -> Result<String, String> {
-    let output = command
-        .output()
-        .map_err(|error| format!("cannot {action}: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "cannot {action}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|_| format!("cannot {action}: non-UTF-8 output"))
-}
-
-fn run_command(command: &mut Command, action: &str) -> Result<(), String> {
-    let status = command
-        .status()
-        .map_err(|error| format!("cannot {action}: {error}"))?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| format!("cannot {action}: process exited with {status}"))
 }
