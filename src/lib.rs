@@ -10,6 +10,7 @@ extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_lexer;
 extern crate rustc_middle;
+extern crate rustc_parse;
 extern crate rustc_serialize;
 extern crate rustc_session;
 extern crate rustc_span;
