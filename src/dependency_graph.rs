@@ -537,15 +537,6 @@ pub enum RootReason {
     GlobalAssembly,
 }
 
-impl RootReason {
-    pub(crate) fn is_semantic(self) -> bool {
-        matches!(
-            self,
-            Self::Main | Self::ExplicitEntry | Self::DownstreamSelection
-        )
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RootRecord {
     pub node: GraphNode,

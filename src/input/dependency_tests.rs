@@ -483,7 +483,7 @@ fn hirless_opaque_lifetime_keeps_its_graph_node() {
     assert!(
         first
             .retention
-            .semantic_required
+            .compile_required
             .contains(&GraphNode::Definition(roots.id))
     );
     let opaque_lifetimes = first
@@ -1904,7 +1904,6 @@ fn assert_roots_and_nodes(graph: &DependencyGraph) {
     let mut roots = graph
         .roots
         .iter()
-        .filter(|root| !root.reason.is_semantic())
         .map(|root| {
             let GraphNode::Mono(node) = root.node else {
                 panic!("compiler-required roots must be monomorphic")
@@ -1922,6 +1921,7 @@ fn assert_roots_and_nodes(graph: &DependencyGraph) {
     assert_eq!(
         roots,
         vec![
+            (RootReason::Main, "main".to_owned()),
             (RootReason::StartInstance, "std::rt::lang_start".to_owned()),
             (RootReason::UsedAttribute, "KEEP".to_owned()),
         ]
