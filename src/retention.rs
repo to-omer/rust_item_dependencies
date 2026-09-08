@@ -64,9 +64,12 @@ use macro_products::{
 };
 
 pub(crate) use external::{
-    ExternalCompilerExpectation, ExternalCompilerObservation, external_compiler_expectation,
-    external_compiler_observation, external_compiler_outcome_difference,
+    ExternalCompilerExpectation, external_compiler_expectation, external_compiler_observation,
+    external_compiler_outcome_difference,
 };
+
+#[cfg(test)]
+pub(crate) use external::ExternalCompilerObservation;
 
 #[cfg(test)]
 use external::{
@@ -77,10 +80,6 @@ use external::{
     ExternalMetadataRequirementKind, LocalMetadataRequirement,
 };
 
-#[cfg(test)]
-pub(crate) fn with_one_omitted_external_compiler_metadata_fact<T>(f: impl FnOnce() -> T) -> T {
-    external::with_one_omitted_external_compiler_metadata_fact(f)
-}
 use external::{
     CompilerCrateLoadCarrier, CompilerCrateLoadDisjunction, ExternalCrateFacts,
     collect_external_crate_facts, validate_external_crate_facts,
@@ -2582,62 +2581,8 @@ fn resolve_definition_unit(
 }
 
 fn validate_source(source: &SourceInventory) -> Result<(), RetentionError> {
-    let source_len =
-        u32::try_from(source.original.len()).map_err(|_| RetentionError::InvalidSource)?;
-    let roots = source
-        .units
-        .iter()
-        .filter(|unit| unit.parent.is_none())
-        .collect::<Vec<_>>();
-    if roots.len() != 1
-        || roots[0].kind != WrittenUnitKind::CrateRoot
-        || roots[0].full_range.start != 0
-        || roots[0].full_range.end != source_len
-    {
-        return Err(RetentionError::InvalidSource);
-    }
-    for (index, unit) in source.units.iter().enumerate() {
-        if unit.id.0 as usize != index
-            || unit.full_range.start > unit.full_range.end
-            || unit.full_range.end > source_len
-            || !source
-                .original
-                .is_char_boundary(unit.full_range.start as usize)
-            || !source
-                .original
-                .is_char_boundary(unit.full_range.end as usize)
-        {
-            return Err(RetentionError::InvalidSource);
-        }
-        if let Some(parent) = unit.parent {
-            let parent = source
-                .units
-                .get(parent.0 as usize)
-                .ok_or(RetentionError::InvalidSource)?;
-            if parent.id == unit.id
-                || !parent.full_range.contains(unit.full_range)
-                || parent.cfg_state == CfgState::Inactive && unit.cfg_state == CfgState::Active
-                || unit.kind == WrittenUnitKind::InactiveCfgComponent
-                    && (unit.cfg_state != CfgState::Inactive
-                        || parent.cfg_state != CfgState::Active)
-            {
-                return Err(RetentionError::InvalidSource);
-            }
-        }
-        let mut cursor = unit.parent;
-        let mut steps = 0;
-        while let Some(parent) = cursor {
-            cursor = source
-                .units
-                .get(parent.0 as usize)
-                .ok_or(RetentionError::InvalidSource)?
-                .parent;
-            steps += 1;
-            if steps > source.units.len() {
-                return Err(RetentionError::InvalidSource);
-            }
-        }
-    }
+    crate::source::validate_units(&source.original, &source.units)
+        .map_err(|_| RetentionError::InvalidSource)?;
     validate_declarative_macro_source_facts(
         &source.original,
         &source.units,

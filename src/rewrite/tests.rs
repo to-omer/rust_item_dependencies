@@ -1956,6 +1956,32 @@ fn range_mapping_preserves_utf8_boundaries() {
     );
 }
 
+#[test]
+fn splice_rejects_deletions_that_cannot_form_an_ordered_utf8_map() {
+    for deletions in [
+        vec![range(2, 1)],
+        vec![range(2, 2)],
+        vec![range(0, 1)],
+        vec![range(2, 6)],
+        vec![range(2, 4), range(3, 5)],
+        vec![range(4, 5), range(2, 3)],
+    ] {
+        assert_eq!(
+            splice("éabc", &deletions),
+            Err(SourceRewriteError::InvalidInventory),
+            "{deletions:?}"
+        );
+    }
+    let empty = splice("éabc", &[range(0, 5)]).unwrap();
+    assert_eq!(empty.source(), "");
+    assert_eq!(empty.original_range(range(0, 0)), Ok(range(0, 0)));
+    assert_eq!(empty.original_crate_range(range(0, 0)), Ok(range(0, 5)));
+    assert_eq!(
+        empty.original_range(range(0, 1)),
+        Err(SourceRewriteError::InvalidInventory)
+    );
+}
+
 fn range(start: u32, end: u32) -> ByteRange {
     ByteRange { start, end }
 }

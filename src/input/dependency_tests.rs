@@ -1,12 +1,9 @@
+use crate::api::{ReductionPlan, inspect_source_with_reduction};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::{
-    Edition, SourceInput, inspect_source_with_dependencies,
-    inspect_source_with_dependencies_at_original_coordinates, inspect_source_with_reduction,
-    normalize_expansion_ranges,
-};
+use super::{Edition, SourceInput, inspect_source_with_dependencies, normalize_expansion_ranges};
 use crate::compiler_terms::CanonicalCompilerTerm;
 use crate::dependency_graph::{
     AllocationDescriptor, AllocationPathSite, AllocationRootKey, DefinitionReferenceKey,
@@ -269,7 +266,7 @@ fn external_symbols_are_compiler_roots_with_their_dependencies() {
     assert!(roots.iter().any(|root| root.ends_with("::method")));
     assert!(roots.iter().any(|root| root == "generated"));
 
-    assert_eq!(reduction.rewrite.source, EXTERNAL_SYMBOL_ROOTS_EXPECTED);
+    assert_eq!(reduction.rewrite.source(), EXTERNAL_SYMBOL_ROOTS_EXPECTED);
 }
 
 #[test]
@@ -289,7 +286,7 @@ fn overlapping_compiler_root_reasons_do_not_duplicate_main_or_used_statics() {
     )
     .expect("overlapping compiler roots must be reducible");
 
-    assert_eq!(reduction.rewrite.source, source);
+    assert_eq!(reduction.rewrite.source(), source);
     let mut reasons = reduction
         .graph
         .roots
@@ -320,9 +317,9 @@ fn rewritten_collection_uses_original_coordinates_for_compiler_identity() {
         &sysroot,
     )
     .expect("the original source must reduce");
-    assert!(!original.rewrite.source.contains("unused_prefix"));
+    assert!(!original.rewrite.source().contains("unused_prefix"));
 
-    let reduced_marker = marker_range_nth(&original.rewrite.source, "identity(VALUE)", 0);
+    let reduced_marker = marker_range_nth(original.rewrite.source(), "identity(VALUE)", 0);
     let original_marker = marker_range_nth(REWRITTEN_COORDINATES, "identity(VALUE)", 0);
     let kind = crate::dependency_graph::ExpansionKind::Macro {
         style: crate::dependency_graph::MacroStyle::Bang,
@@ -360,12 +357,8 @@ fn rewritten_collection_uses_original_coordinates_for_compiler_identity() {
     assert_eq!(probe[0].key.0[0].invocation_range, Some(original_marker));
     assert_eq!(probe[0].key.0[0].node_range, Some(original_marker));
 
-    let reduced = inspect_source_with_dependencies_at_original_coordinates(
-        &SourceInput::binary(original.rewrite.source.clone(), Edition::Rust2024, target),
-        &sysroot,
-        &original.rewrite,
-    )
-    .expect("the rewritten source must be observed once in original coordinates");
+    let reduced = inspect_rewritten(&original, target, &sysroot)
+        .expect("the rewritten source must be observed once in original coordinates");
 
     let (original_main_instance, original_main_definition) = main_nodes(&original.graph);
     let (reduced_main_instance, reduced_main_definition) = main_nodes(&reduced.graph);
@@ -411,12 +404,8 @@ fn rewritten_macro_rule_requirements_keep_their_collected_source_ids() {
     )
     .expect("the original macro source must reduce");
 
-    let reduced = inspect_source_with_dependencies_at_original_coordinates(
-        &SourceInput::binary(original.rewrite.source.clone(), Edition::Rust2024, target),
-        &sysroot,
-        &original.rewrite,
-    )
-    .expect("the reduced macro source must map compiler identities to original coordinates");
+    let reduced = inspect_rewritten(&original, target, &sysroot)
+        .expect("the reduced macro source must map compiler identities to original coordinates");
 
     assert!(
         reduced
@@ -449,14 +438,10 @@ fn a_remaining_full_range_item_is_not_mistaken_for_the_crate_root() {
         &sysroot,
     )
     .expect("the original source must reduce");
-    assert_eq!(original.rewrite.source, "fn main() {}");
+    assert_eq!(original.rewrite.source(), "fn main() {}");
 
-    let reduced = inspect_source_with_dependencies_at_original_coordinates(
-        &SourceInput::binary(original.rewrite.source.clone(), Edition::Rust2024, target),
-        &sysroot,
-        &original.rewrite,
-    )
-    .expect("the remaining full-range item must map independently of the crate root");
+    let reduced = inspect_rewritten(&original, target, &sysroot)
+        .expect("the remaining full-range item must map independently of the crate root");
     let (_, original_main_definition) = main_nodes(&original.graph);
     let (_, reduced_main_definition) = main_nodes(&reduced.graph);
     let original_main =
@@ -3479,4 +3464,26 @@ fn rustc_output(rustc: &str, arguments: &[&str]) -> String {
         .expect("rustc query must start");
     assert!(output.status.success(), "rustc query failed");
     String::from_utf8(output.stdout).expect("rustc output must be UTF-8")
+}
+
+fn inspect_rewritten(
+    original: &ReductionPlan,
+    target: String,
+    sysroot: &std::path::Path,
+) -> Result<super::InspectedDependencies, super::InputError> {
+    let input = SourceInput::binary(
+        original.rewrite.source().to_owned(),
+        Edition::Rust2024,
+        target,
+    );
+    let compilation = super::PreparedCompilationOptions::empty();
+    let context =
+        super::CompilationContext::new(&input, &compilation, sysroot)?.for_reduced_source();
+    super::inspect_dependencies(
+        super::InspectionSource::Rewritten {
+            rewrite: &original.rewrite,
+            identity: &original.definition_identity_universe,
+        },
+        &context,
+    )
 }

@@ -19,12 +19,24 @@ use crate::source::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceRewrite {
-    pub source: String,
-    pub pieces: Vec<SourcePiece>,
+    source: String,
+    pieces: Vec<SourcePiece>,
     original_len: u32,
 }
 
 impl SourceRewrite {
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn into_source(self) -> String {
+        self.source
+    }
+
+    pub(crate) fn pieces(&self) -> &[SourcePiece] {
+        &self.pieces
+    }
+
     pub(crate) fn original_range(&self, range: ByteRange) -> Result<ByteRange, SourceRewriteError> {
         let source_len =
             u32::try_from(self.source.len()).map_err(|_| SourceRewriteError::InvalidInventory)?;
@@ -32,7 +44,6 @@ impl SourceRewrite {
             || range.end > source_len
             || !self.source.is_char_boundary(range.start as usize)
             || !self.source.is_char_boundary(range.end as usize)
-            || !self.valid_piece_map(source_len)
         {
             return Err(SourceRewriteError::InvalidInventory);
         }
@@ -54,7 +65,6 @@ impl SourceRewrite {
                 start: 0,
                 end: source_len,
             })
-            || !self.valid_piece_map(source_len)
         {
             return Err(SourceRewriteError::InvalidInventory);
         }
@@ -181,58 +191,8 @@ fn validate_inventory(inventory: &SourceInventory) -> Result<BTreeSet<u32>, Sour
     let source = inventory.original.as_ref();
     let source_len =
         u32::try_from(source.len()).map_err(|_| SourceRewriteError::InvalidInventory)?;
-    let roots = inventory
-        .units
-        .iter()
-        .filter(|unit| unit.parent.is_none())
-        .collect::<Vec<_>>();
-    if roots.len() != 1
-        || roots[0].kind != WrittenUnitKind::CrateRoot
-        || roots[0].full_range
-            != (ByteRange {
-                start: 0,
-                end: source_len,
-            })
-    {
-        return Err(SourceRewriteError::InvalidInventory);
-    }
-
-    for (index, unit) in inventory.units.iter().enumerate() {
-        if unit.id != SourceUnitId(index as u32)
-            || !valid_range(source, unit.full_range)
-            || unit
-                .parent
-                .is_some_and(|parent| parent.0 as usize >= inventory.units.len())
-        {
-            return Err(SourceRewriteError::InvalidInventory);
-        }
-        if let Some(parent) = unit.parent
-            && (parent == unit.id
-                || !inventory.units[parent.0 as usize]
-                    .full_range
-                    .contains(unit.full_range))
-        {
-            return Err(SourceRewriteError::InvalidInventory);
-        }
-        if unit.kind == WrittenUnitKind::InactiveCfgComponent
-            && (unit.cfg_state != crate::source::CfgState::Inactive
-                || unit.parent.is_none_or(|parent| {
-                    inventory.units[parent.0 as usize].cfg_state != crate::source::CfgState::Active
-                }))
-        {
-            return Err(SourceRewriteError::InvalidInventory);
-        }
-
-        let mut cursor = unit.parent;
-        let mut depth = 0_usize;
-        while let Some(parent) = cursor {
-            depth += 1;
-            if depth > inventory.units.len() {
-                return Err(SourceRewriteError::InvalidInventory);
-            }
-            cursor = inventory.units[parent.0 as usize].parent;
-        }
-    }
+    crate::source::validate_inventory(&inventory.original, &inventory.units, &inventory.pieces)
+        .map_err(|_| SourceRewriteError::InvalidInventory)?;
 
     for leaf in inventory
         .units
@@ -249,28 +209,14 @@ fn validate_inventory(inventory: &SourceInventory) -> Result<BTreeSet<u32>, Sour
         }
     }
     let mut piece_boundaries = BTreeSet::from([0, source_len]);
-    let mut cursor = 0_u32;
     for piece in &inventory.pieces {
-        if piece.range.start != cursor
-            || piece.range.start == piece.range.end
-            || !valid_range(source, piece.range)
-            || inventory
-                .units
-                .get(piece.owner.0 as usize)
-                .is_none_or(|owner| !owner.full_range.contains(piece.range))
-        {
-            return Err(SourceRewriteError::InvalidInventory);
-        }
         piece_boundaries.insert(piece.range.start);
         piece_boundaries.insert(piece.range.end);
-        cursor = piece.range.end;
     }
-    if cursor != source_len
-        || inventory.units.iter().any(|unit| {
-            !piece_boundaries.contains(&unit.full_range.start)
-                || !piece_boundaries.contains(&unit.full_range.end)
-        })
-    {
+    if inventory.units.iter().any(|unit| {
+        !piece_boundaries.contains(&unit.full_range.start)
+            || !piece_boundaries.contains(&unit.full_range.end)
+    }) {
         return Err(SourceRewriteError::InvalidInventory);
     }
     validate_derive_target_facts(&inventory.units, &inventory.derive_targets)
@@ -716,6 +662,13 @@ fn validate_deletion_range(
 fn splice(source: &str, deletions: &[ByteRange]) -> Result<SourceRewrite, SourceRewriteError> {
     let source_len =
         u32::try_from(source.len()).map_err(|_| SourceRewriteError::InvalidInventory)?;
+    let mut previous_end = 0;
+    for deletion in deletions {
+        if deletion.start < previous_end || deletion.is_empty() || !valid_range(source, *deletion) {
+            return Err(SourceRewriteError::InvalidInventory);
+        }
+        previous_end = deletion.end;
+    }
     let removed = deletions
         .iter()
         .map(|range| range.len() as usize)
@@ -728,11 +681,15 @@ fn splice(source: &str, deletions: &[ByteRange]) -> Result<SourceRewrite, Source
         cursor = deletion.end;
     }
     append_piece(source, &mut output, &mut pieces, cursor, source_len)?;
-    Ok(SourceRewrite {
+    let rewrite = SourceRewrite {
         source: output,
         pieces,
         original_len: source_len,
-    })
+    };
+    if !rewrite.valid_piece_map(rewrite.source.len() as u32) {
+        return Err(SourceRewriteError::InvalidInventory);
+    }
+    Ok(rewrite)
 }
 
 fn append_piece(

@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::cell::Cell;
 #[cfg(rust_item_dependencies_patched)]
 use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet};
@@ -126,42 +124,16 @@ pub(crate) struct ExternalCompilerObservation {
 }
 
 #[cfg(test)]
-thread_local! {
-    static OMIT_EXTERNAL_METADATA_AFTER_OBSERVATIONS: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn with_one_omitted_external_compiler_metadata_fact<T>(f: impl FnOnce() -> T) -> T {
-    OMIT_EXTERNAL_METADATA_AFTER_OBSERVATIONS.with(|remaining| {
-        assert!(
-            remaining.get().is_none(),
-            "metadata omission must not be nested"
-        );
-        remaining.set(Some(2));
-    });
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            OMIT_EXTERNAL_METADATA_AFTER_OBSERVATIONS.with(|remaining| remaining.set(None));
-        }
+impl ExternalCompilerObservation {
+    pub(crate) fn omit_one_metadata_fact(&mut self) {
+        let fact = self
+            .metadata
+            .iter()
+            .next()
+            .copied()
+            .expect("the mutation fixture must observe external compiler metadata");
+        self.metadata.remove(&fact);
     }
-    let _reset = Reset;
-    f()
-}
-
-#[cfg(test)]
-fn omit_external_compiler_metadata_fact() -> bool {
-    OMIT_EXTERNAL_METADATA_AFTER_OBSERVATIONS.with(|remaining| match remaining.get() {
-        Some(1) => {
-            remaining.set(None);
-            true
-        }
-        Some(count) => {
-            remaining.set(Some(count - 1));
-            false
-        }
-        None => false,
-    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -656,19 +628,6 @@ pub(crate) fn external_compiler_observation(
 ) -> Result<ExternalCompilerObservation, RetentionError> {
     let loaded = external_loaded_crates(&constraints.external_crates)?;
     let metadata = external_compiler_metadata(&constraints.external_crates, &loaded)?;
-    #[cfg(test)]
-    let metadata = {
-        let mut metadata = metadata;
-        if omit_external_compiler_metadata_fact() {
-            let fact = metadata
-                .iter()
-                .next()
-                .copied()
-                .expect("the mutation fixture must observe external compiler metadata");
-            metadata.remove(&fact);
-        }
-        metadata
-    };
     Ok(ExternalCompilerObservation {
         metadata,
         loaded_crates: loaded

@@ -6,9 +6,11 @@ use std::process::Command;
 #[cfg(rust_item_dependencies_patched)]
 use std::process::Stdio;
 
+#[cfg(rust_item_dependencies_patched)]
+use super::inspect_source_with_definitions;
 use super::{Edition, SourceInput, inspect_source};
 #[cfg(rust_item_dependencies_patched)]
-use super::{inspect_source_with_definitions, inspect_source_with_reduction};
+use crate::api::inspect_source_with_reduction;
 #[cfg(rust_item_dependencies_patched)]
 use crate::dependency_graph::{DependencyGraph, GraphNode};
 #[cfg(rust_item_dependencies_patched)]
@@ -346,7 +348,7 @@ fn use_leaf_matrix_rewrites_exact_original_bytes() {
         let second =
             rewrite_source(&inventory, &retained).expect("use rewrite must be deterministic");
         assert_eq!(first, second);
-        assert_eq!(first.source.as_bytes(), expected);
+        assert_eq!(first.source().as_bytes(), expected);
         assert_piece_map(&inventory, &first);
     }
 }
@@ -365,17 +367,17 @@ fn compiler_retention_rewrites_the_handwritten_fixtures_exactly() {
         (MEMBER_INPUT, MEMBER_EXPECTED, MEMBER_RETAINED),
     ] {
         let reduced = inspect_reduction(input);
-        assert_eq!(reduced.rewrite.source, expected);
+        assert_eq!(reduced.rewrite.source(), expected);
         assert_piece_map(&reduced.source, &reduced.rewrite);
         assert_retained_units(&reduced, expected_units);
     }
     for (input, expected) in [(USE_RESOLUTION_INPUT, USE_RESOLUTION_EXPECTED)] {
         let reduced = inspect_reduction(input);
-        assert_eq!(reduced.rewrite.source, expected);
+        assert_eq!(reduced.rewrite.source(), expected);
         assert_piece_map(&reduced.source, &reduced.rewrite);
     }
     let sysroot = inspect_reduction(SYSROOT_MACRO_INPUT);
-    assert_eq!(sysroot.rewrite.source, SYSROOT_MACRO_EXPECTED);
+    assert_eq!(sysroot.rewrite.source(), SYSROOT_MACRO_EXPECTED);
     assert_piece_map(&sysroot.source, &sysroot.rewrite);
     assert_retained_units(&sysroot, SYSROOT_MACRO_RETAINED);
 }
@@ -400,11 +402,11 @@ fn empty_use_item_is_a_valid_deletion_unit() {
         retained_units_of_kind(&first, WrittenUnitKind::Item),
         BTreeSet::from(["fn main(){}".to_owned()]),
     );
-    assert_eq!(first.rewrite.source, "fn main(){}");
+    assert_eq!(first.rewrite.source(), "fn main(){}");
     assert_piece_map(&first.source, &first.rewrite);
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
 }
 
 #[test]
@@ -412,19 +414,19 @@ fn empty_use_item_is_a_valid_deletion_unit() {
 fn selected_empty_trait_impl_shell_survives_unused_inherent_impl() {
     let reduced = inspect_reduction(IMPL_SHELL_INPUT);
 
-    assert_eq!(reduced.rewrite.source, IMPL_SHELL_EXPECTED);
+    assert_eq!(reduced.rewrite.source(), IMPL_SHELL_EXPECTED);
     assert_piece_map(&reduced.source, &reduced.rewrite);
-    assert!(!reduced.rewrite.source.contains("impl Used"));
-    assert!(reduced.rewrite.source.contains("unsafe trait Marker {}"));
+    assert!(!reduced.rewrite.source().contains("impl Used"));
+    assert!(reduced.rewrite.source().contains("unsafe trait Marker {}"));
     assert!(
         reduced
             .rewrite
-            .source
+            .source()
             .contains("unsafe impl Marker for Used {}")
     );
 
-    let reparsed = inspect_inventory(&reduced.rewrite.source);
-    assert_eq!(reparsed.original.as_ref(), reduced.rewrite.source.as_str());
+    let reparsed = inspect_inventory(reduced.rewrite.source());
+    assert_eq!(reparsed.original.as_ref(), reduced.rewrite.source());
 }
 
 #[test]
@@ -432,7 +434,7 @@ fn selected_empty_trait_impl_shell_survives_unused_inherent_impl() {
 fn must_implement_one_of_accepts_a_macro_generated_impl_member() {
     let reduced = inspect_reduction(MACRO_IMPL_MEMBER_INPUT);
 
-    assert_eq!(reduced.rewrite.source, MACRO_IMPL_MEMBER_EXPECTED);
+    assert_eq!(reduced.rewrite.source(), MACRO_IMPL_MEMBER_EXPECTED);
     assert_piece_map(&reduced.source, &reduced.rewrite);
     assert_eq!(
         source_units_of_kind(&reduced.source, WrittenUnitKind::MacroInvocation),
@@ -442,11 +444,11 @@ fn must_implement_one_of_accepts_a_macro_generated_impl_member() {
         retained_units_of_kind(&reduced, WrittenUnitKind::MacroInvocation),
         BTreeSet::from(["implement_read!();".to_owned()]),
     );
-    assert!(reduced.rewrite.source.contains("impl std::io::Read"));
-    assert!(!reduced.rewrite.source.contains("fn dead()"));
+    assert!(reduced.rewrite.source().contains("impl std::io::Read"));
+    assert!(!reduced.rewrite.source().contains("fn dead()"));
 
-    let second = inspect_reduction(&reduced.rewrite.source);
-    assert_eq!(second.rewrite.source, reduced.rewrite.source);
+    let second = inspect_reduction(reduced.rewrite.source());
+    assert_eq!(second.rewrite.source(), reduced.rewrite.source());
 }
 
 #[test]
@@ -454,8 +456,8 @@ fn must_implement_one_of_accepts_a_macro_generated_impl_member() {
 fn macro_fixed_points_are_byte_idempotent() {
     for input in [MACRO_INPUT, DIRECT_MACRO_INPUT, SYSROOT_MACRO_INPUT] {
         let first = inspect_reduction(input);
-        let second = inspect_reduction(&first.rewrite.source);
-        assert_eq!(second.rewrite.source, first.rewrite.source);
+        let second = inspect_reduction(first.rewrite.source());
+        assert_eq!(second.rewrite.source(), first.rewrite.source());
         assert_piece_map(&second.source, &second.rewrite);
     }
 }
@@ -490,12 +492,12 @@ fn inactive_cfg_component_ranges_preserve_crlf_unicode_and_neighboring_comments(
     assert_eq!(input.len(), 238);
     assert_eq!(expected.len(), 135);
     let first = inspect_reduction(input);
-    assert_eq!(first.rewrite.source, expected);
+    assert_eq!(first.rewrite.source(), expected);
     assert_piece_map(&first.source, &first.rewrite);
-    assert_compiles(&first.rewrite.source);
+    assert_compiles(first.rewrite.source());
 
-    let fixed = inspect_reduction(&first.rewrite.source);
-    assert_eq!(fixed.rewrite.source, first.rewrite.source);
+    let fixed = inspect_reduction(first.rewrite.source());
+    assert_eq!(fixed.rewrite.source(), first.rewrite.source());
     assert_piece_map(&fixed.source, &fixed.rewrite);
 }
 
@@ -504,14 +506,14 @@ fn inactive_cfg_component_ranges_preserve_crlf_unicode_and_neighboring_comments(
 fn generated_sibling_method_keeps_the_required_impl_shell() {
     let first = inspect_reduction(GENERATED_SIBLING_IMPL_INPUT);
 
-    assert_eq!(first.rewrite.source, GENERATED_SIBLING_IMPL_EXPECTED);
+    assert_eq!(first.rewrite.source(), GENERATED_SIBLING_IMPL_EXPECTED);
     assert_retained_units(&first, GENERATED_SIBLING_IMPL_RETAINED);
     assert_piece_map(&first.source, &first.rewrite);
-    assert!(first.rewrite.source.contains("fn sibling()"));
-    assert!(!first.rewrite.source.contains("fn dead()"));
+    assert!(first.rewrite.source().contains("fn sibling()"));
+    assert!(!first.rewrite.source().contains("fn dead()"));
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
 }
 
 #[test]
@@ -535,13 +537,13 @@ fn generated_sibling_keeps_default_blanket_and_nested_local_impls() {
         ),
     ] {
         let first = inspect_reduction(source);
-        assert_eq!(first.rewrite.source, expected, "{case}");
+        assert_eq!(first.rewrite.source(), expected, "{case}");
         assert_piece_map(&first.source, &first.rewrite);
-        assert!(first.rewrite.source.contains("fn sibling()"), "{case}");
-        assert!(!first.rewrite.source.contains("fn dead()"), "{case}");
+        assert!(first.rewrite.source().contains("fn sibling()"), "{case}");
+        assert!(!first.rewrite.source().contains("fn dead()"), "{case}");
 
-        let second = inspect_reduction(&first.rewrite.source);
-        assert_eq!(second.rewrite.source, first.rewrite.source, "{case}");
+        let second = inspect_reduction(first.rewrite.source());
+        assert_eq!(second.rewrite.source(), first.rewrite.source(), "{case}");
     }
 }
 
@@ -587,16 +589,16 @@ fn generated_sibling_autoderef_keeps_the_nested_bound_impl() {
     let first = inspect_reduction(GENERATED_SIBLING_NESTED_AUTODEREF_INPUT);
 
     assert_eq!(
-        first.rewrite.source,
+        first.rewrite.source(),
         GENERATED_SIBLING_NESTED_AUTODEREF_EXPECTED
     );
     assert_piece_map(&first.source, &first.rewrite);
-    assert!(!first.rewrite.source.contains("struct Dead"));
-    assert!(first.rewrite.source.contains("fn sibling("));
-    assert!(!first.rewrite.source.contains("fn dead()"));
+    assert!(!first.rewrite.source().contains("struct Dead"));
+    assert!(first.rewrite.source().contains("fn sibling("));
+    assert!(!first.rewrite.source().contains("fn dead()"));
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
 }
 
 #[test]
@@ -604,22 +606,22 @@ fn generated_sibling_autoderef_keeps_the_nested_bound_impl() {
 fn generic_user_defined_and_param_selections_retain_different_impls() {
     let blanket = inspect_reduction(GENERATED_SIBLING_GENERIC_BLANKET_INPUT);
     assert_eq!(
-        blanket.rewrite.source,
+        blanket.rewrite.source(),
         GENERATED_SIBLING_GENERIC_BLANKET_EXPECTED
     );
     assert_piece_map(&blanket.source, &blanket.rewrite);
-    assert!(blanket.rewrite.source.contains("fn sibling<"));
-    assert!(!blanket.rewrite.source.contains("fn dead()"));
-    let blanket_again = inspect_reduction(&blanket.rewrite.source);
-    assert_eq!(blanket_again.rewrite.source, blanket.rewrite.source);
+    assert!(blanket.rewrite.source().contains("fn sibling<"));
+    assert!(!blanket.rewrite.source().contains("fn dead()"));
+    let blanket_again = inspect_reduction(blanket.rewrite.source());
+    assert_eq!(blanket_again.rewrite.source(), blanket.rewrite.source());
 
     let parameter = inspect_reduction(GENERATED_SIBLING_PARAM_INPUT);
-    assert_eq!(parameter.rewrite.source, GENERATED_SIBLING_PARAM_EXPECTED);
+    assert_eq!(parameter.rewrite.source(), GENERATED_SIBLING_PARAM_EXPECTED);
     assert_piece_map(&parameter.source, &parameter.rewrite);
-    assert!(parameter.rewrite.source.contains("fn sibling<"));
-    assert!(!parameter.rewrite.source.contains("fn dead()"));
-    let parameter_again = inspect_reduction(&parameter.rewrite.source);
-    assert_eq!(parameter_again.rewrite.source, parameter.rewrite.source);
+    assert!(parameter.rewrite.source().contains("fn sibling<"));
+    assert!(!parameter.rewrite.source().contains("fn dead()"));
+    let parameter_again = inspect_reduction(parameter.rewrite.source());
+    assert_eq!(parameter_again.rewrite.source(), parameter.rewrite.source());
 }
 
 #[test]
@@ -628,16 +630,16 @@ fn generated_sibling_signature_well_formedness_keeps_the_selected_impl() {
     let first = inspect_reduction(GENERATED_SIBLING_SIGNATURE_WF_INPUT);
 
     assert_eq!(
-        first.rewrite.source,
+        first.rewrite.source(),
         GENERATED_SIBLING_SIGNATURE_WF_EXPECTED
     );
     assert_piece_map(&first.source, &first.rewrite);
-    assert!(!first.rewrite.source.contains("struct Dead"));
-    assert!(first.rewrite.source.contains("fn sibling("));
-    assert!(!first.rewrite.source.contains("fn dead()"));
+    assert!(!first.rewrite.source().contains("struct Dead"));
+    assert!(first.rewrite.source().contains("fn sibling("));
+    assert!(!first.rewrite.source().contains("fn dead()"));
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
 }
 
 #[test]
@@ -646,17 +648,17 @@ fn generated_sibling_signature_well_formedness_covers_defaults_and_supertraits()
     let first = inspect_reduction(GENERATED_SIBLING_SIGNATURE_WF_FORMS_INPUT);
 
     assert_eq!(
-        first.rewrite.source,
+        first.rewrite.source(),
         GENERATED_SIBLING_SIGNATURE_WF_FORMS_EXPECTED
     );
     assert_piece_map(&first.source, &first.rewrite);
-    assert!(first.rewrite.source.contains("impl B for S"));
-    assert!(!first.rewrite.source.contains("struct Dead"));
-    assert!(first.rewrite.source.contains("fn sibling("));
-    assert!(!first.rewrite.source.contains("fn dead()"));
+    assert!(first.rewrite.source().contains("impl B for S"));
+    assert!(!first.rewrite.source().contains("struct Dead"));
+    assert!(first.rewrite.source().contains("fn sibling("));
+    assert!(!first.rewrite.source().contains("fn dead()"));
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
 }
 
 #[test]
@@ -665,7 +667,7 @@ fn generated_sibling_external_default_override_retains_only_the_selected_member(
     let first = inspect_reduction(GENERATED_SIBLING_EXTERNAL_DEFAULT_OVERRIDE_INPUT);
 
     assert_eq!(
-        first.rewrite.source,
+        first.rewrite.source(),
         GENERATED_SIBLING_EXTERNAL_DEFAULT_OVERRIDE_EXPECTED
     );
     assert_piece_map(&first.source, &first.rewrite);
@@ -688,11 +690,11 @@ fn generated_sibling_external_default_override_retains_only_the_selected_member(
         })
         .expect("the external trait impl must have one handwritten shell");
     assert!(first.retention.retained_units.contains(&impl_shell.id));
-    assert!(first.rewrite.source.contains("fn sibling()"));
-    assert!(!first.rewrite.source.contains("fn dead()"));
+    assert!(first.rewrite.source().contains("fn sibling()"));
+    assert!(!first.rewrite.source().contains("fn dead()"));
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
 }
 
 #[test]
@@ -700,14 +702,17 @@ fn generated_sibling_external_default_override_retains_only_the_selected_member(
 fn generated_sibling_copy_keeps_nested_manual_copy_coherence() {
     let first = inspect_reduction(GENERATED_SIBLING_NESTED_COPY_INPUT);
 
-    assert_eq!(first.rewrite.source, GENERATED_SIBLING_NESTED_COPY_EXPECTED);
+    assert_eq!(
+        first.rewrite.source(),
+        GENERATED_SIBLING_NESTED_COPY_EXPECTED
+    );
     assert_piece_map(&first.source, &first.rewrite);
     assert_retained_units(&first, GENERATED_SIBLING_NESTED_COPY_RETAINED);
-    assert!(first.rewrite.source.contains("fn sibling()"));
-    assert!(!first.rewrite.source.contains("fn dead()"));
+    assert!(first.rewrite.source().contains("fn sibling()"));
+    assert!(!first.rewrite.source().contains("fn dead()"));
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
     assert_piece_map(&second.source, &second.rewrite);
 }
 
@@ -716,12 +721,12 @@ fn generated_sibling_copy_keeps_nested_manual_copy_coherence() {
 fn ordinary_copy_decision_keeps_manual_copy_implementation() {
     let first = inspect_reduction(ORDINARY_COPY_MOVE_INPUT);
 
-    assert_eq!(first.rewrite.source, ORDINARY_COPY_MOVE_EXPECTED);
+    assert_eq!(first.rewrite.source(), ORDINARY_COPY_MOVE_EXPECTED);
     assert_piece_map(&first.source, &first.rewrite);
     assert_retained_units(&first, ORDINARY_COPY_MOVE_RETAINED);
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
     assert_piece_map(&second.source, &second.rewrite);
 }
 
@@ -730,19 +735,19 @@ fn ordinary_copy_decision_keeps_manual_copy_implementation() {
 fn generated_sibling_adt_keeps_its_exact_drop_implementation() {
     let first = inspect_reduction(GENERATED_SIBLING_DROP_INPUT);
 
-    assert_eq!(first.rewrite.source, GENERATED_SIBLING_DROP_EXPECTED);
+    assert_eq!(first.rewrite.source(), GENERATED_SIBLING_DROP_EXPECTED);
     assert_piece_map(&first.source, &first.rewrite);
     assert_eq!(
         retained_units_of_kind(&first, WrittenUnitKind::ImplMember),
         BTreeSet::from(["fn drop(&mut self){}".to_owned()])
     );
-    assert!(!first.rewrite.source.contains("struct Dead"));
-    assert!(first.rewrite.source.contains("fn sibling("));
-    assert!(!first.rewrite.source.contains("fn dead()"));
-    assert_compiles(&first.rewrite.source);
+    assert!(!first.rewrite.source().contains("struct Dead"));
+    assert!(first.rewrite.source().contains("fn sibling("));
+    assert!(!first.rewrite.source().contains("fn dead()"));
+    assert_compiles(first.rewrite.source());
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
     assert_piece_map(&second.source, &second.rewrite);
 }
 
@@ -752,7 +757,7 @@ fn dead_top_level_macro_does_not_follow_crate_expansion_use() {
     let reduced = inspect_reduction(DIRECT_MACRO_INPUT);
     let expected_expansions = BTreeSet::from([ByteRange { start: 43, end: 60 }]);
 
-    assert_eq!(reduced.rewrite.source, DIRECT_MACRO_EXPECTED);
+    assert_eq!(reduced.rewrite.source(), DIRECT_MACRO_EXPECTED);
     assert_retained_units(&reduced, DIRECT_MACRO_RETAINED);
     assert_eq!(
         written_expansion_ranges(
@@ -770,9 +775,9 @@ fn dead_top_level_macro_does_not_follow_crate_expansion_use() {
         ),
         expected_expansions
     );
-    assert!(!reduced.rewrite.source.contains("macro_rules! dead"));
-    assert!(!reduced.rewrite.source.contains("dead!()"));
-    assert!(reduced.rewrite.source.contains("println!(\"kept\")"));
+    assert!(!reduced.rewrite.source().contains("macro_rules! dead"));
+    assert!(!reduced.rewrite.source().contains("dead!()"));
+    assert!(reduced.rewrite.source().contains("println!(\"kept\")"));
 }
 
 #[test]
@@ -857,7 +862,7 @@ fn semantic_and_compile_closures_use_exact_macro_products() {
 #[cfg(rust_item_dependencies_patched)]
 fn retained_use_leaves_keep_their_exact_resolution_targets() {
     let reduced = inspect_reduction(USE_RESOLUTION_INPUT);
-    assert_eq!(reduced.rewrite.source, USE_RESOLUTION_EXPECTED);
+    assert_eq!(reduced.rewrite.source(), USE_RESOLUTION_EXPECTED);
     let expected = BTreeSet::from([
         ("*".to_owned(), "catalog".to_owned()),
         ("Named as Renamed".to_owned(), "catalog::Named".to_owned()),
@@ -934,7 +939,7 @@ fn assert_inventory_units(inventory: &SourceInventory, expected: &[UnitRef]) {
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn assert_retained_units(reduction: &super::InspectedReduction, expected: &[UnitRef]) {
+fn assert_retained_units(reduction: &crate::api::ReductionPlan, expected: &[UnitRef]) {
     let actual = reduction
         .retention
         .retained_units
@@ -952,7 +957,7 @@ fn assert_retained_units(reduction: &super::InspectedReduction, expected: &[Unit
 
 #[cfg(rust_item_dependencies_patched)]
 fn retained_units_of_kind(
-    reduction: &super::InspectedReduction,
+    reduction: &crate::api::ReductionPlan,
     kind: WrittenUnitKind,
 ) -> BTreeSet<String> {
     reduction
@@ -1006,19 +1011,19 @@ fn retained_except_ranges(
 fn assert_piece_map(inventory: &SourceInventory, rewrite: &SourceRewrite) {
     let mut cursor = 0_u32;
     let mut previous_original_end = 0_u32;
-    for piece in &rewrite.pieces {
+    for piece in rewrite.pieces() {
         assert_eq!(piece.output_range.start, cursor);
         assert!(piece.original_range.start >= previous_original_end);
         assert_eq!(piece.output_range.len(), piece.original_range.len());
         assert_eq!(
-            &rewrite.source[piece.output_range.start as usize..piece.output_range.end as usize],
+            &rewrite.source()[piece.output_range.start as usize..piece.output_range.end as usize],
             &inventory.original
                 [piece.original_range.start as usize..piece.original_range.end as usize]
         );
         cursor = piece.output_range.end;
         previous_original_end = piece.original_range.end;
     }
-    assert_eq!(cursor as usize, rewrite.source.len());
+    assert_eq!(cursor as usize, rewrite.source().len());
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -1192,18 +1197,18 @@ fn inspect_definitions(source: &str) -> DefinitionGraph {
 #[cfg(rust_item_dependencies_patched)]
 fn assert_generated_sibling_reduction(source: &str, expected: &str) {
     let first = inspect_reduction(source);
-    assert_eq!(first.rewrite.source, expected);
+    assert_eq!(first.rewrite.source(), expected);
     assert_piece_map(&first.source, &first.rewrite);
-    assert!(first.rewrite.source.contains("fn sibling"));
-    assert!(!first.rewrite.source.contains("fn dead()"));
-    assert_compiles(&first.rewrite.source);
+    assert!(first.rewrite.source().contains("fn sibling"));
+    assert!(!first.rewrite.source().contains("fn dead()"));
+    assert_compiles(first.rewrite.source());
 
-    let second = inspect_reduction(&first.rewrite.source);
-    assert_eq!(second.rewrite.source, first.rewrite.source);
+    let second = inspect_reduction(first.rewrite.source());
+    assert_eq!(second.rewrite.source(), first.rewrite.source());
 }
 
 #[cfg(rust_item_dependencies_patched)]
-fn inspect_reduction(source: &str) -> super::InspectedReduction {
+fn inspect_reduction(source: &str) -> crate::api::ReductionPlan {
     let (sysroot, target) = compiler_context();
     inspect_source_with_reduction(
         &SourceInput::binary(source.to_owned(), Edition::Rust2024, target),

@@ -1,24 +1,32 @@
 //! Public source reduction API.
 
+#[cfg(all(test, rust_item_dependencies_patched))]
+use std::path::Path;
 use std::path::PathBuf;
+
 #[cfg(all(test, rust_item_dependencies_patched))]
 use std::process::Command;
 use std::sync::Arc;
 
 use crate::artifact::compiler_sysroot;
+use crate::definitions::DefinitionIdentityUniverse;
+use crate::dependency_graph::DependencyGraph;
 use crate::error::{
     AnalysisError, CompilerFailure, DecisionDifference, Diagnostic, DiagnosticBundle,
     DiagnosticLevel, ObservationGap, SnapshotDiff as PublicSnapshotDiff, SourceRewriteViolation,
 };
 use crate::input::{
-    CompilationContext, InputError, InspectedDependencies, InspectedReduction,
-    PreparedCompilationOptions,
-    inspect_source_with_dependencies_at_original_coordinates_and_identity_in_context,
-    inspect_source_with_reduction_in_context,
+    CompilationContext, InputError, InspectionSource, PreparedCompilationOptions,
+    inspect_dependencies,
 };
-use crate::retention::external_compiler_outcome_difference;
-use crate::rewrite::SourceRewriteError;
+use crate::retention::{
+    ExternalCompilerExpectation, Retention, SourceConstraints, compute_retention,
+    external_compiler_expectation, external_compiler_observation,
+    external_compiler_outcome_difference, outputless_macro_expansions_in_complete_source,
+};
+use crate::rewrite::{SourceRewrite, SourceRewriteError, rewrite_source};
 use crate::snapshot::{CompilerDecisionSnapshot, SnapshotDiff, SnapshotError};
+use crate::source::SourceInventory;
 
 pub use crate::input::{CompilationOptions, Edition, EntryPoint, OptimizationLevel, SourceInput};
 
@@ -60,7 +68,7 @@ pub(crate) fn reduce_in_context(
     source: &str,
     context: CompilationContext<'_>,
 ) -> Result<Reduction, AnalysisError> {
-    let inspected = inspect_source_with_reduction_in_context(source, &context)
+    let inspected = plan_reduction(source, &context)
         .map_err(|error| analysis_error(error, CompilationPhase::Original))?;
     let original_snapshot = CompilerDecisionSnapshot::original(
         &inspected.graph,
@@ -70,46 +78,24 @@ pub(crate) fn reduce_in_context(
     )
     .map_err(snapshot_error)?;
 
-    let reduced = inspect_reduced(&context.for_reduced_source(), &inspected)?;
-    let reduced_outputless = reduced
-        .complete_source_outputless_macro_expansions
-        .as_ref()
-        .ok_or_else(|| {
-            analysis_error(
-                InputError::CompilerProtocolFailure,
-                CompilationPhase::Reduced,
-            )
-        })?;
-    let reduced_snapshot = CompilerDecisionSnapshot::reduced_excluding_outputless_macros(
-        &reduced.graph,
-        reduced_outputless,
-    )
-    .map_err(snapshot_error)?;
-    if let Some(difference) = original_snapshot.first_difference(&reduced_snapshot) {
-        return Err(AnalysisError::DecisionMismatch(snapshot_difference(
-            difference,
-        )));
-    }
-    Ok(Reduction {
-        reduced_source: inspected.rewrite.source,
-    })
-}
-
-fn inspect_reduced(
-    context: &CompilationContext<'_>,
-    original: &InspectedReduction,
-) -> Result<InspectedDependencies, AnalysisError> {
-    let reduced = inspect_source_with_dependencies_at_original_coordinates_and_identity_in_context(
-        &original.rewrite.source,
-        context,
-        &original.rewrite,
-        &original.definition_identity_universe,
+    let reduced = inspect_dependencies(
+        InspectionSource::Rewritten {
+            rewrite: &inspected.rewrite,
+            identity: &inspected.definition_identity_universe,
+        },
+        &context.for_reduced_source(),
     )
     .map_err(|error| analysis_error(error, CompilationPhase::Reduced))?;
-    if let Some(difference) = external_compiler_outcome_difference(
-        &original.external_compiler,
-        &reduced.external_compiler,
-    ) {
+    let reduced_outputless =
+        outputless_macro_expansions_in_complete_source(&reduced.graph, &reduced.constraints)
+            .map_err(|error| analysis_error(error.into(), CompilationPhase::Reduced))?;
+    let external_compiler = external_compiler_observation(&reduced.constraints)
+        .map_err(|error| analysis_error(error.into(), CompilationPhase::Reduced))?;
+    #[cfg(test)]
+    let external_compiler = mutate_reduced_external_observation(external_compiler);
+    if let Some(difference) =
+        external_compiler_outcome_difference(&inspected.external_compiler, &external_compiler)
+    {
         return Err(AnalysisError::DecisionMismatch(PublicSnapshotDiff::new(
             vec![DecisionDifference {
                 kind: difference.kind().to_owned(),
@@ -119,7 +105,96 @@ fn inspect_reduced(
             }],
         )));
     }
-    Ok(reduced)
+    let reduced_snapshot = CompilerDecisionSnapshot::reduced_excluding_outputless_macros(
+        &reduced.graph,
+        &reduced_outputless,
+    )
+    .map_err(snapshot_error)?;
+    if let Some(difference) = original_snapshot.first_difference(&reduced_snapshot) {
+        return Err(AnalysisError::DecisionMismatch(snapshot_difference(
+            difference,
+        )));
+    }
+    Ok(Reduction {
+        reduced_source: inspected.rewrite.into_source(),
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReductionPlan {
+    pub source: SourceInventory,
+    pub graph: DependencyGraph,
+    pub constraints: SourceConstraints,
+    pub retention: Retention,
+    pub rewrite: SourceRewrite,
+    external_compiler: ExternalCompilerExpectation,
+    pub(crate) definition_identity_universe: DefinitionIdentityUniverse,
+}
+
+fn plan_reduction(
+    source: &str,
+    context: &CompilationContext<'_>,
+) -> Result<ReductionPlan, InputError> {
+    let inspected = inspect_dependencies(InspectionSource::Original(source), context)?;
+    let retention = compute_retention(&inspected.source, &inspected.graph, &inspected.constraints)?;
+    let external_compiler =
+        external_compiler_expectation(&inspected.graph, &inspected.constraints, &retention)?;
+    let rewrite = rewrite_source(&inspected.source, &retention.retained_units)?;
+    Ok(ReductionPlan {
+        source: inspected.source,
+        graph: inspected.graph,
+        constraints: inspected.constraints,
+        retention,
+        rewrite,
+        external_compiler,
+        definition_identity_universe: inspected.definition_identity_universe,
+    })
+}
+
+#[cfg(all(test, rust_item_dependencies_patched))]
+pub(crate) fn inspect_source_with_reduction(
+    input: &SourceInput,
+    sysroot: &Path,
+) -> Result<ReductionPlan, InputError> {
+    let compilation = PreparedCompilationOptions::empty();
+    let context = CompilationContext::new(input, &compilation, sysroot)?;
+    plan_reduction(input.source(), &context)
+}
+
+#[cfg(test)]
+thread_local! {
+    static OMIT_REDUCED_EXTERNAL_METADATA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, rust_item_dependencies_patched))]
+fn with_one_omitted_reduced_external_metadata_fact<T>(f: impl FnOnce() -> T) -> T {
+    assert!(
+        !OMIT_REDUCED_EXTERNAL_METADATA.replace(true),
+        "metadata omission must not be nested"
+    );
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OMIT_REDUCED_EXTERNAL_METADATA.set(false);
+        }
+    }
+    let _reset = Reset;
+    let result = f();
+    assert!(
+        !OMIT_REDUCED_EXTERNAL_METADATA.get(),
+        "the reduced observation must be reached"
+    );
+    result
+}
+
+#[cfg(test)]
+fn mutate_reduced_external_observation(
+    mut observation: crate::retention::ExternalCompilerObservation,
+) -> crate::retention::ExternalCompilerObservation {
+    if OMIT_REDUCED_EXTERNAL_METADATA.replace(false) {
+        observation.omit_one_metadata_fact();
+    }
+    observation
 }
 
 impl Reduction {
@@ -485,10 +560,8 @@ mod tests {
         )
         .with_entry_point(EntryPoint::new("external_outcome::entry"));
 
-        let error = crate::retention::with_one_omitted_external_compiler_metadata_fact(|| {
-            analyzer.reduce(&input)
-        })
-        .expect_err("the public reduction path must compare external compiler outcomes");
+        let error = with_one_omitted_reduced_external_metadata_fact(|| analyzer.reduce(&input))
+            .expect_err("the public reduction path must compare external compiler outcomes");
         let AnalysisError::DecisionMismatch(difference) = error else {
             panic!("unexpected error: {error:?}")
         };
