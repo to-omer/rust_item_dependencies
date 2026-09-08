@@ -2752,7 +2752,6 @@ mod tests {
             ..retained_edge
         });
         let retention = Retention {
-            semantic_required: BTreeSet::new(),
             compile_required: BTreeSet::from([
                 GraphNode::Definition(DefinitionId(0)),
                 GraphNode::Proof(ProofId(0)),
@@ -2813,10 +2812,6 @@ mod tests {
         let inventory = two_item_inventory();
         let retained_units = BTreeSet::from([SourceUnitId(0), SourceUnitId(1), SourceUnitId(2)]);
         let retention = Retention {
-            semantic_required: BTreeSet::from([
-                GraphNode::Definition(DefinitionId(0)),
-                GraphNode::Definition(DefinitionId(1)),
-            ]),
             compile_required: BTreeSet::from([
                 GraphNode::Definition(DefinitionId(0)),
                 GraphNode::Definition(DefinitionId(1)),
@@ -2984,7 +2979,6 @@ mod tests {
             .chain((0..4).map(|id| GraphNode::Expansion(ExpansionId(id)))),
         );
         let retention = Retention {
-            semantic_required: BTreeSet::new(),
             compile_required,
             retained_units: BTreeSet::from([SourceUnitId(0), SourceUnitId(1)]),
             outputless_macro_expansions: BTreeSet::new(),
@@ -3079,7 +3073,6 @@ mod tests {
         );
         let inventory = four_unit_inventory();
         let retention = Retention {
-            semantic_required: BTreeSet::new(),
             compile_required: all_nodes,
             retained_units: inventory.units.iter().map(|unit| unit.id).collect(),
             outputless_macro_expansions: BTreeSet::from([outputless]),
@@ -3143,7 +3136,6 @@ mod tests {
         );
         let inventory = four_unit_inventory();
         let retention = Retention {
-            semantic_required: BTreeSet::new(),
             compile_required: all_nodes,
             retained_units: inventory.units.iter().map(|unit| unit.id).collect(),
             outputless_macro_expansions: BTreeSet::from([outputless]),

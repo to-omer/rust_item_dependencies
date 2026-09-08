@@ -49,7 +49,7 @@ use macro_products::{
     validate_refined_macro_producers,
 };
 use reachability::{CompilerReachabilityClosure, CompilerReachabilityIndex};
-use source_closure::{SourceRequirementClosure, SourceRequirementIndex, SourceRequirementMode};
+use source_closure::{SourceRequirementClosure, SourceRequirementIndex};
 pub(crate) use source_sites::SourceSiteOwnerIndex;
 
 #[cfg(test)]
@@ -135,6 +135,7 @@ struct CompilerMemberConstraints {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Default))]
 struct ValidatedCompilerMemberConstraints {
     requirements_by_trigger: BTreeMap<DefinitionId, Vec<DefinitionId>>,
     conditional_requirements: Vec<ConditionalDefinitionRequirement>,
@@ -786,7 +787,6 @@ fn optional_compiler_definition_id(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Retention {
-    pub semantic_required: BTreeSet<GraphNode>,
     pub compile_required: BTreeSet<GraphNode>,
     pub retained_units: BTreeSet<SourceUnitId>,
     pub outputless_macro_expansions: BTreeSet<ExpansionId>,
@@ -830,19 +830,6 @@ pub(crate) fn compute_retention(
     )?;
     let mut macro_repetition_tokens = crate::rewrite::MacroRepetitionTokenRequirements::new(source)
         .map_err(|_| RetentionError::InvalidConstraint)?;
-    let semantic_roots = graph
-        .roots
-        .iter()
-        .filter(|root| root.reason.is_semantic())
-        .map(|root| root.node)
-        .collect();
-    let semantic_required = semantic_closure_for_source(
-        &validated,
-        &source_requirements,
-        &compiler_reachability,
-        semantic_roots,
-    )?;
-
     let compile_roots = graph
         .roots
         .iter()
@@ -856,14 +843,13 @@ pub(crate) fn compute_retention(
     let mut pending_actual = actual_required.iter().copied().collect::<Vec<_>>();
     let mut pending_source = Vec::new();
     let mut macro_closure =
-        RetentionClosure::new(&validated.macro_products, Some(&validated.compiler_members));
+        RetentionClosure::new(&validated.macro_products, &validated.compiler_members);
     macro_closure.seed(&compile_required, &actual_required, &retained_units)?;
     let mut reachability_closure = CompilerReachabilityClosure::new(&compiler_reachability);
     reachability_closure.seed(&compile_required, &retained_units)?;
     let mut actual_reachability_closure = CompilerReachabilityClosure::new(&compiler_reachability);
     actual_reachability_closure.seed(&actual_required, &retained_units)?;
-    let mut source_closure =
-        SourceRequirementClosure::new(&source_requirements, SourceRequirementMode::Compile);
+    let mut source_closure = SourceRequirementClosure::new(&source_requirements);
     source_closure.seed(&retained_units)?;
     let mut disjunction_closure = DisjunctionClosure::new(
         source,
@@ -943,7 +929,6 @@ pub(crate) fn compute_retention(
         &retained_units,
     )?);
     Ok(Retention {
-        semantic_required,
         compile_required,
         retained_units,
         outputless_macro_expansions,
@@ -1366,128 +1351,6 @@ fn compiler_crate_load_carrier_rank(
                 None,
                 carrier,
             ))
-        }
-    }
-}
-
-fn semantic_closure_for_source(
-    constraints: &ValidatedConstraints,
-    source_requirements: &SourceRequirementIndex,
-    compiler_reachability: &CompilerReachabilityIndex,
-    roots: BTreeSet<GraphNode>,
-) -> Result<BTreeSet<GraphNode>, RetentionError> {
-    let mut reachable = roots;
-    let mut actual_required = reachable.clone();
-    let mut source_units = BTreeSet::new();
-    let mut pending_compile = reachable.iter().copied().collect::<Vec<_>>();
-    let mut pending_actual = actual_required.iter().copied().collect::<Vec<_>>();
-    let mut pending_source = Vec::new();
-    let mut macro_closure = RetentionClosure::new(&constraints.macro_products, None);
-    macro_closure.seed(&reachable, &actual_required, &source_units)?;
-    let mut reachability_closure = CompilerReachabilityClosure::new(compiler_reachability);
-    reachability_closure.seed(&reachable, &source_units)?;
-    let mut actual_reachability_closure = CompilerReachabilityClosure::new(compiler_reachability);
-    actual_reachability_closure.seed(&actual_required, &source_units)?;
-    let mut source_closure =
-        SourceRequirementClosure::new(source_requirements, SourceRequirementMode::Semantic);
-    source_closure.seed(&source_units)?;
-    let mut macro_presence_cursor = 0;
-    let mut macro_actual_cursor = 0;
-    let mut macro_source_cursor = 0;
-    let mut definition_source_cursor = 0;
-    let mut source_closure_cursor = 0;
-    let mut reachability_compile_cursor = 0;
-    let mut reachability_source_cursor = 0;
-    let mut actual_reachability_cursor = 0;
-    let mut actual_reachability_source_cursor = 0;
-    let mut actual_to_compile_cursor = 0;
-
-    loop {
-        while macro_presence_cursor < pending_compile.len()
-            || macro_actual_cursor < pending_actual.len()
-            || macro_source_cursor < pending_source.len()
-            || definition_source_cursor < pending_compile.len()
-            || source_closure_cursor < pending_source.len()
-        {
-            if macro_presence_cursor < pending_compile.len() {
-                let deltas = pending_compile[macro_presence_cursor..].to_vec();
-                macro_presence_cursor = pending_compile.len();
-                macro_closure.add_presence(deltas);
-            }
-            if macro_actual_cursor < pending_actual.len() {
-                let deltas = pending_actual[macro_actual_cursor..].to_vec();
-                macro_actual_cursor = pending_actual.len();
-                macro_closure.add_actual(deltas);
-            }
-            if macro_source_cursor < pending_source.len() {
-                let deltas = pending_source[macro_source_cursor..].to_vec();
-                macro_source_cursor = pending_source.len();
-                macro_closure.add_source(deltas);
-            }
-
-            let compile_deltas = pending_compile[definition_source_cursor..].to_vec();
-            definition_source_cursor = pending_compile.len();
-            for node in compile_deltas {
-                if let GraphNode::Definition(definition) = node
-                    && let Some(unit) =
-                        constraints.singleton_definition_units[definition.0 as usize]
-                {
-                    retain_source_unit(&mut source_units, &mut pending_source, unit);
-                }
-            }
-
-            if source_closure_cursor < pending_source.len() {
-                let deltas = pending_source[source_closure_cursor..].to_vec();
-                source_closure_cursor = pending_source.len();
-                source_closure.add(deltas)?;
-                source_closure.close(&mut source_units, &mut pending_source)?;
-            }
-
-            macro_closure.close(
-                &mut reachable,
-                &mut pending_compile,
-                &mut actual_required,
-                &mut pending_actual,
-                &mut source_units,
-                &mut pending_source,
-            );
-        }
-
-        if reachability_compile_cursor < pending_compile.len() {
-            let deltas = pending_compile[reachability_compile_cursor..].to_vec();
-            reachability_compile_cursor = pending_compile.len();
-            reachability_closure.add_reachable(deltas);
-        }
-        if reachability_source_cursor < pending_source.len() {
-            let deltas = pending_source[reachability_source_cursor..].to_vec();
-            reachability_source_cursor = pending_source.len();
-            reachability_closure.add_sources(deltas)?;
-        }
-        let compile_before = pending_compile.len();
-        reachability_closure.close(&mut reachable, &mut pending_compile)?;
-
-        if actual_reachability_cursor < pending_actual.len() {
-            let deltas = pending_actual[actual_reachability_cursor..].to_vec();
-            actual_reachability_cursor = pending_actual.len();
-            actual_reachability_closure.add_reachable(deltas);
-        }
-        if actual_reachability_source_cursor < pending_source.len() {
-            let deltas = pending_source[actual_reachability_source_cursor..].to_vec();
-            actual_reachability_source_cursor = pending_source.len();
-            actual_reachability_closure.add_sources(deltas)?;
-        }
-        let actual_before = pending_actual.len();
-        actual_reachability_closure.close(&mut actual_required, &mut pending_actual)?;
-        if actual_to_compile_cursor < pending_actual.len() {
-            mirror_actual_nodes_into_compile(
-                &pending_actual[actual_to_compile_cursor..],
-                &mut reachable,
-                &mut pending_compile,
-            );
-            actual_to_compile_cursor = pending_actual.len();
-        }
-        if pending_compile.len() == compile_before && pending_actual.len() == actual_before {
-            return Ok(reachable);
         }
     }
 }

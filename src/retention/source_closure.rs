@@ -4,18 +4,11 @@ use crate::source::SourceUnitId;
 
 use super::{RetentionError, SourceRequirement, retain_source_unit};
 
-#[derive(Clone, Copy)]
-pub(super) enum SourceRequirementMode {
-    Semantic,
-    Compile,
-}
-
 /// Immutable reverse indexes for monotone source-retention requirements.
 pub(super) struct SourceRequirementIndex {
     atomic_groups: Vec<Vec<SourceUnitId>>,
     atomic_group_by_unit: Vec<usize>,
-    semantic_by_trigger: Vec<Vec<SourceUnitId>>,
-    compile_by_trigger: Vec<Vec<SourceUnitId>>,
+    by_trigger: Vec<Vec<SourceUnitId>>,
 }
 
 impl SourceRequirementIndex {
@@ -46,23 +39,16 @@ impl SourceRequirementIndex {
             return Err(RetentionError::InvalidConstraint);
         }
 
-        let mut semantic_by_trigger = vec![Vec::new(); unit_count];
-        let mut compile_by_trigger = vec![Vec::new(); unit_count];
-        for requirement in ancestor_requirements.iter().chain(derive_requirements) {
-            push_requirement(&mut semantic_by_trigger, *requirement, unit_count)?;
-        }
+        let mut by_trigger = vec![Vec::new(); unit_count];
         for requirement in ancestor_requirements
             .iter()
             .chain(shell_requirements)
             .chain(derive_requirements)
             .chain(macro_rule_requirements)
         {
-            push_requirement(&mut compile_by_trigger, *requirement, unit_count)?;
+            push_requirement(&mut by_trigger, *requirement, unit_count)?;
         }
-        for requirements in semantic_by_trigger
-            .iter_mut()
-            .chain(&mut compile_by_trigger)
-        {
+        for requirements in &mut by_trigger {
             requirements.sort_unstable();
             requirements.dedup();
         }
@@ -70,8 +56,7 @@ impl SourceRequirementIndex {
         Ok(Self {
             atomic_groups: atomic_groups.to_vec(),
             atomic_group_by_unit,
-            semantic_by_trigger,
-            compile_by_trigger,
+            by_trigger,
         })
     }
 }
@@ -94,7 +79,6 @@ fn push_requirement(
 /// consumed once.
 pub(super) struct SourceRequirementClosure<'index> {
     index: &'index SourceRequirementIndex,
-    mode: SourceRequirementMode,
     initialized: bool,
     seen: Vec<bool>,
     pending: VecDeque<SourceUnitId>,
@@ -108,10 +92,9 @@ pub(super) struct SourceRequirementClosure<'index> {
 }
 
 impl<'index> SourceRequirementClosure<'index> {
-    pub(super) fn new(index: &'index SourceRequirementIndex, mode: SourceRequirementMode) -> Self {
+    pub(super) fn new(index: &'index SourceRequirementIndex) -> Self {
         Self {
             index,
-            mode,
             initialized: false,
             seen: vec![false; index.atomic_group_by_unit.len()],
             pending: VecDeque::new(),
@@ -177,11 +160,7 @@ impl<'index> SourceRequirementClosure<'index> {
                 }
             }
 
-            let requirements = match self.mode {
-                SourceRequirementMode::Semantic => &self.index.semantic_by_trigger[index],
-                SourceRequirementMode::Compile => &self.index.compile_by_trigger[index],
-            };
-            for &required in requirements {
+            for &required in &self.index.by_trigger[index] {
                 #[cfg(test)]
                 {
                     self.requirement_visits += 1;

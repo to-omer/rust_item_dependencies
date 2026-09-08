@@ -24,7 +24,7 @@ struct ExpansionComponent {
     target_edges: Vec<usize>,
 }
 
-/// Immutable indexes shared by the semantic and compiler retention closures.
+/// Immutable indexes shared by the compiler presence and actual demand closures.
 ///
 /// Expansion parent relations are collapsed into SCCs. This preserves the
 /// greatest-fixed-point behavior of `expansion_source_survival`: a source-free

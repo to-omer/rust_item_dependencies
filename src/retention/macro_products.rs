@@ -768,7 +768,7 @@ pub(super) fn outputless_complete_macro_outputs_with_stats(
 /// reverse indexes then visit only the constraints that mention that delta.
 pub(super) struct RetentionClosure<'a> {
     macro_products: &'a ValidatedMacroProducts,
-    compiler_members: Option<&'a ValidatedCompilerMemberConstraints>,
+    compiler_members: &'a ValidatedCompilerMemberConstraints,
     seen_presence: BTreeSet<GraphNode>,
     processed_presence: BTreeSet<GraphNode>,
     seen_actual_definitions: BTreeSet<DefinitionId>,
@@ -818,7 +818,7 @@ pub(super) struct RetentionClosure<'a> {
 impl<'a> RetentionClosure<'a> {
     pub(super) fn new(
         macro_products: &'a ValidatedMacroProducts,
-        compiler_members: Option<&'a ValidatedCompilerMemberConstraints>,
+        compiler_members: &'a ValidatedCompilerMemberConstraints,
     ) -> Self {
         let meaningful_producers = macro_products
             .output_meaning
@@ -886,15 +886,11 @@ impl<'a> RetentionClosure<'a> {
             demand_clause_satisfied: vec![false; macro_products.demand_clauses.len()],
             conditional_compile_member_state: vec![
                 0;
-                compiler_members.map_or(0, |members| {
-                    members.conditional_requirements.len()
-                })
+                compiler_members.conditional_requirements.len()
             ],
             conditional_actual_member_state: vec![
                 0;
-                compiler_members.map_or(0, |members| {
-                    members.conditional_requirements.len()
-                })
+                compiler_members.conditional_requirements.len()
             ],
             actual_definition_class_processed: vec![
                 false;
@@ -1052,9 +1048,8 @@ impl<'a> RetentionClosure<'a> {
             while let Some(node) = self.pending_presence.pop_front() {
                 let first_processing = self.processed_presence.insert(node);
                 debug_assert!(first_processing);
-                if let GraphNode::Definition(trigger) = node
-                    && let Some(members) = self.compiler_members
-                {
+                if let GraphNode::Definition(trigger) = node {
+                    let members = self.compiler_members;
                     if let Some(required) = members.requirements_by_trigger.get(&trigger) {
                         for &required in required {
                             #[cfg(test)]
@@ -1092,41 +1087,40 @@ impl<'a> RetentionClosure<'a> {
             }
 
             while let Some(trigger) = self.pending_actual_definitions.pop_front() {
-                if let Some(members) = self.compiler_members {
-                    if let Some(required) = members.requirements_by_trigger.get(&trigger) {
-                        for &required in required {
-                            #[cfg(test)]
-                            {
-                                self.actual_member_fact_visits += 1;
-                            }
+                let members = self.compiler_members;
+                if let Some(required) = members.requirements_by_trigger.get(&trigger) {
+                    for &required in required {
+                        #[cfg(test)]
+                        {
+                            self.actual_member_fact_visits += 1;
+                        }
+                        self.require_actual(
+                            actual_required,
+                            newly_actual,
+                            compile_present,
+                            newly_present,
+                            GraphNode::Definition(required),
+                        );
+                    }
+                }
+                if let Some(conditionals) = members.conditional_by_trigger.get(&trigger) {
+                    for &(index, bit) in conditionals {
+                        #[cfg(test)]
+                        {
+                            self.actual_member_fact_visits += 1;
+                        }
+                        let state = &mut self.conditional_actual_member_state[index];
+                        *state |= bit;
+                        if *state == 3 {
                             self.require_actual(
                                 actual_required,
                                 newly_actual,
                                 compile_present,
                                 newly_present,
-                                GraphNode::Definition(required),
+                                GraphNode::Definition(
+                                    members.conditional_requirements[index].required,
+                                ),
                             );
-                        }
-                    }
-                    if let Some(conditionals) = members.conditional_by_trigger.get(&trigger) {
-                        for &(index, bit) in conditionals {
-                            #[cfg(test)]
-                            {
-                                self.actual_member_fact_visits += 1;
-                            }
-                            let state = &mut self.conditional_actual_member_state[index];
-                            *state |= bit;
-                            if *state == 3 {
-                                self.require_actual(
-                                    actual_required,
-                                    newly_actual,
-                                    compile_present,
-                                    newly_present,
-                                    GraphNode::Definition(
-                                        members.conditional_requirements[index].required,
-                                    ),
-                                );
-                            }
                         }
                     }
                 }

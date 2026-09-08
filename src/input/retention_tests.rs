@@ -761,14 +761,6 @@ fn dead_top_level_macro_does_not_follow_crate_expansion_use() {
     assert_retained_units(&reduced, DIRECT_MACRO_RETAINED);
     assert_eq!(
         written_expansion_ranges(
-            &reduced.retention.semantic_required,
-            &reduced.graph,
-            &reduced.source,
-        ),
-        expected_expansions
-    );
-    assert_eq!(
-        written_expansion_ranges(
             &reduced.retention.compile_required,
             &reduced.graph,
             &reduced.source,
@@ -782,7 +774,7 @@ fn dead_top_level_macro_does_not_follow_crate_expansion_use() {
 
 #[test]
 #[cfg(rust_item_dependencies_patched)]
-fn semantic_and_compile_closures_use_exact_macro_products() {
+fn retention_uses_exact_macro_products() {
     let item = inspect_reduction(ITEM_INPUT);
     let expected_item = BTreeSet::from([
         "<crate>".to_owned(),
@@ -792,31 +784,11 @@ fn semantic_and_compile_closures_use_exact_macro_products() {
         "main".to_owned(),
     ]);
     assert_eq!(
-        local_definitions(&item.retention.semantic_required, &item.graph.definitions),
-        expected_item
-    );
-    assert_eq!(
         local_definitions(&item.retention.compile_required, &item.graph.definitions),
         expected_item
     );
-    assert_eq!(
-        injected_definitions(&item.retention.semantic_required, &item.graph.definitions),
-        BTreeSet::new()
-    );
 
     let generated = inspect_reduction(MACRO_INPUT);
-    assert_eq!(
-        local_definitions(
-            &generated.retention.semantic_required,
-            &generated.graph.definitions
-        ),
-        BTreeSet::from([
-            "<crate>".to_owned(),
-            "program".to_owned(),
-            "main".to_owned(),
-            "needed".to_owned(),
-        ])
-    );
     assert_eq!(
         local_definitions(
             &generated.retention.compile_required,
@@ -835,27 +807,18 @@ fn semantic_and_compile_closures_use_exact_macro_products() {
     }]);
     assert_eq!(
         written_expansion_ranges(
-            &generated.retention.semantic_required,
-            &generated.graph,
-            &generated.source,
-        ),
-        expected_expansions
-    );
-    assert_eq!(
-        written_expansion_ranges(
             &generated.retention.compile_required,
             &generated.graph,
             &generated.source,
         ),
         expected_expansions
     );
-    assert_eq!(
-        injected_definitions(
-            &generated.retention.semantic_required,
-            &generated.graph.definitions
-        ),
-        BTreeSet::new()
-    );
+    for (reduced, expected) in [(&item, ITEM_EXPECTED), (&generated, MACRO_EXPECTED)] {
+        assert_eq!(reduced.rewrite.source(), expected);
+        assert_compiles(reduced.rewrite.source());
+        let second = inspect_reduction(reduced.rewrite.source());
+        assert_eq!(second.rewrite.source(), reduced.rewrite.source());
+    }
 }
 
 #[test]
@@ -1038,24 +1001,6 @@ fn local_definitions(nodes: &BTreeSet<GraphNode>, graph: &DefinitionGraph) -> BT
                     DefinitionOrigin::Written { .. } | DefinitionOrigin::Expanded { .. }
                 )
                 .then(|| definition_path(&definition.key))
-            }
-            GraphNode::ExternalDefinition(_)
-            | GraphNode::Expansion(_)
-            | GraphNode::Proof(_)
-            | GraphNode::Mono(_) => None,
-        })
-        .collect()
-}
-
-#[cfg(rust_item_dependencies_patched)]
-fn injected_definitions(nodes: &BTreeSet<GraphNode>, graph: &DefinitionGraph) -> BTreeSet<String> {
-    nodes
-        .iter()
-        .filter_map(|node| match node {
-            GraphNode::Definition(definition) => {
-                let definition = &graph.definitions[definition.0 as usize];
-                matches!(definition.origin, DefinitionOrigin::Injected { .. })
-                    .then(|| definition_path(&definition.key))
             }
             GraphNode::ExternalDefinition(_)
             | GraphNode::Expansion(_)

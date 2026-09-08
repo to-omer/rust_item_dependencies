@@ -272,7 +272,7 @@ fn outputless_mut(constraints: &mut SourceConstraints) -> &mut Vec<ExpansionId> 
 
 fn close_validated_retention_constraints(
     macro_products: &ValidatedMacroProducts,
-    compiler_members: Option<&ValidatedCompilerMemberConstraints>,
+    compiler_members: &ValidatedCompilerMemberConstraints,
     compile_required: &mut BTreeSet<GraphNode>,
     retained_units: &mut BTreeSet<SourceUnitId>,
 ) {
@@ -363,7 +363,7 @@ fn compiler_reachability_keeps_presence_and_actual_demand_as_separate_lanes() {
 }
 
 #[test]
-fn compiler_member_requirement_materializes_compile_presence_without_semantic_demand() {
+fn compiler_member_requirement_retains_its_definition_and_source() {
     let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     let units = vec![
         unit(0, WrittenUnitKind::CrateRoot, (0, 48), None, 0),
@@ -402,11 +402,6 @@ fn compiler_member_requirement_materializes_compile_presence_without_semantic_de
             .contains(&GraphNode::Definition(DefinitionId(2)))
     );
     assert!(retention.retained_units.contains(&SourceUnitId(2)));
-    assert!(
-        !retention
-            .semantic_required
-            .contains(&GraphNode::Definition(DefinitionId(2)))
-    );
 }
 
 fn tied_source_site_reachability_fixture()
@@ -429,6 +424,70 @@ fn tied_source_site_reachability_fixture()
         ByteRange { start: 6, end: 10 },
         ByteRange { start: 21, end: 22 },
     )
+}
+
+#[test]
+fn tied_source_sites_use_the_retention_required_by_compiler_members() {
+    let (inventory, mut definitions, tied_site, _) = tied_source_site_reachability_fixture();
+    definitions.extend([
+        written_definition(
+            2,
+            DefinitionKind::Function,
+            &inventory.units[2],
+            Some(1),
+            "used",
+        ),
+        written_definition(
+            3,
+            DefinitionKind::Impl,
+            &inventory.units[3],
+            Some(1),
+            "required_impl",
+        ),
+    ]);
+    let mut observed = edge(
+        GraphNode::Definition(DefinitionId(2)),
+        GraphNode::Definition(DefinitionId(0)),
+    );
+    observed.sites = vec![ObservationSite::Source(tied_site)];
+    let graph = graph(
+        definitions,
+        vec![
+            edge(
+                GraphNode::Definition(DefinitionId(1)),
+                GraphNode::Definition(DefinitionId(2)),
+            ),
+            observed,
+        ],
+    );
+    let mut constraints = complete_constraints(&inventory, &graph);
+    assert_eq!(
+        compute_retention(&inventory, &graph, &constraints),
+        Err(RetentionError::InvalidGraph),
+    );
+
+    constraints
+        .compiler_members
+        .requirements
+        .push(DefinitionRequirement {
+            trigger: DefinitionId(1),
+            required: DefinitionId(3),
+        });
+    let retention = compute_retention(&inventory, &graph, &constraints).unwrap();
+    assert_eq!(
+        retention.retained_units,
+        BTreeSet::from([
+            SourceUnitId(0),
+            SourceUnitId(1),
+            SourceUnitId(2),
+            SourceUnitId(3)
+        ]),
+    );
+    assert!(
+        retention
+            .compile_required
+            .contains(&GraphNode::Definition(DefinitionId(0)))
+    );
 }
 
 fn rule_selections(constraints: &SourceConstraints) -> &[MacroRuleSelectionRequirement] {
@@ -1089,7 +1148,7 @@ fn macro_materialization_requires_all_contributors_in_both_directions() {
     let mut retained_units = BTreeSet::new();
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -1100,7 +1159,8 @@ fn macro_materialization_requires_all_contributors_in_both_directions() {
 
     compile_required.clear();
     retained_units = BTreeSet::from([SourceUnitId(2)]);
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let mut actual_required = BTreeSet::new();
     let mut newly_required = Vec::new();
     let mut newly_actual = Vec::new();
@@ -1223,7 +1283,7 @@ fn explicit_materialization_group_lowers_all_members_without_pointer_identity() 
     let mut retained_units = BTreeSet::new();
     close_validated_retention_constraints(
         &validated,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -1287,7 +1347,7 @@ fn explicit_materialization_group_lowers_all_members_without_pointer_identity() 
     let mut one_retained = BTreeSet::new();
     close_validated_retention_constraints(
         &independent_producers,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut one_required,
         &mut one_retained,
     );
@@ -1360,7 +1420,7 @@ fn shared_identity_gate_is_atomic_without_replacing_local_provenance() {
     let mut retained_units = BTreeSet::new();
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -1377,7 +1437,7 @@ fn shared_identity_gate_is_atomic_without_replacing_local_provenance() {
     retained_units = BTreeSet::from(sources);
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -1393,7 +1453,7 @@ fn shared_identity_gate_is_atomic_without_replacing_local_provenance() {
     retained_units = BTreeSet::from([sources[0]]);
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -1650,7 +1710,8 @@ fn compiler_closure_delegates_only_refined_classified_macro_expansions() {
     };
     let macro_products =
         ValidatedMacroProducts::new(vec![materialization], BTreeSet::new()).unwrap();
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let mut actual_required = delegated.clone();
     let mut newly_required = Vec::new();
     let mut newly_actual = Vec::new();
@@ -1975,7 +2036,7 @@ fn macro_owner_requirement_keeps_contributors_and_materializes_members() {
 
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -1986,7 +2047,7 @@ fn macro_owner_requirement_keeps_contributors_and_materializes_members() {
     retained_units = BTreeSet::new();
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -1997,7 +2058,7 @@ fn macro_owner_requirement_keeps_contributors_and_materializes_members() {
     retained_units = BTreeSet::new();
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -2050,7 +2111,7 @@ fn transparent_owner_shell_uses_the_same_product_dependency_for_meaning_and_sour
     let mut retained_units = BTreeSet::new();
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -2063,7 +2124,7 @@ fn transparent_owner_shell_uses_the_same_product_dependency_for_meaning_and_sour
     retained_units = BTreeSet::from([SourceUnitId(2)]);
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -2109,7 +2170,7 @@ fn transparent_owner_shell_follows_a_definition_product_without_becoming_intrins
     let mut retained_units = BTreeSet::new();
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -2771,7 +2832,7 @@ fn owner_effect_contributors_can_materialize_an_item_expansion() {
 
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -2841,7 +2902,7 @@ fn control_only_macro_products_are_outputless_transitively_and_do_not_retain_the
     let mut retained_units = BTreeSet::new();
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -2871,7 +2932,8 @@ fn materialized_outputless_child_stays_compile_only_without_reopening_its_contri
     let macro_products =
         ValidatedMacroProducts::new_with_producers(materializations, BTreeSet::new(), producers)
             .unwrap();
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let mut compile_required = BTreeSet::new();
     let mut actual_required = BTreeSet::new();
     let mut retained_units = BTreeSet::from([SourceUnitId(0)]);
@@ -3165,7 +3227,7 @@ fn disappearing_leaf_output_collapses_its_parent_chain_in_one_retention_pass() {
         let mut retained_units = BTreeSet::from([SourceUnitId(2)]);
         close_validated_retention_constraints(
             &macro_products,
-            None,
+            &ValidatedCompilerMemberConstraints::default(),
             &mut compile_required,
             &mut retained_units,
         );
@@ -3329,7 +3391,8 @@ fn meaning_activation_reprocesses_one_consumed_compile_trigger_once() {
     let macro_products =
         ValidatedMacroProducts::new_with_producers(materializations, BTreeSet::new(), producers)
             .unwrap();
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let mut compile_required = BTreeSet::from([child]);
     let mut actual_required = compile_required.clone();
     let mut retained_units = BTreeSet::from([SourceUnitId(1)]);
@@ -3379,7 +3442,7 @@ fn required_child_output_opens_from_its_container_demand() {
 
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -3419,7 +3482,8 @@ fn dependent_child_output_requires_container_and_actual_child_demand_in_either_o
             GraphNode::Definition(DefinitionId(0)),
         ],
     ] {
-        let mut closure = RetentionClosure::new(&macro_products, None);
+        let compiler_members = ValidatedCompilerMemberConstraints::default();
+        let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
         let mut compile_required = BTreeSet::new();
         let mut actual_required = BTreeSet::new();
         let mut retained_units = BTreeSet::new();
@@ -3480,7 +3544,8 @@ fn demanded_container_activates_a_dependent_child_with_residual_semantics() {
     let mut newly_present = Vec::new();
     let mut newly_actual = Vec::new();
     let mut newly_retained = Vec::new();
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     closure
         .seed(&compile_present, &actual_required, &retained_units)
         .unwrap();
@@ -3533,7 +3598,7 @@ fn potential_child_meaning_does_not_bootstrap_actual_demand() {
 
     close_validated_retention_constraints(
         &macro_products,
-        None,
+        &ValidatedCompilerMemberConstraints::default(),
         &mut compile_required,
         &mut retained_units,
     );
@@ -3559,7 +3624,8 @@ fn materialized_presence_upgrades_to_actual_demand_only_after_an_independent_tri
         BTreeMap::from([(ExpansionId(0), vec![DefinitionId(1)])]),
     )
     .unwrap();
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let mut compile_present = BTreeSet::new();
     let mut actual_required = BTreeSet::new();
     let mut retained_units = BTreeSet::from([SourceUnitId(0)]);
@@ -3600,7 +3666,8 @@ fn materialized_presence_upgrades_to_actual_demand_only_after_an_independent_tri
 #[test]
 fn actual_macro_demand_must_already_have_compiler_presence() {
     let macro_products = ValidatedMacroProducts::new(Vec::new(), BTreeSet::new()).unwrap();
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     assert_eq!(
         closure.seed(
             &BTreeSet::new(),
@@ -3642,7 +3709,7 @@ fn compile_presence_and_actual_demand_close_member_constraints_independently() {
     let mut newly_present = Vec::new();
     let mut newly_actual = Vec::new();
     let mut newly_retained = Vec::new();
-    let mut closure = RetentionClosure::new(&macro_products, Some(&compiler_members));
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     closure
         .seed(&compile_present, &actual_required, &retained_units)
         .unwrap();
@@ -3671,7 +3738,7 @@ fn compile_presence_and_actual_demand_close_member_constraints_independently() {
     let mut newly_present = Vec::new();
     let mut newly_actual = Vec::new();
     let mut newly_retained = Vec::new();
-    let mut closure = RetentionClosure::new(&macro_products, Some(&compiler_members));
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     closure
         .seed(&compile_present, &actual_required, &retained_units)
         .unwrap();
@@ -3736,7 +3803,8 @@ fn required_child_demand_does_not_actualize_atomic_sibling_outputs() {
         BTreeMap::from([(ExpansionId(2), vec![DefinitionId(2)])]),
     )
     .unwrap();
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let carrier = GraphNode::Definition(DefinitionId(0));
     let mut compile_present = BTreeSet::from([carrier]);
     let mut actual_required = compile_present.clone();
@@ -3801,7 +3869,8 @@ fn required_child_demand_visits_each_clause_once() {
     let mut newly_present = Vec::new();
     let mut newly_actual = Vec::new();
     let mut newly_retained = Vec::new();
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     closure
         .seed(&compile_present, &actual_required, &retained_units)
         .unwrap();
@@ -3856,7 +3925,8 @@ fn macro_output_meaning_walks_each_group_and_dependency_once() {
     assert_eq!(stats.dependency_visits, COUNT as usize - 1);
     assert_eq!(stats.producer_activations, COUNT as usize);
 
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let mut compile_required = BTreeSet::new();
     let mut actual_required = BTreeSet::new();
     let mut retained_units = BTreeSet::from([SourceUnitId(0)]);
@@ -3922,7 +3992,8 @@ fn transparent_shell_dependencies_visit_each_shared_reverse_fact_once() {
     assert_eq!(stats.dependency_visits, COUNT as usize);
     assert_eq!(stats.producer_activations, COUNT as usize);
 
-    let mut closure = RetentionClosure::new(&macro_products, None);
+    let compiler_members = ValidatedCompilerMemberConstraints::default();
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let mut compile_required = (0..COUNT)
         .map(|definition| GraphNode::Definition(DefinitionId(definition)))
         .collect::<BTreeSet<_>>();
@@ -4883,13 +4954,14 @@ fn source_site_index_does_not_rescan_disjoint_units_per_site() {
 }
 
 #[test]
-fn compiler_roots_do_not_pollute_semantic_requirements() {
-    let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+fn compiler_and_explicit_roots_both_retain_their_dependencies() {
+    let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     let units = vec![
-        unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
+        unit(0, WrittenUnitKind::CrateRoot, (0, 40), None, 0),
         unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
         unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
         unit(3, WrittenUnitKind::Item, (21, 30), Some(0), 3),
+        unit(4, WrittenUnitKind::Item, (31, 39), Some(0), 4),
     ];
     let inventory = inventory(source, units.clone());
     let definitions = vec![
@@ -4903,6 +4975,7 @@ fn compiler_roots_do_not_pollute_semantic_requirements() {
             "compiler_root",
         ),
         written_definition(3, DefinitionKind::Function, &units[3], Some(0), "entry"),
+        written_definition(4, DefinitionKind::Function, &units[4], Some(0), "unused"),
     ];
     let mut graph = graph(
         definitions,
@@ -4940,18 +5013,25 @@ fn compiler_roots_do_not_pollute_semantic_requirements() {
     .unwrap();
 
     assert_eq!(
-        retention.semantic_required,
+        retention.compile_required,
         BTreeSet::from([
             GraphNode::Definition(DefinitionId(0)),
             GraphNode::Definition(DefinitionId(1)),
+            GraphNode::Definition(DefinitionId(2)),
             GraphNode::Definition(DefinitionId(3)),
             GraphNode::Mono(MonoId(0)),
-        ])
+            GraphNode::Mono(MonoId(1)),
+            GraphNode::Mono(compiler_root),
+        ]),
     );
-    assert!(
-        retention
-            .compile_required
-            .contains(&GraphNode::Definition(DefinitionId(2)))
+    assert_eq!(
+        retention.retained_units,
+        BTreeSet::from([
+            SourceUnitId(0),
+            SourceUnitId(1),
+            SourceUnitId(2),
+            SourceUnitId(3)
+        ]),
     );
 }
 
@@ -5009,7 +5089,7 @@ fn a_reexport_definition_root_retains_a_generic_function_without_a_mono_node() {
 
     assert!(graph.mono_nodes.is_empty());
     assert_eq!(
-        retention.semantic_required,
+        retention.compile_required,
         BTreeSet::from([
             GraphNode::Definition(DefinitionId(0)),
             GraphNode::Definition(DefinitionId(1)),
@@ -5023,12 +5103,13 @@ fn a_reexport_definition_root_retains_a_generic_function_without_a_mono_node() {
 }
 
 #[test]
-fn native_link_definition_roots_are_compile_only() {
+fn native_link_definition_roots_retain_their_source() {
     let source = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     let units = vec![
         unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
         unit(1, WrittenUnitKind::Item, (0, 10), Some(0), 1),
         unit(2, WrittenUnitKind::Item, (11, 20), Some(0), 2),
+        unit(3, WrittenUnitKind::Item, (21, 30), Some(0), 3),
     ];
     let inventory = inventory(source, units.clone());
     let definitions = vec![
@@ -5041,6 +5122,7 @@ fn native_link_definition_roots_are_compile_only() {
             Some(0),
             "linked",
         ),
+        written_definition(3, DefinitionKind::Function, &units[3], Some(0), "unused"),
     ];
     let mut graph = graph(
         definitions,
@@ -5061,20 +5143,15 @@ fn native_link_definition_roots_are_compile_only() {
     )
     .unwrap();
 
-    assert_eq!(
-        retention.semantic_required,
-        BTreeSet::from([
-            GraphNode::Definition(DefinitionId(0)),
-            GraphNode::Definition(DefinitionId(1)),
-            GraphNode::Mono(MonoId(0)),
-        ])
-    );
     assert!(
         retention
             .compile_required
             .contains(&GraphNode::Definition(DefinitionId(2)))
     );
-    assert!(retention.retained_units.contains(&SourceUnitId(2)));
+    assert_eq!(
+        retention.retained_units,
+        BTreeSet::from([SourceUnitId(0), SourceUnitId(1), SourceUnitId(2)]),
+    );
 }
 
 #[test]
@@ -5747,7 +5824,7 @@ fn compiler_member_constraints_do_not_collapse_shared_macro_source() {
         let mut retained_units = BTreeSet::new();
         close_validated_retention_constraints(
             &macro_products,
-            Some(&compiler_members),
+            &compiler_members,
             &mut required,
             &mut retained_units,
         );
@@ -5789,7 +5866,7 @@ fn direct_and_conditional_member_requirements_close_each_demand_lane() {
     let mut newly_present = Vec::new();
     let mut newly_actual = Vec::new();
     let mut newly_retained = Vec::new();
-    let mut closure = RetentionClosure::new(&macro_products, Some(&compiler_members));
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     closure
         .seed(&compile_present, &actual_required, &retained_units)
         .unwrap();
@@ -5863,7 +5940,7 @@ fn macro_and_member_reverse_chains_visit_each_indexed_fact_once() {
         conditional_by_trigger: BTreeMap::new(),
         disjunctions: Vec::new(),
     };
-    let mut closure = RetentionClosure::new(&macro_products, Some(&compiler_members));
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let mut compile_required = BTreeSet::from([GraphNode::Definition(DefinitionId(COUNT - 1))]);
     let mut actual_required = compile_required.clone();
     let mut retained_units = BTreeSet::new();
@@ -5923,7 +6000,7 @@ fn conditional_member_reverse_chain_visits_each_operand_once() {
         conditional_by_trigger,
         disjunctions: Vec::new(),
     };
-    let mut closure = RetentionClosure::new(&macro_products, Some(&compiler_members));
+    let mut closure = RetentionClosure::new(&macro_products, &compiler_members);
     let mut compile_required = BTreeSet::from([
         GraphNode::Definition(DefinitionId(COUNT - 1)),
         GraphNode::Definition(COMMON),
@@ -6073,7 +6150,7 @@ fn source_requirement_closure_visits_each_fact_once_across_incremental_waves() {
         .collect::<Vec<_>>();
     let index =
         SourceRequirementIndex::new(unit_count, &groups, &requirements, &[], &[], &[]).unwrap();
-    let mut closure = SourceRequirementClosure::new(&index, SourceRequirementMode::Compile);
+    let mut closure = SourceRequirementClosure::new(&index);
     let mut retained = BTreeSet::new();
     let mut newly_retained = Vec::new();
     closure.seed(&retained).unwrap();
@@ -7433,24 +7510,17 @@ fn macro_capture_slots_use_directed_compile_requirements_and_exact_invocation_co
         &constraints.macro_rule_requirements,
     )
     .unwrap();
-    let mut semantic_retained = BTreeSet::from([SourceUnitId(4)]);
-    let mut semantic_new = Vec::new();
-    let mut semantic =
-        SourceRequirementClosure::new(&requirement_index, SourceRequirementMode::Semantic);
-    semantic.seed(&semantic_retained).unwrap();
-    semantic
-        .close(&mut semantic_retained, &mut semantic_new)
-        .unwrap();
-    assert!(!semantic_retained.contains(&SourceUnitId(3)));
-    let mut compile_retained = BTreeSet::from([SourceUnitId(4)]);
-    let mut compile_new = Vec::new();
-    let mut compile =
-        SourceRequirementClosure::new(&requirement_index, SourceRequirementMode::Compile);
-    compile.seed(&compile_retained).unwrap();
-    compile
-        .close(&mut compile_retained, &mut compile_new)
-        .unwrap();
-    assert!(compile_retained.contains(&SourceUnitId(3)));
+    for (seed, expected) in [
+        (4, BTreeSet::from([SourceUnitId(3), SourceUnitId(4)])),
+        (3, BTreeSet::from([SourceUnitId(3)])),
+    ] {
+        let mut retained = BTreeSet::from([SourceUnitId(seed)]);
+        let mut newly_retained = Vec::new();
+        let mut closure = SourceRequirementClosure::new(&requirement_index);
+        closure.seed(&retained).unwrap();
+        closure.close(&mut retained, &mut newly_retained).unwrap();
+        assert_eq!(retained, expected);
+    }
 
     let mut graph = DependencyGraph {
         definitions: DefinitionGraph {
