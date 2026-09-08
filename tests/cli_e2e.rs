@@ -142,7 +142,7 @@ fn no_main_cli_output_keeps_the_external_entry_and_compiles() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
-fn library_cli_keeps_the_selected_entry_and_emits_a_compilable_rlib() {
+fn library_cli_keeps_unicode_entries_and_emits_a_compilable_rlib() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -159,7 +159,7 @@ fn library_cli_keeps_the_selected_entry_and_emits_a_compilable_rlib() {
     std::fs::write(
         &input,
         concat!(
-            "pub fn kept() -> u8 { helper() }\n",
+            "pub fn cafe\u{0301}() -> u8 { helper() }\n",
             "fn helper() -> u8 { 7 }\n",
             "pub fn dead() -> u8 { 0 }\n",
         ),
@@ -173,7 +173,7 @@ fn library_cli_keeps_the_selected_entry_and_emits_a_compilable_rlib() {
             "--crate-name",
             "cli_library",
             "--entry",
-            "cli_library::kept",
+            "cli_library::cafe\u{0301}",
         ])
         .arg(&input)
         .arg("-o")
@@ -189,7 +189,7 @@ fn library_cli_keeps_the_selected_entry_and_emits_a_compilable_rlib() {
     assert_eq!(
         std::fs::read_to_string(&reduced).unwrap(),
         concat!(
-            "pub fn kept() -> u8 { helper() }\n",
+            "pub fn cafe\u{0301}() -> u8 { helper() }\n",
             "fn helper() -> u8 { 7 }\n",
             "\n",
         )
@@ -213,6 +213,31 @@ fn library_cli_keeps_the_selected_entry_and_emits_a_compilable_rlib() {
         String::from_utf8_lossy(&compilation.stderr)
     );
     assert!(library.is_file());
+
+    let fixed = work.join("fixed.rs");
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_rust-item-dependencies"))
+        .args([
+            "--crate-type",
+            "lib",
+            "--crate-name",
+            "cli_library",
+            "--entry",
+            "cli_library::r#café",
+        ])
+        .arg(&reduced)
+        .arg("-o")
+        .arg(&fixed)
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&fixed).unwrap(),
+        std::fs::read(&reduced).unwrap()
+    );
 
     std::fs::remove_dir_all(work).unwrap();
 }

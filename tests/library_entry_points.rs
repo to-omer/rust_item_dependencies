@@ -59,6 +59,12 @@ fn library_configuration_failures_are_typed() {
         ("entry", EntryPointError::InvalidPath),
         ("another_crate::entry", EntryPointError::WrongCrate),
         ("typed_errors::missing", EntryPointError::NotFound),
+        ("typed_errors::cafe\u{0301}", EntryPointError::NotFound),
+        ("typed_errors::ｅｎｔｒｙ", EntryPointError::NotFound),
+        ("typed_errors::r#self", EntryPointError::InvalidPath),
+        ("typed_errors::r#_", EntryPointError::InvalidPath),
+        ("typed_errors::entry::", EntryPointError::InvalidPath),
+        ("typed_errors::cafe-name", EntryPointError::InvalidPath),
         (
             "typed_errors::Unsupported",
             EntryPointError::UnsupportedItem,
@@ -1025,6 +1031,90 @@ fn external_only_entry_types_do_not_retain_unrelated_trait_implementations() {
             "lifetime_definition::outlives_entry",
         ],
     );
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn entry_identifiers_use_rust_unicode_normalization() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let source = concat!(
+        "pub mod cafe\u{0301} {\n",
+        "    pub fn nai\u{0308}ve() -> u8 { helper() }\n",
+        "    fn helper() -> u8 { 7 }\n",
+        "    pub static CRE\u{0300}ME: u8 = 9;\n",
+        "    pub fn unused() {}\n",
+        "}\n",
+        "pub use cafe\u{0301}::nai\u{0308}ve as fac\u{0327}ade;\n",
+        "pub fn unrelated() {}\n",
+    );
+    let cases: &[&[&str]] = &[
+        &[
+            "entries::café::naïve",
+            "entries::café::CRÈME",
+            "entries::façade",
+        ],
+        &[
+            "entries::cafe\u{0301}::nai\u{0308}ve",
+            "entries::cafe\u{0301}::CRE\u{0300}ME",
+            "entries::fac\u{0327}ade",
+        ],
+        &[
+            "entries::r#fac\u{0327}ade",
+            "entries::r#cafe\u{0301}::r#CRE\u{0300}ME",
+            "entries::r#cafe\u{0301}::r#nai\u{0308}ve",
+            "entries::café::naïve",
+        ],
+    ];
+    let mut expected = None;
+    for &entries in cases {
+        let input = entries
+            .iter()
+            .fold(library_input(source, "entries"), |input, entry| {
+                input.with_entry_point(EntryPoint::new(*entry))
+            });
+        let reduction = analyzer
+            .reduce(&input)
+            .expect("equivalent identifiers must resolve");
+        let reduced = reduction.reduced_source();
+        assert!(reduced.contains("pub fn nai\u{0308}ve()"));
+        assert!(reduced.contains("fn helper()"));
+        assert!(reduced.contains("pub static CRE\u{0300}ME"));
+        assert!(reduced.contains("pub use cafe\u{0301}::nai\u{0308}ve as fac\u{0327}ade;"));
+        assert!(!reduced.contains("unused"));
+        assert!(!reduced.contains("unrelated"));
+        assert_eq!(
+            reduced,
+            expected.get_or_insert_with(|| reduced.to_owned()).as_str()
+        );
+        assert_library_fixed_point(&analyzer, reduced, "entries", entries.iter().copied());
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn entry_identifiers_preserve_edition_keyword_rules() {
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let source = "pub fn r#async() {}\npub fn unused() {}\n";
+    for (edition, path, accepted) in [
+        (Edition::Rust2015, "entries::async", true),
+        (Edition::Rust2024, "entries::async", false),
+        (Edition::Rust2024, "entries::r#async", true),
+    ] {
+        let input = SourceInput::library(source, edition, host_target(), "entries")
+            .with_entry_point(EntryPoint::new(path));
+        if accepted {
+            let reduction = analyzer.reduce(&input).expect("a valid entry must resolve");
+            assert_eq!(reduction.reduced_source(), "pub fn r#async() {}\n\n");
+        } else {
+            assert_eq!(
+                analyzer.reduce(&input).unwrap_err(),
+                AnalysisError::InvalidEntryPoint {
+                    path: path.to_owned(),
+                    reason: EntryPointError::InvalidPath,
+                }
+            );
+        }
+    }
 }
 
 #[cfg(rust_item_dependencies_patched)]

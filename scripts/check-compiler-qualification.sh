@@ -139,6 +139,13 @@ if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
 fi
 rustc_lexer=$1
 
+set -- "$compiler_metadata"/librustc_parse-*.rmeta
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+    echo "expected exactly one rustc_parse metadata file" >&2
+    exit 1
+fi
+rustc_parse=$1
+
 set -- "$compiler_metadata"/librustc_session-*.rmeta
 if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
     echo "expected exactly one rustc_session metadata file" >&2
@@ -178,6 +185,7 @@ rustc_hir=$(native_path "$rustc_hir")
 rustc_feature=$(native_path "$rustc_feature")
 rustc_middle=$(native_path "$rustc_middle")
 rustc_lexer=$(native_path "$rustc_lexer")
+rustc_parse=$(native_path "$rustc_parse")
 rustc_session=$(native_path "$rustc_session")
 rustc_serialize=$(native_path "$rustc_serialize")
 rustc_span=$(native_path "$rustc_span")
@@ -200,6 +208,7 @@ encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_hir=$rustc_hir"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_lexer=$rustc_lexer"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_middle=$rustc_middle"
+encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_parse=$rustc_parse"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_session=$rustc_session"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_serialize=$rustc_serialize"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_span=$rustc_span"

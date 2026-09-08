@@ -35,6 +35,7 @@ const RUSTC_PRIVATE_CRATES: &[&str] = &[
     "rustc_interface",
     "rustc_lexer",
     "rustc_middle",
+    "rustc_parse",
     "rustc_serialize",
     "rustc_session",
     "rustc_span",

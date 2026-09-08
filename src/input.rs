@@ -1282,7 +1282,7 @@ fn parse_entry_point_path(
             if !rustc_lexer::is_ident(name) {
                 return Err(EntryPointError::InvalidPath);
             }
-            let symbol = Symbol::intern(name);
+            let symbol = rustc_parse::lexer::nfc_normalize(name);
             if raw {
                 if !symbol.can_be_raw() {
                     return Err(EntryPointError::InvalidPath);
