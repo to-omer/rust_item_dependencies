@@ -12,8 +12,8 @@ use rustc_ast as ast;
 use rustc_ast::visit::{self, AssocCtxt, Visitor};
 use rustc_driver::{Callbacks, Compilation};
 use rustc_errors::emitter::Emitter;
-use rustc_errors::formatting::format_diag_messages;
-use rustc_errors::{DiagInner, E0463, E0554, E0658, ErrCode, Level};
+use rustc_errors::formatting::{format_diag_message, format_diag_messages};
+use rustc_errors::{DiagInner, E0463, E0554, E0658, ErrCode, Level, SuggestionStyle, Suggestions};
 use rustc_expand::config::{StripUnconfigured, features, pre_configure_attrs};
 use rustc_feature::{Features, UnstableFeatures};
 use rustc_hir as hir;
@@ -41,7 +41,9 @@ use crate::dependency_graph::{
 };
 #[cfg(all(test, rust_item_dependencies_patched))]
 use crate::dependency_graph::{DependencyKind, EvidenceOrigin, ProofRelationKind};
-use crate::error::{AnalysisError, EntryPointError, UnsupportedReason};
+use crate::error::{
+    AnalysisError, Diagnostic, DiagnosticLevel, EntryPointError, UnsupportedReason,
+};
 #[cfg(all(test, rust_item_dependencies_patched))]
 use crate::expansions::validated_outputless_macro_expansions;
 use crate::expansions::{ExpansionError, collect_expansions, collect_macro_provenance};
@@ -463,7 +465,7 @@ pub(crate) enum InputError {
         reason: UnsupportedReason,
         range: Option<ByteRange>,
     },
-    OriginalCompilationFailed(Vec<CompilerDiagnostic>),
+    OriginalCompilationFailed(Vec<Diagnostic>),
     CompilerIce,
     CompilerProtocolFailure,
     Source(SourceError),
@@ -486,12 +488,6 @@ pub(crate) enum DependencyError {
     Retention(RetentionError),
     Graph(DependencyGraphError),
     Rewrite(SourceRewriteError),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CompilerDiagnostic {
-    pub message: String,
-    pub range: Option<ByteRange>,
 }
 
 impl From<SourceError> for InputError {
@@ -911,7 +907,7 @@ fn run_inspection(
             .errors
             .iter()
             .skip(denied.diagnostic_index)
-            .filter_map(|diagnostic| diagnostic.normalized_range)
+            .filter_map(|diagnostic| diagnostic.primary.normalized_range)
             .min()
             .map(|range| callbacks.offsets.original_range(range))
             .transpose()?;
@@ -930,6 +926,7 @@ fn run_inspection(
         .find(|diagnostic| matches!(diagnostic.code, Some(E0554 | E0658)))
     {
         let range = diagnostic
+            .primary
             .normalized_range
             .ok_or(InputError::Source(SourceError::InvalidSpan))?;
         return Err(map_input_error(
@@ -947,6 +944,7 @@ fn run_inspection(
         .find(|diagnostic| diagnostic.code == Some(E0463))
     {
         let range = diagnostic
+            .primary
             .normalized_range
             .ok_or(InputError::Source(SourceError::InvalidSpan))?;
         return Err(map_input_error(
@@ -963,7 +961,7 @@ fn run_inspection(
             .errors
             .iter()
             .skip(denied.diagnostic_index)
-            .filter_map(|diagnostic| diagnostic.normalized_range)
+            .filter_map(|diagnostic| diagnostic.primary.normalized_range)
             .min()
             .ok_or(InputError::Source(SourceError::InvalidSpan))?;
         return Err(map_input_error(
@@ -985,8 +983,10 @@ fn run_inspection(
         let diagnostics = diagnostics
             .errors
             .iter()
+            .flat_map(|diagnostic| std::iter::once(&diagnostic.primary).chain(&diagnostic.related))
             .map(|diagnostic| {
-                Ok(CompilerDiagnostic {
+                Ok(Diagnostic {
+                    level: diagnostic.level,
                     message: diagnostic.message.clone(),
                     range: diagnostic
                         .normalized_range
@@ -2377,8 +2377,15 @@ fn unsupported(
 #[derive(Clone, Debug)]
 struct ObservedDiagnostic {
     code: Option<ErrCode>,
-    normalized_range: Option<ByteRange>,
     compiler_bug: bool,
+    primary: ObservedDiagnosticMessage,
+    related: Vec<ObservedDiagnosticMessage>,
+}
+
+#[derive(Clone, Debug)]
+struct ObservedDiagnosticMessage {
+    level: DiagnosticLevel,
+    normalized_range: Option<ByteRange>,
     message: String,
 }
 
@@ -2394,23 +2401,103 @@ struct CapturingEmitter {
     diagnostics: Arc<Mutex<DiagnosticState>>,
 }
 
+impl CapturingEmitter {
+    fn normalized_range(&self, span: Span) -> Option<ByteRange> {
+        normalized_input_span_range(&self.source_map, &self.input_name, span.source_callsite())
+    }
+
+    fn related_messages(&self, diagnostic: &DiagInner) -> Vec<ObservedDiagnosticMessage> {
+        let mut related = Vec::new();
+        let mut add = |level, message: String, span: Option<Span>| {
+            if !message.is_empty() {
+                related.push(ObservedDiagnosticMessage {
+                    level,
+                    message,
+                    normalized_range: span.and_then(|span| self.normalized_range(span)),
+                });
+            }
+        };
+        for (span, label) in diagnostic.span.span_labels_raw() {
+            add(
+                DiagnosticLevel::Note,
+                format_diag_message(label, &diagnostic.args).into_owned(),
+                Some(*span),
+            );
+        }
+        for child in &diagnostic.children {
+            let level = match child.level {
+                Level::Bug | Level::Fatal | Level::Error | Level::DelayedBug => {
+                    DiagnosticLevel::Error
+                }
+                Level::ForceWarning | Level::Warning => DiagnosticLevel::Warning,
+                Level::Note | Level::OnceNote | Level::FailureNote => DiagnosticLevel::Note,
+                Level::Help | Level::OnceHelp => DiagnosticLevel::Help,
+                Level::Allow | Level::Expect => continue,
+            };
+            add(
+                level,
+                format_diag_messages(&child.messages, &diagnostic.args).into_owned(),
+                child.span.primary_span(),
+            );
+            for (span, label) in child.span.span_labels_raw() {
+                add(
+                    DiagnosticLevel::Note,
+                    format_diag_message(label, &diagnostic.args).into_owned(),
+                    Some(*span),
+                );
+            }
+        }
+        let suggestions = match &diagnostic.suggestions {
+            Suggestions::Enabled(suggestions) => suggestions.as_slice(),
+            Suggestions::Sealed(suggestions) => suggestions.as_ref(),
+            Suggestions::Disabled => &[],
+        };
+        for suggestion in suggestions {
+            if suggestion.style == SuggestionStyle::CompletelyHidden {
+                continue;
+            }
+            // A diagnostic location is not an edit range. Only attach a
+            // suggestion's location when it has one candidate and one part.
+            let span = match suggestion.substitutions.as_slice() {
+                [substitution] => match substitution.parts.as_slice() {
+                    [part] => Some(part.span),
+                    _ => None,
+                },
+                _ => None,
+            };
+            add(
+                DiagnosticLevel::Help,
+                format_diag_message(&suggestion.msg, &diagnostic.args).into_owned(),
+                span,
+            );
+        }
+        related
+    }
+}
+
 impl Emitter for CapturingEmitter {
     fn emit_diagnostic(&mut self, diagnostic: DiagInner) {
         if !diagnostic.is_error() {
             return;
         }
-        let normalized_range = diagnostic.span.primary_span().and_then(|span| {
-            normalized_input_span_range(&self.source_map, &self.input_name, span.source_callsite())
-        });
+        let primary = ObservedDiagnosticMessage {
+            level: DiagnosticLevel::Error,
+            normalized_range: diagnostic
+                .span
+                .primary_span()
+                .and_then(|span| self.normalized_range(span)),
+            message: format_diag_messages(&diagnostic.messages, &diagnostic.args).into_owned(),
+        };
+        let related = self.related_messages(&diagnostic);
         self.diagnostics
             .lock()
             .expect("diagnostic state mutex is poisoned")
             .errors
             .push(ObservedDiagnostic {
-                message: format_diag_messages(&diagnostic.messages, &diagnostic.args).into_owned(),
                 code: diagnostic.code,
-                normalized_range,
                 compiler_bug: matches!(diagnostic.level(), Level::Bug | Level::DelayedBug),
+                primary,
+                related,
             });
     }
 
@@ -3699,9 +3786,13 @@ mod tests {
             .errors
             .push(ObservedDiagnostic {
                 code: None,
-                normalized_range: Some(range(0, 1)),
                 compiler_bug: false,
-                message: "sentinel compiler error".to_owned(),
+                primary: super::ObservedDiagnosticMessage {
+                    level: super::DiagnosticLevel::Error,
+                    normalized_range: Some(range(0, 1)),
+                    message: "sentinel compiler error".to_owned(),
+                },
+                related: Vec::new(),
             });
         loader.deny(UnsupportedReason::ExternalCompileTimeResource);
         let denied = denied_file
@@ -4006,3 +4097,7 @@ mod dependency_tests;
 #[cfg(test)]
 #[path = "input/retention_tests.rs"]
 mod retention_tests;
+
+#[cfg(test)]
+#[path = "input/diagnostic_tests.rs"]
+mod diagnostic_tests;

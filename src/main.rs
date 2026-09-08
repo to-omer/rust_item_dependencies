@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
+use rust_item_dependencies::error::{CompilerFailure, DiagnosticLevel};
 use rust_item_dependencies::{
     AnalysisError, Analyzer, CompilationOptions, Edition, EntryPoint, OptimizationLevel,
     SourceInput,
@@ -158,9 +159,41 @@ fn render_analysis_error(error: AnalysisError) -> String {
         | AnalysisError::ReducedCompilationFailed(diagnostics) => {
             for diagnostic in diagnostics.diagnostics() {
                 rendered.push_str("\n  ");
+                rendered.push_str(match diagnostic.level {
+                    DiagnosticLevel::Error => "error: ",
+                    DiagnosticLevel::Warning => "warning: ",
+                    DiagnosticLevel::Note => "note: ",
+                    DiagnosticLevel::Help => "help: ",
+                    _ => "diagnostic: ",
+                });
                 rendered.push_str(&diagnostic.message);
                 append_range(&mut rendered, diagnostic.range);
             }
+        }
+        AnalysisError::IncompleteObservation(gap) => {
+            rendered.push_str(&format!(": {}: {}", gap.phase, gap.fact));
+            append_range(&mut rendered, gap.range);
+        }
+        AnalysisError::SourceRewriteInvariantViolation(violation) => {
+            rendered.push_str(&format!(": {}", violation.message));
+            append_range(&mut rendered, violation.range);
+        }
+        AnalysisError::DecisionMismatch(difference) => {
+            for difference in difference.differences() {
+                rendered.push_str(&format!("\n  {}", difference.kind));
+                append_range(&mut rendered, difference.range);
+                rendered.push_str(&format!(
+                    "\n    original: {}\n    reduced: {}",
+                    difference.original, difference.reduced,
+                ));
+            }
+        }
+        AnalysisError::CompilerFailure(reason) => {
+            rendered.push_str(match reason {
+                CompilerFailure::Ice => ": internal compiler error",
+                CompilerFailure::DriverProtocol => ": unexpected compiler driver state",
+                _ => ": unknown compiler failure",
+            });
         }
         _ => {}
     }
@@ -608,6 +641,18 @@ mod tests {
 
     #[test]
     fn renders_structured_analysis_error_details() {
+        for (reason, detail) in [
+            (CompilerFailure::Ice, "internal compiler error"),
+            (
+                CompilerFailure::DriverProtocol,
+                "unexpected compiler driver state",
+            ),
+        ] {
+            assert_eq!(
+                render_analysis_error(AnalysisError::CompilerFailure(reason)),
+                format!("the compiler driver failed: {detail}"),
+            );
+        }
         assert_eq!(
             render_analysis_error(AnalysisError::InvalidCrateName {
                 name: "bad-name".to_owned(),
