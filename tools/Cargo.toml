@@ -11,4 +11,7 @@ path = "rid.rs"
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 
+[dev-dependencies]
+walkdir = "2.5"
+
 [workspace]

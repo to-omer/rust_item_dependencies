@@ -75,10 +75,12 @@ jobs:
           path: target/rid/rustc/build
           # Bump the version when compiler build inputs or the cached layout become incompatible.
           key: rid-rustc-v5-${{ runner.os }}-${{ runner.arch }}-${{ steps.runner-image.outputs.name }}-${{ hashFiles('rustc-patches/queue-digest') }}-${{ hashFiles('rustc-patches/patched-revision') }}
-      - name: Bootstrap patched compiler through cargo rid
+      - name: Prepare patched compiler and verify cache reuse
+        env:
+          RUST_ITEM_DEPENDENCIES_TEST_COMPILER_CACHE_HIT: ${{ steps.patched-compiler-cache.outputs.cache-hit == 'true' }}
         run: >-
-          cargo rid tests/fixtures/compiler/driver_smoke.rs
-          -o target/ci-reduced.rs
+          cargo test --locked --manifest-path tools/Cargo.toml --target-dir target/rid-tool-tests
+          --bin cargo-rid -- --ignored --nocapture
       - name: Run full acceptance suite
         shell: bash
         run: |
