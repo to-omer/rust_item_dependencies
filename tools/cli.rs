@@ -1,58 +1,48 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+use clap::{Args, CommandFactory, FromArgMatches, Parser, ValueEnum};
+
 pub fn reducer_usage(command: &str) -> String {
-    format!(
-        r#"{command}
-
-Cargo project options (when INPUT.rs is omitted):
-  -p, --package SPEC      Select a workspace package
-      --bin NAME         Select a binary target
-      --manifest-path PATH
-      --features FEATURES, --all-features, --no-default-features
-      --release, --profile NAME, --target TRIPLE, --target-dir PATH
-      --locked, --offline, --frozen, --config KEY=VALUE, --jobs N
-
-Standalone file options:
-  -o, --output OUTPUT    Write to a new file instead of updating INPUT.rs
-      --edition YEAR     Rust edition: 2015, 2018, 2021, or 2024 [default: 2024]
-      --target TRIPLE    Compilation target [default: compiler host]
-      --crate-type TYPE  Crate type: bin or lib [default: bin]
-      --crate-name NAME  Crate name [default: main]
-      --entry PATH       Preserve a fully qualified function or static; may be repeated
-  -O                     Same as --opt-level 3
-      --opt-level LEVEL  Optimization level: 0, 1, 2, 3, s, or z [default: 0]
-      --cfg NAME         Enable a name-only cfg; may be repeated
-      --extern NAME=PATH Add a direct Rust dependency; may be repeated
-      --dependency-artifact PATH
-                         Add a transitive Rust dependency; may be repeated
-      --allow-proc-macro PATH
-                         Permit a declared procedural macro; may be repeated
-  -h, --help             Print help"#
-    )
+    let help = Arguments::command()
+        .help_template("{all-args}")
+        .render_help();
+    format!("{command}\n\n{help}")
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum CliEdition {
+    #[value(name = "2015")]
     Rust2015,
+    #[value(name = "2018")]
     Rust2018,
+    #[value(name = "2021")]
     Rust2021,
+    #[value(name = "2024")]
     Rust2024,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum CliOptimizationLevel {
+    #[value(name = "0")]
     O0,
+    #[value(name = "1")]
     O1,
+    #[value(name = "2")]
     O2,
+    #[value(name = "3")]
     O3,
+    #[value(name = "s")]
     Size,
+    #[value(name = "z")]
     SizeMin,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum CliCrateType {
+    #[value(name = "bin")]
     Binary,
+    #[value(name = "lib")]
     Library,
 }
 
@@ -88,241 +78,225 @@ pub enum Parsed {
 }
 
 #[derive(Debug, Default)]
+// These fields are consumed by the reducer after the launcher validates them.
+#[allow(dead_code)]
 pub struct ProjectCli {
     pub manifest: Option<PathBuf>,
     pub package: Option<OsString>,
     pub bin: Option<OsString>,
     pub cargo_options: Vec<OsString>,
-    pub metadata_options: Vec<OsString>,
-    pub common_options: Vec<OsString>,
+    pub metadata_options: Vec<String>,
+    pub common_options: Vec<String>,
     pub target_directory: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+#[command(name = "cargo rid", no_binary_name = true, term_width = 0)]
+struct Arguments {
+    /// Source file to update; omit to select a Cargo binary
+    #[arg(value_name = "INPUT.rs")]
+    input: Option<PathBuf>,
+    /// Compilation target [default: compiler host or Cargo configuration]
+    #[arg(long, value_name = "TRIPLE", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    target: Vec<String>,
+    #[command(
+        flatten,
+        next_help_heading = "Cargo project options (when INPUT.rs is omitted)"
+    )]
+    project: ProjectArguments,
+    #[command(flatten, next_help_heading = "Standalone file options")]
+    standalone: StandaloneArguments,
+}
+
+#[derive(Args)]
+#[group(id = "project", multiple = true, conflicts_with = "input")]
+struct ProjectArguments {
+    /// Select a workspace package
+    #[arg(short = 'p', long, value_name = "SPEC")]
+    package: Option<OsString>,
+    /// Select a binary target
+    #[arg(long, value_name = "NAME")]
+    bin: Option<OsString>,
+    #[arg(long, value_name = "PATH")]
+    manifest_path: Option<PathBuf>,
+    #[arg(short = 'F', long, value_name = "FEATURES")]
+    features: Vec<String>,
+    #[arg(long)]
+    all_features: bool,
+    #[arg(long)]
+    no_default_features: bool,
+    #[arg(short = 'r', long)]
+    release: bool,
+    #[arg(long, value_name = "NAME")]
+    profile: Option<OsString>,
+    #[arg(long, value_name = "PATH")]
+    target_dir: Option<PathBuf>,
+    #[arg(long)]
+    locked: bool,
+    #[arg(long)]
+    offline: bool,
+    #[arg(long)]
+    frozen: bool,
+    #[arg(long, value_name = "KEY=VALUE|PATH")]
+    config: Vec<String>,
+    #[arg(short = 'j', long, value_name = "N", allow_negative_numbers = true)]
+    jobs: Option<OsString>,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    #[arg(short = 'q', long)]
+    quiet: bool,
+}
+
+#[derive(Args)]
+#[group(id = "standalone", multiple = true, requires = "input")]
+struct StandaloneArguments {
+    /// Write to a new file instead of updating INPUT.rs
+    #[arg(short = 'o', long, value_name = "OUTPUT", overrides_with = "output")]
+    output: Option<PathBuf>,
+    /// Rust edition [default: 2024]
+    #[arg(long, value_name = "YEAR", overrides_with = "edition")]
+    edition: Option<CliEdition>,
+    /// Crate type [default: bin]
+    #[arg(long, value_name = "TYPE", overrides_with = "crate_type")]
+    crate_type: Option<CliCrateType>,
+    /// Crate name [default: main]
+    #[arg(long, value_name = "NAME", overrides_with = "crate_name")]
+    crate_name: Option<String>,
+    /// Preserve a fully qualified function or static; may be repeated
+    #[arg(long, value_name = "PATH")]
+    entry: Vec<String>,
+    /// Same as --opt-level 3
+    #[arg(short = 'O', overrides_with_all = ["opt_level", "optimize"])]
+    optimize: bool,
+    /// Optimization level [default: 0]
+    #[arg(long, value_name = "LEVEL", overrides_with_all = ["optimize", "opt_level"])]
+    opt_level: Option<CliOptimizationLevel>,
+    /// Enable a name-only cfg; may be repeated
+    #[arg(long, value_name = "NAME")]
+    cfg: Vec<String>,
+    /// Add a direct Rust dependency; may be repeated
+    #[arg(long = "extern", value_name = "NAME=PATH")]
+    external: Vec<OsString>,
+    /// Add a transitive Rust dependency; may be repeated
+    #[arg(long, value_name = "PATH")]
+    dependency_artifact: Vec<PathBuf>,
+    /// Permit a declared procedural macro; may be repeated
+    #[arg(long, value_name = "PATH")]
+    allow_proc_macro: Vec<PathBuf>,
 }
 
 pub fn parse_arguments(
     arguments: impl IntoIterator<Item = OsString>,
     usage: &str,
 ) -> Result<Parsed, String> {
-    let mut arguments: Box<dyn Iterator<Item = OsString>> =
-        Box::new(arguments.into_iter().collect::<Vec<_>>().into_iter());
-    let mut project = ProjectCli::default();
-    let mut standalone_option = false;
-    let mut project_option = false;
-    let mut input = None;
-    let mut output = None;
-    let mut edition = CliEdition::Rust2024;
-    let mut target = None;
-    let mut repeated_target = false;
-    let mut crate_type = CliCrateType::Binary;
-    let mut crate_name = "main".to_owned();
-    let mut entry_points = Vec::new();
-    let mut optimization_level = CliOptimizationLevel::O0;
-    let mut cfg_names = Vec::new();
-    let mut external_crates = Vec::new();
-    let mut dependency_artifacts = Vec::new();
-    let mut allowed_proc_macro_artifacts = Vec::new();
-    let mut positional_only = false;
-
-    while let Some(mut argument) = arguments.next() {
-        if !positional_only {
-            if let Some((name, value)) = argument
-                .to_str()
-                .filter(|value| value.starts_with("--"))
-                .and_then(|value| value.split_once('='))
-            {
-                let name = OsString::from(name);
-                let value = OsString::from(value);
-                arguments = Box::new(std::iter::once(value).chain(arguments));
-                argument = name;
-            }
-            if let Some(name) = argument.to_str() {
-                match name {
-                    "--manifest-path" | "-p" | "--package" | "--bin" => {
-                        project_option = true;
-                        let value = next_value(&mut arguments, name)?;
-                        let previous = match name {
-                            "--manifest-path" => project.manifest.replace(value.into()).is_some(),
-                            "--bin" => project.bin.replace(value).is_some(),
-                            _ => project.package.replace(value).is_some(),
-                        };
-                        if previous {
-                            return Err(format!("{name} may only be specified once"));
-                        }
-                        continue;
-                    }
-                    "--features" | "-F" | "--profile" | "--target-dir" | "--config" | "-j"
-                    | "--jobs" => {
-                        project_option = true;
-                        let value = next_value(&mut arguments, name)?;
-                        if name == "--profile"
-                            && ["test", "bench", "check"]
-                                .iter()
-                                .any(|profile| value == *profile)
-                        {
-                            return Err("cargo rid reduces ordinary binaries; test, bench, and check profiles are unsupported".to_owned());
-                        }
-                        if name == "--target-dir"
-                            && project
-                                .target_directory
-                                .replace(PathBuf::from(&value))
-                                .is_some()
-                        {
-                            return Err("--target-dir may only be specified once".to_owned());
-                        }
-                        if name == "--config" {
-                            project.common_options.extend([argument, value]);
-                            continue;
-                        }
-                        if matches!(name, "--features" | "-F") {
-                            project
-                                .metadata_options
-                                .extend([argument.clone(), value.clone()]);
-                        }
-                        project.cargo_options.extend([argument, value]);
-                        continue;
-                    }
-                    "--all-features"
-                    | "--no-default-features"
-                    | "--locked"
-                    | "--offline"
-                    | "--frozen"
-                    | "--release"
-                    | "-r"
-                    | "--verbose"
-                    | "-v"
-                    | "--quiet"
-                    | "-q" => {
-                        project_option = true;
-                        if matches!(name, "--locked" | "--offline" | "--frozen") {
-                            project.common_options.push(argument);
-                            continue;
-                        }
-                        if matches!(name, "--all-features" | "--no-default-features") {
-                            project.metadata_options.push(argument.clone());
-                        }
-                        project.cargo_options.push(argument);
-                        continue;
-                    }
-                    "--target" | "-h" | "--help" | "--" => {}
-                    _ if name.starts_with('-') => standalone_option = true,
-                    _ => {}
-                }
-            }
-            match argument.to_str() {
-                Some("-h" | "--help") => return Ok(Parsed::Help),
-                Some("--") => {
-                    positional_only = true;
-                    continue;
-                }
-                Some("-o" | "--output") => {
-                    output = Some(next_value(&mut arguments, "--output")?.into());
-                    continue;
-                }
-                Some("--edition") => {
-                    edition = parse_edition(next_utf8(&mut arguments, "--edition")?)?;
-                    continue;
-                }
-                Some("--target") => {
-                    let value = next_utf8(&mut arguments, "--target")?;
-                    if value.is_empty() {
-                        return Err("--target requires a nonempty value".to_owned());
-                    }
-                    repeated_target |= target.replace(value).is_some();
-                    continue;
-                }
-                Some("--crate-type") => {
-                    crate_type = parse_crate_type(next_utf8(&mut arguments, "--crate-type")?)?;
-                    continue;
-                }
-                Some("--crate-name") => {
-                    crate_name = next_utf8(&mut arguments, "--crate-name")?;
-                    continue;
-                }
-                Some("--entry") => {
-                    entry_points.push(next_utf8(&mut arguments, "--entry")?);
-                    continue;
-                }
-                Some("-O") => {
-                    optimization_level = CliOptimizationLevel::O3;
-                    continue;
-                }
-                Some("--opt-level") => {
-                    optimization_level =
-                        parse_optimization_level(next_utf8(&mut arguments, "--opt-level")?)?;
-                    continue;
-                }
-                Some("--cfg") => {
-                    cfg_names.push(next_utf8(&mut arguments, "--cfg")?);
-                    continue;
-                }
-                Some("--extern") => {
-                    external_crates.push(parse_external_crate(next_value(
-                        &mut arguments,
-                        "--extern",
-                    )?)?);
-                    continue;
-                }
-                Some("--dependency-artifact") => {
-                    let artifact = next_value(&mut arguments, "--dependency-artifact")?;
-                    if artifact.is_empty() {
-                        return Err("--dependency-artifact requires a nonempty path".to_owned());
-                    }
-                    dependency_artifacts.push(artifact.into());
-                    continue;
-                }
-                Some("--allow-proc-macro") => {
-                    let artifact = next_value(&mut arguments, "--allow-proc-macro")?;
-                    if artifact.is_empty() {
-                        return Err("--allow-proc-macro requires a nonempty path".to_owned());
-                    }
-                    allowed_proc_macro_artifacts.push(artifact.into());
-                    continue;
-                }
-                Some(value) if value.starts_with('-') => {
-                    return Err(format!("unknown option: {value}\n\n{usage}"));
-                }
-                _ => {}
-            }
+    let Arguments {
+        input,
+        mut target,
+        project,
+        standalone,
+    } = match Arguments::command()
+        .override_usage(usage.strip_prefix("Usage: ").unwrap_or(usage).to_owned())
+        .try_get_matches_from(arguments)
+        .and_then(|matches| Arguments::from_arg_matches(&matches))
+    {
+        Ok(arguments) => arguments,
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+            return Ok(Parsed::Help);
         }
-
-        if input.replace(PathBuf::from(argument)).is_some() {
-            return Err(format!("expected exactly one input file\n\n{usage}"));
+        Err(error) => {
+            return Err(error
+                .to_string()
+                .trim_start_matches("error: ")
+                .trim_end()
+                .to_owned());
         }
-    }
-
+    };
     let Some(input) = input else {
-        if repeated_target {
+        if target.len() > 1 {
             return Err("cargo rid requires a single --target".to_owned());
         }
-        if standalone_option {
-            return Err(format!(
-                "standalone compiler options require an input file\n\n{usage}"
-            ));
+        if project.profile.as_ref().is_some_and(|profile| {
+            ["test", "bench", "check"]
+                .iter()
+                .any(|name| profile == name)
+        }) {
+            return Err("cargo rid reduces ordinary binaries; test, bench, and check profiles are unsupported".to_owned());
         }
-        if let Some(target) = target {
-            project
-                .cargo_options
-                .extend(["--target".into(), target.into()]);
+        let mut cli = ProjectCli {
+            manifest: project.manifest_path,
+            package: project.package,
+            bin: project.bin,
+            target_directory: project.target_dir.clone(),
+            ..ProjectCli::default()
+        };
+        for feature in project.features {
+            cli.metadata_options.extend(["--features".into(), feature]);
         }
-        return Ok(Parsed::Project(project));
+        for (option, enabled) in [
+            ("--all-features", project.all_features),
+            ("--no-default-features", project.no_default_features),
+        ] {
+            if enabled {
+                cli.metadata_options.push(option.into());
+            }
+        }
+        cli.cargo_options
+            .extend(cli.metadata_options.iter().map(OsString::from));
+        for (option, value) in [
+            ("--profile", project.profile),
+            ("--target-dir", project.target_dir.map(OsString::from)),
+            ("--jobs", project.jobs),
+            ("--target", target.pop().map(OsString::from)),
+        ] {
+            if let Some(value) = value {
+                cli.cargo_options.extend([option.into(), value]);
+            }
+        }
+        for (option, enabled) in [("--release", project.release), ("--quiet", project.quiet)] {
+            if enabled {
+                cli.cargo_options.push(option.into());
+            }
+        }
+        cli.cargo_options.extend(std::iter::repeat_n(
+            OsString::from("--verbose"),
+            usize::from(project.verbose),
+        ));
+        for config in project.config {
+            cli.common_options.extend(["--config".into(), config]);
+        }
+        for (option, enabled) in [
+            ("--locked", project.locked),
+            ("--offline", project.offline),
+            ("--frozen", project.frozen),
+        ] {
+            if enabled {
+                cli.common_options.push(option.into());
+            }
+        }
+        return Ok(Parsed::Project(cli));
     };
-    if project_option {
-        return Err(
-            "Cargo project options cannot be combined with a standalone input file".to_owned(),
-        );
-    }
+    let external_crates = standalone
+        .external
+        .into_iter()
+        .map(parse_external_crate)
+        .collect::<Result<_, _>>()?;
     Ok(Parsed::Run(Box::new(Cli {
         input,
-        output,
-        edition,
-        target,
-        crate_type,
-        crate_name,
-        entry_points,
-        optimization_level,
-        cfg_names,
+        output: standalone.output,
+        edition: standalone.edition.unwrap_or(CliEdition::Rust2024),
+        target: target.pop(),
+        crate_type: standalone.crate_type.unwrap_or(CliCrateType::Binary),
+        crate_name: standalone.crate_name.unwrap_or_else(|| "main".to_owned()),
+        entry_points: standalone.entry,
+        optimization_level: if standalone.optimize {
+            CliOptimizationLevel::O3
+        } else {
+            standalone.opt_level.unwrap_or(CliOptimizationLevel::O0)
+        },
+        cfg_names: standalone.cfg,
         external_crates,
-        dependency_artifacts,
-        allowed_proc_macro_artifacts,
+        dependency_artifacts: standalone.dependency_artifact,
+        allowed_proc_macro_artifacts: standalone.allow_proc_macro,
     })))
 }
 
@@ -345,58 +319,6 @@ pub fn validate_output(cli: &Cli) -> Result<(), String> {
 
 pub fn render_path(path: &Path) -> String {
     format!("{path:?}")
-}
-
-fn next_value(
-    arguments: &mut impl Iterator<Item = OsString>,
-    option: &str,
-) -> Result<OsString, String> {
-    arguments
-        .next()
-        .ok_or_else(|| format!("{option} requires a value"))
-}
-
-fn next_utf8(
-    arguments: &mut impl Iterator<Item = OsString>,
-    option: &str,
-) -> Result<String, String> {
-    next_value(arguments, option)?
-        .into_string()
-        .map_err(|_| format!("{option} requires a UTF-8 value"))
-}
-
-fn parse_edition(value: String) -> Result<CliEdition, String> {
-    match value.as_str() {
-        "2015" => Ok(CliEdition::Rust2015),
-        "2018" => Ok(CliEdition::Rust2018),
-        "2021" => Ok(CliEdition::Rust2021),
-        "2024" => Ok(CliEdition::Rust2024),
-        _ => Err(format!("unsupported Rust edition: {value}")),
-    }
-}
-
-fn parse_optimization_level(value: String) -> Result<CliOptimizationLevel, String> {
-    match value.as_str() {
-        "0" => Ok(CliOptimizationLevel::O0),
-        "1" => Ok(CliOptimizationLevel::O1),
-        "2" => Ok(CliOptimizationLevel::O2),
-        "3" => Ok(CliOptimizationLevel::O3),
-        "s" => Ok(CliOptimizationLevel::Size),
-        "z" => Ok(CliOptimizationLevel::SizeMin),
-        _ => Err(format!(
-            "unsupported optimization level: {value}; expected 0, 1, 2, 3, s, or z"
-        )),
-    }
-}
-
-fn parse_crate_type(value: String) -> Result<CliCrateType, String> {
-    match value.as_str() {
-        "bin" => Ok(CliCrateType::Binary),
-        "lib" => Ok(CliCrateType::Library),
-        _ => Err(format!(
-            "unsupported crate type: {value}; expected bin or lib"
-        )),
-    }
 }
 
 fn parse_external_crate(value: OsString) -> Result<CliExternalCrate, String> {

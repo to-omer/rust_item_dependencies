@@ -87,7 +87,7 @@ fn run() -> Result<RunOutcome, String> {
         (Some(arguments[1..].to_vec()), None)
     } else {
         let usage = reducer_usage(USAGE_COMMAND);
-        match parse_arguments(arguments.iter().cloned(), &usage)? {
+        match parse_arguments(arguments.iter().cloned(), USAGE_COMMAND)? {
             Parsed::Run(cli) => {
                 validate_output(&cli)?;
                 (None, cli.target.clone())

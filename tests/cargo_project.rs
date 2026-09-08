@@ -335,6 +335,39 @@ fn compiler_queries_are_identical_to_the_configured_rustc() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_non_unicode_cargo_program_never_falls_back_to_another_cargo() {
+    use std::os::unix::ffi::OsStringExt;
+    let project = Project::new();
+    project.write(
+        "Cargo.toml",
+        "[package]\nname='cargo-selection'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+    );
+    let source = "fn dead() {}\nfn main() {}\n";
+    project.write("src/main.rs", source);
+    success(
+        project
+            .cargo()
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .output()
+            .unwrap(),
+    );
+    let output = project
+        .reduce()
+        .env(
+            "CARGO",
+            std::ffi::OsString::from_vec(b"missing-cargo-\xff".to_vec()),
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("cannot read Cargo metadata"), "{error}");
+    assert!(!project.0.path().join("target/rid").exists());
+    assert_eq!(project.read("src/main.rs"), source);
+}
+
 #[test]
 fn cargo_and_wrapper_resources_remain_alive_through_macro_execution() {
     let project = fixture();

@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use cargo_metadata::{MetadataCommand, PackageId};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::ProjectCli;
@@ -11,28 +12,6 @@ use crate::file_output::SourceFile;
 const ADAPTER_CONFIG: &str = "RUST_ITEM_DEPENDENCIES_ADAPTER_CONFIG";
 const REDUCE_MARKER: &str = "--rust-item-dependencies-reduce-bin";
 const LAUNCHER: &str = "RUST_ITEM_DEPENDENCIES_LAUNCHER";
-
-#[derive(Deserialize)]
-struct Metadata {
-    packages: Vec<Package>,
-    workspace_members: Vec<String>,
-    workspace_default_members: Vec<String>,
-    target_directory: PathBuf,
-}
-
-#[derive(Deserialize)]
-struct Package {
-    id: String,
-    manifest_path: PathBuf,
-    targets: Vec<Target>,
-}
-
-#[derive(Deserialize)]
-struct Target {
-    name: String,
-    kind: Vec<String>,
-    src_path: PathBuf,
-}
 
 #[derive(Deserialize, Serialize)]
 struct AdapterConfig {
@@ -51,26 +30,27 @@ pub(crate) fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>>
 }
 
 pub(crate) fn reduce(cli: ProjectCli) -> Result<(), String> {
-    let mut metadata_command = cargo();
-    metadata_command.args(["metadata", "--format-version", "1", "--no-deps"]);
-    with_manifest(&mut metadata_command, &cli);
+    let mut metadata_command = MetadataCommand::new();
+    metadata_command.cargo_path(cargo().get_program());
+    metadata_command.no_deps().other_options(
+        cli.common_options
+            .iter()
+            .chain(&cli.metadata_options)
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    if let Some(manifest) = &cli.manifest {
+        metadata_command.manifest_path(manifest);
+    }
     if let Some(directory) = &cli.target_directory {
         metadata_command.env("CARGO_TARGET_DIR", directory);
     }
-    metadata_command
-        .args(&cli.common_options)
-        .args(&cli.metadata_options);
-    let output = metadata_command
-        .output()
-        .map_err(|error| format!("cannot run Cargo metadata: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Cargo metadata failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+    let metadata = metadata_command
+        .exec()
+        .map_err(|error| format!("cannot read Cargo metadata: {error}"))?;
+    if metadata.workspace_default_members.is_missing() {
+        return Err("Cargo metadata did not report default workspace members".to_owned());
     }
-    let metadata: Metadata = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("invalid Cargo metadata: {error}"))?;
     let members = if let Some(package) = &cli.package {
         let mut command = cargo();
         command.args(["pkgid", "--package"]).arg(package);
@@ -85,23 +65,24 @@ pub(crate) fn reduce(cli: ProjectCli) -> Result<(), String> {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        let id = String::from_utf8(output.stdout)
+        let repr = String::from_utf8(output.stdout)
             .map_err(|error| error.to_string())?
             .trim()
             .to_owned();
+        let id = PackageId { repr };
         if !metadata.workspace_members.contains(&id) {
             return Err("the selected package is not a workspace member".to_owned());
         }
         vec![id]
     } else {
-        metadata.workspace_default_members.clone()
+        metadata.workspace_default_members.to_vec()
     };
     let candidates = metadata
         .packages
         .iter()
         .filter(|package| members.contains(&package.id))
         .flat_map(|package| package.targets.iter().map(move |target| (package, target)))
-        .filter(|(_, target)| target.kind.iter().any(|kind| kind == "bin"))
+        .filter(|(_, target)| target.is_bin())
         .filter(|(_, target)| {
             cli.bin
                 .as_ref()
@@ -111,8 +92,8 @@ pub(crate) fn reduce(cli: ProjectCli) -> Result<(), String> {
     let [(package, target)] = candidates.as_slice() else {
         return Err("select exactly one workspace binary with --package and/or --bin".to_owned());
     };
-    let original = SourceFile::read(&target.src_path)
-        .map_err(|error| format!("cannot update {}: {error}", target.src_path.display()))?;
+    let original = SourceFile::read(target.src_path.as_std_path())
+        .map_err(|error| format!("cannot update {}: {error}", target.src_path))?;
     let temporary_parent = metadata.target_directory.join("rid");
     fs::create_dir_all(&temporary_parent).map_err(|error| error.to_string())?;
     let temporary = tempfile::Builder::new()
@@ -120,9 +101,9 @@ pub(crate) fn reduce(cli: ProjectCli) -> Result<(), String> {
         .tempdir_in(temporary_parent)
         .map_err(|error| error.to_string())?;
     let config = AdapterConfig {
-        manifest: package.manifest_path.clone(),
+        manifest: package.manifest_path.clone().into_std_path_buf(),
         bin: target.name.clone(),
-        source_path: target.src_path.clone(),
+        source_path: target.src_path.clone().into_std_path_buf(),
         source: original.source().to_owned(),
         result: temporary.path().join("reduced.rs"),
     };
@@ -132,7 +113,7 @@ pub(crate) fn reduce(cli: ProjectCli) -> Result<(), String> {
     let mut command = cargo();
     command
         .args(["rustc", "--package"])
-        .arg(&package.id)
+        .arg(&package.id.repr)
         .arg("--bin")
         .arg(&target.name)
         .env("RUSTC", &executable)
@@ -153,7 +134,7 @@ pub(crate) fn reduce(cli: ProjectCli) -> Result<(), String> {
         .map_err(|error| format!("Cargo did not reduce the selected binary: {error}"))?;
     original
         .replace(&reduced)
-        .map_err(|error| format!("cannot update {}: {error}", target.src_path.display()))
+        .map_err(|error| format!("cannot update {}: {error}", target.src_path))
 }
 
 fn adapter(arguments: &[OsString], config: &Path) -> Result<(), String> {

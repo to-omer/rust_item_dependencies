@@ -49,7 +49,7 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         return result;
     }
     let usage = reducer_usage(USAGE_COMMAND);
-    let cli = match parse_arguments(arguments, &usage)? {
+    let cli = match parse_arguments(arguments, USAGE_COMMAND)? {
         Parsed::Run(cli) => cli,
         Parsed::Project(cli) => return cargo_project::reduce(cli),
         Parsed::Help => {
@@ -220,10 +220,7 @@ mod tests {
     use rust_item_dependencies::{ByteRange, EntryPointError, UnsupportedReason};
 
     fn parse(arguments: &[&str]) -> Result<Parsed, String> {
-        parse_arguments(
-            arguments.iter().map(OsString::from),
-            &reducer_usage(USAGE_COMMAND),
-        )
+        parse_arguments(arguments.iter().map(OsString::from), USAGE_COMMAND)
     }
 
     #[test]
@@ -393,49 +390,183 @@ mod tests {
     }
 
     #[test]
+    fn parses_cargo_short_options_and_preserves_config_override_order() {
+        let Parsed::Project(cli) = parse(&[
+            "-papp",
+            "--bin=main",
+            "--manifest-path=project/Cargo.toml",
+            "-Ffirst",
+            "--features=second",
+            "--no-default-features",
+            "--release",
+            "--config=build.jobs=1",
+            "--config",
+            "build.jobs=2",
+            "--locked",
+            "-j-1",
+            "-vv",
+            "--target-dir=build",
+            "--target=wasm32-unknown-unknown",
+        ])
+        .unwrap() else {
+            panic!("Cargo options must select a project")
+        };
+        assert_eq!(cli.package.as_deref(), Some(std::ffi::OsStr::new("app")));
+        assert_eq!(cli.bin.as_deref(), Some(std::ffi::OsStr::new("main")));
+        assert_eq!(
+            cli.manifest.as_deref(),
+            Some(Path::new("project/Cargo.toml"))
+        );
+        assert_eq!(cli.target_directory.as_deref(), Some(Path::new("build")));
+        assert_eq!(
+            cli.common_options,
+            [
+                "--config",
+                "build.jobs=1",
+                "--config",
+                "build.jobs=2",
+                "--locked"
+            ]
+        );
+        assert_eq!(
+            cli.metadata_options,
+            [
+                "--features",
+                "first",
+                "--features",
+                "second",
+                "--no-default-features"
+            ]
+        );
+        assert_eq!(
+            cli.cargo_options,
+            [
+                "--features",
+                "first",
+                "--features",
+                "second",
+                "--no-default-features",
+                "--target-dir",
+                "build",
+                "--jobs",
+                "-1",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--release",
+                "--verbose",
+                "--verbose"
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn rejects_mixed_modes_and_ambiguous_cargo_options() {
+        for arguments in [
+            vec!["--features=selected", "input.rs"],
+            vec!["--package=app", "input.rs"],
+            vec!["--edition=2024"],
+            vec!["-O"],
+            vec!["--target=host", "--target=wasm32-unknown-unknown"],
+            vec!["--package=one", "--package=two"],
+            vec!["--bin=one", "--bin=two"],
+            vec!["--manifest-path=one", "--manifest-path=two"],
+            vec!["--target-dir=one", "--target-dir=two"],
+            vec!["--profile=test"],
+            vec!["--profile=bench"],
+            vec!["--profile=check"],
+        ] {
+            assert!(parse(&arguments).is_err(), "{arguments:?}");
+        }
+        assert!(matches!(
+            parse(&["--target=wasm32-unknown-unknown"]).unwrap(),
+            Parsed::Project(_)
+        ));
+        let Parsed::Run(cli) =
+            parse(&["--target=first", "--target=second", "--", "--features.rs"]).unwrap()
+        else {
+            panic!("arguments after -- must be file paths")
+        };
+        assert_eq!(cli.input, Path::new("--features.rs"));
+        assert_eq!(cli.target.as_deref(), Some("second"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_non_unicode_paths_in_joined_options() {
+        use std::os::unix::ffi::OsStringExt;
+        let source = OsString::from_vec(b"source-\xff.rs".to_vec());
+        let output = OsString::from_vec(b"--output=reduced-\xfe.rs".to_vec());
+        let external = OsString::from_vec(b"--extern=helper=target/libhelper-\xfd.rlib".to_vec());
+        let Parsed::Run(cli) =
+            parse_arguments([source.clone(), output, external], USAGE_COMMAND).unwrap()
+        else {
+            panic!("non-Unicode paths must be accepted")
+        };
+        assert_eq!(cli.input.as_os_str(), source);
+        assert_eq!(
+            cli.output.unwrap().into_os_string(),
+            OsString::from_vec(b"reduced-\xfe.rs".to_vec())
+        );
+        assert_eq!(cli.external_crates[0].extern_name, "helper");
+        assert_eq!(
+            cli.external_crates[0].artifact.as_os_str(),
+            OsString::from_vec(b"target/libhelper-\xfd.rlib".to_vec())
+        );
+        let manifest = OsString::from_vec(b"--manifest-path=project-\xff/Cargo.toml".to_vec());
+        let directory = OsString::from_vec(b"--target-dir=build-\xfe".to_vec());
+        let Parsed::Project(cli) = parse_arguments([manifest, directory], USAGE_COMMAND).unwrap()
+        else {
+            panic!("Cargo path options must be accepted")
+        };
+        assert_eq!(
+            cli.manifest.unwrap().into_os_string(),
+            OsString::from_vec(b"project-\xff/Cargo.toml".to_vec())
+        );
+        assert_eq!(
+            cli.target_directory.unwrap().into_os_string(),
+            OsString::from_vec(b"build-\xfe".to_vec())
+        );
+        assert_eq!(
+            cli.cargo_options.last().unwrap(),
+            &OsString::from_vec(b"build-\xfe".to_vec())
+        );
+    }
+
+    #[test]
     fn rejects_missing_or_invalid_compilation_options() {
-        assert_eq!(
-            parse(&["--opt-level"]).unwrap_err(),
-            "--opt-level requires a value"
-        );
-        assert_eq!(
-            parse(&["--opt-level", "fast"]).unwrap_err(),
-            "unsupported optimization level: fast; expected 0, 1, 2, 3, s, or z"
-        );
-        assert_eq!(parse(&["--cfg"]).unwrap_err(), "--cfg requires a value");
-        assert_eq!(
-            parse(&["--crate-type"]).unwrap_err(),
-            "--crate-type requires a value"
-        );
-        assert_eq!(
-            parse(&["--crate-type", "rlib", "input.rs", "-o", "output.rs"]).unwrap_err(),
-            "unsupported crate type: rlib; expected bin or lib"
-        );
-        assert_eq!(
-            parse(&["--crate-name"]).unwrap_err(),
-            "--crate-name requires a value"
-        );
-        assert_eq!(parse(&["--entry"]).unwrap_err(), "--entry requires a value");
-        assert_eq!(
-            parse(&["--extern"]).unwrap_err(),
-            "--extern requires a value"
-        );
-        assert_eq!(
-            parse(&["--dependency-artifact"]).unwrap_err(),
-            "--dependency-artifact requires a value"
-        );
-        assert_eq!(
-            parse(&["--dependency-artifact", ""]).unwrap_err(),
-            "--dependency-artifact requires a nonempty path"
-        );
-        assert_eq!(
-            parse(&["--allow-proc-macro"]).unwrap_err(),
-            "--allow-proc-macro requires a value"
-        );
-        assert_eq!(
-            parse(&["--allow-proc-macro", ""]).unwrap_err(),
-            "--allow-proc-macro requires a nonempty path"
-        );
+        for option in [
+            "--opt-level",
+            "--cfg",
+            "--crate-type",
+            "--crate-name",
+            "--entry",
+            "--extern",
+            "--dependency-artifact",
+            "--allow-proc-macro",
+        ] {
+            let error = parse(&[option]).unwrap_err();
+            assert!(error.contains(option), "{error}");
+            assert!(error.contains("value is required"), "{error}");
+        }
+        for (option, value) in [
+            ("--opt-level", "fast"),
+            ("--crate-type", "rlib"),
+            ("--edition", "2000"),
+        ] {
+            let error = parse(&[option, value, "input.rs"]).unwrap_err();
+            assert!(error.contains(option), "{error}");
+            assert!(
+                error.contains(&format!("invalid value '{value}'")),
+                "{error}"
+            );
+            assert!(error.contains("possible values"), "{error}");
+        }
+        for option in ["--dependency-artifact", "--allow-proc-macro"] {
+            let error = parse(&[option, "", "input.rs"]).unwrap_err();
+            assert!(error.contains(option), "{error}");
+            assert!(error.contains("value"), "{error}");
+        }
     }
 
     #[test]
@@ -464,17 +595,8 @@ mod tests {
     #[test]
     fn rejects_ambiguous_or_destructive_arguments() {
         assert!(matches!(parse(&[]).unwrap(), Parsed::Project(_)));
-        assert_eq!(
-            parse(&["first.rs", "second.rs"]).unwrap_err(),
-            format!(
-                "expected exactly one input file\n\n{}",
-                reducer_usage(USAGE_COMMAND)
-            )
-        );
-        assert_eq!(
-            parse(&["--edition", "2000", "input.rs"]).unwrap_err(),
-            "unsupported Rust edition: 2000"
-        );
+        let error = parse(&["first.rs", "second.rs"]).unwrap_err();
+        assert!(error.contains("unexpected argument 'second.rs'"), "{error}");
         let Parsed::Run(same_output) = parse(&["input.rs", "-o", "input.rs"]).unwrap() else {
             panic!("input must run the reducer")
         };
