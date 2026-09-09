@@ -1,3 +1,5 @@
+#![cfg_attr(windows, feature(windows_by_handle))]
+
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -7,6 +9,10 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 mod cli;
 #[cfg(test)]
 mod compiler_cache_tests;
+mod container;
+mod container_protocol;
+#[path = "../src/file_output.rs"]
+mod file_output;
 #[path = "../src/target_libraries.rs"]
 mod target_libraries;
 
@@ -16,7 +22,7 @@ use target_libraries::{
 };
 
 const RUST_REPOSITORY: &str = "https://github.com/rust-lang/rust.git";
-const USAGE_COMMAND: &str = "Usage: cargo rid [CARGO_OPTIONS]\n       cargo rid [OPTIONS] INPUT.rs\n       cargo rid rustc [RUSTC_OPTIONS]...";
+const USAGE_COMMAND: &str = "Usage: cargo rid [CARGO_OPTIONS]\n       cargo rid [OPTIONS] INPUT.rs\n       cargo rid rustc [RUSTC_OPTIONS]...\n       cargo rid docker [OPTIONS]...";
 const SNAPSHOT_PARENT_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_PARENT";
 const SNAPSHOT_OWNER_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_OWNER";
 const PROCESS_OWNER_PREFIX: &str = ".rust-item-dependencies-owner-";
@@ -45,8 +51,8 @@ const RUSTC_PRIVATE_CRATES: &[&str] = &[
 fn main() -> ExitCode {
     match run() {
         Ok(RunOutcome::Success) => ExitCode::SUCCESS,
-        Ok(RunOutcome::Rustc(status)) if status.success() => ExitCode::SUCCESS,
-        Ok(RunOutcome::Rustc(status)) => match status.code() {
+        Ok(RunOutcome::Child(status)) if status.success() => ExitCode::SUCCESS,
+        Ok(RunOutcome::Child(status)) => match status.code() {
             Some(code) => std::process::exit(code),
             None => ExitCode::FAILURE,
         },
@@ -59,13 +65,19 @@ fn main() -> ExitCode {
 
 enum RunOutcome {
     Success,
-    Rustc(ExitStatus),
+    Child(ExitStatus),
 }
 
 fn run() -> Result<RunOutcome, String> {
     let mut arguments = env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.first().is_some_and(|argument| argument == "rid") {
         arguments.remove(0);
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "docker")
+    {
+        return container::run(&arguments[1..]).map(RunOutcome::Child);
     }
     let preparation_only = arguments
         .first()
@@ -139,7 +151,7 @@ fn run() -> Result<RunOutcome, String> {
         let status = command
             .status()
             .map_err(|error| format!("cannot start the configured rustc: {error}"))?;
-        return Ok(RunOutcome::Rustc(status));
+        return Ok(RunOutcome::Child(status));
     }
 
     if let Some(target) = reducer_target {

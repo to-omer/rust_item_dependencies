@@ -19,11 +19,16 @@ use rust_item_dependencies::{
 mod cargo_project;
 #[path = "../tools/cli.rs"]
 mod cli;
+#[path = "../tools/container_protocol.rs"]
+mod container_protocol;
 mod file_output;
+mod source_output;
 #[path = "target_libraries.rs"]
 mod target_libraries;
 
-use file_output::{SourceFile, write_new as write_output};
+#[cfg(test)]
+use file_output::write_new as write_output;
+use source_output::SourceOutput;
 
 #[cfg(test)]
 use cli::Cli;
@@ -45,14 +50,20 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
-    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let mut arguments = arguments.into_iter().collect::<Vec<_>>();
     if let Some(result) = cargo_project::run_internal(&arguments) {
         return result;
+    }
+    let container = arguments
+        .first()
+        .is_some_and(|argument| argument == container_protocol::RESULT_ARGUMENT);
+    if container {
+        arguments.remove(0);
     }
     let usage = reducer_usage(USAGE_COMMAND);
     let cli = match parse_arguments(arguments, USAGE_COMMAND)? {
         Parsed::Run(cli) => cli,
-        Parsed::Project(cli) => return cargo_project::reduce(cli),
+        Parsed::Project(cli) => return cargo_project::reduce(cli, container),
         Parsed::Help => {
             println!("{usage}");
             return Ok(());
@@ -60,19 +71,9 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     };
     validate_output(&cli)?;
 
-    let original = cli
-        .output
-        .is_none()
-        .then(|| SourceFile::read(&cli.input))
-        .transpose()
-        .map_err(|error| format!("cannot update {}: {error}", render_path(&cli.input)))?;
-    let source = original
-        .as_ref()
-        .map_or_else(
-            || std::fs::read_to_string(&cli.input),
-            |input| Ok(input.source().to_owned()),
-        )
+    let original = SourceOutput::read(&cli.input, cli.output.as_deref(), container)
         .map_err(|error| format!("cannot read {}: {error}", render_path(&cli.input)))?;
+    let source = original.source().to_owned();
     let output = cli.output.as_deref().unwrap_or(&cli.input);
     let target = cli.target.map_or_else(host_target, Ok)?;
     let mut options = cli.cfg_names.into_iter().fold(
@@ -103,11 +104,9 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let analyzer = Analyzer::new_with_options(options).map_err(render_analysis_error)?;
     let reduction = analyzer.reduce(&input).map_err(render_analysis_error)?;
 
-    match original {
-        Some(original) => original.replace(reduction.reduced_source()),
-        None => write_output(output, reduction.reduced_source()),
-    }
-    .map_err(|error| format!("cannot write {}: {error}", render_path(output)))
+    original
+        .write(reduction.reduced_source())
+        .map_err(|error| format!("cannot write {}: {error}", render_path(output)))
 }
 
 fn render_analysis_error(error: AnalysisError) -> String {
@@ -500,6 +499,8 @@ mod tests {
             vec!["--package=app", "input.rs"],
             vec!["--edition=2024"],
             vec!["-O"],
+            vec!["--offline", "-o", "reduced.rs"],
+            vec!["--release", "-O"],
             vec!["--target=host", "--target=wasm32-unknown-unknown"],
             vec!["--package=one", "--package=two"],
             vec!["--bin=one", "--bin=two"],

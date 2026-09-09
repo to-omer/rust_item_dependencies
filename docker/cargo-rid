@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+if [ "${1-}" = rid ]; then
+    shift
+fi
+if [ "${1-}" = rustc ]; then
+    shift
+    exec /usr/local/bin/rustc "$@"
+fi
+printf '%s\n' 'Use cargo rid docker on the host to preserve source file permissions.' >&2
+exit 1
