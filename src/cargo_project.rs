@@ -7,7 +7,7 @@ use cargo_metadata::{MetadataCommand, PackageId};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::ProjectCli;
-use crate::file_output::SourceFile;
+use crate::source_output::SourceOutput;
 
 const ADAPTER_CONFIG: &str = "RUST_ITEM_DEPENDENCIES_ADAPTER_CONFIG";
 const REDUCE_MARKER: &str = "--rust-item-dependencies-reduce-bin";
@@ -29,7 +29,7 @@ pub(crate) fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>>
     None
 }
 
-pub(crate) fn reduce(cli: ProjectCli) -> Result<(), String> {
+pub(crate) fn reduce(cli: ProjectCli, container: bool) -> Result<(), String> {
     let mut metadata_command = MetadataCommand::new();
     metadata_command.cargo_path(cargo().get_program());
     metadata_command.no_deps().other_options(
@@ -92,7 +92,7 @@ pub(crate) fn reduce(cli: ProjectCli) -> Result<(), String> {
     let [(package, target)] = candidates.as_slice() else {
         return Err("select exactly one workspace binary with --package and/or --bin".to_owned());
     };
-    let original = SourceFile::read(target.src_path.as_std_path())
+    let original = SourceOutput::read(target.src_path.as_std_path(), None, container)
         .map_err(|error| format!("cannot update {}: {error}", target.src_path))?;
     let temporary_parent = metadata.target_directory.join("rid");
     fs::create_dir_all(&temporary_parent).map_err(|error| error.to_string())?;
@@ -133,7 +133,7 @@ pub(crate) fn reduce(cli: ProjectCli) -> Result<(), String> {
     let reduced = fs::read_to_string(&config.result)
         .map_err(|error| format!("Cargo did not reduce the selected binary: {error}"))?;
     original
-        .replace(&reduced)
+        .write(&reduced)
         .map_err(|error| format!("cannot update {}: {error}", target.src_path))
 }
 
@@ -275,7 +275,7 @@ fn prepare_target(
     };
     if ready()?.is_none() {
         let launcher = std::env::var_os(LAUNCHER)
-            .ok_or("target libraries are missing; run cargo rid through the installed launcher")?;
+            .ok_or_else(|| format!("target libraries are not installed for {target}"))?;
         let status = Command::new(launcher)
             .args(["--rust-item-dependencies-prepare-target", target])
             .env_remove(ADAPTER_CONFIG)

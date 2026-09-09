@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 #[cfg(windows)]
+#[path = "file_output/windows.rs"]
 mod windows;
 
 /// The source read for one reduction, held until its verified replacement is ready.
@@ -147,6 +148,7 @@ pub(crate) fn write_new(path: &Path, source: &str) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "file_output/tests.rs"]
 mod tests;
 
 fn temporary_file(path: &Path) -> io::Result<NamedTempFile> {

@@ -1,7 +1,13 @@
 use super::*;
 
 fn work() -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tests");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repository = if env!("CARGO_PKG_NAME") == "cargo-rid" {
+        manifest.parent().unwrap()
+    } else {
+        manifest
+    };
+    let root = repository.join("target/tests");
     fs::create_dir_all(&root).unwrap();
     tempfile::Builder::new()
         .prefix("file-output-")
@@ -252,6 +258,73 @@ fn preserves_macos_access_acls() {
     SourceFile::read(&path).unwrap().replace("reduced").unwrap();
     assert_eq!(access(&path), before);
     assert_eq!(fs::read_to_string(&path).unwrap(), "reduced");
+}
+
+#[cfg(windows)]
+fn windows_sddl(path: &Path) -> String {
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Acl -LiteralPath $env:RID_TEST_ACL_PATH -ErrorAction Stop).Sddl",
+        ])
+        .env("RID_TEST_ACL_PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sddl = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    assert!(!sddl.is_empty());
+    sddl
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_windows_owner_group_and_access_permissions() {
+    let work = work();
+    let path = work.path().join("input 空白.rs");
+    fs::write(&path, "original").unwrap();
+    let before = windows_sddl(&path);
+    SourceFile::read(&path).unwrap().replace("reduced").unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "reduced");
+    assert_eq!(windows_sddl(&path), before);
+    assert_eq!(fs::read_dir(work.path()).unwrap().count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn refuses_unreproducible_windows_dacls_without_changing_the_original() {
+    let work = work();
+    let path = work.path().join("input 空白.rs");
+    fs::write(&path, "original").unwrap();
+    let inherited = windows_sddl(&path);
+    let output = std::process::Command::new("icacls.exe")
+        .arg(&path)
+        .args(["/inheritancelevel:d", "/q"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before = windows_sddl(&path);
+    assert_ne!(before, inherited);
+    let source = SourceFile::read(&path).unwrap();
+    assert_eq!(
+        source.replace("reduced").unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+    assert_eq!(windows_sddl(&path), before);
+    assert_eq!(fs::read_dir(work.path()).unwrap().count(), 1);
 }
 
 #[cfg(windows)]

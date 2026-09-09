@@ -148,7 +148,12 @@ struct ProjectArguments {
 }
 
 #[derive(Args)]
-#[group(id = "standalone", multiple = true, requires = "input")]
+#[group(
+    id = "standalone",
+    multiple = true,
+    requires = "input",
+    conflicts_with = "project"
+)]
 struct StandaloneArguments {
     /// Write to a new file instead of updating INPUT.rs
     #[arg(short = 'o', long, value_name = "OUTPUT", overrides_with = "output")]
