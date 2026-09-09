@@ -127,7 +127,7 @@ jobs:
   container:
     name: Container (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
       packages: write
@@ -137,8 +137,10 @@ jobs:
         include:
           - os: windows-2025
             arch: amd64
+            timeout: 45
           - os: ubuntu-24.04-arm
             arch: arm64
+            timeout: 25
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -249,7 +251,7 @@ jobs:
     needs: [full, container]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
     permissions:
       contents: read
       packages: write

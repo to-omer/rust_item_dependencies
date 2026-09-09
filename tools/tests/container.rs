@@ -210,9 +210,27 @@ fn image_preserves_relative_docker_configuration_and_temporary_paths() {
     assert_eq!(fs::read_dir(&temporary).unwrap().count(), 0);
 
     fixture.write("input.rs", source);
+    let info = success(
+        Command::new("docker")
+            .args(["info", "--format", "{{json .ClientInfo.Plugins}}"])
+            .output()
+            .unwrap(),
+    );
+    let plugins: Vec<serde_json::Value> = serde_json::from_slice(&info.stdout).unwrap();
+    let buildx = plugins
+        .iter()
+        .find(|plugin| plugin["Name"] == "buildx")
+        .expect("Docker must have a working Buildx plugin");
+    let buildx = Path::new(buildx["Path"].as_str().unwrap());
+    assert!(buildx.is_file(), "Buildx is missing: {}", buildx.display());
+    // Changing DOCKER_CONFIG also changes the per-user plugin directory.
+    let config = serde_json::json!({
+        "currentContext": "rid-missing-relative-context",
+        "cliPluginsExtraDirs": [buildx.parent().unwrap()],
+    });
     fixture.write(
         ".docker/config.json",
-        r#"{"currentContext":"rid-missing-relative-context"}"#,
+        &serde_json::to_string(&config).unwrap(),
     );
     let result = fixture
         .launcher()
@@ -600,14 +618,39 @@ fn image_refuses_direct_updates_without_the_host_launcher() {
     let fixture = Fixture::new();
     let source = "fn unused() {}\nfn main() {}\n";
     fixture.write("input.rs", source);
-    let result = Command::new("docker")
-        .args(["run", "--rm", "--network=none"])
-        .arg(&fixture.image)
-        .arg("input.rs")
-        .output()
-        .unwrap();
-    assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("cargo rid docker"));
+    // Windows-to-WSL attach streams can lose output when stdin is closed.
+    let started = success(
+        Command::new("docker")
+            .args(["run", "--detach", "--network=none"])
+            .arg(&fixture.image)
+            .arg("input.rs")
+            .output()
+            .unwrap(),
+    );
+    let id = String::from_utf8(started.stdout).unwrap();
+    let id = id.trim();
+    let waited = Command::new("docker").args(["wait", id]).output();
+    let logs = Command::new("docker").args(["logs", id]).output();
+    // Collect errors and remove the container before assertions can panic.
+    success(
+        Command::new("docker")
+            .args(["rm", "--force", id])
+            .output()
+            .unwrap(),
+    );
+    let waited = success(waited.unwrap());
+    let logs = success(logs.unwrap());
+    let stderr = String::from_utf8_lossy(&logs.stderr);
+    let diagnostic = format!(
+        "stdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&logs.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&waited.stdout).trim(),
+        "1",
+        "{diagnostic}"
+    );
+    assert!(stderr.contains("cargo rid docker"), "{diagnostic}");
     assert_eq!(fixture.read("input.rs"), source);
 }
 
