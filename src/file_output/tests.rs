@@ -263,6 +263,8 @@ fn preserves_macos_access_acls() {
 #[cfg(windows)]
 fn windows_sddl(path: &Path) -> String {
     let output = std::process::Command::new("powershell.exe")
+        // PowerShell 7 module paths cannot be loaded by Windows PowerShell.
+        .env_remove("PSModulePath")
         .args([
             "-NoLogo",
             "-NoProfile",

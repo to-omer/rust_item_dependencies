@@ -418,6 +418,8 @@ fn image_preserves_windows_permissions_or_refuses_unreproducible_dacls() {
     let descriptor = |path: &Path| {
         let output = success(
             Command::new("powershell.exe")
+                // PowerShell 7 module paths cannot be loaded by Windows PowerShell.
+                .env_remove("PSModulePath")
                 .args([
                     "-NoLogo",
                     "-NoProfile",

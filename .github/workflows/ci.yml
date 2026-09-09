@@ -233,11 +233,16 @@ jobs:
           if-no-files-found: error
           overwrite: true
           retention-days: 30
-      - name: Show WSL Docker Engine logs
+      - name: Show WSL Docker Engine diagnostics
         if: always() && runner.os == 'Windows'
         shell: pwsh
         run: |
-          Get-ChildItem "$env:RUNNER_TEMP/rid-wsl-docker.*.log" | Get-Content
+          if ($env:RID_WSL_DOCKER_PID) {
+            Get-Process -Id $env:RID_WSL_DOCKER_PID -ErrorAction Continue |
+              Select-Object Id, ProcessName, StartTime
+          }
+          wsl --list --verbose
+          wsl --distribution Ubuntu-24.04 --user root --exec tail -n 200 /var/log/rid-docker.log
 
   publish-container:
     name: Publish container
