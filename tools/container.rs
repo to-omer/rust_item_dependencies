@@ -64,6 +64,9 @@ fn reduce(arguments: &[&str]) -> io::Result<ExitStatus> {
         // Use the current Docker daemon's image store, including local images.
         .env_remove("BUILDX_BUILDER")
         .env("DOCKER_BUILDKIT", "1")
+        // This build exports a reduction result, not an image with Git metadata.
+        .env("BUILDX_GIT_INFO", "false")
+        .env("BUILDX_GIT_LABELS", "false")
         .args(["build", "--no-cache", "--progress=plain", "--file"])
         .arg(&dockerfile)
         .arg("--build-arg")
@@ -90,7 +93,7 @@ fn build_definition(arguments: &[&str]) -> io::Result<String> {
     command.extend_from_slice(arguments);
     let command = serde_json::to_string(&command)?;
     Ok(format!(
-        "ARG RID_IMAGE\n\
+        "ARG RID_IMAGE={DEFAULT_IMAGE}\n\
          FROM ${{RID_IMAGE}} AS reduce\n\
          ENV CARGO_HOME=/tmp/rid-cargo-home CARGO_TARGET_DIR=/tmp/rid-target\n\
          COPY --chown=1000:1000 . /workspace/\n\

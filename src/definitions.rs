@@ -2531,10 +2531,10 @@ fn collect_import_edges(
             .get(invocation.unit.0 as usize)
             .filter(|unit| unit.id == invocation.unit)
             .ok_or(DefinitionError::IncompleteDependency)?;
-        let from = if source_origin.target_span_is_present {
+        let from = if origin.target_span.is_some() && source_origin.target_span_is_present {
             source_owner(source, source_owners, source_unit.id)?
         } else {
-            source_origin.parent_definition
+            origin.parent_definition
         };
         if let Some(target) = macro_definition {
             edges.push(RawEdge {
@@ -3104,6 +3104,52 @@ mod exact_tests {
                 ("std::derive".to_owned(), vec![invocation]),
             ])
         );
+    }
+
+    #[test]
+    fn nested_macro_paths_and_imports_belong_to_the_generated_function() {
+        let source =
+            include_str!("../tests/fixtures/retention/macro_generated_path_owners.input.rs");
+        let graph = inspect(source);
+        let actual = project_graph(&graph);
+        let invocation = marker_range(source, "functions!()");
+        for (function, import) in [
+            ("kept", "use std::assert as required;"),
+            ("unused", "use std::debug_assert as unused_check;"),
+        ] {
+            let owner = find_local(
+                &actual.definitions,
+                DefinitionKind::Function,
+                Some(function),
+            );
+            let import_anchor = marker_in(
+                source,
+                import,
+                if function == "kept" {
+                    "std::assert"
+                } else {
+                    "std::debug_assert"
+                },
+            );
+            let import =
+                find_local_with_anchor(&actual.definitions, DefinitionKind::Use, import_anchor);
+            let dependencies = edges_of_kinds(
+                &actual.edges,
+                &[DependencyKind::MacroPath, DependencyKind::ImportLeaf],
+            );
+            assert!(dependencies.contains(&edge(
+                &owner,
+                TargetRef::Local(import),
+                DependencyKind::ImportLeaf,
+                [invocation]
+            )));
+            assert!(
+                dependencies
+                    .iter()
+                    .any(|dependency| dependency.from == owner
+                        && dependency.kind == DependencyKind::MacroPath)
+            );
+        }
     }
 
     #[test]

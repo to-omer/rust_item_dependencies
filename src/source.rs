@@ -809,7 +809,12 @@ impl<'a> EditableMacroSourceResolver<'a> {
                                 .units
                                 .get(unit.0 as usize)
                                 .filter(|source| {
-                                    source.full_range == call_range
+                                    // Written item ranges include attributes, while
+                                    // rustc's invocation node span does not. Direct
+                                    // discovery identifies the invocation itself;
+                                    // late-parsed calls still need an exact range.
+                                    origin.discovered_in_expansion == ExpnId::root()
+                                        || source.full_range == call_range
                                         || source.full_range == node_range
                                 })
                                 .map(|source| source.id),

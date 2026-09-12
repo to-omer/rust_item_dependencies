@@ -2489,6 +2489,92 @@ fn macro_definition_classes_follow_the_nearest_root_or_source_owner() {
 }
 
 #[test]
+fn macro_owner_members_stop_at_the_nearest_other_producer() {
+    let units = [
+        unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
+        unit(1, WrittenUnitKind::MacroInvocation, (0, 32), Some(0), 1),
+        unit(2, WrittenUnitKind::Item, (0, 10), Some(0), 2),
+    ];
+    for kind in [
+        DefinitionKind::Function,
+        DefinitionKind::AssociatedFunction,
+        DefinitionKind::Closure,
+        DefinitionKind::InlineConst,
+    ] {
+        let mut graph = graph(
+            vec![
+                written_definition(0, DefinitionKind::Crate, &units[0], None, "crate"),
+                expanded_definition(1, kind, &units[1], Some(0), "owner"),
+                expanded_definition(2, DefinitionKind::Closure, &units[1], Some(1), "member"),
+                expanded_definition(3, DefinitionKind::InlineConst, &units[1], Some(2), "nested"),
+                written_definition(4, DefinitionKind::Function, &units[2], Some(0), "main"),
+            ],
+            vec![],
+        );
+        let outer = add_macro_expansion(&mut graph, &units[1], DefinitionId(0), [DefinitionId(1)]);
+        let inner = add_macro_expansion(
+            &mut graph,
+            &units[1],
+            DefinitionId(1),
+            [DefinitionId(2), DefinitionId(3)],
+        );
+        let index = DefinitionMacroProducerIndex::new(macro_graph(&graph));
+        let members = [
+            GraphNode::Definition(DefinitionId(2)),
+            GraphNode::Definition(DefinitionId(3)),
+        ];
+        assert_eq!(
+            validate_macro_owner_effect_members(
+                macro_graph(&graph),
+                &index,
+                inner,
+                DefinitionId(1),
+                &members
+            ),
+            Ok(vec![DefinitionId(2), DefinitionId(3)]),
+        );
+        assert_eq!(
+            validate_macro_owner_effect_members(
+                macro_graph(&graph),
+                &index,
+                inner,
+                DefinitionId(0),
+                &members
+            ),
+            Err(RetentionError::InvalidConstraint),
+            "the owner cannot skip the nearest producer boundary",
+        );
+        assert_eq!(
+            validate_macro_owner_effect_members(
+                macro_graph(&graph),
+                &index,
+                outer,
+                DefinitionId(1),
+                &members
+            ),
+            Err(RetentionError::InvalidConstraint),
+            "members belong to the inner producer",
+        );
+        graph.edges.retain(|edge| {
+            !(edge.kind == DependencyKind::GeneratedBy
+                && edge.from == GraphNode::Definition(DefinitionId(1)))
+        });
+        let index = DefinitionMacroProducerIndex::new(macro_graph(&graph));
+        assert_eq!(
+            validate_macro_owner_effect_members(
+                macro_graph(&graph),
+                &index,
+                inner,
+                DefinitionId(1),
+                &members
+            ),
+            Err(RetentionError::IncompleteMacroProductConstraints),
+            "an unresolved producer is not evidence of another producer",
+        );
+    }
+}
+
+#[test]
 fn definition_macro_producer_index_resolves_shared_parent_chains_once() {
     let units = [
         unit(0, WrittenUnitKind::CrateRoot, (0, 32), None, 0),
@@ -6136,6 +6222,62 @@ fn atomicity_and_an_empty_impl_shell_are_retained() {
 }
 
 #[test]
+fn joint_source_requirements_need_both_triggers_and_close_new_waves() {
+    let groups = (0..5).map(|id| vec![SourceUnitId(id)]).collect::<Vec<_>>();
+    let requirements = [
+        ConditionalSourceRequirement {
+            left: SourceUnitId(0),
+            right: SourceUnitId(1),
+            required: SourceUnitId(2),
+        },
+        ConditionalSourceRequirement {
+            left: SourceUnitId(2),
+            right: SourceUnitId(3),
+            required: SourceUnitId(4),
+        },
+    ];
+    let index = SourceRequirementIndex::new(5, &groups, &[], &[], &[], &[], &requirements).unwrap();
+    for first in [0, 1] {
+        let mut retained = BTreeSet::from([SourceUnitId(first), SourceUnitId(3)]);
+        let mut newly_retained = Vec::new();
+        let mut closure = SourceRequirementClosure::new(&index);
+        closure.seed(&retained).unwrap();
+        closure.close(&mut retained, &mut newly_retained).unwrap();
+        assert_eq!(
+            retained.len(),
+            2,
+            "one trigger must not keep the other or its output"
+        );
+        let second = SourceUnitId(1 - first);
+        retained.insert(second);
+        closure.add([second]).unwrap();
+        closure.close(&mut retained, &mut newly_retained).unwrap();
+        assert_eq!(retained, (0..5).map(SourceUnitId).collect());
+        assert_eq!(closure.unit_visits, 5);
+        assert_eq!(closure.requirement_visits, 4);
+    }
+    for invalid in [
+        ConditionalSourceRequirement {
+            left: SourceUnitId(5),
+            ..requirements[0]
+        },
+        ConditionalSourceRequirement {
+            right: SourceUnitId(5),
+            ..requirements[0]
+        },
+        ConditionalSourceRequirement {
+            required: SourceUnitId(5),
+            ..requirements[0]
+        },
+    ] {
+        assert!(matches!(
+            SourceRequirementIndex::new(5, &groups, &[], &[], &[], &[], &[invalid]),
+            Err(RetentionError::InvalidConstraint)
+        ));
+    }
+}
+
+#[test]
 fn source_requirement_closure_visits_each_fact_once_across_incremental_waves() {
     const COUNT: u32 = 1_024;
     let unit_count = COUNT as usize * 2;
@@ -6148,8 +6290,8 @@ fn source_requirement_closure_visits_each_fact_once_across_incremental_waves() {
             required: SourceUnitId(COUNT + trigger),
         })
         .collect::<Vec<_>>();
-    let index =
-        SourceRequirementIndex::new(unit_count, &groups, &requirements, &[], &[], &[]).unwrap();
+    let index = SourceRequirementIndex::new(unit_count, &groups, &requirements, &[], &[], &[], &[])
+        .unwrap();
     let mut closure = SourceRequirementClosure::new(&index);
     let mut retained = BTreeSet::new();
     let mut newly_retained = Vec::new();
@@ -7508,6 +7650,7 @@ fn macro_capture_slots_use_directed_compile_requirements_and_exact_invocation_co
         &[],
         &[],
         &constraints.macro_rule_requirements,
+        &[],
     )
     .unwrap();
     for (seed, expected) in [

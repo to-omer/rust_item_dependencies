@@ -250,32 +250,18 @@ impl RefinementDraft {
 
         let origins = &tcx.resolutions(()).macro_invocation_origins;
         let source_resolver = crate::source::EditableMacroSourceResolver::new(origins);
-        let first_refined_rules = inventory
-            .macro_rules
-            .iter()
-            .filter_map(|facts| match facts {
-                MacroRuleSourceFacts::Whole { .. } => None,
-                MacroRuleSourceFacts::Refined { rules, .. } => rules.first().copied(),
-            })
-            .collect::<BTreeSet<_>>();
-        let sole_first_rule_selections = inventory
-            .macro_rules
-            .iter()
-            .filter_map(|facts| match facts {
-                MacroRuleSourceFacts::Refined {
-                    rules,
-                    observed_selections,
-                    ..
-                } => rules.first().copied().and_then(|first| {
-                    (!observed_selections.is_empty()
-                        && observed_selections
-                            .iter()
-                            .all(|selection| *selection == first))
-                    .then_some((first, observed_selections.len()))
-                }),
-                MacroRuleSourceFacts::Whole { .. } => None,
-            })
-            .collect::<BTreeMap<_, _>>();
+        let mut rule_selection_counts = BTreeMap::new();
+        for facts in &inventory.macro_rules {
+            if let MacroRuleSourceFacts::Refined {
+                observed_selections,
+                ..
+            } = facts
+            {
+                for &rule in observed_selections {
+                    *rule_selection_counts.entry(rule).or_insert(0) += 1;
+                }
+            }
+        }
 
         let (mut pending, _) = pending_units(&inventory.units);
         let mut next_temporary =
@@ -344,7 +330,7 @@ impl RefinementDraft {
         }
 
         let mut capture_slots = Vec::new();
-        for (rule, expected_selections) in sole_first_rule_selections {
+        for (rule, expected_selections) in rule_selection_counts {
             if observations.complete_rules.get(&rule) != Some(&true) {
                 continue;
             }
@@ -413,11 +399,6 @@ impl RefinementDraft {
             else {
                 continue;
             };
-            if !first_refined_rules.contains(&rule) {
-                // Deleting matcher input from a later rule could make an
-                // earlier rule match. Template output has no such restriction.
-                continue;
-            }
             let Some(editable) = source_resolver.resolve(compiler, inventory, expansion_id)? else {
                 continue;
             };
@@ -435,11 +416,7 @@ impl RefinementDraft {
                         && unit.cfg_state == CfgState::Active
                 })
                 .ok_or(SourceError::InvalidInventory)?;
-            let Some(matcher) = expansion
-                .matcher
-                .as_ref()
-                .filter(|matcher| matcher.invocation_refinement_safe)
-            else {
+            let Some(matcher) = expansion.matcher.as_ref() else {
                 continue;
             };
             let Some(observed) = matcher_repetitions(

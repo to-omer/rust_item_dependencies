@@ -662,10 +662,9 @@ fn definition_identity_survives_when_the_last_split_component_disappears() {
     };\n\
 }\n\
 mod selected_first { choose_rule!(kept); }\n\
-mod selected_second { choose_rule!(Kept, Dead); }\n\
 fn main() {\n\
     assert_eq!(selected_first::kept(), 99);\n\
-    let _ = selected_second::Generated::Kept;\n\
+    assert_eq!({ choose_rule!(Kept, Dead); let _ = Generated::Kept; 0 }, 0);\n\
 }\n";
     const REDUCED: &str = "macro_rules! choose_rule {\n\
     ($one:ident) => { pub fn $one() -> u32 { 99 } };\n\
@@ -674,10 +673,9 @@ fn main() {\n\
     };\n\
 }\n\
 mod selected_first { choose_rule!(kept); }\n\
-mod selected_second { choose_rule!(Kept, Dead); }\n\
 fn main() {\n\
     assert_eq!(selected_first::kept(), 99);\n\
-    let _ = selected_second::Generated::Kept;\n\
+    assert_eq!({ choose_rule!(Kept, Dead); let _ = Generated::Kept; 0 }, 0);\n\
 }\n";
     let original = collect(ORIGINAL);
     let reduced = collect(REDUCED);

@@ -128,6 +128,85 @@ fn success(output: Output) -> Output {
 
 #[test]
 #[ignore = "runs the distribution image using Docker"]
+fn launcher_reduces_without_image_metadata_warnings() {
+    let fixture = Fixture::new();
+    fixture.write("input.rs", "fn unused() {}\nfn main() {}\n");
+    fixture.write(".git/HEAD", "ref: refs/heads/main\n");
+    fixture.write(".git/config", "[core]\nrepositoryformatversion = 999\n");
+    for directory in [".git/objects", ".git/refs"] {
+        fs::create_dir_all(fixture.directory.path().join(directory)).unwrap();
+    }
+    let git = Command::new("git")
+        .current_dir(fixture.directory.path())
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .unwrap();
+    assert!(!git.status.success());
+
+    let mut previous = None;
+    for _ in 0..2 {
+        let output = success(
+            fixture
+                .launcher()
+                .env("BUILDX_GIT_INFO", "true")
+                .env("BUILDX_GIT_LABELS", "full")
+                .arg("input.rs")
+                .output()
+                .unwrap(),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("InvalidDefaultArgInFrom"), "{stderr}");
+        assert!(
+            !stderr.contains("current commit information was not captured"),
+            "{stderr}"
+        );
+        let reduced = fixture.read("input.rs");
+        assert!(!reduced.contains("unused"));
+        assert!(reduced.contains("fn main()"));
+        if let Some(previous) = previous {
+            assert_eq!(reduced, previous);
+        }
+        previous = Some(reduced);
+    }
+    success(fixture.compile("input.rs", None));
+}
+
+#[test]
+#[ignore = "runs the distribution image using Docker"]
+fn image_reduces_nested_macros_in_cargo_binaries() {
+    let fixture = Fixture::new();
+    fixture.write("Cargo.toml", "[package]\nname='nested-macros'\nversion='0.1.0'\nedition='2024'\n[workspace]\n[[bin]]\nname='at'\npath='src/main.rs'\n");
+    for (source, expected, stdout) in [
+        (
+            include_str!("../../tests/fixtures/retention/macro_body_generated_owners.input.rs"),
+            include_str!("../../tests/fixtures/retention/macro_body_generated_owners.expected.rs"),
+            "128\n",
+        ),
+        (
+            include_str!("../../tests/fixtures/retention/macro_generated_path_owners.input.rs"),
+            include_str!("../../tests/fixtures/retention/macro_generated_path_owners.expected.rs"),
+            "42\n",
+        ),
+        (
+            include_str!("../../tests/fixtures/retention/macro_competing_rules.input.rs"),
+            include_str!("../../tests/fixtures/retention/macro_competing_rules.expected.rs"),
+            "245\n",
+        ),
+    ] {
+        fixture.write("src/main.rs", source);
+        success(fixture.run(["--offline", "--bin", "at"]));
+        assert_eq!(fixture.read("src/main.rs"), expected);
+        assert_eq!(
+            success(fixture.cargo(&["run", "--offline", "--quiet", "--bin", "at"])).stdout,
+            stdout.as_bytes()
+        );
+        success(fixture.run(["--offline", "--bin", "at"]));
+        assert_eq!(fixture.read("src/main.rs"), expected);
+    }
+}
+
+#[test]
+#[ignore = "runs the distribution image using Docker"]
 fn image_reduces_both_targets_without_writing_to_the_installation() {
     let fixture = Fixture::new();
     fixture.write("target/host-sentinel", "host build directory");

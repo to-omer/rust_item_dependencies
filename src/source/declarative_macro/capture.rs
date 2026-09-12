@@ -114,11 +114,7 @@ pub(super) fn capture_observation_for_expansion(
     expansion: &MacroDeclarativeExpansion,
     classified_outputs: &[(MacroOutputRange, bool)],
 ) -> Result<Option<TemplateCaptureObservation>, SourceError> {
-    let Some(matcher) = expansion
-        .matcher
-        .as_ref()
-        .filter(|matcher| expansion.complete && matcher.invocation_refinement_safe)
-    else {
+    let Some(matcher) = expansion.matcher.as_ref().filter(|_| expansion.complete) else {
         return Ok(None);
     };
     if expansion
