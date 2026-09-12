@@ -2,13 +2,14 @@ use std::collections::{BTreeSet, VecDeque};
 
 use crate::source::SourceUnitId;
 
-use super::{RetentionError, SourceRequirement, retain_source_unit};
+use super::{ConditionalSourceRequirement, RetentionError, SourceRequirement, retain_source_unit};
 
 /// Immutable reverse indexes for monotone source-retention requirements.
 pub(super) struct SourceRequirementIndex {
     atomic_groups: Vec<Vec<SourceUnitId>>,
     atomic_group_by_unit: Vec<usize>,
     by_trigger: Vec<Vec<SourceUnitId>>,
+    by_joint_trigger: Vec<Vec<(SourceUnitId, SourceUnitId)>>,
 }
 
 impl SourceRequirementIndex {
@@ -19,6 +20,7 @@ impl SourceRequirementIndex {
         shell_requirements: &[SourceRequirement],
         derive_requirements: &[SourceRequirement],
         macro_rule_requirements: &[SourceRequirement],
+        joint_requirements: &[ConditionalSourceRequirement],
     ) -> Result<Self, RetentionError> {
         let mut atomic_group_by_unit = vec![usize::MAX; unit_count];
         for (group, members) in atomic_groups.iter().enumerate() {
@@ -53,10 +55,29 @@ impl SourceRequirementIndex {
             requirements.dedup();
         }
 
+        let mut by_joint_trigger = vec![Vec::new(); unit_count];
+        for requirement in joint_requirements {
+            if [requirement.left, requirement.right, requirement.required]
+                .iter()
+                .any(|unit| unit.0 as usize >= unit_count)
+            {
+                return Err(RetentionError::InvalidConstraint);
+            }
+            by_joint_trigger[requirement.left.0 as usize]
+                .push((requirement.right, requirement.required));
+            by_joint_trigger[requirement.right.0 as usize]
+                .push((requirement.left, requirement.required));
+        }
+        for requirements in &mut by_joint_trigger {
+            requirements.sort_unstable();
+            requirements.dedup();
+        }
+
         Ok(Self {
             atomic_groups: atomic_groups.to_vec(),
             atomic_group_by_unit,
             by_trigger,
+            by_joint_trigger,
         })
     }
 }
@@ -166,6 +187,17 @@ impl<'index> SourceRequirementClosure<'index> {
                     self.requirement_visits += 1;
                 }
                 if retain_source_unit(retained, newly_retained, required) {
+                    self.add([required])?;
+                }
+            }
+            for &(other, required) in &self.index.by_joint_trigger[index] {
+                #[cfg(test)]
+                {
+                    self.requirement_visits += 1;
+                }
+                if retained.contains(&other)
+                    && retain_source_unit(retained, newly_retained, required)
+                {
                     self.add([required])?;
                 }
             }

@@ -1676,7 +1676,6 @@ pub(crate) struct PreparedEditableMacroOrigin {
     pub source: EditableMacroSource,
     pub target_range: Option<ByteRange>,
     pub target_span_is_present: bool,
-    pub parent_definition: rustc_hir::def_id::LocalDefId,
 }
 
 #[cfg(rust_item_dependencies_patched)]
@@ -1693,13 +1692,12 @@ impl PreparedExpansionOrigin {
         let Some(source) = self.editable_source else {
             return Ok(None);
         };
+        self.parent_definition
+            .ok_or(ExpansionError::IncompleteOrigin)?;
         Ok(Some(PreparedEditableMacroOrigin {
             source,
             target_range: self.target_range,
             target_span_is_present: self.target_span_is_present,
-            parent_definition: self
-                .parent_definition
-                .ok_or(ExpansionError::IncompleteOrigin)?,
         }))
     }
 }

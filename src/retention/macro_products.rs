@@ -3537,20 +3537,19 @@ impl DefinitionMacroProducerIndex {
                             parent: MacroDefinitionParent::Owner(parent),
                         });
                     }
+                    Some(_) if producers[parent_index] != Ok(producer) => {
+                        break producers[parent_index].map(|_| IndexedMacroDefinitionParent {
+                            producer,
+                            parent: MacroDefinitionParent::Owner(parent),
+                        });
+                    }
                     Some(MacroDefinitionProductRole::Root) => {
-                        break if producers[parent_index] == Ok(producer) {
-                            Ok(IndexedMacroDefinitionParent {
-                                producer,
-                                parent: MacroDefinitionParent::Root(parent),
-                            })
-                        } else {
-                            Err(RetentionError::InvalidConstraint)
-                        };
+                        break Ok(IndexedMacroDefinitionParent {
+                            producer,
+                            parent: MacroDefinitionParent::Root(parent),
+                        });
                     }
                     Some(MacroDefinitionProductRole::Subordinate) => {
-                        if producers[parent_index] != Ok(producer) {
-                            break Err(RetentionError::InvalidConstraint);
-                        }
                         current = parent_index;
                     }
                 }

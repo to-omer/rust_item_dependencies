@@ -153,9 +153,9 @@ pub(super) fn validate_refined_rule_links(
             return Err(SourceError::InvalidInventory);
         }
         let observed = observed_selections.iter().copied().collect::<BTreeSet<_>>();
-        for (index, &rule) in rules.iter().enumerate() {
+        for &rule in rules {
             if refined_rules
-                .insert(rule, (index == 0, observed.contains(&rule)))
+                .insert(rule, observed.contains(&rule))
                 .is_some()
             {
                 return Err(SourceError::InvalidInventory);
@@ -166,15 +166,15 @@ pub(super) fn validate_refined_rule_links(
     if templates.iter().any(|template| {
         refined_rules
             .get(&template.rule)
-            .is_none_or(|(_, observed)| !observed)
+            .is_none_or(|observed| !observed)
     }) || capture_slots.iter().any(|slot| {
         refined_rules
             .get(&slot.rule)
-            .is_none_or(|(first, observed)| !first || !observed)
+            .is_none_or(|observed| !observed)
     }) || repetitions.iter().any(|repetition| {
         refined_rules
             .get(&repetition.rule)
-            .is_none_or(|(first, observed)| !first || !observed)
+            .is_none_or(|observed| !observed)
     }) {
         return Err(SourceError::InvalidInventory);
     }
@@ -295,22 +295,14 @@ pub(super) fn validate_capture_slots(
     let mut rule_selection_counts = BTreeMap::new();
     for facts in macro_rules {
         let MacroRuleSourceFacts::Refined {
-            rules,
             observed_selections,
             ..
         } = facts
         else {
             continue;
         };
-        let Some(&first) = rules.first() else {
-            return Err(SourceError::InvalidInventory);
-        };
-        if !observed_selections.is_empty()
-            && observed_selections
-                .iter()
-                .all(|selection| *selection == first)
-        {
-            rule_selection_counts.insert(first, observed_selections.len());
+        for &rule in observed_selections {
+            *rule_selection_counts.entry(rule).or_insert(0) += 1;
         }
     }
 

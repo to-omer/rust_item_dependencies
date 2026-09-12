@@ -841,6 +841,8 @@ fn command_output(command: &mut Command, action: &str) -> Result<String, String>
 
 fn run_command(command: &mut Command, action: &str) -> Result<(), String> {
     let status = command
+        // Preparation output must not enter Cargo's rustc --print protocol.
+        .stdout(std::io::stderr())
         .status()
         .map_err(|error| format!("cannot {action}: {error}"))?;
     status
@@ -941,6 +943,27 @@ mod target_tests {
 
         assert!(!rust_source.join("build").exists());
         assert!(rust_source.join("source.rs").is_file());
+    }
+
+    #[test]
+    fn preparation_output_is_separate_from_compiler_stdout() {
+        const CHILD: &str = "RID_TEST_PREPARATION_OUTPUT_CHILD";
+        if env::var_os(CHILD).is_some() {
+            run_command(Command::new("git").arg("--version"), "query Git version").unwrap();
+            return;
+        }
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "target_tests::preparation_output_is_separate_from_compiler_stdout",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("git version"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("git version"));
     }
 
     #[test]

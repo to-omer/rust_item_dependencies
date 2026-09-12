@@ -106,6 +106,24 @@ const MACRO_COMPONENT_CASES: &[(&str, &str, &str, &str)] = &[
         "macro_body_definitions",
     ),
     (
+        "macro body generated owners",
+        include_str!("fixtures/retention/macro_body_generated_owners.input.rs"),
+        include_str!("fixtures/retention/macro_body_generated_owners.expected.rs"),
+        "macro_body_generated_owners",
+    ),
+    (
+        "macro generated path owners",
+        include_str!("fixtures/retention/macro_generated_path_owners.input.rs"),
+        include_str!("fixtures/retention/macro_generated_path_owners.expected.rs"),
+        "macro_generated_path_owners",
+    ),
+    (
+        "macro competing rules",
+        include_str!("fixtures/retention/macro_competing_rules.input.rs"),
+        include_str!("fixtures/retention/macro_competing_rules.expected.rs"),
+        "macro_competing_rules",
+    ),
+    (
         "macro control chain",
         include_str!("fixtures/retention/macro_control_chain.input.rs"),
         include_str!("fixtures/retention/macro_control_chain.expected.rs"),

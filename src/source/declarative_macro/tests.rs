@@ -829,7 +829,7 @@ fn templates_require_an_observed_rule_but_not_the_first_rule() {
 }
 
 #[test]
-fn repetitions_require_the_observed_first_rule_in_source_order() {
+fn repetitions_require_an_observed_rule_and_valid_source_order() {
     let source = " ".repeat(100);
     let units = vec![
         unit(0, WrittenUnitKind::CrateRoot, (0, 100), None),
@@ -859,7 +859,7 @@ fn repetitions_require_the_observed_first_rule_in_source_order() {
             &[],
             &repetitions,
         ),
-        Err(SourceError::InvalidInventory)
+        Ok(())
     );
 
     let reordered = refined_rules(1, &[3, 2], &[3]);

@@ -92,6 +92,54 @@ pub(crate) struct SourceRequirement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ConditionalSourceRequirement {
+    left: SourceUnitId,
+    right: SourceUnitId,
+    required: SourceUnitId,
+}
+
+fn source_macro_matcher_requirements(
+    source: &SourceInventory,
+) -> Vec<ConditionalSourceRequirement> {
+    let mut rules_by_member = BTreeMap::new();
+    for facts in &source.macro_rules {
+        if let MacroRuleSourceFacts::Refined { rules, .. } = facts {
+            for (index, &rule) in rules.iter().enumerate() {
+                rules_by_member.insert(rule, (rules.as_slice(), index));
+            }
+        }
+    }
+    let mut requirements = Vec::new();
+    for repetition in &source.macro_repetitions {
+        let (rules, index) = rules_by_member[&repetition.rule];
+        // A surviving earlier rule could match after invocation input is removed.
+        for &earlier in &rules[..index] {
+            for element in &repetition.elements {
+                requirements.push(ConditionalSourceRequirement {
+                    left: earlier,
+                    right: repetition.invocation,
+                    required: element.unit,
+                });
+            }
+        }
+    }
+    for slot in &source.macro_capture_slots {
+        let (rules, _) = rules_by_member[&slot.rule];
+        // Changing the matcher can also capture calls intended for a later rule.
+        for &other in rules {
+            if other != slot.rule {
+                requirements.push(ConditionalSourceRequirement {
+                    left: slot.rule,
+                    right: other,
+                    required: slot.unit,
+                });
+            }
+        }
+    }
+    requirements
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct MacroRuleSelectionRequirement {
     pub expansion: crate::dependency_graph::ExpansionId,
     pub rule: SourceUnitId,
@@ -820,6 +868,7 @@ pub(crate) fn compute_retention(
         &validated.shell_requirements,
         &validated.derive_requirements,
         &validated.macro_rule_requirements,
+        &source_macro_matcher_requirements(source),
     )?;
     let source_sites = SourceSiteOwnerIndex::new(source)?;
     let compiler_reachability = CompilerReachabilityIndex::new(
