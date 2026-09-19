@@ -25,11 +25,12 @@ COPY tests/fixtures/compiler/patch_abi.rs tests/fixtures/compiler/patch_abi.rs
 COPY docker/package.sh docker/package.sh
 RUN sh docker/package.sh
 
-FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
+FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates gcc g++ libc6-dev make pkg-config git zlib1g \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=application /opt/rid/target/container-root/ /
+COPY --from=application /opt/rid/target/container-compiler/ /
+COPY --from=application /opt/rid/target/container-application/ /
 COPY --chmod=755 docker/cargo-rid /usr/local/bin/cargo-rid
 ENV CARGO_HOME=/tmp/rid-cargo-home \
     CARGO_TARGET_DIR=/tmp/rid-target \

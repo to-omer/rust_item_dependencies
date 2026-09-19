@@ -23,7 +23,8 @@ pub(crate) use derive::{
     DeriveTargetObservation, ObservedDeriveHelper, refine_derive_targets,
 };
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 #[cfg(any(rust_item_dependencies_patched, test))]
 use std::hash::Hash;
 use std::sync::Arc;
@@ -3440,21 +3441,32 @@ fn own_lexical_pieces(source: &str, units: &[WrittenUnit]) -> Result<Vec<OwnedPi
     }
 
     let depths = unit_depths(units)?;
+    let mut by_start = units.iter().collect::<Vec<_>>();
+    by_start.sort_unstable_by_key(|unit| unit.full_range.start);
+    let mut pending = by_start.into_iter().peekable();
+    let mut active = BinaryHeap::new();
     raw.into_iter()
         .map(|(range, kind)| {
-            let owner = units
-                .iter()
-                .filter(|unit| unit.full_range.contains(range))
-                .max_by_key(|unit| {
+            while let Some(unit) = pending.next_if(|unit| unit.full_range.start <= range.start) {
+                if unit.full_range.end < range.end {
+                    continue;
+                }
+                active.push((
                     (
                         depths[unit.id.0 as usize],
-                        std::cmp::Reverse(unit.full_range.len()),
+                        Reverse(unit.full_range.len()),
                         unit.kind.rank(),
-                        std::cmp::Reverse(unit.id),
-                    )
-                })
-                .ok_or(SourceError::InvalidInventory)?
-                .id;
+                        Reverse(unit.id),
+                    ),
+                    unit.full_range.end,
+                ));
+            }
+            // Piece ends only advance, so an expired unit cannot own a later piece.
+            while active.peek().is_some_and(|&(_, end)| end < range.end) {
+                active.pop();
+            }
+            let &((_, _, _, Reverse(owner)), _) =
+                active.peek().ok_or(SourceError::InvalidInventory)?;
             Ok(OwnedPiece { range, owner, kind })
         })
         .collect()
@@ -3771,6 +3783,133 @@ mod tests {
         assert_eq!(
             &source[pieces[0].range.start as usize..pieces[0].range.end as usize],
             "#!/usr/bin/env rustx"
+        );
+    }
+
+    #[test]
+    fn lexical_ownership_preserves_priority_across_overlapping_and_partial_ranges() {
+        let source = "aa bb cc dd ee";
+        let units = [
+            (WrittenUnitKind::CrateRoot, 0, 14, None),
+            (WrittenUnitKind::Item, 0, 8, Some(0)),
+            (WrittenUnitKind::MacroInvocation, 3, 11, Some(0)),
+            (WrittenUnitKind::NestedItem, 3, 8, Some(1)),
+            (WrittenUnitKind::MacroRule, 3, 8, Some(1)),
+            (WrittenUnitKind::MacroRule, 3, 8, Some(1)),
+            (WrittenUnitKind::MacroRule, 3, 7, Some(2)),
+            (WrittenUnitKind::Item, 1, 14, Some(0)),
+            (WrittenUnitKind::MacroRule, 0, 1, Some(0)),
+            (WrittenUnitKind::MacroRule, 11, 11, Some(0)),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(id, (kind, start, end, parent))| {
+            unit(id as u32, kind, ByteRange { start, end }, parent, id as u32)
+        })
+        .collect::<Vec<_>>();
+        let pieces = own_lexical_pieces(source, &units).unwrap();
+        super::validate_inventory(source, &units, &pieces).unwrap();
+        assert_eq!(
+            pieces.iter().map(|piece| piece.owner.0).collect::<Vec<_>>(),
+            [1, 1, 6, 6, 4, 2, 2, 7, 7]
+        );
+    }
+
+    #[test]
+    fn lexical_ownership_prefers_depth_before_range_size_or_kind() {
+        let source = "aa bb";
+        let units = [
+            unit(
+                0,
+                WrittenUnitKind::CrateRoot,
+                ByteRange { start: 0, end: 5 },
+                None,
+                0,
+            ),
+            unit(
+                1,
+                WrittenUnitKind::MacroRule,
+                ByteRange { start: 0, end: 2 },
+                Some(0),
+                1,
+            ),
+            unit(
+                2,
+                WrittenUnitKind::InlineModule,
+                ByteRange { start: 0, end: 5 },
+                Some(0),
+                2,
+            ),
+            unit(
+                3,
+                WrittenUnitKind::Item,
+                ByteRange { start: 0, end: 5 },
+                Some(2),
+                3,
+            ),
+        ];
+        let pieces = own_lexical_pieces(source, &units).unwrap();
+        super::validate_inventory(source, &units, &pieces).unwrap();
+        assert_eq!(
+            pieces.iter().map(|piece| piece.owner.0).collect::<Vec<_>>(),
+            [3, 3, 3]
+        );
+    }
+
+    #[test]
+    fn lexical_ownership_requires_full_token_coverage() {
+        let source = "aa bb";
+        let units = [unit(
+            0,
+            WrittenUnitKind::Item,
+            ByteRange { start: 1, end: 5 },
+            None,
+            0,
+        )];
+        assert_eq!(
+            own_lexical_pieces(source, &units),
+            Err(SourceError::InvalidInventory)
+        );
+        let units = [unit(
+            0,
+            WrittenUnitKind::Item,
+            ByteRange { start: 0, end: 4 },
+            None,
+            0,
+        )];
+        assert_eq!(
+            own_lexical_pieces(source, &units),
+            Err(SourceError::InvalidInventory)
+        );
+    }
+
+    #[test]
+    fn lexical_ownership_does_not_compute_lengths_of_reversed_ranges() {
+        let source = "aa bb";
+        let units = [
+            unit(
+                0,
+                WrittenUnitKind::CrateRoot,
+                ByteRange { start: 0, end: 5 },
+                None,
+                0,
+            ),
+            unit(
+                1,
+                WrittenUnitKind::Item,
+                ByteRange { start: 2, end: 1 },
+                Some(0),
+                1,
+            ),
+        ];
+        let pieces = own_lexical_pieces(source, &units).unwrap();
+        assert_eq!(
+            pieces.iter().map(|piece| piece.owner.0).collect::<Vec<_>>(),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            super::validate_inventory(source, &units, &pieces),
+            Err(SourceError::InvalidInventory)
         );
     }
 

@@ -128,6 +128,39 @@ fn success(output: Output) -> Output {
 
 #[test]
 #[ignore = "runs the distribution image using Docker"]
+fn image_strips_runtime_symbols_and_preserves_shared_llvm_storage() {
+    let fixture = Fixture::new();
+    fixture.write("input.rs", "fn unused() {}\nfn main() {}\n");
+    let sections = success(fixture.execute(&[
+        "/bin/sh",
+        "-c",
+        "sysroot=$(rustc --print sysroot) && readelf --sections --wide \
+         \"$sysroot/bin/rustc\" \"$sysroot\"/lib/librustc_driver-*.so \
+         \"$sysroot\"/lib/libLLVM.so.* /usr/local/bin/cargo /usr/local/bin/rust-item-dependencies",
+    ]));
+    let sections = String::from_utf8(sections.stdout).unwrap();
+    assert_eq!(sections.matches("File: ").count(), 5, "{sections}");
+    assert_eq!(sections.matches(".dynsym").count(), 5, "{sections}");
+    assert!(
+        !sections
+            .split_whitespace()
+            .any(|name| name == ".symtab" || name.starts_with(".debug_")),
+        "{sections}"
+    );
+    let storage = success(fixture.execute(&[
+        "/bin/sh",
+        "-c",
+        "sysroot=$(rustc --print sysroot) && host=$(rustc -Vv | sed -n 's/^host: //p') && \
+         stat --format='%d:%i' \"$sysroot\"/lib/libLLVM.so.* \"$sysroot/lib/rustlib/$host/lib\"/libLLVM.so.*",
+    ]));
+    let storage = String::from_utf8(storage.stdout).unwrap();
+    let files = storage.lines().collect::<Vec<_>>();
+    assert_eq!(files.len(), 2, "{storage}");
+    assert_eq!(files[0], files[1], "{storage}");
+}
+
+#[test]
+#[ignore = "runs the distribution image using Docker"]
 fn launcher_reduces_without_image_metadata_warnings() {
     let fixture = Fixture::new();
     fixture.write("input.rs", "fn unused() {}\nfn main() {}\n");
@@ -334,7 +367,7 @@ fn image_rebuilds_dependencies_after_host_atomic_edits() {
         "helper/Cargo.toml",
         "[package]\nname='helper'\nversion='0.1.0'\nedition='2024'\n",
     );
-    let source = "fn left() -> u32 { 1 }\nfn right() -> u32 { 2 }\n\
+    let source = "fn left() -> u32 { 1 }\nfn rght() -> u32 { 2 }\n\
                   fn main() { println!(\"{}\", helper::value!()); }\n";
     fixture.write("src/main.rs", source);
     fixture.write(
@@ -352,27 +385,139 @@ fn image_rebuilds_dependencies_after_host_atomic_edits() {
     success(fixture.run(["--offline"]));
     let before = fixture.read("src/main.rs");
     assert!(before.contains("fn left"));
-    assert!(!before.contains("fn right"));
+    assert!(!before.contains("fn rght"));
     fixture.write("src/main.rs", source);
     fixture.write(
         "helper/src/replacement.rs",
-        "#[macro_export] macro_rules! value { () => { right() }; }\n",
+        "#[macro_export] macro_rules! value { () => { rght() }; }\n",
     );
     fs::rename(
         fixture.directory.path().join("helper/src/replacement.rs"),
         fixture.directory.path().join("helper/src/lib.rs"),
     )
     .unwrap();
+    // Cargo must notice changed Rust contents even when the copied file is older
+    // than its cached artifact (for example after restoring a checkout).
+    fs::File::options()
+        .write(true)
+        .open(fixture.directory.path().join("helper/src/lib.rs"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+        .unwrap();
     success(fixture.run(["--offline"]));
     let reduced = fixture.read("src/main.rs");
     assert!(!reduced.contains("fn left"));
-    assert!(reduced.contains("fn right"));
+    assert!(reduced.contains("fn rght"));
     assert_eq!(
         success(fixture.cargo(&["run", "--offline", "--quiet"])).stdout,
         b"2\n"
     );
     success(fixture.run(["--offline"]));
     assert_eq!(fixture.read("src/main.rs"), reduced);
+}
+
+#[test]
+#[ignore = "runs the distribution image using Docker"]
+fn image_reuses_dependencies_and_rebuilds_changed_build_inputs() {
+    let fixture = Fixture::new();
+    fixture.write("Cargo.toml", "[package]\nname='cache-inputs'\nversion='0.1.0'\nedition='2024'\n[workspace]\n[dependencies]\nhelper={path='helper'}\n");
+    fixture.write(".cargo/config.toml", "[term]\nverbose=true\n");
+    fixture.write(
+        "helper/Cargo.toml",
+        "[package]\nname='helper'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    fixture.write(
+        "helper/src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/choose.rs\"));\n",
+    );
+    fixture.write(
+        "helper/build.rs",
+        r##"fn main() {
+    println!("cargo::rerun-if-changed=choice.txt");
+    println!("cargo::rerun-if-env-changed=RID_TEST_CHOICE");
+    let choice = std::env::var("RID_TEST_CHOICE")
+        .unwrap_or_else(|_| std::fs::read_to_string("choice.txt").unwrap());
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(output.join("choose.rs"), format!(
+        "#[macro_export] macro_rules! choose {{ () => {{ {}() }}; }}", choice
+    )).unwrap();
+}
+"##,
+    );
+    fixture.write("helper/choice.txt", "left");
+    let source = "fn left() -> u32 { 1 }\nfn rght() -> u32 { 2 }\nfn third() -> u32 { 3 }\n\
+                  fn main() { println!(\"{}\", helper::choose!()); }\n";
+    for (index, kept, expected) in [
+        (0, "left", b"1\n"),
+        (1, "left", b"1\n"),
+        (2, "rght", b"2\n"),
+        (3, "third", b"3\n"),
+    ] {
+        fixture.write("src/main.rs", source);
+        if index == 2 {
+            fixture.write("helper/choice.txt", "rght");
+        } else if index == 3 {
+            fixture.write(
+                ".cargo/config.toml",
+                "[term]\nverbose=true\n[env]\nRID_TEST_CHOICE={value='third',force=true}\n",
+            );
+        }
+        let output = success(fixture.run(["--offline"]));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Compiling cache-inputs"), "{stderr}");
+        if index == 1 {
+            assert!(stderr.contains("Fresh helper"), "{stderr}");
+            assert!(!stderr.contains("Compiling helper"), "{stderr}");
+            let other = Fixture::new();
+            for file in [
+                "Cargo.toml",
+                ".cargo/config.toml",
+                "helper/Cargo.toml",
+                "helper/build.rs",
+                "helper/src/lib.rs",
+            ] {
+                other.write(file, &fixture.read(file));
+            }
+            other.write("src/main.rs", source);
+            other.write("helper/choice.txt", "third");
+            // Inside the container these projects have identical package paths.
+            // An older build-script input exposes accidental cache sharing.
+            fs::File::options()
+                .write(true)
+                .open(other.directory.path().join("helper/choice.txt"))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+                .unwrap();
+            success(other.run(["--offline"]));
+            let reduced = other.read("src/main.rs");
+            assert!(reduced.contains("fn third"));
+            assert!(!reduced.contains("fn left"));
+            assert!(!reduced.contains("fn rght"));
+            assert_eq!(
+                success(other.cargo(&["run", "--offline", "--quiet"])).stdout,
+                b"3\n"
+            );
+            success(other.run(["--offline"]));
+            assert_eq!(other.read("src/main.rs"), reduced);
+        } else {
+            assert!(stderr.contains("Compiling helper"), "{stderr}");
+        }
+        let reduced = fixture.read("src/main.rs");
+        for function in ["left", "rght", "third"] {
+            assert_eq!(
+                reduced.contains(&format!("fn {function}")),
+                function == kept
+            );
+        }
+        assert_eq!(
+            success(fixture.cargo(&["run", "--offline", "--quiet"])).stdout,
+            expected
+        );
+        success(fixture.run(["--offline"]));
+        assert_eq!(fixture.read("src/main.rs"), reduced);
+    }
+    assert!(!fixture.directory.path().join("target").exists());
+    assert!(!fixture.directory.path().join("Cargo.lock").exists());
 }
 
 #[test]
