@@ -1631,33 +1631,21 @@ fn associated_selection_matches(
 }
 
 fn valid_proof_relations(proofs: &[ProofNode], edges: &[DependencyEdge]) -> bool {
-    let relations = edges
-        .iter()
-        .filter_map(|edge| match edge.kind {
-            DependencyKind::ProofRelation { relation, ordinal } => {
-                Some((edge.from, edge.to, relation, ordinal))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    let mut slots = BTreeSet::new();
-    if relations
-        .iter()
-        .any(|&(from, _, relation, ordinal)| !slots.insert((from, relation, ordinal)))
-    {
-        return false;
+    let mut groups = BTreeMap::<(GraphNode, ProofRelationKind), Vec<(u32, GraphNode)>>::new();
+    for edge in edges {
+        if let DependencyKind::ProofRelation { relation, ordinal } = edge.kind {
+            groups
+                .entry((edge.from, relation))
+                .or_default()
+                .push((ordinal, edge.to));
+        }
     }
-    let mut groups = BTreeMap::<(GraphNode, ProofRelationKind), Vec<u32>>::new();
-    for &(from, _, relation, ordinal) in &relations {
-        groups.entry((from, relation)).or_default().push(ordinal);
-    }
-    if groups.values_mut().any(|ordinals| {
-        ordinals.sort_unstable();
-        ordinals
+    if groups.values_mut().any(|targets| {
+        targets.sort_unstable_by_key(|&(ordinal, _)| ordinal);
+        targets
             .iter()
             .enumerate()
-            .any(|(expected, &actual)| usize::try_from(actual) != Ok(expected))
+            .any(|(expected, &(actual, _))| usize::try_from(actual) != Ok(expected))
     }) {
         return false;
     }
@@ -1665,7 +1653,12 @@ fn valid_proof_relations(proofs: &[ProofNode], edges: &[DependencyEdge]) -> bool
     for proof in proofs {
         let from = GraphNode::Proof(proof.id);
         let exact = |relation, expected: &[GraphNode]| {
-            ordered_relation_targets(&relations, from, relation) == expected
+            groups
+                .get(&(from, relation))
+                .into_iter()
+                .flatten()
+                .map(|&(_, target)| target)
+                .eq(expected.iter().copied())
         };
         let mut expected = [
             ProofRelationKind::TraceObligation,
@@ -1851,21 +1844,6 @@ fn insert_trace_expectations(
             ids.iter().copied().map(GraphNode::Proof).collect(),
         );
     }
-}
-
-fn ordered_relation_targets(
-    relations: &[(GraphNode, GraphNode, ProofRelationKind, u32)],
-    from: GraphNode,
-    relation: ProofRelationKind,
-) -> Vec<GraphNode> {
-    let mut targets = relations
-        .iter()
-        .filter_map(|&(edge_from, to, edge_relation, ordinal)| {
-            (edge_from == from && edge_relation == relation).then_some((ordinal, to))
-        })
-        .collect::<Vec<_>>();
-    targets.sort_by_key(|&(ordinal, _)| ordinal);
-    targets.into_iter().map(|(_, target)| target).collect()
 }
 
 fn definition_node(target: DefinitionTarget) -> GraphNode {
@@ -3624,8 +3602,30 @@ mod tests {
 
     #[test]
     fn accepts_relations_that_exactly_match_proof_payloads() {
-        let (proofs, edges) = exact_proofs();
+        let (proofs, mut edges) = exact_proofs();
         assert!(valid_proof_relations(&proofs, &edges));
+        edges.reverse();
+        assert!(valid_proof_relations(&proofs, &edges));
+    }
+
+    #[test]
+    fn rejects_missing_and_unexpected_proof_relations() {
+        let (proofs, edges) = exact_proofs();
+        assert!(!edges.is_empty());
+        for index in 0..edges.len() {
+            let mut missing = edges.clone();
+            missing.remove(index);
+            assert!(!valid_proof_relations(&proofs, &missing), "missing {index}");
+        }
+
+        let mut unexpected = edges;
+        unexpected.push(relation(
+            0,
+            GraphNode::Proof(ProofId(1)),
+            ProofRelationKind::CycleMember,
+            0,
+        ));
+        assert!(!valid_proof_relations(&proofs, &unexpected));
     }
 
     #[test]

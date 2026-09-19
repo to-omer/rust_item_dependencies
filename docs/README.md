@@ -41,7 +41,9 @@ cargo-rid docker
 
 解析対象は`x86_64-unknown-linux-gnu`と`aarch64-unknown-linux-gnu`です。省略時はコンテナのCPUに対応するLinux向けの条件を使い、`--target`またはCargo設定で切り替えられます。macOS・Windows上で実行しても、解析対象のOSはLinuxです。
 
-依存クレートはコンテナ内の専用コンパイラでビルドします。取得した依存クレートはDockerのビルドキャッシュに保持し、コンパイル成果物は実行ごとに用意します。`--target-dir`もコンテナ内の出力先を指定します。削減したソース以外の生成物はホストへ戻しません。ホストでビルドした`.rlib`や手続きマクロは、そのまま流用できるとは限りません。
+依存クレートはコンテナ内の専用コンパイラでビルドします。取得した依存クレートと、プロジェクトごとのビルド成果物をDockerのビルドキャッシュに保持し、Cargoが再ビルドを必要としない成果物を再利用します。解析対象の削減と検証は毎回行います。Dockerのキャッシュを削除した場合は、次回の実行で再取得・再ビルドします。
+
+`--target-dir`はコンテナ内の出力先を指定し、既定の成果物キャッシュは使いません。削減したソース以外の生成物はホストへ戻しません。ホストの`target/`は入力として転送しますが、macOS・Windows向けや異なるコンパイラの成果物をLinux用のビルドへ流用することはできません。
 
 既定のイメージは`ghcr.io/to-omer/rust_item_dependencies:main`です。ローカルにない場合は自動で取得します。更新する場合は`docker pull ghcr.io/to-omer/rust_item_dependencies:main`を実行してください。特定のタグやdigestを使う場合は、環境変数`RUST_ITEM_DEPENDENCIES_IMAGE`へイメージ参照を指定できます。
 

@@ -4,6 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+use sha2::{Digest, Sha256};
+
 use crate::cli::{Parsed, parse_arguments, reducer_usage};
 use crate::container_protocol::{ContainerResult, RESULT_ARGUMENT, RESULT_PATH, VERSION};
 use crate::file_output::{SourceFile, write_new};
@@ -29,15 +31,15 @@ pub(super) fn run(arguments: &[OsString]) -> Result<ExitStatus, String> {
 
 fn reduce(arguments: &[&str]) -> io::Result<ExitStatus> {
     let root = fs::canonicalize(std::env::current_dir()?)?;
-    if root.to_str().is_none() {
-        return Err(io::Error::new(
+    let root_name = root.to_str().ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
             "the working directory is not Unicode",
-        ));
-    }
+        )
+    })?;
     let temporary = tempfile::Builder::new().prefix("rid-docker-").tempdir()?;
     let dockerfile = temporary.path().join("Dockerfile");
-    fs::write(&dockerfile, build_definition(arguments)?)?;
+    fs::write(&dockerfile, build_definition(arguments, root_name)?)?;
     // Program inputs may be ignored by an unrelated image's Dockerfile.
     fs::write(temporary.path().join("Dockerfile.dockerignore"), "")?;
     let exported = temporary.path().join("result");
@@ -67,10 +69,20 @@ fn reduce(arguments: &[&str]) -> io::Result<ExitStatus> {
         // This build exports a reduction result, not an image with Git metadata.
         .env("BUILDX_GIT_INFO", "false")
         .env("BUILDX_GIT_LABELS", "false")
-        .args(["build", "--no-cache", "--progress=plain", "--file"])
+        // Refresh input metadata without discarding Cargo's cache mounts.
+        .args([
+            "build",
+            "--no-cache-filter",
+            "input",
+            "--progress=plain",
+            "--file",
+        ])
         .arg(&dockerfile)
         .arg("--build-arg")
         .arg(format!("RID_IMAGE={image}"))
+        // A unique build argument forces reduction even when every input is unchanged.
+        .arg("--build-arg")
+        .arg(format!("RID_INVOCATION={}", temporary.path().display()))
         .arg("--output")
         .arg(exporter)
         .arg(&root)
@@ -88,18 +100,26 @@ fn reduce(arguments: &[&str]) -> io::Result<ExitStatus> {
     Ok(status)
 }
 
-fn build_definition(arguments: &[&str]) -> io::Result<String> {
+fn build_definition(arguments: &[&str], root: &str) -> io::Result<String> {
     let mut command = vec!["/usr/local/bin/rust-item-dependencies", RESULT_ARGUMENT];
     command.extend_from_slice(arguments);
     let command = serde_json::to_string(&command)?;
+    let cache = Sha256::digest(root.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     Ok(format!(
         "ARG RID_IMAGE={DEFAULT_IMAGE}\n\
-         FROM ${{RID_IMAGE}} AS reduce\n\
-         ENV CARGO_HOME=/tmp/rid-cargo-home CARGO_TARGET_DIR=/tmp/rid-target\n\
+         FROM scratch AS input\n\
          COPY --chown=1000:1000 . /workspace/\n\
+         FROM ${{RID_IMAGE}} AS reduce\n\
+         ENV CARGO_HOME=/tmp/rid-cargo-home CARGO_TARGET_DIR=/tmp/rid-target CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true\n\
          WORKDIR /workspace\n\
          USER 1000:1000\n\
-         RUN --mount=type=cache,id=rid-cargo-home,target=/tmp/rid-cargo-home,uid=1000,gid=1000,sharing=locked {command}\n\
+         ARG RID_INVOCATION\n\
+         RUN --mount=type=bind,from=input,source=/workspace,target=/workspace,rw \
+             --mount=type=cache,id=rid-cargo-home,target=/tmp/rid-cargo-home,uid=1000,gid=1000,sharing=locked \
+             --mount=type=cache,id=rid-target-{cache},target=/tmp/rid-target,uid=1000,gid=1000,sharing=locked {command}\n\
          FROM scratch\n\
          COPY --from=reduce {RESULT_PATH} /result.json\n"
     ))
