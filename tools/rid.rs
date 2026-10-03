@@ -9,6 +9,8 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 mod cli;
 #[cfg(test)]
 mod compiler_cache_tests;
+#[cfg(test)]
+mod compiler_checkout_tests;
 mod container;
 mod container_protocol;
 #[path = "../src/file_output.rs"]
@@ -29,6 +31,9 @@ const PROCESS_OWNER_PREFIX: &str = ".rust-item-dependencies-owner-";
 const PROCESS_ROOT_PREFIX: &str = "rust-item-dependencies-process-";
 const SNAPSHOT_OWNER_ATTEMPTS: u64 = 1_024;
 const COMPILER_BUILD_IDENTITY_FILE: &str = ".rust-item-dependencies-build-identity-v3";
+const PREVIOUS_COMPILER_BUILD_IDENTITY_FILE: &str = ".rust-item-dependencies-build-identity-v2";
+const COMPILER_PATCH_WORKTREE_PREFIX: &str = "rustc-patch-";
+const COMPILER_CHECKOUT_REVISION_KEY: &str = "rust-item-dependencies.patched-revision";
 #[cfg(windows)]
 const SNAPSHOT_PARENT_LOCK_FILE: &str = ".rust-item-dependencies-parent-lock";
 const RUSTC_PRIVATE_CRATES: &[&str] = &[
@@ -319,28 +324,29 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
         }
     }
 
-    if git_output(rust_source, &["rev-parse", "--verify", "HEAD"]).is_err() {
-        run_command(
-            Command::new("git").args(["-C"]).arg(rust_source).args([
-                "fetch",
-                "--depth",
-                "1",
-                "origin",
-                &base_revision,
-            ]),
-            "download the pinned Rust source",
-        )?;
-        run_command(
-            Command::new("git").args(["-C"]).arg(rust_source).args([
-                "checkout",
-                "--detach",
-                "FETCH_HEAD",
-            ]),
-            "check out the pinned Rust source",
-        )?;
-    }
-
-    let revision = git_output(rust_source, &["rev-parse", "HEAD"])?;
+    let head = Command::new("git")
+        .args(["-C"])
+        .arg(rust_source)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output()
+        .map_err(|error| format!("cannot query the Rust checkout: {error}"))?;
+    let revision = match head.status.code() {
+        Some(0) => String::from_utf8(head.stdout)
+            .map_err(|_| "the Rust checkout revision is not UTF-8".to_owned())?
+            .trim()
+            .to_owned(),
+        Some(1) => {
+            fetch_compiler_base(rust_source, &base_revision)?;
+            checkout_compiler_revision(rust_source, &base_revision)?;
+            base_revision.clone()
+        }
+        _ => {
+            return Err(format!(
+                "cannot query the Rust checkout: {}",
+                String::from_utf8_lossy(&head.stderr).trim()
+            ));
+        }
+    };
     let changes = git_output(rust_source, &["status", "--porcelain"])?;
     if !changes.is_empty() {
         return Err(format!(
@@ -349,15 +355,192 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
         ));
     }
     if revision == patched_revision {
-        return Ok(());
+        return record_compiler_checkout_revision(rust_source, &patched_revision);
     }
-    if revision != base_revision {
+    if revision != base_revision
+        && !compiler_checkout_has_recorded_revision(rust_source, &revision)?
+    {
         return Err(format!(
-            "the generated Rust checkout has an unexpected revision; remove {} and run the command again",
+            "the generated Rust checkout has an unrecorded revision; its source was preserved: {}",
             render_path(rust_source)
         ));
     }
 
+    let submodule_files = git_output(
+        rust_source,
+        &[
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            "git ls-files --others --ignored --exclude-standard",
+        ],
+    )?;
+    if !submodule_files.is_empty() {
+        return Err(format!(
+            "the generated Rust checkout has local files in a submodule; its source was preserved: {}",
+            render_path(rust_source)
+        ));
+    }
+    fetch_compiler_base(rust_source, &base_revision)?;
+    stage_compiler_patches(
+        repository_root,
+        rust_source,
+        &base_revision,
+        &patched_revision,
+    )?;
+    // Leave clean submodules uninitialized so interrupted preparation never
+    // presents their previous commits as manual changes in the new checkout.
+    run_command(
+        Command::new("git")
+            .arg("-C")
+            .arg(rust_source)
+            .args(["submodule", "deinit", "--all"]),
+        "detach the previous compiler submodules",
+    )?;
+    checkout_compiler_revision(rust_source, &patched_revision)?;
+    record_compiler_checkout_revision(rust_source, &patched_revision)
+}
+
+fn fetch_compiler_base(rust_source: &Path, base_revision: &str) -> Result<(), String> {
+    if git_output(
+        rust_source,
+        &["cat-file", "-e", &format!("{base_revision}^{{commit}}")],
+    )
+    .is_err()
+    {
+        run_command(
+            Command::new("git").args(["-C"]).arg(rust_source).args([
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                base_revision,
+            ]),
+            "download the pinned Rust source",
+        )?;
+    }
+    Ok(())
+}
+
+fn checkout_compiler_revision(rust_source: &Path, revision: &str) -> Result<(), String> {
+    run_command(
+        Command::new("git").args(["-C"]).arg(rust_source).args([
+            "checkout",
+            "--detach",
+            "--no-overwrite-ignore",
+            revision,
+        ]),
+        "check out the pinned Rust source",
+    )
+}
+
+fn stage_compiler_patches(
+    repository_root: &Path,
+    rust_source: &Path,
+    base_revision: &str,
+    patched_revision: &str,
+) -> Result<(), String> {
+    // Apply the complete queue away from the active checkout. Allocate a new
+    // directory so interrupted or manually registered worktrees remain untouched.
+    let temporary = tempfile::Builder::new()
+        .prefix(COMPILER_PATCH_WORKTREE_PREFIX)
+        .tempdir_in(
+            rust_source
+                .parent()
+                .ok_or("the Rust checkout has no parent")?,
+        )
+        .map_err(|error| format!("cannot allocate the Rust patch worktree: {error}"))?;
+    let worktree = temporary.path();
+    run_command(
+        Command::new("git")
+            .arg("-C")
+            .arg(rust_source)
+            .args(["worktree", "add", "--detach"])
+            .arg(worktree)
+            .arg(base_revision),
+        "prepare the temporary Rust patch worktree",
+    )?;
+    let result = apply_compiler_patches(repository_root, worktree, patched_revision);
+    let cleanup = run_command(
+        Command::new("git")
+            .arg("-C")
+            .arg(rust_source)
+            .args(["worktree", "remove", "--force"])
+            .arg(worktree),
+        "remove the temporary Rust patch worktree",
+    );
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+    }
+}
+
+fn compiler_checkout_has_recorded_revision(
+    rust_source: &Path,
+    revision: &str,
+) -> Result<bool, String> {
+    if git_output(
+        rust_source,
+        &[
+            "config",
+            "--local",
+            "--default",
+            "",
+            "--get",
+            COMPILER_CHECKOUT_REVISION_KEY,
+        ],
+    )? == revision
+    {
+        return Ok(true);
+    }
+    for name in [
+        COMPILER_BUILD_IDENTITY_FILE,
+        PREVIOUS_COMPILER_BUILD_IDENTITY_FILE,
+    ] {
+        let path = rust_source.join("build").join(name);
+        match fs::read_to_string(&path) {
+            Ok(identity) if identity.lines().next() == Some(revision) => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot read {}: {error}", render_path(&path))),
+        }
+    }
+    Ok(false)
+}
+
+fn record_compiler_checkout_revision(rust_source: &Path, revision: &str) -> Result<(), String> {
+    if git_output(
+        rust_source,
+        &[
+            "config",
+            "--local",
+            "--default",
+            "",
+            "--get",
+            COMPILER_CHECKOUT_REVISION_KEY,
+        ],
+    )? != revision
+    {
+        run_command(
+            Command::new("git").arg("-C").arg(rust_source).args([
+                "config",
+                "--local",
+                COMPILER_CHECKOUT_REVISION_KEY,
+                revision,
+            ]),
+            "record the generated Rust checkout revision",
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_compiler_patches(
+    repository_root: &Path,
+    rust_source: &Path,
+    patched_revision: &str,
+) -> Result<(), String> {
     let patch_directory = repository_root.join("rustc-patches");
     let series = fs::read_to_string(patch_directory.join("series"))
         .map_err(|error| format!("cannot read the patch series: {error}"))?;
@@ -370,7 +553,7 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
         if !patch.is_file() {
             return Err(format!("patch does not exist: {}", render_path(&patch)));
         }
-        let result = run_command(
+        run_command(
             Command::new("git")
                 .args(["-C"])
                 .arg(rust_source)
@@ -386,15 +569,7 @@ fn ensure_patched_checkout(repository_root: &Path, rust_source: &Path) -> Result
                 ])
                 .arg(&patch),
             &format!("apply {patch_name}"),
-        );
-        if let Err(error) = result {
-            let _ = Command::new("git")
-                .args(["-C"])
-                .arg(rust_source)
-                .args(["am", "--abort"])
-                .status();
-            return Err(error);
-        }
+        )?;
     }
 
     let revision = git_output(rust_source, &["rev-parse", "HEAD"])?;
@@ -1058,7 +1233,9 @@ mod target_tests {
         let (directory, rust_source) = compiler_cache_fixture();
         fs::rename(
             rust_source.join("build").join(COMPILER_BUILD_IDENTITY_FILE),
-            rust_source.join("build/.rust-item-dependencies-build-identity-v2"),
+            rust_source
+                .join("build")
+                .join(PREVIOUS_COMPILER_BUILD_IDENTITY_FILE),
         )
         .unwrap();
         assert!(!compiler_build_identity_matches(directory.path(), &rust_source).unwrap());
