@@ -1,4 +1,4 @@
-From fb6d6ec83054f6fa3dd719b8f9e1a3f4b356cea1 Mon Sep 17 00:00:00 2001
+From ba71bce81a7d491631016e71a626af4021b3b2c5 Mon Sep 17 00:00:00 2001
 From: to-omer <48119218+to-omer@users.noreply.github.com>
 Date: Thu, 27 Aug 2026 03:56:01 +0900
 Subject: [PATCH] Expose global assembly monomorphization roots
@@ -12,7 +12,7 @@ Subject: [PATCH] Expose global assembly monomorphization roots
  5 files changed, 140 insertions(+), 56 deletions(-)
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 1a7d8add..92cb39ef 100644
+index 80d0006d8..aafbc9b68 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -25,7 +25,7 @@ index 1a7d8add..92cb39ef 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_middle/src/mono.rs b/compiler/rustc_middle/src/mono.rs
-index 96dcb732..c62e1336 100644
+index 96dcb7328..c62e13362 100644
 --- a/compiler/rustc_middle/src/mono.rs
 +++ b/compiler/rustc_middle/src/mono.rs
 @@ -67,6 +67,7 @@ pub enum MonoItem<'tcx> {
@@ -37,7 +37,7 @@ index 96dcb732..c62e1336 100644
  
  /// A node retained by the typed monomorphization observer.
 diff --git a/compiler/rustc_middle/src/query/keys.rs b/compiler/rustc_middle/src/query/keys.rs
-index 8a4f5fe9..df67499d 100644
+index 8a4f5fe93..df67499d5 100644
 --- a/compiler/rustc_middle/src/query/keys.rs
 +++ b/compiler/rustc_middle/src/query/keys.rs
 @@ -435,6 +435,7 @@ fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
@@ -49,11 +49,11 @@ index 8a4f5fe9..df67499d 100644
      }
  }
 diff --git a/compiler/rustc_monomorphize/src/collector.rs b/compiler/rustc_monomorphize/src/collector.rs
-index e8e042d3..aa45b438 100644
+index 6c08fb36c..9282fb57b 100644
 --- a/compiler/rustc_monomorphize/src/collector.rs
 +++ b/compiler/rustc_monomorphize/src/collector.rs
-@@ -739,61 +739,11 @@ fn collect_items_rec<'tcx>(
-             });
+@@ -737,61 +737,11 @@ fn collect_items_rec<'tcx>(
+             mentioned_items.extend(mentioned.into_iter().copied());
          }
          MonoItem::GlobalAsm(item_id) => {
 -            assert!(
@@ -118,7 +118,7 @@ index e8e042d3..aa45b438 100644
          }
      };
  
-@@ -1913,6 +1863,82 @@ fn collect_items_of_static<'tcx>(
+@@ -1924,6 +1874,82 @@ fn collect_items_of_static<'tcx>(
      (used_items, mentioned_items)
  }
  
@@ -201,7 +201,7 @@ index e8e042d3..aa45b438 100644
  #[instrument(skip(tcx), level = "debug")]
  fn collect_items_of_instance<'tcx>(
      tcx: TyCtxt<'tcx>,
-@@ -2068,6 +2094,10 @@ fn mono_successors<'tcx>(
+@@ -2079,6 +2105,10 @@ fn mono_successors<'tcx>(
              )?;
              (items.0, items.1, associated_consts)
          }
@@ -213,7 +213,7 @@ index e8e042d3..aa45b438 100644
  
      let (used, mut facts, mut proof_uses) = used_items.into_observation_parts()?;
 diff --git a/tests/ui-fulldeps/typed-mono-successors.rs b/tests/ui-fulldeps/typed-mono-successors.rs
-index 9ef6dfd6..8888f6c0 100644
+index 9ef6dfd64..8888f6c07 100644
 --- a/tests/ui-fulldeps/typed-mono-successors.rs
 +++ b/tests/ui-fulldeps/typed-mono-successors.rs
 @@ -51,6 +51,13 @@ fn static_dead() {}
@@ -285,6 +285,3 @@ index 9ef6dfd6..8888f6c0 100644
      assert!(inline_asm_successors.facts.iter().any(|fact| {
          fact.collection == MonoTraceCollection::Used
              && fact.cause == MonoUseCause::InlineAsmSymbol
--- 
-2.55.0
-

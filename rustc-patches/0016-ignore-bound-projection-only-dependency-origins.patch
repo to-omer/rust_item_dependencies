@@ -1,7 +1,7 @@
-From 14998244294254b9c86bc473022b9c3980d2bc75 Mon Sep 17 00:00:00 2001
+From 747b1a819cdf728878c53b4344f4393b9730c515 Mon Sep 17 00:00:00 2001
 From: to-omer <48119218+to-omer@users.noreply.github.com>
 Date: Fri, 14 Aug 2026 08:12:55 +0900
-Subject: [PATCH 16/16] Ignore bound projection-only dependency origins
+Subject: [PATCH] Ignore bound projection-only dependency origins
 
 ---
  .../src/traits/typeck_impl_dependencies.rs             |  2 +-
@@ -10,7 +10,7 @@ Subject: [PATCH 16/16] Ignore bound projection-only dependency origins
  3 files changed, 16 insertions(+), 1 deletion(-)
 
 diff --git a/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs b/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs
-index 36fb2f6b..6823f377 100644
+index 36fb2f6b4..6823f377d 100644
 --- a/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs
 +++ b/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs
 @@ -442,7 +442,7 @@ pub fn finish(&self, infcx: &InferCtxt<'tcx>) -> Result<Vec<TypeckImplDependency
@@ -23,7 +23,7 @@ index 36fb2f6b..6823f377 100644
                  key: (origin.key.0, projection.projection_term),
                  owner: origin.owner,
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs
-index 5300de2f..da442a60 100644
+index 5300de2f6..da442a600 100644
 --- a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs
 @@ -34,3 +34,13 @@ fn require<T>()
@@ -41,7 +41,7 @@ index 5300de2f..da442a60 100644
 +        .collect()
 +}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs b/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs
-index e6c339ce..d2fd5f75 100644
+index e6c339ce3..d2fd5f754 100644
 --- a/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs
 @@ -42,11 +42,16 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
@@ -61,6 +61,3 @@ index e6c339ce..d2fd5f75 100644
          assert_eq!(
              exact_dependencies(cold, tcx),
              HashSet::from([
--- 
-2.55.0
-

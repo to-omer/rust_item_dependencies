@@ -7,7 +7,7 @@ if [ "$#" -gt 1 ]; then
 fi
 
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-base_revision=$(tr -d '\r\n' < "$repository_root/rustc-patches/base-revision")
+stock_revision=$(tr -d '\r\n' < "$repository_root/rust-toolchain-revision")
 queue_digest=$(tr -d '\r\n' < "$repository_root/rustc-patches/queue-digest")
 
 if [ "${RUSTFLAGS+x}" = x ] || [ "${CARGO_ENCODED_RUSTFLAGS+x}" = x ]; then
@@ -24,8 +24,8 @@ sh -n \
 if [ "$#" -eq 0 ]; then
     active_rustc=$(command -v rustc)
     actual_revision=$("$active_rustc" -Vv | sed -n 's/^commit-hash: //p' | tr -d '\r')
-    if [ "$actual_revision" != "$base_revision" ]; then
-        echo "active rustc revision mismatch: expected $base_revision, got $actual_revision" >&2
+    if [ "$actual_revision" != "$stock_revision" ]; then
+        echo "active rustc revision mismatch: expected $stock_revision, got $actual_revision" >&2
         exit 1
     fi
 
@@ -89,6 +89,13 @@ if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
     exit 1
 fi
 rustc_interface=$1
+
+set -- "$compiler_metadata"/librustc_crate_store-*.rmeta
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+    echo "expected exactly one rustc_crate_store metadata file" >&2
+    exit 1
+fi
+rustc_crate_store=$1
 
 set -- "$compiler_metadata"/librustc_data_structures-*.rmeta
 if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
@@ -178,6 +185,7 @@ stage2_rustc=$(native_path "$stage2_rustc")
 rustc_driver=$(native_path "$rustc_driver")
 rustc_ast=$(native_path "$rustc_ast")
 rustc_interface=$(native_path "$rustc_interface")
+rustc_crate_store=$(native_path "$rustc_crate_store")
 rustc_data_structures=$(native_path "$rustc_data_structures")
 rustc_errors=$(native_path "$rustc_errors")
 rustc_expand=$(native_path "$rustc_expand")
@@ -200,6 +208,7 @@ unit_separator=$(printf '\037')
 encoded_rustflags="--extern${unit_separator}rustc_driver=$rustc_driver"
 encoded_rustflags="${encoded_rustflags}${unit_separator}-C${unit_separator}prefer-dynamic"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_ast=$rustc_ast"
+encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_crate_store=$rustc_crate_store"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_data_structures=$rustc_data_structures"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_errors=$rustc_errors"
 encoded_rustflags="${encoded_rustflags}${unit_separator}--extern${unit_separator}rustc_expand=$rustc_expand"

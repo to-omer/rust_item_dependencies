@@ -1,4 +1,4 @@
-From 6d9f0f9ef6a674a5078bb0fd6e9436f31fc16774 Mon Sep 17 00:00:00 2001
+From 1060f9cd6670b28590c1e4d1a31d3415a9dc96ca Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Sat, 22 Aug 2026 15:00:00 +0900
 Subject: [PATCH] rustc: preserve associated struct path arguments
@@ -13,10 +13,10 @@ Subject: [PATCH] rustc: preserve associated struct path arguments
  create mode 100644 tests/ui-fulldeps/typeck-impl-dependencies-associated-struct.rs
 
 diff --git a/compiler/rustc_hir_typeck/src/fn_ctxt/checks.rs b/compiler/rustc_hir_typeck/src/fn_ctxt/checks.rs
-index 46001b8b..2cc7c5df 100644
+index 9becad0db..c14d72a40 100644
 --- a/compiler/rustc_hir_typeck/src/fn_ctxt/checks.rs
 +++ b/compiler/rustc_hir_typeck/src/fn_ctxt/checks.rs
-@@ -1533,6 +1533,13 @@ fn finish_resolving_struct_path(
+@@ -1571,6 +1571,13 @@ fn finish_resolving_struct_path(
  
                  // Write back the new resolution.
                  self.write_resolution(hir_id, resolution);
@@ -31,7 +31,7 @@ index 46001b8b..2cc7c5df 100644
                  (result.unwrap_or(Res::Err), ty)
              }
 diff --git a/compiler/rustc_traits/src/typeck_impl_dependencies.rs b/compiler/rustc_traits/src/typeck_impl_dependencies.rs
-index dd2929f4..71073314 100644
+index dd2929f45..71073314f 100644
 --- a/compiler/rustc_traits/src/typeck_impl_dependencies.rs
 +++ b/compiler/rustc_traits/src/typeck_impl_dependencies.rs
 @@ -1,7 +1,8 @@
@@ -113,7 +113,7 @@ index dd2929f4..71073314 100644
      items: Vec<(DefId, HirId, Span)>,
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-associated-struct-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-associated-struct-input.rs
 new file mode 100644
-index 00000000..523fc832
+index 000000000..523fc8326
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-associated-struct-input.rs
 @@ -0,0 +1,100 @@
@@ -219,7 +219,7 @@ index 00000000..523fc832
 +fn main() {}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-associated-struct.rs b/tests/ui-fulldeps/typeck-impl-dependencies-associated-struct.rs
 new file mode 100644
-index 00000000..fadea6da
+index 000000000..fadea6da0
 --- /dev/null
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies-associated-struct.rs
 @@ -0,0 +1,269 @@
@@ -492,6 +492,3 @@ index 00000000..fadea6da
 +    assert_eq!(impls.next(), None);
 +    impl_def_id
 +}
--- 
-2.55.0
-

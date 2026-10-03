@@ -1,4 +1,4 @@
-From 0b58b8b7166e7018e33fdf2595ed45e01aab5ff5 Mon Sep 17 00:00:00 2001
+From d1db03e975fcd5b03547bceb6b38704b03263b56 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Sun, 30 Aug 2026 16:25:19 +0900
 Subject: [PATCH] rustc: observe successful proc-macro library loads
@@ -11,7 +11,7 @@ Subject: [PATCH] rustc: observe successful proc-macro library loads
  4 files changed, 144 insertions(+), 13 deletions(-)
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 416094a2e..575ac1160 100644
+index 5bb156972..65422a695 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -24,7 +24,7 @@ index 416094a2e..575ac1160 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_metadata/src/creader.rs b/compiler/rustc_metadata/src/creader.rs
-index d540f1b11..41616def2 100644
+index 8374c8da3..35720fa7c 100644
 --- a/compiler/rustc_metadata/src/creader.rs
 +++ b/compiler/rustc_metadata/src/creader.rs
 @@ -754,9 +754,13 @@ fn register_crate<'tcx>(
@@ -45,10 +45,10 @@ index d540f1b11..41616def2 100644
          let crate_metadata = CrateMetadata::new(
              tcx,
 diff --git a/compiler/rustc_session/src/session.rs b/compiler/rustc_session/src/session.rs
-index a3fe5a3c5..61a98a981 100644
+index 88dc0d3d4..bd17e6c1b 100644
 --- a/compiler/rustc_session/src/session.rs
 +++ b/compiler/rustc_session/src/session.rs
-@@ -110,15 +110,29 @@ fn report(&self, resource_use: ExternalResourceUse) {
+@@ -111,15 +111,29 @@ fn report(&self, resource_use: ExternalResourceUse) {
      }
  }
  
@@ -81,7 +81,7 @@ index a3fe5a3c5..61a98a981 100644
      }
  }
  
-@@ -525,6 +539,12 @@ pub fn is_proc_macro_load_allowed(&self, path: &Path) -> bool {
+@@ -526,6 +540,12 @@ pub fn is_proc_macro_load_allowed(&self, path: &Path) -> bool {
          self.proc_macro_load_guard.as_ref().is_none_or(|guard| guard.is_allowed(path))
      }
  
@@ -95,7 +95,7 @@ index a3fe5a3c5..61a98a981 100644
          self.miri_unleashed_features.lock().push((span, feature_gate));
      }
 diff --git a/tests/ui-fulldeps/proc-macro-load-guard.rs b/tests/ui-fulldeps/proc-macro-load-guard.rs
-index f5d581624..cd0456a88 100644
+index f5d581624..7ce9524bf 100644
 --- a/tests/ui-fulldeps/proc-macro-load-guard.rs
 +++ b/tests/ui-fulldeps/proc-macro-load-guard.rs
 @@ -10,6 +10,7 @@
@@ -296,5 +296,3 @@ index f5d581624..cd0456a88 100644
              })),
          }
      }
--- 
-2.55.0

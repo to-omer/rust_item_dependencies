@@ -157,6 +157,124 @@ const MACRO_COMPONENT_CASES: &[(&str, &str, &str, &str)] = &[
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn stable_1_99_inputs_preserve_dependencies_execution_and_a_fixed_point() {
+    let target = host_target();
+    let options = CompilationOptions::default();
+    let analyzer = Analyzer::new().unwrap();
+    for (name, source, required, stdout) in [
+        (
+            "c_variadic",
+            include_str!("fixtures/retention/c_variadic.input.rs"),
+            "unsafe fn consume",
+            b"42\n".as_slice(),
+        ),
+        (
+            "stable_1_99_apis",
+            include_str!("fixtures/retention/stable_1_99_apis.input.rs"),
+            "fn round_trip",
+            b"ok:42\n".as_slice(),
+        ),
+    ] {
+        let original = input(source, &target);
+        let reduction = analyzer
+            .reduce(&original)
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert!(!reduction.reduced_source().contains("fn unused"), "{name}");
+        assert!(reduction.reduced_source().contains(required), "{name}");
+        let reduced = original.with_source(reduction.reduced_source());
+        let fixed = analyzer.reduce(&reduced).unwrap();
+        assert_eq!(fixed.reduced_source(), reduction.reduced_source(), "{name}");
+        let before = compile_and_run(&original, &options, &format!("{name}_original"));
+        let after = compile_and_run(&reduced, &options, &format!("{name}_reduced"));
+        assert!(before.status.success(), "{name}: {before:?}");
+        assert_eq!(before.stdout, stdout, "{name}");
+        assert_eq!(after.status, before.status, "{name}");
+        assert_eq!(after.stdout, before.stdout, "{name}");
+        assert_eq!(after.stderr, before.stderr, "{name}");
+    }
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn naked_variadic_functions_preserve_assembly_dependencies() {
+    let source = include_str!("fixtures/retention/naked_variadic.input.rs");
+    let target = host_target();
+    let options = CompilationOptions::default();
+    let analyzer = Analyzer::new().unwrap();
+    let original = input(source, &target);
+    let reduction = analyzer.reduce(&original).unwrap();
+    for required in ["fn unused", "fn sum", "fn naked_sum", "naked_asm!"] {
+        assert!(reduction.reduced_source().contains(required), "{required}");
+    }
+    let reduced = original.with_source(reduction.reduced_source());
+    let fixed = analyzer.reduce(&reduced).unwrap();
+    assert_eq!(fixed.reduced_source(), reduction.reduced_source());
+    let before = compile_and_run(&original, &options, "naked_variadic_original");
+    let after = compile_and_run(&reduced, &options, "naked_variadic_reduced");
+    assert!(before.status.success());
+    assert_eq!(before.stdout, b"42\n");
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.stdout, before.stdout);
+    assert_eq!(after.stderr, before.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn empty_macro_inputs_keep_independent_origins() {
+    let source = concat!(
+        "macro_rules! emit { () => { fn used() -> i32 { 35 } fn unused() {} }; }\n",
+        "macro_rules! value { () => { 7 }; }\n",
+        "macro_rules! empty { () => {}; }\n",
+        "emit!(); empty!();\n",
+        "fn main() { println!(\"{}\", used() + value!()); }\n",
+    );
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let options = CompilationOptions::default();
+    let original_input = input(source, &target);
+    let reduction = analyzer.reduce(&original_input).unwrap();
+    assert!(!reduction.reduced_source().contains("fn unused"));
+    assert!(reduction.reduced_source().contains("fn used"));
+    assert!(reduction.reduced_source().contains("value!()"));
+    let reduced_input = original_input.with_source(reduction.reduced_source());
+    let fixed = analyzer.reduce(&reduced_input).unwrap();
+    assert_eq!(fixed.reduced_source(), reduction.reduced_source());
+    let original = compile_and_run(&original_input, &options, "empty_macro_origins_original");
+    let reduced = compile_and_run(&reduced_input, &options, "empty_macro_origins_reduced");
+    assert_eq!(original.stdout, b"42\n");
+    assert_eq!(reduced.status, original.status);
+    assert_eq!(reduced.stdout, original.stdout);
+    assert_eq!(reduced.stderr, original.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
+fn vector_clone_keeps_the_derived_clone_and_copy_providers() {
+    let source = concat!(
+        "#[derive(Clone, Copy)] struct Value(u32);\n",
+        "fn unused() {}\n",
+        "fn main() { let values = vec![Value(42)]; let cloned = values.clone(); println!(\"{}\", cloned[0].0); }\n",
+    );
+    let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
+    let target = host_target();
+    let options = CompilationOptions::default();
+    let original_input = input(source, &target);
+    let reduction = analyzer.reduce(&original_input).unwrap();
+    assert!(!reduction.reduced_source().contains("fn unused"));
+    assert!(reduction.reduced_source().contains("derive(Clone, Copy)"));
+    let reduced_input = original_input.with_source(reduction.reduced_source());
+    let fixed = analyzer.reduce(&reduced_input).unwrap();
+    assert_eq!(fixed.reduced_source(), reduction.reduced_source());
+    let original = compile_and_run(&original_input, &options, "vector_clone_original");
+    let reduced = compile_and_run(&reduced_input, &options, "vector_clone_reduced");
+    assert_eq!(original.stdout, b"42\n");
+    assert_eq!(reduced.status, original.status);
+    assert_eq!(reduced.stdout, original.stdout);
+    assert_eq!(reduced.stderr, original.stderr);
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn complex_reductions_match_handwritten_sources() {
     let analyzer = Analyzer::new().expect("the qualified compiler artifact must be accepted");
     let target = host_target();

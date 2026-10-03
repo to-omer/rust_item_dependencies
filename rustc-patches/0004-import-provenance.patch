@@ -1,4 +1,4 @@
-From 3fd0a2f57c265a90a0b000527cc4e0c935ac09be Mon Sep 17 00:00:00 2001
+From 5fcd9df7e60b04efd26a91736434f7055883ba02 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Tue, 11 Aug 2026 04:20:24 +0900
 Subject: [PATCH] rustc: preserve selected import provenance
@@ -16,7 +16,7 @@ Subject: [PATCH] rustc: preserve selected import provenance
  9 files changed, 119 insertions(+), 11 deletions(-)
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 49ed4e63..3e4e3ca9 100644
+index b21e7e5bb..52c5ed7c6 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -29,7 +29,7 @@ index 49ed4e63..3e4e3ca9 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_hir_typeck/src/method/mod.rs b/compiler/rustc_hir_typeck/src/method/mod.rs
-index 3425ba5d..4d7b98da 100644
+index 3425ba5d7..4d7b98da4 100644
 --- a/compiler/rustc_hir_typeck/src/method/mod.rs
 +++ b/compiler/rustc_hir_typeck/src/method/mod.rs
 @@ -253,6 +253,13 @@ pub(crate) fn lookup_method(
@@ -60,7 +60,7 @@ index 3425ba5d..4d7b98da 100644
      }
  
 diff --git a/compiler/rustc_hir_typeck/src/writeback.rs b/compiler/rustc_hir_typeck/src/writeback.rs
-index 7b1f38f8..c47b3272 100644
+index 7b1f38f88..c47b3272a 100644
 --- a/compiler/rustc_hir_typeck/src/writeback.rs
 +++ b/compiler/rustc_hir_typeck/src/writeback.rs
 @@ -85,6 +85,10 @@ pub(crate) fn resolve_type_vars_in_body(
@@ -75,7 +75,7 @@ index 7b1f38f8..c47b3272 100644
  
          self.tcx.arena.alloc(wbcx.typeck_results)
 diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
-index 5328b295..3bfd1be9 100644
+index cd9e5f690..41456ea67 100644
 --- a/compiler/rustc_middle/src/ty/mod.rs
 +++ b/compiler/rustc_middle/src/ty/mod.rs
 @@ -113,7 +113,7 @@
@@ -118,7 +118,7 @@ index 5328b295..3bfd1be9 100644
  pub struct PerOwnerResolverData<'tcx> {
      pub node_id_to_def_id: NodeMap<LocalDefId> = Default::default(),
 diff --git a/compiler/rustc_middle/src/ty/typeck_results.rs b/compiler/rustc_middle/src/ty/typeck_results.rs
-index ff7cef36..1d55f197 100644
+index ff7cef361..1d55f197d 100644
 --- a/compiler/rustc_middle/src/ty/typeck_results.rs
 +++ b/compiler/rustc_middle/src/ty/typeck_results.rs
 @@ -162,6 +162,10 @@ pub struct TypeckResults<'tcx> {
@@ -156,7 +156,7 @@ index ff7cef36..1d55f197 100644
          &self,
      ) -> LocalTableInContext<'_, Result<SplattedDef<'tcx>, ErrorGuaranteed>> {
 diff --git a/compiler/rustc_resolve/src/ident.rs b/compiler/rustc_resolve/src/ident.rs
-index 2a1b208f..c855a43c 100644
+index 2a1b208f9..c855a43cf 100644
 --- a/compiler/rustc_resolve/src/ident.rs
 +++ b/compiler/rustc_resolve/src/ident.rs
 @@ -1350,7 +1350,7 @@ fn finalize_module_binding(
@@ -179,7 +179,7 @@ index 2a1b208f..c855a43c 100644
          return Ok(binding);
      }
 diff --git a/compiler/rustc_resolve/src/imports.rs b/compiler/rustc_resolve/src/imports.rs
-index 499f9ea2..d74e6f8f 100644
+index 499f9ea29..d74e6f8fd 100644
 --- a/compiler/rustc_resolve/src/imports.rs
 +++ b/compiler/rustc_resolve/src/imports.rs
 @@ -1199,7 +1199,8 @@ fn finalize_import(&mut self, import: Import<'ra>) -> Option<UnresolvedImportErr
@@ -193,10 +193,10 @@ index 499f9ea2..d74e6f8f 100644
          // We'll provide more context to the privacy errors later, up to `len`.
          let privacy_errors_len = self.privacy_errors.len();
 diff --git a/compiler/rustc_resolve/src/late.rs b/compiler/rustc_resolve/src/late.rs
-index fc723586..97c91098 100644
+index c21d3653a..9d1754c23 100644
 --- a/compiler/rustc_resolve/src/late.rs
 +++ b/compiler/rustc_resolve/src/late.rs
-@@ -979,7 +979,10 @@ fn visit_ty(&mut self, ty: &'ast Ty) {
+@@ -962,7 +962,10 @@ fn visit_ty(&mut self, ty: &'ast Ty) {
                      .resolve_ident_in_lexical_scope(
                          self_ty,
                          TypeNS,
@@ -208,7 +208,7 @@ index fc723586..97c91098 100644
                          None,
                      )
                      .map_or(Res::Err, |d| d.res());
-@@ -3460,7 +3463,8 @@ fn with_optional_trait_ref<T>(
+@@ -3439,7 +3442,8 @@ fn with_optional_trait_ref<T>(
                  &None,
                  &path,
                  PathSource::Trait(AliasPossibility::No),
@@ -218,7 +218,7 @@ index fc723586..97c91098 100644
                  RecordPartialRes::Yes,
                  None,
              );
-@@ -4428,6 +4432,12 @@ fn try_resolve_as_non_binding(
+@@ -4407,6 +4411,12 @@ fn try_resolve_as_non_binding(
              ) if is_syntactic_ambiguity => {
                  // Disambiguate in favor of a unit struct/variant or constant pattern.
                  if let Some(binding) = binding {
@@ -231,7 +231,7 @@ index fc723586..97c91098 100644
                      self.r.record_use(ident, binding, Used::Other);
                  }
                  Some(res)
-@@ -4540,7 +4550,7 @@ fn smart_resolve_path(
+@@ -4499,7 +4509,7 @@ fn smart_resolve_path(
              qself,
              &Segment::from_path(path),
              source,
@@ -240,7 +240,7 @@ index fc723586..97c91098 100644
              RecordPartialRes::Yes,
              None,
          );
-@@ -4871,18 +4881,24 @@ fn resolve_qpath_anywhere(
+@@ -4830,18 +4840,24 @@ fn resolve_qpath_anywhere(
          source: PathSource<'_, 'ast, 'ra>,
      ) -> Result<Option<PartialRes>, Spanned<ResolutionError<'ra>>> {
          let mut fin_res = None;
@@ -266,7 +266,7 @@ index fc723586..97c91098 100644
                          }
                      }
                  }
-@@ -4897,6 +4913,7 @@ fn resolve_qpath_anywhere(
+@@ -4856,6 +4872,7 @@ fn resolve_qpath_anywhere(
              return Ok(Some(res));
          }
  
@@ -274,7 +274,7 @@ index fc723586..97c91098 100644
          Ok(fin_res)
      }
  
-@@ -4931,7 +4948,7 @@ fn resolve_qpath(
+@@ -4890,7 +4907,7 @@ fn resolve_qpath(
                  &None,
                  &path[..qself.position],
                  PathSource::Trait(AliasPossibility::No),
@@ -283,7 +283,7 @@ index fc723586..97c91098 100644
                  RecordPartialRes::No,
                  Some(&qself),
              );
-@@ -4956,7 +4973,7 @@ fn resolve_qpath(
+@@ -4915,7 +4932,7 @@ fn resolve_qpath(
                  &None,
                  &path[..=qself.position],
                  PathSource::TraitItem(ns, &source),
@@ -292,7 +292,7 @@ index fc723586..97c91098 100644
                  RecordPartialRes::No,
                  Some(&qself),
              );
-@@ -4970,6 +4987,7 @@ fn resolve_qpath(
+@@ -4929,6 +4946,7 @@ fn resolve_qpath(
              )));
          }
  
@@ -300,7 +300,7 @@ index fc723586..97c91098 100644
          let result = match self.resolve_path(path, Some(ns), Some(finalize), source) {
              PathResult::NonModule(path_res) => path_res,
              PathResult::Module(ModuleOrUniformRoot::Module(module)) if !module.is_normal() => {
-@@ -4997,6 +5015,10 @@ fn resolve_qpath(
+@@ -4956,6 +4974,10 @@ fn resolve_qpath(
                  if (ns == TypeNS || path.len() > 1)
                      && PrimTy::from_name(path[0].ident.name).is_some() =>
              {
@@ -312,7 +312,7 @@ index fc723586..97c91098 100644
                  let tcx = self.r.tcx();
  
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index b7e57ad8..e5cfcfc0 100644
+index b7e57ad8e..e5cfcfc07 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
 @@ -65,7 +65,7 @@
@@ -402,6 +402,3 @@ index b7e57ad8..e5cfcfc0 100644
  }
  
  pub fn provide(providers: &mut Providers) {
--- 
-2.55.0
-

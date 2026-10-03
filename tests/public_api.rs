@@ -46,6 +46,24 @@ fn high_level_reduction_removes_dead_code_and_reaches_a_fixed_point() {
 
 #[cfg(rust_item_dependencies_patched)]
 #[test]
+fn stable_borrow_checking_defaults_reject_invalid_input() {
+    let analyzer = Analyzer::new().unwrap();
+    let source = include_str!("fixtures/retention/stable_borrow_checking_error.input.rs");
+    let input = SourceInput::binary(source, Edition::Rust2024, host_target());
+    let AnalysisError::OriginalCompilationFailed(diagnostics) =
+        analyzer.reduce(&input).unwrap_err()
+    else {
+        panic!("the analyzer must preserve stable borrow-checking defaults");
+    };
+    assert!(
+        diagnostics.diagnostics().iter().any(|diagnostic| {
+            diagnostic.message == "cannot assign to `z` because it is borrowed"
+        })
+    );
+}
+
+#[cfg(rust_item_dependencies_patched)]
+#[test]
 fn compilation_options_are_accepted_by_the_high_level_api() {
     let analyzer = Analyzer::new_with_options(
         CompilationOptions::new()

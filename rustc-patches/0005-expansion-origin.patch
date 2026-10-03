@@ -1,4 +1,4 @@
-From 98d89107e7d34cba785905ed7b63e7ea2cd67fbb Mon Sep 17 00:00:00 2001
+From 905e3d8f4a2a519ca1b565c9d9723c22ae81b548 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Tue, 11 Aug 2026 05:25:28 +0900
 Subject: [PATCH] rustc: preserve macro invocation origins
@@ -12,7 +12,7 @@ Subject: [PATCH] rustc: preserve macro invocation origins
  5 files changed, 195 insertions(+), 10 deletions(-)
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 3e4e3ca9..5e0116c0 100644
+index 52c5ed7c6..78a83b92a 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -25,10 +25,10 @@ index 3e4e3ca9..5e0116c0 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_expand/src/expand.rs b/compiler/rustc_expand/src/expand.rs
-index c80ffe62..29b6bbfa 100644
+index fa7a2dce7..e0d1d7b95 100644
 --- a/compiler/rustc_expand/src/expand.rs
 +++ b/compiler/rustc_expand/src/expand.rs
-@@ -372,12 +372,16 @@ pub struct Invocation {
+@@ -371,12 +371,16 @@ pub struct Invocation {
      pub kind: InvocationKind,
      pub fragment_kind: AstFragmentKind,
      pub expansion_data: ExpansionData,
@@ -45,7 +45,7 @@ index c80ffe62..29b6bbfa 100644
      },
      Attr {
          attr: ast::Attribute,
-@@ -428,6 +432,24 @@ pub fn span(&self) -> Span {
+@@ -427,6 +431,24 @@ pub fn span(&self) -> Span {
          }
      }
  
@@ -70,7 +70,7 @@ index c80ffe62..29b6bbfa 100644
      fn span_mut(&mut self) -> &mut Span {
          match &mut self.kind {
              InvocationKind::Bang { span, .. } => span,
-@@ -561,6 +583,7 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
+@@ -560,6 +582,7 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
                                                  id: expn_id,
                                                  ..self.cx.current_expansion.clone()
                                              },
@@ -78,7 +78,7 @@ index c80ffe62..29b6bbfa 100644
                                          },
                                          None,
                                      ));
-@@ -724,7 +747,7 @@ fn expand_invoc(
+@@ -723,7 +746,7 @@ fn expand_invoc(
  
          let (fragment_kind, span) = (invoc.fragment_kind, invoc.span());
          ExpandResult::Ready(match invoc.kind {
@@ -87,7 +87,7 @@ index c80ffe62..29b6bbfa 100644
                  if let SyntaxExtensionKind::Bang(expander) = ext {
                      match expander.expand(self.cx, span, mac.args.tokens.clone()) {
                          Ok(tok_result) => {
-@@ -749,7 +772,7 @@ fn expand_invoc(
+@@ -748,7 +771,7 @@ fn expand_invoc(
                          ExpandResult::Retry(_) => {
                              // retry the original
                              return ExpandResult::Retry(Invocation {
@@ -96,7 +96,7 @@ index c80ffe62..29b6bbfa 100644
                                  ..invoc
                              });
                          }
-@@ -1248,6 +1271,9 @@ fn walk(&mut self, _collector: &mut InvocationCollector<'_, '_>) {
+@@ -1247,6 +1270,9 @@ fn walk(&mut self, _collector: &mut InvocationCollector<'_, '_>) {
      fn is_mac_call(&self) -> bool {
          false
      }
@@ -106,7 +106,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          unreachable!()
      }
-@@ -1305,6 +1331,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+@@ -1304,6 +1330,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
      fn is_mac_call(&self) -> bool {
          matches!(self.kind, ItemKind::MacCall(..))
      }
@@ -116,7 +116,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          match self.kind {
              ItemKind::MacCall(mac) => (mac, self.attrs, AddSemicolon::No),
-@@ -1459,6 +1488,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+@@ -1458,6 +1487,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
      fn is_mac_call(&self) -> bool {
          matches!(self.wrapped.kind, AssocItemKind::MacCall(..))
      }
@@ -126,7 +126,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          let item = self.wrapped;
          match item.kind {
-@@ -1503,6 +1535,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+@@ -1502,6 +1534,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
      fn is_mac_call(&self) -> bool {
          matches!(self.wrapped.kind, AssocItemKind::MacCall(..))
      }
@@ -136,7 +136,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          let item = self.wrapped;
          match item.kind {
-@@ -1547,6 +1582,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+@@ -1546,6 +1581,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
      fn is_mac_call(&self) -> bool {
          matches!(self.wrapped.kind, AssocItemKind::MacCall(..))
      }
@@ -146,7 +146,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          let item = self.wrapped;
          match item.kind {
-@@ -1588,6 +1626,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
+@@ -1587,6 +1625,9 @@ fn walk_flat_map(self, collector: &mut InvocationCollector<'_, '_>) -> Self::Out
      fn is_mac_call(&self) -> bool {
          matches!(self.kind, ForeignItemKind::MacCall(..))
      }
@@ -156,7 +156,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          match self.kind {
              ForeignItemKind::MacCall(mac) => (mac, self.attrs, AddSemicolon::No),
-@@ -1768,6 +1809,9 @@ fn is_mac_call(&self) -> bool {
+@@ -1767,6 +1808,9 @@ fn is_mac_call(&self) -> bool {
              StmtKind::Let(..) | StmtKind::Empty => false,
          }
      }
@@ -166,7 +166,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          // We pull macro invocations (both attributes and fn-like macro calls) out of their
          // `StmtKind`s and treat them as statement macro invocations, not as items or expressions.
-@@ -1878,6 +1922,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
+@@ -1877,6 +1921,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
      fn is_mac_call(&self) -> bool {
          matches!(self.kind, ast::TyKind::MacCall(..))
      }
@@ -176,7 +176,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          match self.kind {
              TyKind::MacCall(mac) => (mac, AttrVec::new(), AddSemicolon::No),
-@@ -1905,6 +1952,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
+@@ -1904,6 +1951,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
      fn is_mac_call(&self) -> bool {
          matches!(self.kind, PatKind::MacCall(..))
      }
@@ -186,7 +186,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          match self.kind {
              PatKind::MacCall(mac) => (mac, AttrVec::new(), AddSemicolon::No),
-@@ -1934,6 +1984,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
+@@ -1933,6 +1983,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
      fn is_mac_call(&self) -> bool {
          matches!(self.kind, ExprKind::MacCall(..))
      }
@@ -196,7 +196,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          match self.kind {
              ExprKind::MacCall(mac) => (mac, self.attrs, AddSemicolon::No),
-@@ -1962,6 +2015,9 @@ fn walk_flat_map(mut self, collector: &mut InvocationCollector<'_, '_>) -> Self:
+@@ -1961,6 +2014,9 @@ fn walk_flat_map(mut self, collector: &mut InvocationCollector<'_, '_>) -> Self:
      fn is_mac_call(&self) -> bool {
          matches!(self.wrapped.kind, ast::ExprKind::MacCall(..))
      }
@@ -206,7 +206,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          let node = self.wrapped;
          match node.kind {
-@@ -1999,6 +2055,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
+@@ -1998,6 +2054,9 @@ fn walk(&mut self, collector: &mut InvocationCollector<'_, '_>) {
      fn is_mac_call(&self) -> bool {
          matches!(self.wrapped.kind, ast::ExprKind::MacCall(..))
      }
@@ -216,7 +216,7 @@ index c80ffe62..29b6bbfa 100644
      fn take_mac_call(self) -> (Box<ast::MacCall>, ast::AttrVec, AddSemicolon) {
          let node = self.wrapped;
          match node.kind {
-@@ -2127,17 +2186,23 @@ fn collect(&mut self, fragment_kind: AstFragmentKind, kind: InvocationKind) -> A
+@@ -2126,17 +2185,23 @@ fn collect(&mut self, fragment_kind: AstFragmentKind, kind: InvocationKind) -> A
                      depth: self.cx.current_expansion.depth + 1,
                      ..self.cx.current_expansion.clone()
                  },
@@ -242,7 +242,7 @@ index c80ffe62..29b6bbfa 100644
      }
  
      fn collect_attr(
-@@ -2357,9 +2422,11 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
+@@ -2360,9 +2425,11 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
                      }
                  },
                  None if node.is_mac_call() => {
@@ -255,7 +255,7 @@ index c80ffe62..29b6bbfa 100644
                      Node::post_flat_map_node_collect_bang(&mut res, add_semicolon);
                      res
                  }
-@@ -2447,11 +2514,13 @@ fn visit_node<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode
+@@ -2450,11 +2517,13 @@ fn visit_node<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode
                      }
                  },
                  None if node.is_mac_call() => {
@@ -271,7 +271,7 @@ index c80ffe62..29b6bbfa 100644
                  None if node.delegation().is_some() => unreachable!(),
                  None => {
 diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
-index 3bfd1be9..b46955ac 100644
+index 41456ea67..b393a84c6 100644
 --- a/compiler/rustc_middle/src/ty/mod.rs
 +++ b/compiler/rustc_middle/src/ty/mod.rs
 @@ -189,6 +189,8 @@ pub struct ResolverGlobalCtxt {
@@ -341,7 +341,7 @@ index 3bfd1be9..b46955ac 100644
  pub struct PerOwnerResolverData<'tcx> {
      pub node_id_to_def_id: NodeMap<LocalDefId> = Default::default(),
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index e5cfcfc0..8a915528 100644
+index e5cfcfc07..8a915528a 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
 @@ -65,8 +65,9 @@
@@ -383,7 +383,7 @@ index e5cfcfc0..8a915528 100644
              trait_impls: self.trait_impls,
              proc_macros,
 diff --git a/compiler/rustc_resolve/src/macros.rs b/compiler/rustc_resolve/src/macros.rs
-index 9747ebd4..78ac5096 100644
+index 9747ebd4a..78ac50960 100644
 --- a/compiler/rustc_resolve/src/macros.rs
 +++ b/compiler/rustc_resolve/src/macros.rs
 @@ -21,7 +21,10 @@
@@ -467,6 +467,3 @@ index 9747ebd4..78ac5096 100644
          Ok(Arc::clone(ext))
      }
  
--- 
-2.55.0
-

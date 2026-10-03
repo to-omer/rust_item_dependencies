@@ -1,4 +1,4 @@
-From e823797f83d590c1cafed8f4cf45dfd20be3a033 Mon Sep 17 00:00:00 2001
+From a0ce219e0c0af8d378428da1b08ee1b9daee8bc9 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Tue, 11 Aug 2026 04:15:00 +0900
 Subject: [PATCH] rustc_driver: bind stage2 to patch queue digest
@@ -8,7 +8,7 @@ Subject: [PATCH] rustc_driver: bind stage2 to patch queue digest
  1 file changed, 9 insertions(+), 1 deletion(-)
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 780186e9..49ed4e63 100644
+index 51c03409c..b21e7e5bb 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,15 @@ pub(super) fn install() {}
@@ -28,6 +28,3 @@ index 780186e9..49ed4e63 100644
  
  pub use rustc_interface::interface::Config as CompilerConfig;
  pub use rustc_session::{ExternalResourceGuard, ExternalResourceKind, ExternalResourceUse};
--- 
-2.55.0
-

@@ -1,4 +1,4 @@
-From 13be3f01f31fc92d20f475aa2a4fe2dbe296441a Mon Sep 17 00:00:00 2001
+From 6232aed55c09d45e725499c8d890fdd0dcf93575 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Thu, 27 Aug 2026 21:44:12 +0900
 Subject: [PATCH] rustc: observe unused built-in derive dependencies
@@ -118,7 +118,7 @@ index d66d14bb8..f96da83d2 100644
  
      let default_substructure = combine_substructure(Box::new(|cx, span, substr| {
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 92cb39ef3..e572445eb 100644
+index aafbc9b68..90018db5a 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -131,10 +131,10 @@ index 92cb39ef3..e572445eb 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_expand/src/base.rs b/compiler/rustc_expand/src/base.rs
-index dfad80959..2df63adeb 100644
+index f43a124c8..888002fc2 100644
 --- a/compiler/rustc_expand/src/base.rs
 +++ b/compiler/rustc_expand/src/base.rs
-@@ -1029,6 +1029,10 @@ pub struct DeriveResolution {
+@@ -1028,6 +1028,10 @@ pub struct DeriveResolution {
      // is completed.
      pub exts: Option<Arc<SyntaxExtension>>,
      pub is_const: bool,
@@ -145,7 +145,7 @@ index dfad80959..2df63adeb 100644
  }
  
  pub trait ResolverExpand {
-@@ -1070,10 +1074,12 @@ fn record_macro_rule_usage(
+@@ -1069,10 +1073,12 @@ fn record_macro_rule_usage(
      fn check_unused_macros(&mut self);
  
      // Resolver interfaces for specific built-in macros.
@@ -163,10 +163,10 @@ index dfad80959..2df63adeb 100644
      fn resolve_derives(
          &mut self,
 diff --git a/compiler/rustc_expand/src/expand.rs b/compiler/rustc_expand/src/expand.rs
-index 29b6bbfa1..ca8a27fe3 100644
+index e0d1d7b95..09541ae3f 100644
 --- a/compiler/rustc_expand/src/expand.rs
 +++ b/compiler/rustc_expand/src/expand.rs
-@@ -395,6 +395,7 @@ pub enum InvocationKind {
+@@ -394,6 +394,7 @@ pub enum InvocationKind {
          path: ast::Path,
          is_const: bool,
          item: Annotatable,
@@ -174,7 +174,7 @@ index 29b6bbfa1..ca8a27fe3 100644
      },
      GlobDelegation {
          item: Box<ast::AssocItem>,
-@@ -570,25 +571,42 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
+@@ -569,25 +570,42 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
                              derive_invocations.reserve(derives.len());
                              derives
                                  .into_iter()
@@ -235,7 +235,7 @@ index 29b6bbfa1..ca8a27fe3 100644
                                  .collect::<Vec<_>>()
                          })
                          .unwrap_or_default();
-@@ -935,7 +953,7 @@ fn expand_invoc(
+@@ -934,7 +952,7 @@ fn expand_invoc(
                      unreachable!();
                  }
              }
@@ -244,7 +244,7 @@ index 29b6bbfa1..ca8a27fe3 100644
                  SyntaxExtensionKind::Derive(expander)
                  | SyntaxExtensionKind::LegacyDerive(expander) => {
                      // The `MetaItem` representing the trait to derive can't
-@@ -951,7 +969,12 @@ fn expand_invoc(
+@@ -950,7 +968,12 @@ fn expand_invoc(
                          ExpandResult::Retry(item) => {
                              // Reassemble the original invocation for retrying.
                              return ExpandResult::Retry(Invocation {
@@ -259,7 +259,7 @@ index 29b6bbfa1..ca8a27fe3 100644
                              });
                          }
 diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
-index d4125c4a5..abaa42100 100644
+index a13ea7d99..68dbc3804 100644
 --- a/compiler/rustc_middle/src/queries.rs
 +++ b/compiler/rustc_middle/src/queries.rs
 @@ -114,8 +114,8 @@
@@ -319,7 +319,7 @@ index 8e7d3d0d9..9915e5fb3 100644
                          $name: IndexVec::new(),
                      )*
 diff --git a/compiler/rustc_middle/src/traits/mod.rs b/compiler/rustc_middle/src/traits/mod.rs
-index 704d9d22c..479271537 100644
+index 6c890eceb..b55a3d126 100644
 --- a/compiler/rustc_middle/src/traits/mod.rs
 +++ b/compiler/rustc_middle/src/traits/mod.rs
 @@ -1237,3 +1237,10 @@ pub struct EvaluationImplDependencies<'tcx> {
@@ -334,7 +334,7 @@ index 704d9d22c..479271537 100644
 +    pub dependencies: Result<&'tcx [TypeckImplDependency], TypeckImplDependenciesError>,
 +}
 diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
-index b85f57775..55c202ce1 100644
+index 13c09c12f..2563b0408 100644
 --- a/compiler/rustc_middle/src/ty/mod.rs
 +++ b/compiler/rustc_middle/src/ty/mod.rs
 @@ -196,6 +196,14 @@ pub struct ResolverGlobalCtxt {
@@ -530,13 +530,13 @@ index 0230840ef..49d97bf39 100644
          let tcx = self.tcx;
          let ty::Value { ty, valtree } = value;
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index 5a1fd814b..6ebe7c0a8 100644
+index 01be580dc..49e9dcd03 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
-@@ -43,7 +43,9 @@
-     self as ast, AngleBracketedArg, CRATE_NODE_ID, Crate, DUMMY_NODE_ID, Expr, ExprKind,
+@@ -44,7 +44,9 @@
      GenericArg, GenericArgs, Generics, NodeId, Path, attr,
  };
+ use rustc_crate_store::CrateDepKind;
 -use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet, default};
 +use rustc_data_structures::fx::{
 +    FxBuildHasher, FxHashMap, FxHashSet, FxIndexMap, FxIndexSet, default,
@@ -544,7 +544,7 @@ index 5a1fd814b..6ebe7c0a8 100644
  use rustc_data_structures::intern::Interned;
  use rustc_data_structures::steal::Steal;
  use rustc_data_structures::sync::{FreezeReadGuard, FreezeWriteGuard, WorkerLocal};
-@@ -65,10 +67,11 @@
+@@ -66,10 +68,11 @@
  use rustc_middle::middle::privacy::EffectiveVisibilities;
  use rustc_middle::query::Providers;
  use rustc_middle::ty::{
@@ -1715,6 +1715,3 @@ index 000000000..7fb644bef
 +fn snippet(tcx: TyCtxt<'_>, span: Span) -> String {
 +    tcx.sess.source_map().span_to_snippet(span).unwrap()
 +}
--- 
-2.55.0
-

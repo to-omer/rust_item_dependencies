@@ -1,4 +1,4 @@
-From 14bbac98cf78c1b94fa63e3e7221d163d5f65187 Mon Sep 17 00:00:00 2001
+From c12cd85bed16d013f14389f93bd2731860cb3e28 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Fri, 28 Aug 2026 05:52:23 +0900
 Subject: [PATCH] rustc: expose declarative macro component origins
@@ -164,7 +164,7 @@ index 428f37b8a..6e1ca64ab 100644
          TokenStream(Arc::new(tts))
      }
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index e572445eb..f5b0938be 100644
+index 90018db5a..626444c08 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -185,7 +185,7 @@ index e572445eb..f5b0938be 100644
          psess_created: None,
          track_state: None,
 diff --git a/compiler/rustc_expand/src/base.rs b/compiler/rustc_expand/src/base.rs
-index 2df63adeb..513ef347d 100644
+index 888002fc2..0c8b43195 100644
 --- a/compiler/rustc_expand/src/base.rs
 +++ b/compiler/rustc_expand/src/base.rs
 @@ -1,4 +1,5 @@
@@ -193,8 +193,8 @@ index 2df63adeb..513ef347d 100644
 +use std::cell::{Cell, RefCell};
  use std::default::Default;
  use std::iter;
- use std::path::Component::Prefix;
-@@ -7,7 +8,7 @@
+ use std::path::PathBuf;
+@@ -6,7 +7,7 @@
  use std::sync::Arc;
  
  use rustc_ast::attr::MarkedAttrs;
@@ -202,8 +202,8 @@ index 2df63adeb..513ef347d 100644
 +use rustc_ast::tokenstream::{MacroParserRange, TokenStream};
  use rustc_ast::visit::{AssocCtxt, Visitor};
  use rustc_ast::{self as ast, AttrVec, Attribute, HasAttrs, Item, NodeId, PatKind, Safety};
- use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
-@@ -416,9 +417,47 @@ pub trait GlobDelegationExpander {
+ use rustc_attr_ir::{
+@@ -415,9 +416,47 @@ pub trait GlobDelegationExpander {
      })
  }
  
@@ -251,7 +251,7 @@ index 2df63adeb..513ef347d 100644
      /// Creates an expression.
      fn make_expr(self: Box<Self>) -> Option<Box<ast::Expr>> {
          None
-@@ -1044,6 +1083,7 @@ fn visit_ast_fragment_with_placeholders(
+@@ -1043,6 +1082,7 @@ fn visit_ast_fragment_with_placeholders(
          &mut self,
          expn_id: LocalExpnId,
          fragment: &AstFragment,
@@ -259,7 +259,7 @@ index 2df63adeb..513ef347d 100644
      );
      fn register_builtin_macro(&mut self, name: Symbol, ext: SyntaxExtensionKind);
  
-@@ -1071,6 +1111,57 @@ fn record_macro_rule_usage(
+@@ -1070,6 +1110,57 @@ fn record_macro_rule_usage(
          invocation_id: LocalExpnId,
      );
  
@@ -318,7 +318,7 @@ index 2df63adeb..513ef347d 100644
  
      // Resolver interfaces for specific built-in macros.
 diff --git a/compiler/rustc_expand/src/expand.rs b/compiler/rustc_expand/src/expand.rs
-index ca8a27fe3..9501bcef2 100644
+index 09541ae3f..cb158b763 100644
 --- a/compiler/rustc_expand/src/expand.rs
 +++ b/compiler/rustc_expand/src/expand.rs
 @@ -4,13 +4,13 @@
@@ -337,16 +337,16 @@ index ca8a27fe3..9501bcef2 100644
 +    NodeId, PatKind, StmtKind, SyntheticAttr, TyKind, token,
  };
  use rustc_ast_pretty::pprust;
- use rustc_attr_parsing::parser::AllowExprMetavar;
-@@ -20,6 +20,7 @@
+ use rustc_attr_ir::target::Target;
+@@ -21,6 +21,7 @@
  };
  use rustc_data_structures::Limit;
  use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
 +use rustc_data_structures::fx::FxHashMap;
- use rustc_data_structures::stack::ensure_sufficient_stack;
  use rustc_errors::PResult;
  use rustc_feature::Features;
-@@ -88,14 +89,19 @@ pub fn name(self) -> &'static str {
+ use rustc_hir::def::MacroKinds;
+@@ -87,14 +88,19 @@ pub fn name(self) -> &'static str {
                  }
              }
  
@@ -369,7 +369,7 @@ index ca8a27fe3..9501bcef2 100644
              }
          }
  
-@@ -165,6 +171,12 @@ pub fn visit_with<'a, V: Visitor<'a>>(&'a self, visitor: &mut V) -> V::Result {
+@@ -164,6 +170,12 @@ pub fn visit_with<'a, V: Visitor<'a>>(&'a self, visitor: &mut V) -> V::Result {
          }
  
          impl<'a, 'b> MacResult for crate::mbe::macro_rules::ParserAnyMacro<'a, 'b> {
@@ -382,7 +382,7 @@ index ca8a27fe3..9501bcef2 100644
              $(fn $make_ast(self: Box<crate::mbe::macro_rules::ParserAnyMacro<'a, 'b>>)
                             -> Option<$AstTy> {
                  Some(self.make(AstFragmentKind::$Kind).$make_ast())
-@@ -266,6 +278,17 @@ impl<'a, 'b> MacResult for crate::mbe::macro_rules::ParserAnyMacro<'a, 'b> {
+@@ -265,6 +277,17 @@ impl<'a, 'b> MacResult for crate::mbe::macro_rules::ParserAnyMacro<'a, 'b> {
      }
  }
  
@@ -400,7 +400,7 @@ index ca8a27fe3..9501bcef2 100644
  pub enum SupportsMacroExpansion {
      No,
      Yes { supports_inner_attrs: bool },
-@@ -273,7 +296,9 @@ pub enum SupportsMacroExpansion {
+@@ -272,7 +295,9 @@ pub enum SupportsMacroExpansion {
  
  impl AstFragmentKind {
      pub(crate) fn dummy(self, span: Span, guar: ErrorGuaranteed) -> AstFragment {
@@ -411,7 +411,7 @@ index ca8a27fe3..9501bcef2 100644
      }
  
      pub fn supports_macro_expansion(self) -> SupportsMacroExpansion {
-@@ -498,7 +523,7 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
+@@ -497,7 +522,7 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
  
          // Collect all macro invocations and replace them with placeholders.
          let (mut fragment_with_placeholders, mut invocations) =
@@ -420,7 +420,7 @@ index ca8a27fe3..9501bcef2 100644
  
          // Optimization: if we resolve all imports now,
          // we'll be able to immediately resolve most of imported macros.
-@@ -561,7 +586,7 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
+@@ -560,7 +585,7 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
  
              let fragment_kind = invoc.fragment_kind;
              match self.expand_invoc(invoc, &ext.kind) {
@@ -429,7 +429,7 @@ index ca8a27fe3..9501bcef2 100644
                      let mut derive_invocations = Vec::new();
                      let derive_placeholders = self
                          .cx
-@@ -611,8 +636,12 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
+@@ -610,8 +635,12 @@ pub fn fully_expand_fragment(&mut self, input_fragment: AstFragment) -> AstFragm
                          })
                          .unwrap_or_default();
  
@@ -444,7 +444,7 @@ index ca8a27fe3..9501bcef2 100644
                      // We choose to expand any derive invocations associated with this macro
                      // invocation *before* any macro invocations collected from the output
                      // fragment.
-@@ -669,11 +698,18 @@ fn collect_invocations(
+@@ -668,11 +697,18 @@ fn collect_invocations(
          &mut self,
          mut fragment: AstFragment,
          extra_placeholders: &[NodeId],
@@ -464,7 +464,7 @@ index ca8a27fe3..9501bcef2 100644
              let mut collector = InvocationCollector {
                  // Non-derive macro invocations cannot see the results of cfg expansion - they
                  // will either be removed along with the item, or invoked before the cfg/cfg_attr
-@@ -683,16 +719,38 @@ fn collect_invocations(
+@@ -682,16 +718,38 @@ fn collect_invocations(
                  cx: self.cx,
                  invocations: Vec::new(),
                  monotonic: self.monotonic,
@@ -507,7 +507,7 @@ index ca8a27fe3..9501bcef2 100644
  
              if self.cx.sess.opts.incremental.is_some() {
                  for (invoc, _) in invocations.iter_mut() {
-@@ -702,6 +760,23 @@ fn collect_invocations(
+@@ -701,6 +759,23 @@ fn collect_invocations(
                      *span = span.with_parent(Some(parent_def));
                  }
              }
@@ -531,7 +531,7 @@ index ca8a27fe3..9501bcef2 100644
          }
  
          (fragment, invocations)
-@@ -743,7 +818,7 @@ fn expand_invoc(
+@@ -742,7 +817,7 @@ fn expand_invoc(
          &mut self,
          invoc: Invocation,
          ext: &SyntaxExtensionKind,
@@ -540,7 +540,7 @@ index ca8a27fe3..9501bcef2 100644
          let recursion_limit = match self.cx.reduced_recursion_limit {
              Some((limit, _)) => limit,
              None => self.cx.ecfg.recursion_limit,
-@@ -758,18 +833,21 @@ fn expand_invoc(
+@@ -757,18 +832,21 @@ fn expand_invoc(
              // Reduce the recursion limit by half each time it triggers.
              self.cx.reduced_recursion_limit = Some((recursion_limit / 2, guar));
  
@@ -565,7 +565,7 @@ index ca8a27fe3..9501bcef2 100644
                                  self.parse_ast_fragment(tok_result, fragment_kind, &mac.path, span);
                              if macro_stats {
                                  update_bang_macro_stats(
-@@ -777,12 +855,17 @@ fn expand_invoc(
+@@ -776,12 +854,17 @@ fn expand_invoc(
                                      fragment_kind,
                                      span,
                                      mac,
@@ -586,7 +586,7 @@ index ca8a27fe3..9501bcef2 100644
                      }
                  } else if let Some(expander) = ext.as_legacy_bang() {
                      let tok_result = match expander.expand(self.cx, span, mac.args.tokens.clone()) {
-@@ -795,7 +878,17 @@ fn expand_invoc(
+@@ -794,7 +877,17 @@ fn expand_invoc(
                              });
                          }
                      };
@@ -605,7 +605,7 @@ index ca8a27fe3..9501bcef2 100644
                          if macro_stats {
                              update_bang_macro_stats(self.cx, fragment_kind, span, mac, &fragment);
                          }
-@@ -877,7 +970,7 @@ fn expand_invoc(
+@@ -876,7 +969,7 @@ fn expand_invoc(
                      let inner_tokens = attr_item.args.inner_tokens();
                      match expander.expand_with_safety(self.cx, safety, span, inner_tokens, tokens) {
                          Ok(tok_result) => {
@@ -614,7 +614,7 @@ index ca8a27fe3..9501bcef2 100644
                                  tok_result,
                                  fragment_kind,
                                  &attr_item.path,
-@@ -891,12 +984,17 @@ fn expand_invoc(
+@@ -890,12 +983,17 @@ fn expand_invoc(
                                      &attr_item.path,
                                      &attr,
                                      item,
@@ -635,7 +635,7 @@ index ca8a27fe3..9501bcef2 100644
                      }
                  } else if let SyntaxExtensionKind::LegacyAttr(expander) = ext {
                      self.gate_proc_macro_attr_item(span, &item);
-@@ -999,12 +1097,14 @@ fn expand_invoc(
+@@ -998,12 +1096,14 @@ fn expand_invoc(
                              .cx
                              .dcx()
                              .span_err(span, "macro `derive` does not support const derives");
@@ -652,7 +652,7 @@ index ca8a27fe3..9501bcef2 100644
                                  self.parse_ast_fragment(tok_result, fragment_kind, &path, span);
                              if macro_stats {
                                  update_derive_macro_stats(
-@@ -1012,12 +1112,17 @@ fn expand_invoc(
+@@ -1011,12 +1111,17 @@ fn expand_invoc(
                                      fragment_kind,
                                      span,
                                      &path,
@@ -673,7 +673,7 @@ index ca8a27fe3..9501bcef2 100644
                      }
                  }
                  _ => unreachable!(),
-@@ -1039,7 +1144,9 @@ fn expand_invoc(
+@@ -1038,7 +1143,9 @@ fn expand_invoc(
                      SyntaxExtensionKind::Bang(..) => {
                          let msg = "expanded a dummy glob delegation";
                          let guar = self.cx.dcx().span_delayed_bug(span, msg);
@@ -684,7 +684,7 @@ index ca8a27fe3..9501bcef2 100644
                      }
                      _ => unreachable!(),
                  };
-@@ -1058,7 +1165,8 @@ fn expand_invoc(
+@@ -1057,7 +1164,8 @@ fn expand_invoc(
                      Annotatable::AssocItem(Box::new(item), AssocCtxt::Impl { of_trait })
                  }))
              }
@@ -694,7 +694,7 @@ index ca8a27fe3..9501bcef2 100644
      }
  
      fn gate_proc_macro_attr_item(&self, span: Span, item: &Annotatable) {
-@@ -1103,100 +1211,190 @@ fn parse_ast_fragment(
+@@ -1102,100 +1210,190 @@ fn parse_ast_fragment(
          kind: AstFragmentKind,
          path: &ast::Path,
          span: Span,
@@ -961,7 +961,7 @@ index ca8a27fe3..9501bcef2 100644
  }
  
  pub(crate) fn ensure_complete_parse<'a>(
-@@ -1204,7 +1402,7 @@ pub(crate) fn ensure_complete_parse<'a>(
+@@ -1203,7 +1401,7 @@ pub(crate) fn ensure_complete_parse<'a>(
      macro_path: &ast::Path,
      kind_name: &str,
      span: Span,
@@ -970,7 +970,7 @@ index ca8a27fe3..9501bcef2 100644
      if parser.token != token::Eof {
          let descr = token_descr(&parser.token);
          // Avoid emitting backtrace info twice.
-@@ -1229,6 +1427,125 @@ pub(crate) fn ensure_complete_parse<'a>(
+@@ -1228,6 +1426,125 @@ pub(crate) fn ensure_complete_parse<'a>(
              expands_to_match_arm,
              add_semicolon,
          });
@@ -1096,7 +1096,7 @@ index ca8a27fe3..9501bcef2 100644
      }
  }
  
-@@ -1338,6 +1655,9 @@ fn declared_idents(&self) -> Vec<Ident> {
+@@ -1337,6 +1654,9 @@ fn declared_idents(&self) -> Vec<Ident> {
      }
  
      fn as_target(&self) -> Target;
@@ -1106,7 +1106,7 @@ index ca8a27fe3..9501bcef2 100644
  }
  
  impl InvocationCollectorNode for Box<ast::Item> {
-@@ -1345,6 +1665,9 @@ impl InvocationCollectorNode for Box<ast::Item> {
+@@ -1344,6 +1664,9 @@ impl InvocationCollectorNode for Box<ast::Item> {
      fn to_annotatable(self) -> Annotatable {
          Annotatable::Item(self)
      }
@@ -1116,7 +1116,7 @@ index ca8a27fe3..9501bcef2 100644
      fn fragment_to_output(fragment: AstFragment) -> Self::OutputTy {
          fragment.make_items()
      }
-@@ -1496,6 +1819,9 @@ fn as_target(&self) -> Target {
+@@ -1495,6 +1818,9 @@ fn as_target(&self) -> Target {
  
  struct TraitItemTag;
  impl InvocationCollectorNode for AstNodeWrapper<Box<ast::AssocItem>, TraitItemTag> {
@@ -1126,7 +1126,7 @@ index ca8a27fe3..9501bcef2 100644
      type OutputTy = SmallVec<[Box<ast::AssocItem>; 1]>;
      type ItemKind = AssocItemKind;
      const KIND: AstFragmentKind = AstFragmentKind::TraitItems;
-@@ -1543,6 +1869,9 @@ fn as_target(&self) -> Target {
+@@ -1542,6 +1868,9 @@ fn as_target(&self) -> Target {
  
  struct ImplItemTag;
  impl InvocationCollectorNode for AstNodeWrapper<Box<ast::AssocItem>, ImplItemTag> {
@@ -1136,7 +1136,7 @@ index ca8a27fe3..9501bcef2 100644
      type OutputTy = SmallVec<[Box<ast::AssocItem>; 1]>;
      type ItemKind = AssocItemKind;
      const KIND: AstFragmentKind = AstFragmentKind::ImplItems;
-@@ -1590,6 +1919,9 @@ fn as_target(&self) -> Target {
+@@ -1589,6 +1918,9 @@ fn as_target(&self) -> Target {
  
  struct TraitImplItemTag;
  impl InvocationCollectorNode for AstNodeWrapper<Box<ast::AssocItem>, TraitImplItemTag> {
@@ -1146,7 +1146,7 @@ index ca8a27fe3..9501bcef2 100644
      type OutputTy = SmallVec<[Box<ast::AssocItem>; 1]>;
      type ItemKind = AssocItemKind;
      const KIND: AstFragmentKind = AstFragmentKind::TraitImplItems;
-@@ -1636,6 +1968,9 @@ fn as_target(&self) -> Target {
+@@ -1635,6 +1967,9 @@ fn as_target(&self) -> Target {
  }
  
  impl InvocationCollectorNode for Box<ast::ForeignItem> {
@@ -1156,7 +1156,7 @@ index ca8a27fe3..9501bcef2 100644
      const KIND: AstFragmentKind = AstFragmentKind::ForeignItems;
      fn to_annotatable(self) -> Annotatable {
          Annotatable::ForeignItem(self)
-@@ -1813,6 +2148,9 @@ fn as_target(&self) -> Target {
+@@ -1812,6 +2147,9 @@ fn as_target(&self) -> Target {
  }
  
  impl InvocationCollectorNode for ast::Stmt {
@@ -1166,7 +1166,7 @@ index ca8a27fe3..9501bcef2 100644
      const KIND: AstFragmentKind = AstFragmentKind::Stmts;
      fn to_annotatable(self) -> Annotatable {
          Annotatable::Stmt(Box::new(self))
-@@ -1990,6 +2328,9 @@ fn as_target(&self) -> Target {
+@@ -1989,6 +2327,9 @@ fn as_target(&self) -> Target {
  }
  
  impl InvocationCollectorNode for ast::Expr {
@@ -1176,7 +1176,7 @@ index ca8a27fe3..9501bcef2 100644
      type OutputTy = Box<ast::Expr>;
      const KIND: AstFragmentKind = AstFragmentKind::Expr;
      fn to_annotatable(self) -> Annotatable {
-@@ -2023,6 +2364,9 @@ fn as_target(&self) -> Target {
+@@ -2022,6 +2363,9 @@ fn as_target(&self) -> Target {
  
  struct OptExprTag;
  impl InvocationCollectorNode for AstNodeWrapper<Box<ast::Expr>, OptExprTag> {
@@ -1186,7 +1186,7 @@ index ca8a27fe3..9501bcef2 100644
      type OutputTy = Option<Box<ast::Expr>>;
      const KIND: AstFragmentKind = AstFragmentKind::OptExpr;
      fn to_annotatable(self) -> Annotatable {
-@@ -2061,6 +2405,9 @@ fn as_target(&self) -> Target {
+@@ -2060,6 +2404,9 @@ fn as_target(&self) -> Target {
  struct MethodReceiverTag;
  
  impl InvocationCollectorNode for AstNodeWrapper<ast::Expr, MethodReceiverTag> {
@@ -1196,7 +1196,7 @@ index ca8a27fe3..9501bcef2 100644
      type OutputTy = AstNodeWrapper<Box<ast::Expr>, MethodReceiverTag>;
      const KIND: AstFragmentKind = AstFragmentKind::MethodReceiverExpr;
      fn descr() -> &'static str {
-@@ -2180,6 +2527,16 @@ struct InvocationCollector<'a, 'b> {
+@@ -2179,6 +2526,16 @@ struct InvocationCollector<'a, 'b> {
      cx: &'a mut ExtCtxt<'b>,
      invocations: Vec<(Invocation, Option<Arc<SyntaxExtension>>)>,
      monotonic: bool,
@@ -1213,7 +1213,7 @@ index ca8a27fe3..9501bcef2 100644
  }
  
  impl<'a, 'b> InvocationCollector<'a, 'b> {
-@@ -2194,6 +2551,22 @@ fn cfg(&self) -> StripUnconfigured<'_> {
+@@ -2193,6 +2550,22 @@ fn cfg(&self) -> StripUnconfigured<'_> {
  
      fn collect(&mut self, fragment_kind: AstFragmentKind, kind: InvocationKind) -> AstFragment {
          let expn_id = LocalExpnId::fresh_empty();
@@ -1236,7 +1236,7 @@ index ca8a27fe3..9501bcef2 100644
          if matches!(kind, InvocationKind::GlobDelegation { .. }) {
              // In resolver we need to know which invocation ids are delegations early,
              // before their `ExpnData` is filled.
-@@ -2216,6 +2589,20 @@ fn collect(&mut self, fragment_kind: AstFragmentKind, kind: InvocationKind) -> A
+@@ -2215,6 +2588,20 @@ fn collect(&mut self, fragment_kind: AstFragmentKind, kind: InvocationKind) -> A
          placeholder(fragment_kind, NodeId::placeholder_from_expn_id(expn_id), vis)
      }
  
@@ -1257,7 +1257,7 @@ index ca8a27fe3..9501bcef2 100644
      fn collect_bang(
          &mut self,
          mac: Box<ast::MacCall>,
-@@ -2410,6 +2797,18 @@ fn expand_cfg_attr(&self, node: &mut impl HasAttrs, attr: &ast::Attribute, pos:
+@@ -2413,6 +2800,18 @@ fn expand_cfg_attr(&self, node: &mut impl HasAttrs, attr: &ast::Attribute, pos:
      }
  
      fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
@@ -1276,7 +1276,7 @@ index ca8a27fe3..9501bcef2 100644
          &mut self,
          mut node: Node,
      ) -> Node::OutputTy {
-@@ -2494,9 +2893,27 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
+@@ -2497,9 +2896,27 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
                      }))
                  }
                  None => {
@@ -1307,7 +1307,7 @@ index ca8a27fe3..9501bcef2 100644
                          Ok(output) => output,
                          Err(returned_node) => {
                              node = returned_node;
-@@ -2511,6 +2928,17 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
+@@ -2514,6 +2931,17 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
      fn visit_node<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode>(
          &mut self,
          node: &mut Node,
@@ -1325,7 +1325,7 @@ index ca8a27fe3..9501bcef2 100644
      ) {
          loop {
              return match self.take_first_attr(node) {
-@@ -2556,7 +2984,10 @@ fn visit_node<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode
+@@ -2559,7 +2987,10 @@ fn visit_node<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode
  
  impl<'a, 'b> MutVisitor for InvocationCollector<'a, 'b> {
      fn flat_map_item(&mut self, node: Box<ast::Item>) -> SmallVec<[Box<ast::Item>; 1]> {
@@ -1337,7 +1337,7 @@ index ca8a27fe3..9501bcef2 100644
      }
  
      fn flat_map_assoc_item(
-@@ -2564,7 +2995,8 @@ fn flat_map_assoc_item(
+@@ -2567,7 +2998,8 @@ fn flat_map_assoc_item(
          node: Box<ast::AssocItem>,
          ctxt: AssocCtxt,
      ) -> SmallVec<[Box<ast::AssocItem>; 1]> {
@@ -1347,7 +1347,7 @@ index ca8a27fe3..9501bcef2 100644
              AssocCtxt::Trait => self.flat_map_node(AstNodeWrapper::new(node, TraitItemTag)),
              AssocCtxt::Impl { of_trait: false, .. } => {
                  self.flat_map_node(AstNodeWrapper::new(node, ImplItemTag))
-@@ -2572,14 +3004,19 @@ fn flat_map_assoc_item(
+@@ -2575,14 +3007,19 @@ fn flat_map_assoc_item(
              AssocCtxt::Impl { of_trait: true, .. } => {
                  self.flat_map_node(AstNodeWrapper::new(node, TraitImplItemTag))
              }
@@ -1369,7 +1369,7 @@ index ca8a27fe3..9501bcef2 100644
      }
  
      fn flat_map_variant(&mut self, node: ast::Variant) -> SmallVec<[ast::Variant; 1]> {
-@@ -2621,6 +3058,22 @@ fn flat_map_generic_param(
+@@ -2624,6 +3061,22 @@ fn flat_map_generic_param(
      }
  
      fn flat_map_stmt(&mut self, node: ast::Stmt) -> SmallVec<[ast::Stmt; 1]> {
@@ -1392,7 +1392,7 @@ index ca8a27fe3..9501bcef2 100644
          // FIXME: invocations in semicolon-less expressions positions are expanded as expressions,
          // changing that requires some compatibility measures.
          if node.is_expr() {
-@@ -2631,7 +3084,7 @@ fn flat_map_generic_param(
+@@ -2634,7 +3087,7 @@ fn flat_map_generic_param(
              // `SEMICOLON_IN_EXPRESSIONS_FROM_MACROS` lint if needed.
              // See #78991 for an investigation of treating macros in this position
              // as statements, rather than expressions, during parsing.
@@ -1401,7 +1401,7 @@ index ca8a27fe3..9501bcef2 100644
                  StmtKind::Expr(expr)
                      if matches!(**expr, ast::Expr { kind: ExprKind::MacCall(..), .. }) =>
                  {
-@@ -2644,9 +3097,13 @@ fn flat_map_generic_param(
+@@ -2647,9 +3100,13 @@ fn flat_map_generic_param(
                  }
                  _ => walk_flat_map_stmt(self, node),
              };
@@ -1416,7 +1416,7 @@ index ca8a27fe3..9501bcef2 100644
      }
  
      fn visit_crate(&mut self, node: &mut ast::Crate) {
-@@ -2654,11 +3111,15 @@ fn visit_crate(&mut self, node: &mut ast::Crate) {
+@@ -2657,11 +3114,15 @@ fn visit_crate(&mut self, node: &mut ast::Crate) {
      }
  
      fn visit_ty(&mut self, node: &mut ast::Ty) {
@@ -1434,11 +1434,11 @@ index ca8a27fe3..9501bcef2 100644
      }
  
      fn visit_expr(&mut self, node: &mut ast::Expr) {
-@@ -2666,7 +3127,18 @@ fn visit_expr(&mut self, node: &mut ast::Expr) {
+@@ -2669,7 +3130,18 @@ fn visit_expr(&mut self, node: &mut ast::Expr) {
          if let Some(attr) = node.attrs.first() {
              self.cfg().maybe_emit_expr_attr_err(attr);
          }
--        ensure_sufficient_stack(|| self.visit_node(node))
+-        self.visit_node(node)
 +        let role = if matches!(node.kind, ExprKind::MacCall(_))
 +            || matches!(node.kind, ExprKind::Block(..))
 +                && self.owner_product_role == MacroOwnerProductRole::Dependent
@@ -1447,14 +1447,14 @@ index ca8a27fe3..9501bcef2 100644
 +        } else {
 +            Some(mem::replace(&mut self.owner_product_role, MacroOwnerProductRole::Required))
 +        };
-+        ensure_sufficient_stack(|| self.visit_node(node));
++        self.visit_node(node);
 +        if let Some(role) = role {
 +            self.owner_product_role = role;
 +        }
      }
  
      fn visit_method_receiver_expr(&mut self, node: &mut ast::Expr) {
-@@ -2682,7 +3154,36 @@ fn visit_block(&mut self, node: &mut ast::Block) {
+@@ -2685,7 +3157,36 @@ fn visit_block(&mut self, node: &mut ast::Block) {
              &mut self.cx.current_expansion.dir_ownership,
              DirOwnership::UnownedViaBlock,
          );
@@ -1493,7 +1493,7 @@ index ca8a27fe3..9501bcef2 100644
      }
  
 diff --git a/compiler/rustc_expand/src/mbe/diagnostics.rs b/compiler/rustc_expand/src/mbe/diagnostics.rs
-index cd0c54f29..e02dacb9a 100644
+index 89b4aac32..43599fab7 100644
 --- a/compiler/rustc_expand/src/mbe/diagnostics.rs
 +++ b/compiler/rustc_expand/src/mbe/diagnostics.rs
 @@ -49,11 +49,20 @@ pub(super) fn failed_to_match_macro(
@@ -2311,7 +2311,7 @@ index 95a4ebc63..0586ce48f 100644
 +    }
 +}
 diff --git a/compiler/rustc_expand/src/mbe/macro_rules.rs b/compiler/rustc_expand/src/mbe/macro_rules.rs
-index ddf3b8e86..95dc8c28e 100644
+index 29a06bb24..35ce7effb 100644
 --- a/compiler/rustc_expand/src/mbe/macro_rules.rs
 +++ b/compiler/rustc_expand/src/mbe/macro_rules.rs
 @@ -7,7 +7,7 @@
@@ -2322,8 +2322,8 @@ index ddf3b8e86..95dc8c28e 100644
 +use rustc_ast::tokenstream::{self, DelimSpan, TokenCursor, TokenStream};
  use rustc_ast::{self as ast, DUMMY_NODE_ID, NodeId, Safety};
  use rustc_ast_pretty::pprust;
- use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
-@@ -22,7 +22,7 @@
+ use rustc_attr_ir::diagnostic::Directive;
+@@ -21,7 +21,7 @@
      SEMICOLON_IN_EXPRESSIONS_FROM_NON_LOCAL_MACROS,
  };
  use rustc_parse::exp;
@@ -2332,7 +2332,7 @@ index ddf3b8e86..95dc8c28e 100644
  use rustc_session::Session;
  use rustc_session::diagnostics::feature_err;
  use rustc_session::parse::ParseSess;
-@@ -33,19 +33,62 @@
+@@ -32,19 +32,62 @@
  
  use super::SequenceRepetition;
  use super::diagnostics::{FailedMacro, failed_to_match_macro};
@@ -2399,7 +2399,7 @@ index ddf3b8e86..95dc8c28e 100644
  pub(crate) struct ParserAnyMacro<'a, 'b> {
      parser: Parser<'a>,
  
-@@ -58,11 +101,18 @@ pub(crate) struct ParserAnyMacro<'a, 'b> {
+@@ -57,11 +100,18 @@ pub(crate) struct ParserAnyMacro<'a, 'b> {
      arm_span: Span,
      /// Whether or not this macro is defined in the current crate
      is_local: bool,
@@ -2418,7 +2418,7 @@ index ddf3b8e86..95dc8c28e 100644
      pub(crate) fn make(
          mut self: Box<ParserAnyMacro<'a, 'b>>,
          kind: AstFragmentKind,
-@@ -75,13 +125,20 @@ pub(crate) fn make(
+@@ -74,13 +124,20 @@ pub(crate) fn make(
              arm_span,
              is_trailing_mac,
              is_local,
@@ -2441,7 +2441,7 @@ index ddf3b8e86..95dc8c28e 100644
                  let guar = super::diagnostics::emit_frag_parse_err(
                      err,
                      parser,
-@@ -95,6 +152,15 @@ pub(crate) fn make(
+@@ -94,6 +151,15 @@ pub(crate) fn make(
                  return kind.dummy(site_span, guar);
              }
          };
@@ -2457,7 +2457,7 @@ index ddf3b8e86..95dc8c28e 100644
  
          // We allow semicolons at the end of expressions -- e.g., the semicolon in
          // `macro_rules! m { () => { panic!(); } }` isn't parsed by `.parse_expr()`,
-@@ -116,7 +182,11 @@ pub(crate) fn make(
+@@ -115,7 +181,11 @@ pub(crate) fn make(
  
          // Make sure we don't have any tokens left to parse so we don't silently drop anything.
          let path = ast::Path::from_ident(macro_ident.with_span_pos(site_span));
@@ -2470,7 +2470,7 @@ index ddf3b8e86..95dc8c28e 100644
          fragment
      }
  
-@@ -144,6 +214,10 @@ pub(crate) fn from_tts<'cx>(
+@@ -143,6 +213,10 @@ pub(crate) fn from_tts<'cx>(
              is_trailing_mac: cx.current_expansion.is_trailing_mac,
              arm_span,
              is_local,
@@ -2481,7 +2481,7 @@ index ddf3b8e86..95dc8c28e 100644
              bindings,
              matched_rule_bindings,
          }
-@@ -260,8 +334,26 @@ pub fn expand_derive(
+@@ -259,8 +333,26 @@ pub fn expand_derive(
              trace_macros_note(&mut cx.expansions, sp, msg);
          }
  
@@ -2510,7 +2510,7 @@ index ddf3b8e86..95dc8c28e 100644
                  let MacroRule::Derive { rhs, .. } = rule else {
                      panic!("try_match_macro_derive returned non-derive rule");
                  };
-@@ -270,15 +362,16 @@ pub fn expand_derive(
+@@ -269,15 +361,16 @@ pub fn expand_derive(
                  };
  
                  let id = cx.current_expansion.id;
@@ -2530,7 +2530,7 @@ index ddf3b8e86..95dc8c28e 100644
                      cx.resolver.record_macro_rule_usage(
                          self.node_id,
                          rule_index,
-@@ -286,6 +379,17 @@ pub fn expand_derive(
+@@ -285,6 +378,17 @@ pub fn expand_derive(
                      );
                  }
  
@@ -2548,7 +2548,7 @@ index ddf3b8e86..95dc8c28e 100644
                  Ok(tts)
              }
              Err(CanRetry::No(guar)) => Err(guar),
-@@ -321,6 +425,7 @@ fn expand<'cx, 'a: 'cx>(
+@@ -320,6 +424,7 @@ fn expand<'cx, 'a: 'cx>(
              self.node_id,
              self.name,
              self.transparency,
@@ -2556,7 +2556,7 @@ index ddf3b8e86..95dc8c28e 100644
              input,
              &self.rules,
              self.on_unmatched_args.as_ref(),
-@@ -354,6 +459,7 @@ fn expand_with_safety(
+@@ -353,6 +458,7 @@ fn expand_with_safety(
              self.node_id,
              self.name,
              self.transparency,
@@ -2564,7 +2564,7 @@ index ddf3b8e86..95dc8c28e 100644
              safety,
              args,
              body,
-@@ -455,6 +561,7 @@ fn expand_macro<'cx, 'a: 'cx>(
+@@ -454,6 +560,7 @@ fn expand_macro<'cx, 'a: 'cx>(
      node_id: NodeId,
      name: Ident,
      transparency: Transparency,
@@ -2572,7 +2572,7 @@ index ddf3b8e86..95dc8c28e 100644
      arg: TokenStream,
      rules: &'a [MacroRule],
      on_unmatched_args: Option<&Directive>,
-@@ -467,10 +574,20 @@ fn expand_macro<'cx, 'a: 'cx>(
+@@ -466,10 +573,20 @@ fn expand_macro<'cx, 'a: 'cx>(
      }
  
      // Track nothing for the best performance.
@@ -2595,7 +2595,7 @@ index ddf3b8e86..95dc8c28e 100644
              let MacroRule::Func { lhs, rhs, .. } = rule else {
                  panic!("try_match_macro returned non-func rule");
              };
-@@ -481,24 +598,35 @@ fn expand_macro<'cx, 'a: 'cx>(
+@@ -480,24 +597,35 @@ fn expand_macro<'cx, 'a: 'cx>(
  
              // rhs has holes ( `$id` and `$(...)` that need filled)
              let id = cx.current_expansion.id;
@@ -2639,7 +2639,7 @@ index ddf3b8e86..95dc8c28e 100644
              // Let the context choose how to interpret the result. Weird, but useful for X-macros.
              Box::new(ParserAnyMacro::from_tts(cx, tts, sp, arm_span, is_local, name, rules, lhs))
          }
-@@ -533,6 +661,7 @@ fn expand_macro_attr(
+@@ -532,6 +660,7 @@ fn expand_macro_attr(
      node_id: NodeId,
      name: Ident,
      transparency: Transparency,
@@ -2647,7 +2647,7 @@ index ddf3b8e86..95dc8c28e 100644
      safety: Safety,
      args: TokenStream,
      body: TokenStream,
-@@ -543,6 +672,21 @@ fn expand_macro_attr(
+@@ -542,6 +671,21 @@ fn expand_macro_attr(
      // Macros defined in the current crate have a real node id,
      // whereas macros from an external crate have a dummy id.
      let is_local = node_id != DUMMY_NODE_ID;
@@ -2669,7 +2669,7 @@ index ddf3b8e86..95dc8c28e 100644
  
      if !is_local && !cx.ecfg.features.macro_attr() {
          feature_err(cx.sess, sym::macro_attr, sp, "`macro_rules!` attributes are unstable").emit();
-@@ -558,8 +702,19 @@ fn expand_macro_attr(
+@@ -557,8 +701,19 @@ fn expand_macro_attr(
      }
  
      // Track nothing for the best performance.
@@ -2691,7 +2691,7 @@ index ddf3b8e86..95dc8c28e 100644
              let MacroRule::Attr { rhs, unsafe_rule, .. } = rule else {
                  panic!("try_macro_match_attr returned non-attr rule");
              };
-@@ -581,7 +736,7 @@ fn expand_macro_attr(
+@@ -580,7 +735,7 @@ fn expand_macro_attr(
              }
  
              let id = cx.current_expansion.id;
@@ -2700,7 +2700,7 @@ index ddf3b8e86..95dc8c28e 100644
                  .map_err(|e| e.emit())?;
  
              if cx.trace_macros() {
-@@ -593,6 +748,17 @@ fn expand_macro_attr(
+@@ -592,6 +747,17 @@ fn expand_macro_attr(
                  cx.resolver.record_macro_rule_usage(node_id, i, cx.current_expansion.id);
              }
  
@@ -2718,7 +2718,7 @@ index ddf3b8e86..95dc8c28e 100644
              Ok(tts)
          }
          Err(CanRetry::No(guar)) => Err(guar),
-@@ -629,8 +795,10 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
+@@ -628,8 +794,10 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
      name: Ident,
      arg: &TokenStream,
      rules: &'matcher [MacroRule],
@@ -2730,7 +2730,7 @@ index ddf3b8e86..95dc8c28e 100644
      // We create a base parser that can be used for the "black box" parts.
      // Every iteration needs a fresh copy of that parser. However, the parser
      // is not mutated on many of the iterations, particularly when dealing with
-@@ -650,9 +818,10 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
+@@ -649,9 +817,10 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
      // hacky, but speeds up the `html5ever` benchmark significantly. (Issue
      // 68836 suggests a more comprehensive but more complex change to deal with
      // this situation.)
@@ -2743,7 +2743,7 @@ index ddf3b8e86..95dc8c28e 100644
      for (i, rule) in rules.iter().enumerate() {
          let MacroRule::Func { lhs, .. } = rule else { continue };
          let _tracing_span = trace_span!("Matching arm", %i);
-@@ -664,17 +833,22 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
+@@ -663,17 +832,22 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
          let mut gated_spans_snapshot = mem::take(&mut *psess.gated_spans.spans.borrow_mut());
  
          track.prepare(WhichMatcher::FOR_FUNC, lhs);
@@ -2769,7 +2769,7 @@ index ddf3b8e86..95dc8c28e 100644
              }
              Failure => {
                  trace!("Failed to match arm, trying the next one");
-@@ -710,23 +884,30 @@ pub(super) fn try_match_macro_attr<'matcher, T: Tracker<'matcher>>(
+@@ -709,23 +883,30 @@ pub(super) fn try_match_macro_attr<'matcher, T: Tracker<'matcher>>(
      attr_args: &TokenStream,
      attr_body: &TokenStream,
      rules: &'matcher [MacroRule],
@@ -2807,7 +2807,7 @@ index ddf3b8e86..95dc8c28e 100644
              Failure => {
                  mem::swap(&mut gated_spans_snapshot, &mut psess.gated_spans.spans.borrow_mut());
                  continue;
-@@ -735,16 +916,54 @@ pub(super) fn try_match_macro_attr<'matcher, T: Tracker<'matcher>>(
+@@ -734,16 +915,54 @@ pub(super) fn try_match_macro_attr<'matcher, T: Tracker<'matcher>>(
              ErrorReported(guar) => return Err(CanRetry::No(guar)),
          };
  
@@ -2866,7 +2866,7 @@ index ddf3b8e86..95dc8c28e 100644
              }
              Failure => {
                  mem::swap(&mut gated_spans_snapshot, &mut psess.gated_spans.spans.borrow_mut())
-@@ -766,24 +985,32 @@ pub(super) fn try_match_macro_derive<'matcher, T: Tracker<'matcher>>(
+@@ -765,24 +984,32 @@ pub(super) fn try_match_macro_derive<'matcher, T: Tracker<'matcher>>(
      name: Ident,
      body: &TokenStream,
      rules: &'matcher [MacroRule],
@@ -2905,7 +2905,7 @@ index ddf3b8e86..95dc8c28e 100644
              }
              Failure => {
                  mem::swap(&mut gated_spans_snapshot, &mut psess.gated_spans.spans.borrow_mut())
-@@ -1902,3 +2129,51 @@ pub(super) fn parser_from_cx(
+@@ -1901,3 +2128,51 @@ pub(super) fn parser_from_cx(
      tts.desugar_doc_comments();
      Parser::new(psess, tts, rustc_parse::MACRO_ARGUMENTS).recovery(recovery)
  }
@@ -4428,7 +4428,7 @@ index d691c04e5..a5ec7f9d8 100644
              let codegen_backend = match config.make_codegen_backend {
                  None => util::get_codegen_backend(
 diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
-index 55c202ce1..da9551d83 100644
+index 2563b0408..789a713a3 100644
 --- a/compiler/rustc_middle/src/ty/mod.rs
 +++ b/compiler/rustc_middle/src/ty/mod.rs
 @@ -338,6 +338,14 @@ pub enum MacroImplementationKind {
@@ -4843,10 +4843,10 @@ index fe34d9951..d333b52ee 100644
  
          assert!(tokens_used); // check we didn't create `tokens` unnecessarily
 diff --git a/compiler/rustc_parse/src/parser/expr.rs b/compiler/rustc_parse/src/parser/expr.rs
-index af20b0957..c33bb27e2 100644
+index 3e03730ab..88dd4be3e 100644
 --- a/compiler/rustc_parse/src/parser/expr.rs
 +++ b/compiler/rustc_parse/src/parser/expr.rs
-@@ -1703,6 +1703,7 @@ fn parse_expr_array_or_repeat(&mut self, close: ExpTokenPair) -> PResult<'a, Box
+@@ -1699,6 +1699,7 @@ fn parse_expr_array_or_repeat(&mut self, close: ExpTokenPair) -> PResult<'a, Box
      }
  
      fn parse_expr_path_start(&mut self) -> PResult<'a, Box<Expr>> {
@@ -4854,7 +4854,7 @@ index af20b0957..c33bb27e2 100644
          let maybe_eq_tok = self.prev_token;
          let (qself, path) = if self.eat_lt() {
              let lt_span = self.prev_token.span;
-@@ -1734,6 +1735,7 @@ fn parse_expr_path_start(&mut self) -> PResult<'a, Box<Expr>> {
+@@ -1730,6 +1731,7 @@ fn parse_expr_path_start(&mut self) -> PResult<'a, Box<Expr>> {
              }
              let lo = path.span;
              let mac = Box::new(MacCall { path, args: self.parse_delim_args()? });
@@ -5231,10 +5231,10 @@ index 7c3752cff..66d4405ee 100644
          let mut eat_semi = true;
          let mut add_semi_to_stmt = false;
 diff --git a/compiler/rustc_parse/src/parser/ty.rs b/compiler/rustc_parse/src/parser/ty.rs
-index 98593c3c3..cc1c21fba 100644
+index 1d2021cfe..c8d10da74 100644
 --- a/compiler/rustc_parse/src/parser/ty.rs
 +++ b/compiler/rustc_parse/src/parser/ty.rs
-@@ -1036,11 +1036,14 @@ fn parse_path_start_ty(
+@@ -1033,11 +1033,14 @@ fn parse_path_start_ty(
          allow_plus: AllowPlus,
          ty_generics: Option<&Generics>,
      ) -> PResult<'a, TyKind> {
@@ -5817,7 +5817,7 @@ index e4e1e1f96..eefaf3d11 100644
                  InlineAsmOperand::Sym { sym } => self.visit_inline_asm_sym(sym),
                  InlineAsmOperand::Label { block } => self.visit_block(block),
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index 6ebe7c0a8..f380e8a9d 100644
+index 49e9dcd03..8adfe5ba8 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
 @@ -1389,6 +1389,20 @@ pub struct Resolver<'ra, 'tcx> {
@@ -6241,10 +6241,10 @@ index 35083674d..87ca088a7 100644
          if !rules.is_macro_rules() {
              return;
 diff --git a/compiler/rustc_session/src/session.rs b/compiler/rustc_session/src/session.rs
-index 3de2dac83..a3fe5a3c5 100644
+index 38f014d10..88dc0d3d4 100644
 --- a/compiler/rustc_session/src/session.rs
 +++ b/compiler/rustc_session/src/session.rs
-@@ -445,6 +445,9 @@ pub struct Session {
+@@ -446,6 +446,9 @@ pub struct Session {
      /// registration mutates compiler state or loads them into the compiler process.
      pub proc_macro_load_guard: Option<ProcMacroLoadGuard>,
  
@@ -6254,7 +6254,7 @@ index 3de2dac83..a3fe5a3c5 100644
      target_filesearch: Arc<FileSearch>,
      host_filesearch: Arc<FileSearch>,
  
-@@ -1418,6 +1421,7 @@ pub fn build_session(
+@@ -1454,6 +1457,7 @@ pub fn build_session(
          file_depinfo: Default::default(),
          external_resource_guard: None,
          proc_macro_load_guard: None,
@@ -8352,6 +8352,3 @@ index 8888f6c07..87778c116 100644
      };
  
      interface::run_compiler(config, |compiler| {
--- 
-2.55.0
-

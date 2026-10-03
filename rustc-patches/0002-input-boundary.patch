@@ -1,21 +1,21 @@
-From 1de82b5179b502b752eb13266abe428d7fcbed8f Mon Sep 17 00:00:00 2001
+From 4f6f8a485fcde463caf7a535289b1f455a5f2332 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Tue, 11 Aug 2026 03:16:07 +0900
 Subject: [PATCH] rustc: guard compile-time environment access
 
 ---
  compiler/rustc_builtin_macros/src/env.rs      | 11 ++++
- compiler/rustc_driver_impl/src/lib.rs         |  9 ++--
+ compiler/rustc_driver_impl/src/lib.rs         |  6 ++-
  compiler/rustc_interface/src/interface.rs     |  8 ++-
  compiler/rustc_session/src/session.rs         | 53 ++++++++++++++++++-
  .../examples/rustc-interface-example.rs       |  1 +
  .../rustc-interface-getting-diagnostics.rs    |  1 +
  src/librustdoc/core.rs                        |  1 +
  src/librustdoc/doctest.rs                     |  1 +
- 8 files changed, 80 insertions(+), 5 deletions(-)
+ 8 files changed, 79 insertions(+), 3 deletions(-)
 
 diff --git a/compiler/rustc_builtin_macros/src/env.rs b/compiler/rustc_builtin_macros/src/env.rs
-index aaa9117b..a7cc8f56 100644
+index aaa9117bb..a7cc8f56d 100644
 --- a/compiler/rustc_builtin_macros/src/env.rs
 +++ b/compiler/rustc_builtin_macros/src/env.rs
 @@ -11,6 +11,7 @@
@@ -51,16 +51,10 @@ index aaa9117b..a7cc8f56 100644
          return ExpandResult::Retry(());
      };
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index ee06a618..780186e9 100644
+index 7f6eae4a7..51c03409c 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
-@@ -116,12 +116,14 @@ pub(super) fn install() {}
- 
- /// The upstream revision against which the rust-item-dependencies observer ABI
- /// was implemented.
--pub const RUST_ITEM_DEPENDENCIES_BASE_REVISION: &str =
--    "969b803cbe1d4499f841ae0a49c637d8c70a0458";
-+pub const RUST_ITEM_DEPENDENCIES_BASE_REVISION: &str = "969b803cbe1d4499f841ae0a49c637d8c70a0458";
+@@ -120,7 +120,10 @@ pub(super) fn install() {}
  
  /// Incremented whenever the observer records consumed by rust-item-dependencies
  /// change incompatibly.
@@ -72,7 +66,7 @@ index ee06a618..780186e9 100644
  
  pub const DEFAULT_BUG_REPORT_URL: &str = "https://github.com/rust-lang/rust/issues/new\
      ?labels=C-bug%2C+I-ICE%2C+T-compiler&template=ice.md";
-@@ -223,6 +225,7 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send))
+@@ -222,6 +225,7 @@ pub fn run_compiler(at_args: &[String], callbacks: &mut (dyn Callbacks + Send))
          output_dir: odir,
          ice_file,
          file_loader: None,
@@ -81,7 +75,7 @@ index ee06a618..780186e9 100644
          psess_created: None,
          track_state: None,
 diff --git a/compiler/rustc_interface/src/interface.rs b/compiler/rustc_interface/src/interface.rs
-index 2737d2ca..a9c759ee 100644
+index 2737d2ca8..a9c759eea 100644
 --- a/compiler/rustc_interface/src/interface.rs
 +++ b/compiler/rustc_interface/src/interface.rs
 @@ -17,7 +17,7 @@
@@ -121,10 +115,10 @@ index 2737d2ca..a9c759ee 100644
              let codegen_backend = match config.make_codegen_backend {
                  None => util::get_codegen_backend(
 diff --git a/compiler/rustc_session/src/session.rs b/compiler/rustc_session/src/session.rs
-index f30d825b..abac8c79 100644
+index 7db30b38f..ca9d45402 100644
 --- a/compiler/rustc_session/src/session.rs
 +++ b/compiler/rustc_session/src/session.rs
-@@ -7,7 +7,7 @@
+@@ -8,7 +8,7 @@
  
  use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
  use rustc_data_structures::profiling::{SelfProfiler, SelfProfilerRef};
@@ -133,7 +127,7 @@ index f30d825b..abac8c79 100644
  use rustc_data_structures::{Limit, flock};
  use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
  use rustc_errors::codes::*;
-@@ -77,6 +77,39 @@ pub struct CompilerIO {
+@@ -78,6 +78,39 @@ pub struct CompilerIO {
      pub temps_dir: Option<PathBuf>,
  }
  
@@ -173,7 +167,7 @@ index f30d825b..abac8c79 100644
  pub trait DynLintStore: Any + DynSync + DynSend {
      /// Provides a way to access lint groups without depending on `rustc_lint`
      fn lint_groups_iter(&self) -> Box<dyn Iterator<Item = LintGroup> + '_>;
-@@ -392,6 +425,10 @@ pub struct Session {
+@@ -393,6 +426,10 @@ pub struct Session {
      /// File paths accessed during the build.
      pub file_depinfo: Lock<FxIndexSet<Symbol>>,
  
@@ -184,7 +178,7 @@ index f30d825b..abac8c79 100644
      target_filesearch: Arc<FileSearch>,
      host_filesearch: Arc<FileSearch>,
  
-@@ -452,6 +489,19 @@ pub struct LintGroup {
+@@ -453,6 +490,19 @@ pub struct LintGroup {
  }
  
  impl Session {
@@ -204,7 +198,7 @@ index f30d825b..abac8c79 100644
      pub fn miri_unleashed_feature(&self, span: Span, feature_gate: Option<Symbol>) {
          self.miri_unleashed_features.lock().push((span, feature_gate));
      }
-@@ -1346,6 +1396,7 @@ pub fn build_session(
+@@ -1382,6 +1432,7 @@ pub fn build_session(
          using_internal_features,
          env_depinfo: Default::default(),
          file_depinfo: Default::default(),
@@ -213,7 +207,7 @@ index f30d825b..abac8c79 100644
          host_filesearch,
          replaced_intrinsics: FxHashSet::default(), // filled by `run_compiler`
 diff --git a/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs b/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs
-index 4601d9ad..03aec7a8 100644
+index 4601d9adb..03aec7a80 100644
 --- a/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs
 +++ b/src/doc/rustc-dev-guide/examples/rustc-interface-example.rs
 @@ -33,6 +33,7 @@ fn main() {
@@ -225,7 +219,7 @@ index 4601d9ad..03aec7a8 100644
          // This is a callback from the driver that is called when [`ParseSess`] is created.
          psess_created: None, //Option<Box<dyn FnOnce(&mut ParseSess) + Send>>
 diff --git a/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs b/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs
-index ea2a7727..93fe66ec 100644
+index ea2a77270..93fe66ec2 100644
 --- a/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs
 +++ b/src/doc/rustc-dev-guide/examples/rustc-interface-getting-diagnostics.rs
 @@ -66,6 +66,7 @@ fn main() {
@@ -237,7 +231,7 @@ index ea2a7727..93fe66ec 100644
          psess_created: Some(Box::new(|parse_sess| {
              parse_sess.dcx().set_emitter(Box::new(DebugEmitter {
 diff --git a/src/librustdoc/core.rs b/src/librustdoc/core.rs
-index af102458..80f72873 100644
+index af1024580..80f728733 100644
 --- a/src/librustdoc/core.rs
 +++ b/src/librustdoc/core.rs
 @@ -309,6 +309,7 @@ pub(crate) fn create_config(
@@ -249,7 +243,7 @@ index af102458..80f72873 100644
          psess_created: None,
          track_state: None,
 diff --git a/src/librustdoc/doctest.rs b/src/librustdoc/doctest.rs
-index 7ba40962..d75b5a8b 100644
+index 7ba409626..d75b5a8b9 100644
 --- a/src/librustdoc/doctest.rs
 +++ b/src/librustdoc/doctest.rs
 @@ -189,6 +189,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
@@ -260,6 +254,3 @@ index 7ba40962..d75b5a8b 100644
          lint_caps,
          psess_created: None,
          track_state: None,
--- 
-2.55.0
-

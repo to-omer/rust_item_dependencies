@@ -1,4 +1,4 @@
-From 7564e70010a59d2e3409459bfdcbead3ed4076b9 Mon Sep 17 00:00:00 2001
+From 8fb2068f3845c312a1a2e9be92ece9b05dad6213 Mon Sep 17 00:00:00 2001
 From: to-omer <48119218+to-omer@users.noreply.github.com>
 Date: Sun, 16 Aug 2026 15:56:03 +0900
 Subject: [PATCH] Expose selected declarative macro rules
@@ -18,7 +18,7 @@ Subject: [PATCH] Expose selected declarative macro rules
  create mode 100644 tests/ui-fulldeps/macro-rule-observer.rs
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index ca5d524b..2381668e 100644
+index 2ad789683..3be4893fb 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -31,10 +31,10 @@ index ca5d524b..2381668e 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_expand/src/base.rs b/compiler/rustc_expand/src/base.rs
-index f15b0059..dfad8095 100644
+index 64b6e4b8e..f43a124c8 100644
 --- a/compiler/rustc_expand/src/base.rs
 +++ b/compiler/rustc_expand/src/base.rs
-@@ -1060,7 +1060,12 @@ fn resolve_macro_invocation(
+@@ -1059,7 +1059,12 @@ fn resolve_macro_invocation(
          force: bool,
      ) -> Result<Arc<SyntaxExtension>, Indeterminate>;
  
@@ -49,10 +49,10 @@ index f15b0059..dfad8095 100644
      fn check_unused_macros(&mut self);
  
 diff --git a/compiler/rustc_expand/src/mbe/macro_rules.rs b/compiler/rustc_expand/src/mbe/macro_rules.rs
-index 6b997713..ddf3b8e8 100644
+index b268b8b76..29a06bb24 100644
 --- a/compiler/rustc_expand/src/mbe/macro_rules.rs
 +++ b/compiler/rustc_expand/src/mbe/macro_rules.rs
-@@ -152,7 +152,7 @@ pub(crate) fn from_tts<'cx>(
+@@ -151,7 +151,7 @@ pub(crate) fn from_tts<'cx>(
  
  pub(crate) enum MacroRule {
      /// A function-style rule, for use with `m!()`
@@ -61,7 +61,7 @@ index 6b997713..ddf3b8e8 100644
      /// An attr rule, for use with `#[m]`
      Attr {
          unsafe_rule: bool,
-@@ -161,9 +161,10 @@ pub(crate) enum MacroRule {
+@@ -160,9 +160,10 @@ pub(crate) enum MacroRule {
          body: Vec<MatcherLoc>,
          body_span: Span,
          rhs: mbe::TokenTree,
@@ -73,7 +73,7 @@ index 6b997713..ddf3b8e8 100644
  }
  
  /// A selection of a matcher in a [`MacroRule`].
-@@ -224,6 +225,20 @@ pub fn nrules(&self) -> usize {
+@@ -223,6 +224,20 @@ pub fn nrules(&self) -> usize {
          self.rules.len()
      }
  
@@ -94,7 +94,7 @@ index 6b997713..ddf3b8e8 100644
      pub fn is_macro_rules(&self) -> bool {
          self.macro_rules
      }
-@@ -264,7 +279,11 @@ pub fn expand_derive(
+@@ -263,7 +278,11 @@ pub fn expand_derive(
                  }
  
                  if is_defined_in_current_crate(self.node_id) {
@@ -107,7 +107,7 @@ index 6b997713..ddf3b8e8 100644
                  }
  
                  Ok(tts)
-@@ -477,7 +496,7 @@ fn expand_macro<'cx, 'a: 'cx>(
+@@ -476,7 +495,7 @@ fn expand_macro<'cx, 'a: 'cx>(
  
              let is_local = is_defined_in_current_crate(node_id);
              if is_local {
@@ -116,7 +116,7 @@ index 6b997713..ddf3b8e8 100644
              }
  
              // Let the context choose how to interpret the result. Weird, but useful for X-macros.
-@@ -571,7 +590,7 @@ fn expand_macro_attr(
+@@ -570,7 +589,7 @@ fn expand_macro_attr(
              }
  
              if is_local {
@@ -125,7 +125,7 @@ index 6b997713..ddf3b8e8 100644
              }
  
              Ok(tts)
-@@ -809,6 +828,7 @@ pub fn compile_declarative_macro(
+@@ -808,6 +827,7 @@ pub fn compile_declarative_macro(
      let mut rules = Vec::new();
  
      while p.token != token::Eof {
@@ -133,7 +133,7 @@ index 6b997713..ddf3b8e8 100644
          let unsafe_rule = p.eat_keyword_noexpect(kw::Unsafe);
          let unsafe_keyword_span = p.prev_token.span;
          if unsafe_rule && let Some(guar) = check_no_eof(sess, &p, "expected `attr`") {
-@@ -893,6 +913,8 @@ pub fn compile_declarative_macro(
+@@ -892,6 +912,8 @@ pub fn compile_declarative_macro(
              return dummy_syn_ext(guar.unwrap());
          };
          let lhs = mbe::macro_parser::compute_locs(&delimited.tts);
@@ -142,7 +142,7 @@ index 6b997713..ddf3b8e8 100644
          if let Some(args) = args {
              let args_span = args.span();
              let mbe::TokenTree::Delimited(.., delimited) = args else {
-@@ -900,11 +922,19 @@ pub fn compile_declarative_macro(
+@@ -899,11 +921,19 @@ pub fn compile_declarative_macro(
              };
              let args = mbe::macro_parser::compute_locs(&delimited.tts);
              let body_span = lhs_span;
@@ -166,7 +166,7 @@ index 6b997713..ddf3b8e8 100644
          if p.token == token::Eof {
              break;
 diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
-index 726b06df..ee972d02 100644
+index 242eed4f1..03caf718a 100644
 --- a/compiler/rustc_middle/src/ty/mod.rs
 +++ b/compiler/rustc_middle/src/ty/mod.rs
 @@ -191,6 +191,10 @@ pub struct ResolverGlobalCtxt {
@@ -210,7 +210,7 @@ index 726b06df..ee972d02 100644
  pub struct PerOwnerResolverData<'tcx> {
      pub node_id_to_def_id: NodeMap<LocalDefId> = Default::default(),
 diff --git a/compiler/rustc_resolve/src/def_collector.rs b/compiler/rustc_resolve/src/def_collector.rs
-index 32453a62..e4e1e1f9 100644
+index 32453a629..e4e1e1f96 100644
 --- a/compiler/rustc_resolve/src/def_collector.rs
 +++ b/compiler/rustc_resolve/src/def_collector.rs
 @@ -231,6 +231,7 @@ fn visit_item(&mut self, i: &'a Item) {
@@ -222,7 +222,7 @@ index 32453a62..e4e1e1f9 100644
                  }
  
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index f044c189..bddb6a0f 100644
+index f044c1893..bddb6a0f1 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
 @@ -1375,6 +1375,12 @@ pub struct Resolver<'ra, 'tcx> {
@@ -255,7 +255,7 @@ index f044c189..bddb6a0f 100644
              trait_impls: self.trait_impls,
              proc_macros,
 diff --git a/compiler/rustc_resolve/src/macros.rs b/compiler/rustc_resolve/src/macros.rs
-index 9bb58b4a..e034e657 100644
+index 9bb58b4a4..e034e6577 100644
 --- a/compiler/rustc_resolve/src/macros.rs
 +++ b/compiler/rustc_resolve/src/macros.rs
 @@ -22,8 +22,8 @@
@@ -350,7 +350,7 @@ index 9bb58b4a..e034e657 100644
      /// for better error recovery.
 diff --git a/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs b/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs
 new file mode 100644
-index 00000000..9dd1d45f
+index 000000000..9dd1d45f0
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/macro-rule-observer-input.rs
 @@ -0,0 +1,40 @@
@@ -396,7 +396,7 @@ index 00000000..9dd1d45f
 +}
 diff --git a/tests/ui-fulldeps/macro-rule-observer.rs b/tests/ui-fulldeps/macro-rule-observer.rs
 new file mode 100644
-index 00000000..7e14ee8e
+index 000000000..7e14ee8e5
 --- /dev/null
 +++ b/tests/ui-fulldeps/macro-rule-observer.rs
 @@ -0,0 +1,132 @@
@@ -532,6 +532,3 @@ index 00000000..7e14ee8e
 +        })
 +        .unwrap()
 +}
--- 
-2.55.0
-

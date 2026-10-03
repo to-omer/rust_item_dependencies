@@ -1,7 +1,7 @@
-From bb01380f7af4e9f8da77b19af289f6196388cd54 Mon Sep 17 00:00:00 2001
+From 87d6ab8fb7e0f117c8a72892bcde6e5c29d3e8af Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Fri, 14 Aug 2026 06:40:00 +0900
-Subject: [PATCH 12/14] rustc: complete cached codegen projection proofs
+Subject: [PATCH] rustc: complete cached codegen projection proofs
 
 ---
  .../src/traits/codegen_proof.rs               | 16 +++-------
@@ -11,7 +11,7 @@ Subject: [PATCH 12/14] rustc: complete cached codegen projection proofs
  4 files changed, 45 insertions(+), 29 deletions(-)
 
 diff --git a/compiler/rustc_trait_selection/src/traits/codegen_proof.rs b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
-index 0c332374..59ecf0f6 100644
+index 0c3323741..59ecf0f63 100644
 --- a/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
 +++ b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
 @@ -77,12 +77,6 @@ pub(crate) fn unmute(&mut self) {
@@ -45,10 +45,10 @@ index 0c332374..59ecf0f6 100644
      }
  
 diff --git a/compiler/rustc_trait_selection/src/traits/project.rs b/compiler/rustc_trait_selection/src/traits/project.rs
-index 883ce0d5..c96aae1c 100644
+index 25250611d..1ebbc3d3f 100644
 --- a/compiler/rustc_trait_selection/src/traits/project.rs
 +++ b/compiler/rustc_trait_selection/src/traits/project.rs
-@@ -333,30 +333,23 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
+@@ -332,30 +332,23 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
      // bounds. It might be the case that we want two distinct caches,
      // or else another kind of cache entry.
      let mut cache_entry = infcx.inner.borrow_mut().projection_cache().try_start(cache_key);
@@ -90,7 +90,7 @@ index 883ce0d5..c96aae1c 100644
          let mut cache = inner.projection_cache();
          assert!(cache.remove(cache_key));
 diff --git a/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
-index e7e55142..72918153 100644
+index e7e551420..729181530 100644
 --- a/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
 +++ b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
 @@ -19,6 +19,7 @@ trait Supply {
@@ -102,7 +102,7 @@ index e7e55142..72918153 100644
  impl Other for Source {
      type X = Value;
 diff --git a/tests/ui-fulldeps/selection-proof-trace.rs b/tests/ui-fulldeps/selection-proof-trace.rs
-index de531d48..2fe8b0dc 100644
+index de531d48b..2fe8b0dc6 100644
 --- a/tests/ui-fulldeps/selection-proof-trace.rs
 +++ b/tests/ui-fulldeps/selection-proof-trace.rs
 @@ -275,6 +275,34 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
@@ -156,6 +156,3 @@ index de531d48..2fe8b0dc 100644
      header: CanonicalSelectionReport,
      cache: CanonicalSelectionReport,
      param_env: CanonicalSelectionReport,
--- 
-2.55.0
-

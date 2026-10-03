@@ -1,9 +1,10 @@
-From eb3bf018ba5120eb7652b381651baf53fa3364b0 Mon Sep 17 00:00:00 2001
+From 851569facef7b4b351d734a5e8caa0efc62fd391 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Wed, 26 Aug 2026 23:41:51 +0900
 Subject: [PATCH] rustc: expose external crate load requirements
 
 ---
+ Cargo.lock                                    |   1 +
  compiler/rustc_driver_impl/src/lib.rs         |   2 +-
  compiler/rustc_metadata/src/creader.rs        | 142 +++-
  compiler/rustc_metadata/src/rmeta/decoder.rs  |   9 +
@@ -12,15 +13,28 @@ Subject: [PATCH] rustc: expose external crate load requirements
  compiler/rustc_middle/src/query/keys.rs       |   6 +
  compiler/rustc_middle/src/ty/context.rs       |   2 +
  compiler/rustc_middle/src/ty/mod.rs           |  70 ++
+ compiler/rustc_resolve/Cargo.toml             |   1 +
  .../rustc_resolve/src/build_reduced_graph.rs  |   7 +-
  compiler/rustc_resolve/src/ident.rs           |  12 +-
  compiler/rustc_resolve/src/lib.rs             | 109 ++-
- .../external-crate-load-requirements.rs       | 725 ++++++++++++++++++
- 12 files changed, 1143 insertions(+), 59 deletions(-)
+ .../external-crate-load-requirements.rs       | 727 ++++++++++++++++++
+ 14 files changed, 1147 insertions(+), 59 deletions(-)
  create mode 100644 tests/ui-fulldeps/external-crate-load-requirements.rs
 
+diff --git a/Cargo.lock b/Cargo.lock
+index 10daf3480..7fcd06348 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4716,6 +4716,7 @@ dependencies = [
+  "rustc_ast",
+  "rustc_ast_pretty",
+  "rustc_attr_parsing",
++ "rustc_crate_store",
+  "rustc_data_structures",
+  "rustc_errors",
+  "rustc_expand",
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 9a741579..1a7d8add 100644
+index 47b65f701..80d0006d8 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -33,10 +47,10 @@ index 9a741579..1a7d8add 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_metadata/src/creader.rs b/compiler/rustc_metadata/src/creader.rs
-index 90d6f6ab..d540f1b1 100644
+index 15ab4613d..8374c8da3 100644
 --- a/compiler/rustc_metadata/src/creader.rs
 +++ b/compiler/rustc_metadata/src/creader.rs
-@@ -19,7 +19,10 @@
+@@ -20,7 +20,10 @@
  use rustc_index::IndexVec;
  use rustc_middle::bug;
  use rustc_middle::ty::data_structures::IndexSet;
@@ -265,7 +279,7 @@ index 90d6f6ab..d540f1b1 100644
              _ => bug!(),
          }
 diff --git a/compiler/rustc_metadata/src/rmeta/decoder.rs b/compiler/rustc_metadata/src/rmeta/decoder.rs
-index 3a7cffb5..c3baab71 100644
+index f4d338059..6b63528ea 100644
 --- a/compiler/rustc_metadata/src/rmeta/decoder.rs
 +++ b/compiler/rustc_metadata/src/rmeta/decoder.rs
 @@ -2002,6 +2002,15 @@ pub(crate) fn dependencies(&self) -> impl Iterator<Item = CrateNum> {
@@ -285,19 +299,19 @@ index 3a7cffb5..c3baab71 100644
          self.root.decode_target_modifiers(&self.blob).collect()
      }
 diff --git a/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs b/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
-index a9d52471..fe1f4cd5 100644
+index 8fe1d6561..d634a8c3a 100644
 --- a/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
 +++ b/compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs
-@@ -3,7 +3,7 @@
- use std::sync::Arc;
+@@ -4,7 +4,7 @@
  
- use rustc_data_structures::unord::ExtendUnord;
+ use rustc_crate_store::{CrateStore, ExternCrate};
+ use rustc_data_structures::fx::FxHashMap;
 -use rustc_hir::attrs::Deprecation;
 +use rustc_hir::attrs::{Deprecation, NativeLibKind};
  use rustc_hir::def::{CtorKind, DefKind};
  use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, LOCAL_CRATE};
  use rustc_hir::definitions::{DefKey, DefPath, DefPathHash};
-@@ -15,7 +15,9 @@
+@@ -16,7 +16,9 @@
  use rustc_middle::queries::ExternProviders;
  use rustc_middle::query::LocalCrate;
  use rustc_middle::ty::fast_reject::SimplifiedType;
@@ -394,7 +408,7 @@ index a9d52471..fe1f4cd5 100644
  pub(in crate::rmeta) fn provide(providers: &mut Providers) {
      provide_cstore_hooks(providers);
      providers.queries = rustc_middle::query::Providers {
-@@ -583,11 +657,22 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
+@@ -589,11 +663,22 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
          dependency_formats: |tcx, ()| Arc::new(crate::dependency_format::calculate(tcx)),
          has_global_allocator: |tcx, LocalCrate| CStore::from_tcx(tcx).has_global_allocator(),
          has_alloc_error_handler: |tcx, LocalCrate| CStore::from_tcx(tcx).has_alloc_error_handler(),
@@ -418,7 +432,7 @@ index a9d52471..fe1f4cd5 100644
              // The loaded-crate list is now frozen in the query cache; stop
              // mutating the cstore and stable crate id map from here on.
 diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
-index 8548a583..d4125c4a 100644
+index dd1944954..a13ea7d99 100644
 --- a/compiler/rustc_middle/src/queries.rs
 +++ b/compiler/rustc_middle/src/queries.rs
 @@ -122,8 +122,9 @@
@@ -472,7 +486,7 @@ index 8548a583..d4125c4a 100644
      /// is marked as a private dependency
      query is_private_dep(c: CrateNum) -> bool {
 diff --git a/compiler/rustc_middle/src/query/keys.rs b/compiler/rustc_middle/src/query/keys.rs
-index d907da1b..8a4f5fe9 100644
+index d907da1b8..8a4f5fe93 100644
 --- a/compiler/rustc_middle/src/query/keys.rs
 +++ b/compiler/rustc_middle/src/query/keys.rs
 @@ -115,6 +115,12 @@ fn as_local_key(&self) -> Option<Self::LocalQueryKey> {
@@ -489,7 +503,7 @@ index d907da1b..8a4f5fe9 100644
      type Cache<V> = VecCache<Self, V, DepNodeIndex>;
  
 diff --git a/compiler/rustc_middle/src/ty/context.rs b/compiler/rustc_middle/src/ty/context.rs
-index 136a9e6c..a7d30af1 100644
+index 75aa5aaaa..64624bc22 100644
 --- a/compiler/rustc_middle/src/ty/context.rs
 +++ b/compiler/rustc_middle/src/ty/context.rs
 @@ -2822,6 +2822,8 @@ pub fn is_entrypoint(self, def_id: DefId) -> bool {
@@ -502,17 +516,17 @@ index 136a9e6c..a7d30af1 100644
          // We want to check if the panic handler was defined in this crate
          tcx.lang_items().panic_impl().is_some_and(|did| did.is_local())
 diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
-index ee972d02..b85f5777 100644
+index 03caf718a..13c09c12f 100644
 --- a/compiler/rustc_middle/src/ty/mod.rs
 +++ b/compiler/rustc_middle/src/ty/mod.rs
-@@ -51,6 +51,7 @@
- };
- use rustc_serialize::{Decodable, Encodable};
- use rustc_session::config::OptLevel;
-+use rustc_session::cstore::CrateDepKind;
- pub use rustc_session::lint::RegisteredTools;
- use rustc_span::def_id::{LocalModId, ModId};
- use rustc_span::hygiene::MacroKind;
+@@ -31,6 +31,7 @@
+ use rustc_ast::node_id::NodeMap;
+ use rustc_ast::{self as ast, NodeId};
+ pub use rustc_ast_ir::{Movability, Mutability, try_visit};
++use rustc_crate_store::CrateDepKind;
+ use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
+ use rustc_data_structures::intern::Interned;
+ use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
 @@ -183,6 +184,10 @@ pub struct ResolverGlobalCtxt {
      // correct reachability logic is implemented for macros.
      pub macro_reachable_adts: FxIndexMap<LocalDefId, FxIndexSet<LocalDefId>>,
@@ -596,8 +610,20 @@ index ee972d02..b85f5777 100644
  #[derive(Debug, StableHash)]
  pub struct ResolvedImportUse {
      pub owner: LocalDefId,
+diff --git a/compiler/rustc_resolve/Cargo.toml b/compiler/rustc_resolve/Cargo.toml
+index bafff3ec6..d4c324da7 100644
+--- a/compiler/rustc_resolve/Cargo.toml
++++ b/compiler/rustc_resolve/Cargo.toml
+@@ -14,6 +14,7 @@ rustc_arena = { path = "../rustc_arena" }
+ rustc_ast = { path = "../rustc_ast" }
+ rustc_ast_pretty = { path = "../rustc_ast_pretty" }
+ rustc_attr_parsing = { path = "../rustc_attr_parsing" }
++rustc_crate_store = { path = "../rustc_crate_store" }
+ rustc_data_structures = { path = "../rustc_data_structures" }
+ rustc_errors = { path = "../rustc_errors" }
+ rustc_expand = { path = "../rustc_expand" }
 diff --git a/compiler/rustc_resolve/src/build_reduced_graph.rs b/compiler/rustc_resolve/src/build_reduced_graph.rs
-index ad00003a..81c9d7ff 100644
+index ad00003af..81c9d7ff2 100644
 --- a/compiler/rustc_resolve/src/build_reduced_graph.rs
 +++ b/compiler/rustc_resolve/src/build_reduced_graph.rs
 @@ -1021,9 +1021,10 @@ fn build_reduced_graph_for_extern_crate(
@@ -615,7 +641,7 @@ index ad00003a..81c9d7ff 100644
          }
          .map(|module| {
 diff --git a/compiler/rustc_resolve/src/ident.rs b/compiler/rustc_resolve/src/ident.rs
-index b607803b..ce2ccbeb 100644
+index b607803bf..ce2ccbeb7 100644
 --- a/compiler/rustc_resolve/src/ident.rs
 +++ b/compiler/rustc_resolve/src/ident.rs
 @@ -735,7 +735,11 @@ fn resolve_ident_in_scope<'r>(
@@ -645,10 +671,18 @@ index b607803b..ce2ccbeb 100644
                      None => Err(Determinacy::Determined),
                  }
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index bddb6a0f..5a1fd814 100644
+index bddb6a0f1..01be580dc 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
-@@ -65,12 +65,14 @@
+@@ -43,6 +43,7 @@
+     self as ast, AngleBracketedArg, CRATE_NODE_ID, Crate, DUMMY_NODE_ID, Expr, ExprKind,
+     GenericArg, GenericArgs, Generics, NodeId, Path, attr,
+ };
++use rustc_crate_store::CrateDepKind;
+ use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet, default};
+ use rustc_data_structures::intern::Interned;
+ use rustc_data_structures::steal::Steal;
+@@ -65,9 +66,10 @@
  use rustc_middle::middle::privacy::EffectiveVisibilities;
  use rustc_middle::query::Providers;
  use rustc_middle::ty::{
@@ -662,10 +696,6 @@ index bddb6a0f..5a1fd814 100644
  };
  use rustc_middle::{bug, span_bug};
  use rustc_session::config::CrateType;
-+use rustc_session::cstore::CrateDepKind;
- use rustc_session::lint::builtin::PRIVATE_MACRO_USE;
- use rustc_span::def_id::{LocalModId, ModId};
- use rustc_span::hygiene::{ExpnId, LocalExpnId, MacroKind, SyntaxContext, Transparency};
 @@ -1372,6 +1374,9 @@ pub struct Resolver<'ra, 'tcx> {
      /// Finalized import/re-export provenance for semantic, non-macro paths.
      resolved_import_uses: Vec<ResolvedImportUse> = Vec::new(),
@@ -814,10 +844,10 @@ index bddb6a0f..5a1fd814 100644
      /// Rustdoc uses this to resolve doc link paths in a recoverable way. `PathResult<'a>`
 diff --git a/tests/ui-fulldeps/external-crate-load-requirements.rs b/tests/ui-fulldeps/external-crate-load-requirements.rs
 new file mode 100644
-index 00000000..7db79815
+index 000000000..a303fabe9
 --- /dev/null
 +++ b/tests/ui-fulldeps/external-crate-load-requirements.rs
-@@ -0,0 +1,725 @@
+@@ -0,0 +1,727 @@
 +//@ edition: 2024
 +//@ run-pass
 +//@ run-flags: {{sysroot-base}} {{target-linker}}
@@ -827,6 +857,7 @@ index 00000000..7db79815
 +
 +#![feature(rustc_private)]
 +
++extern crate rustc_crate_store;
 +extern crate rustc_driver;
 +extern crate rustc_hir;
 +extern crate rustc_interface;
@@ -844,7 +875,7 @@ index 00000000..7db79815
 +use rustc_middle::ty::{
 +    CompilerMetadataProvider, CompilerMetadataRequirement, ExternalCrateDependency, TyCtxt,
 +};
-+use rustc_session::cstore::CrateDepKind;
++use rustc_crate_store::CrateDepKind;
 +
 +fn main() -> ExitCode {
 +    rustc_driver::catch_with_exit_code(|| {
@@ -924,7 +955,7 @@ index 00000000..7db79815
 +        sysroot,
 +        linker,
 +        &tmp,
-+        "compiler_builtins",
++        "compiler_builtins_provider",
 +        "#![no_std]\n#![feature(compiler_builtins)]\n#![compiler_builtins]\n",
 +        &[],
 +    );
@@ -1068,6 +1099,7 @@ index 00000000..7db79815
 +#![no_std]
 +
 +extern crate forced;
++extern crate compiler_builtins_provider;
 +extern crate panic_runtime_provider;
 +extern crate profiler_runtime_provider;
 +extern crate global_allocator_provider;
@@ -1097,7 +1129,7 @@ index 00000000..7db79815
 +        extern_arg("weak", &weak),
 +        extern_arg("strong", &strong),
 +        extern_arg("macro_crate", &macro_crate),
-+        extern_arg("compiler_builtins", &compiler_builtins),
++        extern_arg("compiler_builtins_provider", &compiler_builtins),
 +        extern_arg("panic_runtime_provider", &panic_runtime),
 +        extern_arg("profiler_runtime_provider", &profiler_runtime),
 +        extern_arg("global_allocator_provider", &global_allocator),
@@ -1311,7 +1343,7 @@ index 00000000..7db79815
 +            ]
 +        );
 +        assert_eq!(
-+            tcx.compiler_metadata_providers(crate_num(tcx, "compiler_builtins")),
++            tcx.compiler_metadata_providers(crate_num(tcx, "compiler_builtins_provider")),
 +            [CompilerMetadataProvider::CompilerBuiltins]
 +        );
 +        assert_eq!(

@@ -1,7 +1,7 @@
-From 09501401d2015dab76ca2a0661c8f0c17f378761 Mon Sep 17 00:00:00 2001
+From 55975fa159e68c5f809521108b9c63f5aa6e4115 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Fri, 14 Aug 2026 06:45:00 +0900
-Subject: [PATCH 13/14] rustc: preserve desugared associated path arguments
+Subject: [PATCH] rustc: preserve desugared associated path arguments
 
 ---
  compiler/rustc_hir_typeck/src/expr.rs         |  1 +
@@ -13,10 +13,10 @@ Subject: [PATCH 13/14] rustc: preserve desugared associated path arguments
  create mode 100644 tests/ui-fulldeps/typeck-impl-dependencies-for-loop.rs
 
 diff --git a/compiler/rustc_hir_typeck/src/expr.rs b/compiler/rustc_hir_typeck/src/expr.rs
-index 37b8b194..a5796459 100644
+index cbbd66f64..d7ac41f63 100644
 --- a/compiler/rustc_hir_typeck/src/expr.rs
 +++ b/compiler/rustc_hir_typeck/src/expr.rs
-@@ -573,6 +573,7 @@ pub(crate) fn check_expr_path(
+@@ -572,6 +572,7 @@ pub(crate) fn check_expr_path(
              };
              if let Some(code) = code {
                  let args = self.fresh_args_for_item(expr.span, def_id);
@@ -25,7 +25,7 @@ index 37b8b194..a5796459 100644
                      code.clone()
                  });
 diff --git a/compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs b/compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs
-index 89ff35b0..5b902815 100644
+index 89ff35b00..5b9028159 100644
 --- a/compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs
 +++ b/compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs
 @@ -311,7 +311,7 @@ pub(crate) fn write_splatted_call(
@@ -39,7 +39,7 @@ index 89ff35b0..5b902815 100644
  
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-for-loop-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-for-loop-input.rs
 new file mode 100644
-index 00000000..b284c2bf
+index 000000000..b284c2bfd
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-for-loop-input.rs
 @@ -0,0 +1,3 @@
@@ -48,7 +48,7 @@ index 00000000..b284c2bf
 +}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-for-loop.rs b/tests/ui-fulldeps/typeck-impl-dependencies-for-loop.rs
 new file mode 100644
-index 00000000..fbb2370f
+index 000000000..fbb2370f7
 --- /dev/null
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies-for-loop.rs
 @@ -0,0 +1,81 @@
@@ -133,6 +133,3 @@ index 00000000..fbb2370f
 +        intravisit::walk_expr(self, expression);
 +    }
 +}
--- 
-2.55.0
-

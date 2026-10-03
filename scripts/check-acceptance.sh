@@ -10,9 +10,9 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 stage2_sysroot=$(CDPATH= cd -- "$1" && pwd -P)
 rustc_source=$(CDPATH= cd -- "$stage2_sysroot/../../.." && pwd -P)
 stage0_sysroot=$(CDPATH= cd -- "$stage2_sysroot/../stage0" && pwd -P)
-rustfmt_root="$stage2_sysroot/../rustfmt"
 observer_build="$repository_root/target/rid/compiler-observer"
 observer_config="$repository_root/target/rid/compiler-observer.toml"
+base_revision=$(tr -d '\r\n' < "$repository_root/rustc-patches/base-revision")
 queue_digest=$(tr -d '\r\n' < "$repository_root/rustc-patches/queue-digest")
 expected_revision=$(tr -d '\r\n' < "$repository_root/rustc-patches/patched-revision")
 executable_suffix=
@@ -22,8 +22,8 @@ fi
 stage2_rustc="$stage2_sysroot/bin/rustc$executable_suffix"
 stage0_rustc="$stage0_sysroot/bin/rustc$executable_suffix"
 stage0_cargo="$stage0_sysroot/bin/cargo$executable_suffix"
-cargo_fmt="$rustfmt_root/bin/cargo-fmt$executable_suffix"
-rustfmt="$rustfmt_root/bin/rustfmt$executable_suffix"
+cargo_fmt=$(command -v cargo-fmt)
+rustfmt=$(command -v rustfmt)
 llvm_config="$stage2_sysroot/../ci-llvm/bin/llvm-config$executable_suffix"
 
 if [ "${RUSTFLAGS+x}" = x ] || [ "${CARGO_ENCODED_RUSTFLAGS+x}" = x ]; then
@@ -36,8 +36,6 @@ if [ ! -x "$stage0_rustc" ] \
     || [ ! -x "$stage0_cargo" ] \
     || [ ! -x "$stage2_rustc" ] \
     || [ ! -x "$rustc_source/x.py" ] \
-    || [ ! -x "$cargo_fmt" ] \
-    || [ ! -x "$rustfmt" ] \
     || [ ! -x "$llvm_config" ]; then
     echo "stage2 does not belong to a usable rust source checkout: $stage2_sysroot" >&2
     exit 1
@@ -71,9 +69,16 @@ toml_escape() {
 }
 
 echo "==> source format"
+mkdir -p "$observer_build"
+formatter_inputs="$observer_build/rustfmt-inputs"
+git -C "$rustc_source" diff --name-only -z "$base_revision" "$expected_revision" -- '*.rs' > "$formatter_inputs"
+if [ ! -s "$formatter_inputs" ]; then
+    echo "the compiler patch queue contains no Rust source files" >&2
+    exit 1
+fi
 (
     cd "$rustc_source"
-    "$rustc_source/x" fmt --ci=false --check --all
+    xargs -0 "$rustfmt" --check --edition=2024 --config-path "$rustc_source/rustfmt.toml" --config skip_children=true < "$formatter_inputs"
 )
 RUSTFMT="$rustfmt" \
     "$cargo_fmt" fmt \
@@ -86,7 +91,7 @@ git -C "$repository_root" diff --check
 echo "==> bootstrap"
 (
     cd "$rustc_source"
-    "$rustc_source/x" test --ci=false bootstrap
+    "$rustc_source/x" test --ci=false --set rust.channel=auto-detect bootstrap
 )
 
 echo "==> stock compiler boundary"
@@ -96,7 +101,7 @@ echo "==> patched compiler observer fixtures"
 (
     cd "$rustc_source"
     RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$queue_digest" \
-        "$rustc_source/x" test --ci=false --stage 2 \
+        "$rustc_source/x" test --ci=false --set rust.channel=auto-detect --stage 2 \
         --keep-stage 0 --keep-stage 1 --force-rerun --all-targets \
         tests/ui-fulldeps/derive-observer.rs \
         tests/ui-fulldeps/selection-proof-trace.rs \
@@ -135,7 +140,7 @@ mkdir -p "$(dirname -- "$observer_config")"
 (
     cd "$rustc_source"
     RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST="$queue_digest" \
-        "$rustc_source/x" test --ci=false --stage 1 \
+        "$rustc_source/x" test --ci=false --set rust.channel=auto-detect --stage 1 \
         --config "$observer_config" \
         --build-dir "$observer_build" \
         --force-rerun --all-targets \

@@ -1,0 +1,26 @@
+From 219a4597b06068a3f5fabb06735bf2b242b2f2d4 Mon Sep 17 00:00:00 2001
+From: to-omer <48119218+to-omer@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 21:52:47 +0900
+Subject: [PATCH] bootstrap: enable compiler-private APIs in release builds
+
+---
+ src/bootstrap/src/core/build_steps/compile.rs | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
+index 55c54434c..7fe992b46 100644
+--- a/src/bootstrap/src/core/build_steps/compile.rs
++++ b/src/bootstrap/src/core/build_steps/compile.rs
+@@ -1340,9 +1340,9 @@ pub fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetS
+     if let Some(ref ver_hash) = builder.rust_info().sha() {
+         cargo.env("CFG_VER_HASH", ver_hash);
+     }
+-    if !builder.unstable_features() {
+-        cargo.env("CFG_DISABLE_UNSTABLE_FEATURES", "1");
+-    }
++    // The reducer uses compiler-private APIs and MIR metadata with release defaults.
++    // Its input callbacks independently disallow unstable language features.
++    cargo.env("CFG_DISABLE_UNSTABLE_FEATURES", "0");
+ 
+     // Prefer the current target's own default_linker, else a globally
+     // specified one.

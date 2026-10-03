@@ -1,7 +1,7 @@
-From b334aaa86cee982781f307e08a67eea4edd7593d Mon Sep 17 00:00:00 2001
+From 56b579d6956fd688b9c157a8dc7eafee16220dcd Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Thu, 13 Aug 2026 19:00:00 +0900
-Subject: [PATCH 11/11] rustc: expose finalized typeck impl dependencies
+Subject: [PATCH] rustc: expose finalized typeck impl dependencies
 
 ---
  Cargo.lock                                    |   1 +
@@ -43,7 +43,7 @@ Subject: [PATCH 11/11] rustc: expose finalized typeck impl dependencies
  .../src/traits/engine.rs                      |  80 ++-
  .../src/traits/fulfill.rs                     |  90 +++-
  .../rustc_trait_selection/src/traits/misc.rs  | 128 ++++-
- .../rustc_trait_selection/src/traits/mod.rs   | 114 +++-
+ .../rustc_trait_selection/src/traits/mod.rs   | 115 +++-
  .../src/traits/normalize.rs                   | 104 +++-
  .../src/traits/project.rs                     |  69 ++-
  .../src/traits/query/evaluate_obligation.rs   |  69 +++
@@ -70,7 +70,7 @@ Subject: [PATCH 11/11] rustc: expose finalized typeck impl dependencies
  ...k-impl-dependencies-source-free-origins.rs | 111 ++++
  .../typeck-impl-dependencies-union.rs         | 139 +++++
  tests/ui-fulldeps/typeck-impl-dependencies.rs | 353 ++++++++++++
- 66 files changed, 4573 insertions(+), 389 deletions(-)
+ 66 files changed, 4577 insertions(+), 386 deletions(-)
  create mode 100644 compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs
  create mode 100644 compiler/rustc_traits/src/typeck_impl_dependencies.rs
  create mode 100644 tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-copy-coherence-input.rs
@@ -89,10 +89,10 @@ Subject: [PATCH 11/11] rustc: expose finalized typeck impl dependencies
  create mode 100644 tests/ui-fulldeps/typeck-impl-dependencies.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 5fc3a5ac..7d0bc293 100644
+index c91d37925..10daf3480 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -4875,6 +4875,7 @@ name = "rustc_traits"
+@@ -4896,6 +4896,7 @@ name = "rustc_traits"
  version = "0.0.0"
  dependencies = [
   "rustc_data_structures",
@@ -101,7 +101,7 @@ index 5fc3a5ac..7d0bc293 100644
   "rustc_middle",
   "rustc_span",
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index dd25bd0e..ca5d524b 100644
+index 78388bf5a..2ad789683 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -114,7 +114,7 @@ index dd25bd0e..ca5d524b 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_hir_analysis/src/autoderef.rs b/compiler/rustc_hir_analysis/src/autoderef.rs
-index 20c3ac60..1e21e366 100644
+index 20c3ac603..1e21e366e 100644
 --- a/compiler/rustc_hir_analysis/src/autoderef.rs
 +++ b/compiler/rustc_hir_analysis/src/autoderef.rs
 @@ -4,7 +4,9 @@
@@ -175,7 +175,7 @@ index 20c3ac60..1e21e366 100644
      /// e.g., assuming ptr_to_Foo is the type `*const Foo`
      /// fcx.autoderef(span, ptr_to_Foo)  => [*const Foo]
 diff --git a/compiler/rustc_hir_analysis/src/check/always_applicable.rs b/compiler/rustc_hir_analysis/src/check/always_applicable.rs
-index 972c6715..5ff0084e 100644
+index 6a30ff40e..6d9277816 100644
 --- a/compiler/rustc_hir_analysis/src/check/always_applicable.rs
 +++ b/compiler/rustc_hir_analysis/src/check/always_applicable.rs
 @@ -17,6 +17,7 @@
@@ -313,7 +313,7 @@ index 972c6715..5ff0084e 100644
  }
  
 diff --git a/compiler/rustc_hir_analysis/src/check/check.rs b/compiler/rustc_hir_analysis/src/check/check.rs
-index d98125f7..1d522d99 100644
+index 01df2e199..4194c2ce1 100644
 --- a/compiler/rustc_hir_analysis/src/check/check.rs
 +++ b/compiler/rustc_hir_analysis/src/check/check.rs
 @@ -17,6 +17,7 @@
@@ -324,7 +324,7 @@ index d98125f7..1d522d99 100644
  use rustc_middle::ty::error::TypeErrorToStringExt;
  use rustc_middle::ty::layout::LayoutError;
  use rustc_middle::ty::util::Discr;
-@@ -105,10 +106,14 @@ pub fn check_custom_abi(tcx: TyCtxt<'_>, def_id: LocalDefId, fn_sig: FnSig<'_>,
+@@ -93,10 +94,14 @@ fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
      }
  }
  
@@ -341,7 +341,7 @@ index d98125f7..1d522d99 100644
  
      if let Some(scalable) = def.repr().scalable {
          check_scalable_vector(tcx, span, def_id, scalable);
-@@ -118,24 +123,43 @@ fn check_struct(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(), ErrorGuarante
+@@ -106,24 +111,43 @@ fn check_struct(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(), ErrorGuarante
  
      check_transparent(tcx, def);
      check_packed(tcx, span, def);
@@ -390,7 +390,7 @@ index d98125f7..1d522d99 100644
  ) -> bool {
      // HACK (not that bad of a hack don't worry): Some codegen tests don't even define proper
      // impls for `Copy`. Let's short-circuit here for this validity check, since a lot of them
-@@ -146,25 +170,53 @@ fn allowed_union_or_unsafe_field<'tcx>(
+@@ -134,25 +158,53 @@ fn allowed_union_or_unsafe_field<'tcx>(
      }
      // If `BikeshedGuaranteedNoDrop` is not defined in a `#[no_core]` test, fall back to `Copy`.
      // This is an underapproximation of `BikeshedGuaranteedNoDrop`,
@@ -453,7 +453,7 @@ index d98125f7..1d522d99 100644
      let def = tcx.adt_def(item_def_id);
      assert!(def.is_union());
  
-@@ -174,9 +226,11 @@ fn check_union_fields(tcx: TyCtxt<'_>, span: Span, item_def_id: LocalDefId) -> b
+@@ -162,9 +214,11 @@ fn check_union_fields(tcx: TyCtxt<'_>, span: Span, item_def_id: LocalDefId) -> b
      for field in &def.non_enum_variant().fields {
          if !allowed_union_or_unsafe_field(
              tcx,
@@ -465,7 +465,7 @@ index d98125f7..1d522d99 100644
          ) {
              let (field_span, ty_span) = match tcx.hir_get_if_local(field.did) {
                  // We are currently checking the type this field came from, so it must be local.
-@@ -246,7 +300,11 @@ fn check_static_inhabited(tcx: TyCtxt<'_>, def_id: LocalDefId) {
+@@ -234,7 +288,11 @@ fn check_static_inhabited(tcx: TyCtxt<'_>, def_id: LocalDefId) {
  
  /// Checks that an opaque type does not contain cycles and does not use `Self` or `T::Foo`
  /// projections that would result in "inheriting lifetimes".
@@ -478,7 +478,7 @@ index d98125f7..1d522d99 100644
      let hir::OpaqueTy { origin, .. } = *tcx.hir_expect_opaque_ty(def_id);
  
      // HACK(jynelson): trying to infer the type of `impl trait` breaks documenting
-@@ -254,17 +312,30 @@ fn check_opaque(tcx: TyCtxt<'_>, def_id: LocalDefId) {
+@@ -242,17 +300,30 @@ fn check_opaque(tcx: TyCtxt<'_>, def_id: LocalDefId) {
      // Since rustdoc doesn't care about the hidden type behind `impl Trait`, just don't look at it!
      // See https://github.com/rust-lang/rust/issues/75100
      if tcx.sess.opts.actually_rustdoc {
@@ -510,7 +510,7 @@ index d98125f7..1d522d99 100644
  }
  
  /// Checks that an opaque type does not contain cycles.
-@@ -304,6 +375,7 @@ fn check_opaque_meets_bounds<'tcx>(
+@@ -292,6 +363,7 @@ fn check_opaque_meets_bounds<'tcx>(
      tcx: TyCtxt<'tcx>,
      def_id: LocalDefId,
      origin: hir::OpaqueTyOrigin<LocalDefId>,
@@ -518,7 +518,7 @@ index d98125f7..1d522d99 100644
  ) -> Result<(), ErrorGuaranteed> {
      let (span, definition_def_id) =
          if let Some((span, def_id)) = best_definition_site_of_opaque(tcx, def_id, origin) {
-@@ -325,7 +397,13 @@ fn check_opaque_meets_bounds<'tcx>(
+@@ -313,7 +385,13 @@ fn check_opaque_meets_bounds<'tcx>(
      } else {
          TypingMode::analysis_in_body(tcx, defining_use_anchor)
      });
@@ -533,7 +533,7 @@ index d98125f7..1d522d99 100644
  
      let args = match origin {
          hir::OpaqueTyOrigin::FnReturn { parent, .. }
-@@ -418,7 +496,7 @@ fn check_opaque_meets_bounds<'tcx>(
+@@ -412,7 +490,7 @@ fn check_opaque_meets_bounds<'tcx>(
      let wf_tys = ocx.assumed_wf_types_and_report_errors(param_env, defining_use_anchor)?;
      ocx.resolve_regions_and_report_errors(defining_use_anchor, param_env, wf_tys)?;
  
@@ -542,7 +542,7 @@ index d98125f7..1d522d99 100644
          Ok(())
      } else if let hir::OpaqueTyOrigin::FnReturn { .. } | hir::OpaqueTyOrigin::AsyncFn { .. } =
          origin
-@@ -438,7 +516,13 @@ fn check_opaque_meets_bounds<'tcx>(
+@@ -432,7 +510,13 @@ fn check_opaque_meets_bounds<'tcx>(
              sanity_check_found_hidden_type(tcx, key, ty)?;
          }
          Ok(())
@@ -556,7 +556,7 @@ index d98125f7..1d522d99 100644
  }
  
  fn best_definition_site_of_opaque<'tcx>(
-@@ -762,7 +846,11 @@ fn check_static_linkage(tcx: TyCtxt<'_>, def_id: LocalDefId) {
+@@ -756,7 +840,11 @@ fn check_static_linkage(tcx: TyCtxt<'_>, def_id: LocalDefId) {
      }
  }
  
@@ -569,7 +569,7 @@ index d98125f7..1d522d99 100644
      let mut res = Ok(());
      let generics = tcx.generics_of(def_id);
  
-@@ -799,7 +887,11 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -793,7 +881,11 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
              check_static_linkage(tcx, def_id);
              let ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
              res = res.and(wfcheck::check_static_item(
@@ -582,7 +582,7 @@ index d98125f7..1d522d99 100644
              ));
  
              // Only `Node::Item` and `Node::ForeignItem` still have HIR based
-@@ -812,9 +904,9 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -806,9 +898,9 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
              tcx.ensure_ok().type_of(def_id);
              tcx.ensure_ok().clauses_of(def_id);
              crate::collect::check_enum_variant_types(tcx, def_id);
@@ -594,7 +594,7 @@ index d98125f7..1d522d99 100644
              // enums are fully handled by the type based check and have no hir wfcheck logic
              return res;
          }
-@@ -840,14 +932,29 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -834,14 +926,29 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
              tcx.ensure_ok().associated_items(def_id);
              if of_trait {
                  let impl_trait_header = tcx.impl_trait_header(def_id);
@@ -627,7 +627,7 @@ index d98125f7..1d522d99 100644
                  }
              }
          }
-@@ -863,17 +970,23 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -857,17 +964,23 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
                  match assoc_item.kind {
                      ty::AssocKind::Type { .. } if assoc_item.defaultness(tcx).has_value() => {
                          let trait_args = GenericArgs::identity_for_item(tcx, def_id);
@@ -653,7 +653,7 @@ index d98125f7..1d522d99 100644
              wfcheck::check_gat_where_clauses(tcx, def_id);
              // Trait aliases do not have hir checks anymore
              return res;
-@@ -883,7 +996,7 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -877,7 +990,7 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
              tcx.ensure_ok().explicit_implied_clauses_of(def_id);
              tcx.ensure_ok().explicit_super_clauses_of(def_id);
              tcx.ensure_ok().clauses_of(def_id);
@@ -662,7 +662,7 @@ index d98125f7..1d522d99 100644
              // Trait aliases do not have hir checks anymore
              return res;
          }
-@@ -904,8 +1017,8 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -898,8 +1011,8 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
              }
              check_variances_for_type_defn(tcx, def_id);
              res = res.and(match def_kind {
@@ -673,7 +673,7 @@ index d98125f7..1d522d99 100644
                  _ => unreachable!(),
              });
              // structs and enums are fully handled by the type based check and have no hir wfcheck logic
-@@ -922,7 +1035,7 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -916,7 +1029,7 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
              {
                  // Skip opaques from RPIT in traits with no default body.
              } else {
@@ -682,7 +682,7 @@ index d98125f7..1d522d99 100644
              }
  
              tcx.ensure_ok().clauses_of(def_id);
-@@ -943,28 +1056,33 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -937,28 +1050,33 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
              tcx.ensure_ok().type_of(def_id);
              tcx.ensure_ok().clauses_of(def_id);
  
@@ -736,7 +736,7 @@ index d98125f7..1d522d99 100644
  
              // Only `Node::Item` and `Node::ForeignItem` still have HIR based
              // checks. Returning early here does not miss any checks and
-@@ -978,19 +1096,29 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -972,19 +1090,29 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
              let ty = tcx.type_of(def_id).instantiate_identity();
              let span = tcx.def_span(def_id);
              if tcx.type_alias_is_checked(def_id) {
@@ -777,7 +777,7 @@ index d98125f7..1d522d99 100644
                      // HACK: We sometimes incidentally check that const arguments have the correct
                      // type as a side effect of the anon const desugaring. To make this "consistent"
                      // for users we explicitly check `ConstArgHasType` clauses so that const args
-@@ -1012,7 +1140,8 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -1006,7 +1134,8 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
                          wfcx.ocx.register_obligations(filtered_obligations)
                      }
                      Ok(())
@@ -787,7 +787,7 @@ index d98125f7..1d522d99 100644
              }
  
              // Only `Node::Item` and `Node::ForeignItem` still have HIR based
-@@ -1111,12 +1240,12 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -1105,12 +1234,12 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
              tcx.ensure_ok().type_of(def_id);
              tcx.ensure_ok().fn_sig(def_id);
              tcx.ensure_ok().clauses_of(def_id);
@@ -802,7 +802,7 @@ index d98125f7..1d522d99 100644
                  }
              }
  
-@@ -1128,12 +1257,12 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -1122,12 +1251,12 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
          DefKind::AssocConst { .. } => {
              tcx.ensure_ok().type_of(def_id);
              tcx.ensure_ok().clauses_of(def_id);
@@ -817,7 +817,7 @@ index d98125f7..1d522d99 100644
                  }
              }
  
-@@ -1144,7 +1273,7 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -1138,7 +1267,7 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
          }
          DefKind::AssocTy => {
              tcx.ensure_ok().clauses_of(def_id);
@@ -826,7 +826,7 @@ index d98125f7..1d522d99 100644
  
              let assoc_item = tcx.associated_item(def_id);
              let has_type = match assoc_item.container {
-@@ -1156,7 +1285,7 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -1150,7 +1279,7 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
                          tcx.ensure_ok().explicit_implied_const_bounds(def_id);
                          tcx.ensure_ok().const_conditions(def_id);
                      }
@@ -835,7 +835,7 @@ index d98125f7..1d522d99 100644
                      assoc_item.defaultness(tcx).has_value()
                  }
              };
-@@ -1182,8 +1311,8 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
+@@ -1176,8 +1305,8 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
      let node = tcx.hir_node_by_def_id(def_id);
      res.and(match node {
          hir::Node::Crate(_) => bug!("check_well_formed cannot be applied to the crate root"),
@@ -846,7 +846,7 @@ index d98125f7..1d522d99 100644
          _ => unreachable!("{node:?}"),
      })
  }
-@@ -1267,6 +1396,7 @@ fn check_impl_items_against_trait<'tcx>(
+@@ -1261,6 +1390,7 @@ fn check_impl_items_against_trait<'tcx>(
      tcx: TyCtxt<'tcx>,
      impl_id: LocalDefId,
      impl_trait_header: ty::ImplTraitHeader<'tcx>,
@@ -854,7 +854,7 @@ index d98125f7..1d522d99 100644
  ) {
      let trait_ref = impl_trait_header.trait_ref.instantiate_identity().skip_norm_wip();
      // If the trait reference itself is erroneous (so the compilation is going
-@@ -1307,7 +1437,13 @@ fn check_impl_items_against_trait<'tcx>(
+@@ -1301,7 +1431,13 @@ fn check_impl_items_against_trait<'tcx>(
              Err(ErrorGuaranteed { .. }) => continue,
          };
  
@@ -869,7 +869,7 @@ index d98125f7..1d522d99 100644
          if res.is_ok() {
              match ty_impl_item.kind {
                  ty::AssocKind::Fn { .. } => {
-@@ -1318,6 +1454,7 @@ fn check_impl_items_against_trait<'tcx>(
+@@ -1312,6 +1448,7 @@ fn check_impl_items_against_trait<'tcx>(
                          tcx.impl_trait_ref(ty_impl_item.container_id(tcx))
                              .instantiate_identity()
                              .skip_norm_wip(),
@@ -877,7 +877,7 @@ index d98125f7..1d522d99 100644
                      );
                  }
                  ty::AssocKind::Const { .. } => {}
-@@ -1883,9 +2020,13 @@ fn is_trivial<'tcx>(
+@@ -1877,9 +2014,13 @@ fn is_trivial<'tcx>(
  }
  
  #[allow(trivial_numeric_casts)]
@@ -893,7 +893,7 @@ index d98125f7..1d522d99 100644
  
      if def.variants().is_empty() {
          find_attr!(tcx, def_id, Repr { reprs, first_span } => {
-@@ -2264,6 +2405,13 @@ pub(super) fn check_coroutine_obligations(
+@@ -2258,6 +2399,13 @@ pub(super) fn check_coroutine_obligations(
      tcx: TyCtxt<'_>,
      def_id: LocalDefId,
  ) -> Result<(), ErrorGuaranteed> {
@@ -907,7 +907,7 @@ index d98125f7..1d522d99 100644
      debug_assert!(!tcx.is_typeck_child(def_id.to_def_id()));
  
      let typeck_results = tcx.typeck(def_id);
-@@ -2286,32 +2434,46 @@ pub(super) fn check_coroutine_obligations(
+@@ -2280,32 +2428,46 @@ pub(super) fn check_coroutine_obligations(
      // that all obligations already hold modulo regions.
      let infcx = tcx.infer_ctxt().ignoring_regions().build(mode);
  
@@ -974,7 +974,7 @@ index d98125f7..1d522d99 100644
  
  pub(super) fn check_potentially_region_dependent_goals<'tcx>(
 diff --git a/compiler/rustc_hir_analysis/src/check/compare_eii.rs b/compiler/rustc_hir_analysis/src/check/compare_eii.rs
-index aefe53f2..996b1ee8 100644
+index aefe53f2f..996b1ee8c 100644
 --- a/compiler/rustc_hir_analysis/src/check/compare_eii.rs
 +++ b/compiler/rustc_hir_analysis/src/check/compare_eii.rs
 @@ -19,10 +19,13 @@
@@ -1059,7 +1059,7 @@ index aefe53f2..996b1ee8 100644
  }
  
 diff --git a/compiler/rustc_hir_analysis/src/check/compare_impl_item.rs b/compiler/rustc_hir_analysis/src/check/compare_impl_item.rs
-index 2f65b443..bc85ff3a 100644
+index 2f65b443d..bc85ff3ad 100644
 --- a/compiler/rustc_hir_analysis/src/check/compare_impl_item.rs
 +++ b/compiler/rustc_hir_analysis/src/check/compare_impl_item.rs
 @@ -12,6 +12,9 @@
@@ -1475,7 +1475,7 @@ index 2f65b443..bc85ff3a 100644
  
  /// Install projection predicates that allow GATs to project to their own
 diff --git a/compiler/rustc_hir_analysis/src/check/compare_impl_item/refine.rs b/compiler/rustc_hir_analysis/src/check/compare_impl_item/refine.rs
-index 0b40d802..3c90a034 100644
+index 0b40d8023..3c90a0341 100644
 --- a/compiler/rustc_hir_analysis/src/check/compare_impl_item/refine.rs
 +++ b/compiler/rustc_hir_analysis/src/check/compare_impl_item/refine.rs
 @@ -14,7 +14,12 @@
@@ -1615,7 +1615,7 @@ index 0b40d802..3c90a034 100644
      // For quicker lookup, use an `IndexSet` (we don't use one earlier because
      // it's not foldable..).
 diff --git a/compiler/rustc_hir_analysis/src/check/mod.rs b/compiler/rustc_hir_analysis/src/check/mod.rs
-index e9bc2a2d..a9513563 100644
+index eac3762ef..f45dc35a4 100644
 --- a/compiler/rustc_hir_analysis/src/check/mod.rs
 +++ b/compiler/rustc_hir_analysis/src/check/mod.rs
 @@ -72,6 +72,7 @@
@@ -1625,7 +1625,7 @@ index e9bc2a2d..a9513563 100644
 +use std::cell::RefCell;
  use std::num::NonZero;
  
- pub use check::{check_abi, check_custom_abi};
+ pub use check::check_abi;
 @@ -86,6 +87,7 @@
  use rustc_infer::traits::{ObligationCause, TraitErrors};
  use rustc_middle::middle::stability::EvalResult;
@@ -1702,7 +1702,7 @@ index e9bc2a2d..a9513563 100644
  
  fn adt_async_destructor(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<ty::AsyncDestructor> {
 diff --git a/compiler/rustc_hir_analysis/src/check/wfcheck.rs b/compiler/rustc_hir_analysis/src/check/wfcheck.rs
-index 9a498837..7052a8cc 100644
+index 9a498837b..7052a8cc9 100644
 --- a/compiler/rustc_hir_analysis/src/check/wfcheck.rs
 +++ b/compiler/rustc_hir_analysis/src/check/wfcheck.rs
 @@ -20,6 +20,7 @@
@@ -2189,7 +2189,7 @@ index 9a498837..7052a8cc 100644
      // The `arbitrary_self_types` feature allows custom smart pointer
      // types to be method receivers, as identified by following the Receiver<Target=T>
 diff --git a/compiler/rustc_hir_analysis/src/coherence/builtin.rs b/compiler/rustc_hir_analysis/src/coherence/builtin.rs
-index 3b57f45e..7a989ccf 100644
+index 3b57f45e6..7a989ccf2 100644
 --- a/compiler/rustc_hir_analysis/src/coherence/builtin.rs
 +++ b/compiler/rustc_hir_analysis/src/coherence/builtin.rs
 @@ -20,11 +20,13 @@
@@ -2282,7 +2282,7 @@ index 3b57f45e..7a989ccf 100644
          Err(CopyImplementationError::InfringingFields(fields)) => {
              let span = tcx.hir_expect_item(impl_did).expect_impl().self_ty.span;
 diff --git a/compiler/rustc_hir_analysis/src/coherence/mod.rs b/compiler/rustc_hir_analysis/src/coherence/mod.rs
-index 894cd584..84b621c1 100644
+index 894cd584a..84b621c15 100644
 --- a/compiler/rustc_hir_analysis/src/coherence/mod.rs
 +++ b/compiler/rustc_hir_analysis/src/coherence/mod.rs
 @@ -10,12 +10,14 @@
@@ -2347,7 +2347,7 @@ index 894cd584..84b621c1 100644
  
      res
 diff --git a/compiler/rustc_hir_analysis/src/collect/type_of.rs b/compiler/rustc_hir_analysis/src/collect/type_of.rs
-index 3402f56b..824c0fd8 100644
+index 3402f56be..824c0fd80 100644
 --- a/compiler/rustc_hir_analysis/src/collect/type_of.rs
 +++ b/compiler/rustc_hir_analysis/src/collect/type_of.rs
 @@ -148,7 +148,9 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_
@@ -2373,7 +2373,7 @@ index 3402f56b..824c0fd8 100644
                      Err(guar) => Ty::new_error(tcx, guar),
                  }
 diff --git a/compiler/rustc_hir_typeck/src/coercion.rs b/compiler/rustc_hir_typeck/src/coercion.rs
-index 6aa88ee6..1277d6d1 100644
+index 6aa88ee62..1277d6d19 100644
 --- a/compiler/rustc_hir_typeck/src/coercion.rs
 +++ b/compiler/rustc_hir_typeck/src/coercion.rs
 @@ -35,6 +35,7 @@
@@ -2580,7 +2580,7 @@ index 6aa88ee6..1277d6d1 100644
          for expr in exprs {
              self.apply_adjustments(expr, adjustments.clone());
 diff --git a/compiler/rustc_hir_typeck/src/expr_use_visitor.rs b/compiler/rustc_hir_typeck/src/expr_use_visitor.rs
-index b2255c8d..ea3c1d22 100644
+index b2255c8d9..ea3c1d225 100644
 --- a/compiler/rustc_hir_typeck/src/expr_use_visitor.rs
 +++ b/compiler/rustc_hir_typeck/src/expr_use_visitor.rs
 @@ -169,6 +169,10 @@ pub trait TypeInformationCtxt<'tcx> {
@@ -2647,7 +2647,7 @@ index b2255c8d..ea3c1d22 100644
          } else if self.cx.type_is_use_cloned_modulo_regions(place_with_id.place.ty()) {
              self.delegate.borrow_mut().use_cloned(place_with_id, diag_expr_id);
 diff --git a/compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs b/compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs
-index 8ff4c3bf..89ff35b0 100644
+index 8ff4c3bf2..89ff35b00 100644
 --- a/compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs
 +++ b/compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs
 @@ -494,7 +494,10 @@ pub(crate) fn normalize<T>(&self, span: Span, value: Unnormalized<'tcx, T>) -> T
@@ -2663,7 +2663,7 @@ index 8ff4c3bf..89ff35b0 100644
      }
  
 diff --git a/compiler/rustc_hir_typeck/src/method/mod.rs b/compiler/rustc_hir_typeck/src/method/mod.rs
-index 4d7b98da..79cb9660 100644
+index 4d7b98da4..79cb96600 100644
 --- a/compiler/rustc_hir_typeck/src/method/mod.rs
 +++ b/compiler/rustc_hir_typeck/src/method/mod.rs
 @@ -436,7 +436,10 @@ pub(super) fn lookup_method_for_operator(
@@ -2694,7 +2694,7 @@ index 4d7b98da..79cb9660 100644
                  assert!(!pred.has_escaping_bound_vars());
                  pred
 diff --git a/compiler/rustc_hir_typeck/src/typeck_root_ctxt.rs b/compiler/rustc_hir_typeck/src/typeck_root_ctxt.rs
-index 945e14b3..2371d489 100644
+index 945e14b3d..2371d489b 100644
 --- a/compiler/rustc_hir_typeck/src/typeck_root_ctxt.rs
 +++ b/compiler/rustc_hir_typeck/src/typeck_root_ctxt.rs
 @@ -8,7 +8,10 @@
@@ -2739,7 +2739,7 @@ index 945e14b3..2371d489 100644
              deferred_sized_obligations: RefCell::new(Vec::new()),
              deferred_call_resolutions: RefCell::new(Default::default()),
 diff --git a/compiler/rustc_hir_typeck/src/upvar.rs b/compiler/rustc_hir_typeck/src/upvar.rs
-index 91771fb3..69dd46c3 100644
+index 91771fb37..69dd46c32 100644
 --- a/compiler/rustc_hir_typeck/src/upvar.rs
 +++ b/compiler/rustc_hir_typeck/src/upvar.rs
 @@ -42,7 +42,7 @@
@@ -2820,7 +2820,7 @@ index 91771fb3..69dd46c3 100644
      if let (false, UpvarCapture::ByValue) = (is_copy_type, curr_mode) {
          for i in 0..place.projections.len() {
 diff --git a/compiler/rustc_hir_typeck/src/writeback.rs b/compiler/rustc_hir_typeck/src/writeback.rs
-index c47b3272..9cf17fe4 100644
+index c47b3272a..9cf17fe41 100644
 --- a/compiler/rustc_hir_typeck/src/writeback.rs
 +++ b/compiler/rustc_hir_typeck/src/writeback.rs
 @@ -89,6 +89,9 @@ pub(crate) fn resolve_type_vars_in_body(
@@ -2834,7 +2834,7 @@ index c47b3272..9cf17fe4 100644
  
          self.tcx.arena.alloc(wbcx.typeck_results)
 diff --git a/compiler/rustc_infer/src/traits/project.rs b/compiler/rustc_infer/src/traits/project.rs
-index 9dd35b6d..aa64aa90 100644
+index 9dd35b6de..aa64aa90a 100644
 --- a/compiler/rustc_infer/src/traits/project.rs
 +++ b/compiler/rustc_infer/src/traits/project.rs
 @@ -165,6 +165,10 @@ pub fn try_start(
@@ -2849,7 +2849,7 @@ index 9dd35b6d..aa64aa90 100644
      pub fn insert_term(&mut self, key: ProjectionCacheKey<'tcx>, value: NormalizedTerm<'tcx>) {
          debug!(
 diff --git a/compiler/rustc_middle/src/hooks/mod.rs b/compiler/rustc_middle/src/hooks/mod.rs
-index c70ceef1..a22c6bc9 100644
+index c70ceef1d..a22c6bc98 100644
 --- a/compiler/rustc_middle/src/hooks/mod.rs
 +++ b/compiler/rustc_middle/src/hooks/mod.rs
 @@ -109,7 +109,7 @@ fn clone(&self) -> Self { *self }
@@ -2862,7 +2862,7 @@ index c70ceef1..a22c6bc9 100644
      /// Serializes all eligible query return values into the on-disk cache.
      hook encode_query_values(encoder: &mut CacheEncoder<'_, 'tcx>) -> ();
 diff --git a/compiler/rustc_middle/src/mir/mod.rs b/compiler/rustc_middle/src/mir/mod.rs
-index e6437327..68ccd7b8 100644
+index e6437327e..68ccd7b8c 100644
 --- a/compiler/rustc_middle/src/mir/mod.rs
 +++ b/compiler/rustc_middle/src/mir/mod.rs
 @@ -29,6 +29,7 @@
@@ -2894,7 +2894,7 @@ index e6437327..68ccd7b8 100644
  pub type LocalDecls<'tcx> = IndexSlice<Local, LocalDecl<'tcx>>;
  
 diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
-index 02200c67..8548a583 100644
+index 0a807f54d..dd1944954 100644
 --- a/compiler/rustc_middle/src/queries.rs
 +++ b/compiler/rustc_middle/src/queries.rs
 @@ -102,17 +102,20 @@
@@ -2903,12 +2903,12 @@ index 02200c67..8548a583 100644
      CanonicalAliasGoal, CanonicalDropckOutlivesGoal, CanonicalImpliedOutlivesBoundsGoal,
 -    CanonicalMethodAutoderefStepsGoal, CanonicalPredicateGoal, CanonicalTypeOpAscribeUserTypeGoal,
 -    CanonicalTypeOpNormalizeGoal, CanonicalTypeOpProvePredicateGoal, DropckConstraint,
--    DropckOutlivesResult, MethodAutoderefStepsResult, NoSolution, NormalizationResult,
--    OutlivesBound,
+-    DropckOutlivesResult, MethodAutoderefStepsResult, MirBorrowckImpliedOutlivesBounds, NoSolution,
+-    NormalizationResult, OutlivesBound,
 +    CanonicalMethodAutoderefStepsGoal, CanonicalNormalizationImplDependencies,
 +    CanonicalPredicateGoal, CanonicalTypeOpAscribeUserTypeGoal, CanonicalTypeOpNormalizeGoal,
 +    CanonicalTypeOpProvePredicateGoal, DropckConstraint, DropckOutlivesResult,
-+    MethodAutoderefStepsResult, NoSolution, NormalizationResult,
++    MethodAutoderefStepsResult, MirBorrowckImpliedOutlivesBounds, NoSolution, NormalizationResult,
 +    NormalizedGenericArgImplDependencies, OutlivesBound,
  };
  use crate::traits::{
@@ -3060,7 +3060,7 @@ index 02200c67..8548a583 100644
      query implied_outlives_bounds(
          key: (CanonicalImpliedOutlivesBoundsGoal<'tcx>, bool)
      ) -> Result<
-@@ -2572,6 +2636,13 @@
+@@ -2581,6 +2645,13 @@
          desc { "evaluating trait selection obligation `{}`", goal.canonical.value.value }
      }
  
@@ -3074,7 +3074,7 @@ index 02200c67..8548a583 100644
      /// Do not call this query directly: part of the `Eq` type-op
      query type_op_ascribe_user_type(
          goal: CanonicalTypeOpAscribeUserTypeGoal<'tcx>
-@@ -2751,6 +2822,13 @@
+@@ -2760,6 +2831,13 @@
          desc { "checking assoc item `{}` is compatible with trait definition", tcx.def_path_str(key) }
      }
  
@@ -3089,7 +3089,7 @@ index 02200c67..8548a583 100644
          desc { "deducing parameter attributes for {}", tcx.def_path_str(def_id) }
          separate_provide_extern
 diff --git a/compiler/rustc_middle/src/query/erase.rs b/compiler/rustc_middle/src/query/erase.rs
-index febbf075..2717e96f 100644
+index 2f7e3f319..98fa90c48 100644
 --- a/compiler/rustc_middle/src/query/erase.rs
 +++ b/compiler/rustc_middle/src/query/erase.rs
 @@ -207,6 +207,7 @@ impl Erasable for $ty {
@@ -3101,7 +3101,7 @@ index febbf075..2717e96f 100644
      Result<&'_ traits::CodegenProjectionProof<'_>, traits::CodegenProjectionProofError>,
      Result<&'_ traits::CodegenSelectionProof<'_>, traits::CodegenSelectionProofError>,
 diff --git a/compiler/rustc_middle/src/query/keys.rs b/compiler/rustc_middle/src/query/keys.rs
-index 2e8e0ecc..d907da1b 100644
+index 2e8e0ecc0..d907da1b8 100644
 --- a/compiler/rustc_middle/src/query/keys.rs
 +++ b/compiler/rustc_middle/src/query/keys.rs
 @@ -324,6 +324,12 @@ fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
@@ -3131,7 +3131,7 @@ index 2e8e0ecc..d907da1b 100644
      fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
          DUMMY_SP
 diff --git a/compiler/rustc_middle/src/traits/mod.rs b/compiler/rustc_middle/src/traits/mod.rs
-index 159483bb..704d9d22 100644
+index b62295ab2..6c890eceb 100644
 --- a/compiler/rustc_middle/src/traits/mod.rs
 +++ b/compiler/rustc_middle/src/traits/mod.rs
 @@ -16,7 +16,7 @@
@@ -3198,7 +3198,7 @@ index 159483bb..704d9d22 100644
 +    pub dependencies: Result<&'tcx [TypeckImplDependency], TypeckImplDependenciesError>,
 +}
 diff --git a/compiler/rustc_middle/src/traits/query.rs b/compiler/rustc_middle/src/traits/query.rs
-index 85d88b98..15c15485 100644
+index f2a2c6c3f..be21142ab 100644
 --- a/compiler/rustc_middle/src/traits/query.rs
 +++ b/compiler/rustc_middle/src/traits/query.rs
 @@ -10,8 +10,8 @@
@@ -3232,7 +3232,7 @@ index 85d88b98..15c15485 100644
      CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, type_op::AscribeUserType<'tcx>>>;
  
 diff --git a/compiler/rustc_middle/src/ty/typeck_results.rs b/compiler/rustc_middle/src/ty/typeck_results.rs
-index 1d55f197..a354ffa5 100644
+index 1d55f197d..a354ffa52 100644
 --- a/compiler/rustc_middle/src/ty/typeck_results.rs
 +++ b/compiler/rustc_middle/src/ty/typeck_results.rs
 @@ -21,7 +21,7 @@
@@ -3263,7 +3263,7 @@ index 1d55f197..a354ffa5 100644
              closure_min_captures: Default::default(),
              closure_fake_reads: Default::default(),
 diff --git a/compiler/rustc_mir_build/src/builder/expr/as_rvalue.rs b/compiler/rustc_mir_build/src/builder/expr/as_rvalue.rs
-index ea484bd0..660f91d0 100644
+index ea484bd05..660f91d09 100644
 --- a/compiler/rustc_mir_build/src/builder/expr/as_rvalue.rs
 +++ b/compiler/rustc_mir_build/src/builder/expr/as_rvalue.rs
 @@ -293,7 +293,7 @@ pub(crate) fn as_rvalue(
@@ -3276,10 +3276,10 @@ index ea484bd0..660f91d0 100644
                              _ => {
                                  // Turn mutable borrow captures into unique
 diff --git a/compiler/rustc_mir_build/src/builder/expr/into.rs b/compiler/rustc_mir_build/src/builder/expr/into.rs
-index 977c126e..c40e71cb 100644
+index 13a64346c..3ecd4dc85 100644
 --- a/compiler/rustc_mir_build/src/builder/expr/into.rs
 +++ b/compiler/rustc_mir_build/src/builder/expr/into.rs
-@@ -374,14 +374,13 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
+@@ -371,14 +371,13 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
                                              )
                                              .into_block();
  
@@ -3297,7 +3297,7 @@ index 977c126e..c40e71cb 100644
                                          );
                                          block.unit()
                                      },
-@@ -519,7 +518,7 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
+@@ -516,7 +515,7 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
                  let place = unpack!(block = this.as_place(block, expr));
                  let ty = place.ty(&this.local_decls, this.tcx).ty;
  
@@ -3306,7 +3306,7 @@ index 977c126e..c40e71cb 100644
                      this.cfg.push_assign(
                          block,
                          source_info,
-@@ -647,7 +646,10 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
+@@ -644,7 +643,10 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
                                  None => {
                                      let place =
                                          place_builder.clone_project(PlaceElem::Field(n, *ty));
@@ -3318,7 +3318,7 @@ index 977c126e..c40e71cb 100644
                                  }
                              })
                              .collect()
-@@ -844,7 +846,8 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
+@@ -841,7 +843,8 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
                  debug_assert!(Category::of(&expr.kind) == Some(Category::Place));
  
                  let place = unpack!(block = this.as_place(block, expr_id));
@@ -3328,7 +3328,7 @@ index 977c126e..c40e71cb 100644
                  this.cfg.push_assign(block, source_info, destination, rvalue);
                  block.unit()
              }
-@@ -859,7 +862,8 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
+@@ -856,7 +859,8 @@ fn is_supported_loop_match_type(ty: Ty<'_>) -> bool {
                  }
  
                  let place = unpack!(block = this.as_place(block, expr_id));
@@ -3339,10 +3339,10 @@ index 977c126e..c40e71cb 100644
                  block.unit()
              }
 diff --git a/compiler/rustc_mir_build/src/builder/matches/mod.rs b/compiler/rustc_mir_build/src/builder/matches/mod.rs
-index 22da174c..10c33002 100644
+index ddeb9e084..7837e1a56 100644
 --- a/compiler/rustc_mir_build/src/builder/matches/mod.rs
 +++ b/compiler/rustc_mir_build/src/builder/matches/mod.rs
-@@ -2731,9 +2731,10 @@ fn bind_matched_candidate_for_arm_body<'b>(
+@@ -2728,9 +2728,10 @@ fn bind_matched_candidate_for_arm_body<'b>(
                  self.schedule_drop_for_binding(binding.var_id, binding.span, OutsideGuard);
              }
              let rvalue = match binding.binding_mode.0 {
@@ -3357,7 +3357,7 @@ index 22da174c..10c33002 100644
                      let rvalue =
                          Rvalue::Ref(re_erased, util::ref_pat_borrow_kind(mutbl), binding.source);
 diff --git a/compiler/rustc_mir_build/src/builder/misc.rs b/compiler/rustc_mir_build/src/builder/misc.rs
-index 6e8e74fd..3cd52e14 100644
+index 6e8e74fd4..3cd52e14e 100644
 --- a/compiler/rustc_mir_build/src/builder/misc.rs
 +++ b/compiler/rustc_mir_build/src/builder/misc.rs
 @@ -5,6 +5,7 @@
@@ -3399,7 +3399,7 @@ index 6e8e74fd..3cd52e14 100644
      }
  }
 diff --git a/compiler/rustc_mir_build/src/builder/mod.rs b/compiler/rustc_mir_build/src/builder/mod.rs
-index 5efe62c3..ec94e528 100644
+index 5efe62c3e..ec94e5284 100644
 --- a/compiler/rustc_mir_build/src/builder/mod.rs
 +++ b/compiler/rustc_mir_build/src/builder/mod.rs
 @@ -37,6 +37,7 @@
@@ -3572,7 +3572,7 @@ index 5efe62c3..ec94e528 100644
  
      fn insert_upvar_arg(&mut self) {
 diff --git a/compiler/rustc_mir_transform/src/lib.rs b/compiler/rustc_mir_transform/src/lib.rs
-index d2dd77c9..87673469 100644
+index d2dd77c98..876734698 100644
 --- a/compiler/rustc_mir_transform/src/lib.rs
 +++ b/compiler/rustc_mir_transform/src/lib.rs
 @@ -21,9 +21,10 @@
@@ -3650,7 +3650,7 @@ index d2dd77c9..87673469 100644
  
  /// Compute the main MIR body and the list of MIR bodies of the promoteds.
 diff --git a/compiler/rustc_trait_selection/src/infer.rs b/compiler/rustc_trait_selection/src/infer.rs
-index f0fb4452..2a9dc0a1 100644
+index f0fb44523..2a9dc0a1f 100644
 --- a/compiler/rustc_trait_selection/src/infer.rs
 +++ b/compiler/rustc_trait_selection/src/infer.rs
 @@ -10,6 +10,7 @@
@@ -3686,7 +3686,7 @@ index f0fb4452..2a9dc0a1 100644
          let ty = self.resolve_vars_if_possible(ty);
          let clone_def_id = self.tcx.require_lang_item(LangItem::Clone, DUMMY_SP);
 diff --git a/compiler/rustc_trait_selection/src/traits/engine.rs b/compiler/rustc_trait_selection/src/traits/engine.rs
-index b891b5a8..45290990 100644
+index b891b5a8d..452909902 100644
 --- a/compiler/rustc_trait_selection/src/traits/engine.rs
 +++ b/compiler/rustc_trait_selection/src/traits/engine.rs
 @@ -18,6 +18,7 @@
@@ -3828,10 +3828,10 @@ index b891b5a8..45290990 100644
  
      pub fn structurally_normalize_ty(
 diff --git a/compiler/rustc_trait_selection/src/traits/fulfill.rs b/compiler/rustc_trait_selection/src/traits/fulfill.rs
-index dde9f370..a1d6529d 100644
+index 62f075cff..f2ffce627 100644
 --- a/compiler/rustc_trait_selection/src/traits/fulfill.rs
 +++ b/compiler/rustc_trait_selection/src/traits/fulfill.rs
-@@ -25,6 +25,7 @@
+@@ -26,6 +26,7 @@
  use super::effects::{self, HostEffectObligation};
  use super::project::{self, ProjectAndUnifyResult};
  use super::select::SelectionContext;
@@ -3839,7 +3839,7 @@ index dde9f370..a1d6529d 100644
  use super::{
      EvaluationResult, FulfillmentError, FulfillmentErrorCode, PredicateObligation,
      ScrubbedTraitError, const_evaluatable, wf,
-@@ -72,6 +73,8 @@ pub struct FulfillmentContext<'tcx, E: 'tcx> {
+@@ -73,6 +74,8 @@ pub struct FulfillmentContext<'tcx, E: 'tcx> {
  
      codegen_proof_recorder: Option<SharedCodegenProofRecorder<'tcx>>,
  
@@ -3848,7 +3848,7 @@ index dde9f370..a1d6529d 100644
      _errors: PhantomData<E>,
  }
  
-@@ -104,6 +107,7 @@ pub(super) fn new(infcx: &InferCtxt<'tcx>) -> FulfillmentContext<'tcx, E> {
+@@ -105,6 +108,7 @@ pub(super) fn new(infcx: &InferCtxt<'tcx>) -> FulfillmentContext<'tcx, E> {
              predicates: ObligationForest::new(),
              usable_in_snapshot: infcx.num_open_snapshots(),
              codegen_proof_recorder: None,
@@ -3856,7 +3856,7 @@ index dde9f370..a1d6529d 100644
              _errors: PhantomData,
          }
      }
-@@ -117,6 +121,15 @@ pub(crate) fn new_with_codegen_proof(
+@@ -118,6 +122,15 @@ pub(crate) fn new_with_codegen_proof(
          context
      }
  
@@ -3872,7 +3872,7 @@ index dde9f370..a1d6529d 100644
      /// Attempts to select obligations using `selcx`.
      fn select(&mut self, selcx: SelectionContext<'_, 'tcx>) -> TraitErrors<E> {
          let span = debug_span!("select", obligation_forest_size = ?self.predicates.len());
-@@ -165,6 +178,10 @@ fn register_predicate_obligation(
+@@ -166,6 +179,10 @@ fn register_predicate_obligation(
          debug_assert!(!obligation.param_env.has_non_region_infer());
          obligation.predicate = infcx.resolve_vars_if_possible(obligation.predicate);
  
@@ -3883,7 +3883,7 @@ index dde9f370..a1d6529d 100644
          debug!(?obligation, "register_predicate_obligation");
  
          self.predicates
-@@ -181,11 +198,15 @@ fn collect_remaining_errors(&mut self, infcx: &InferCtxt<'tcx>) -> TraitErrors<E
+@@ -182,11 +199,15 @@ fn collect_remaining_errors(&mut self, infcx: &InferCtxt<'tcx>) -> TraitErrors<E
      }
  
      fn try_evaluate_obligations(&mut self, infcx: &InferCtxt<'tcx>) -> TraitErrors<E> {
@@ -3902,7 +3902,7 @@ index dde9f370..a1d6529d 100644
          };
          self.select(selcx)
      }
-@@ -320,6 +341,17 @@ fn mk_pending<'tcx>(
+@@ -321,6 +342,17 @@ fn mk_pending<'tcx>(
          .collect()
  }
  
@@ -3920,7 +3920,7 @@ index dde9f370..a1d6529d 100644
  impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
      type Obligation = PendingPredicateObligation<'tcx>;
      type Error = FulfillmentErrorCode<'tcx>;
-@@ -408,6 +440,25 @@ fn process_obligation(
+@@ -409,6 +441,25 @@ fn process_obligation(
          &mut self,
          pending_obligation: &mut PendingPredicateObligation<'tcx>,
      ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
@@ -3946,7 +3946,7 @@ index dde9f370..a1d6529d 100644
          pending_obligation.stalled_on.clear();
  
          let obligation = &mut pending_obligation.obligation;
-@@ -426,7 +477,7 @@ fn process_obligation(
+@@ -427,7 +478,7 @@ fn process_obligation(
              && !infcx.disable_trait_solver_fast_paths()
              && sizedness_fast_path(infcx.tcx, obligation.predicate, obligation.param_env)
          {
@@ -3955,7 +3955,7 @@ index dde9f370..a1d6529d 100644
          }
  
          if obligation.predicate.has_aliases() {
-@@ -441,11 +492,13 @@ fn process_obligation(
+@@ -442,11 +493,13 @@ fn process_obligation(
              );
              if predicate != obligation.predicate {
                  obligations.push(obligation.with(infcx.tcx, predicate));
@@ -3971,7 +3971,7 @@ index dde9f370..a1d6529d 100644
              None => match binder.skip_binder() {
                  // Evaluation will discard candidates using the leak check.
                  // This means we need to pass it the bound version of our
-@@ -577,10 +630,12 @@ fn process_obligation(
+@@ -578,10 +631,12 @@ fn process_obligation(
                              };
                              pending_obligation.stalled_on.clear();
                              pending_obligation.stalled_on.extend([var]);
@@ -3986,7 +3986,7 @@ index dde9f370..a1d6529d 100644
                          }
                          ty::ConstKind::Value(cv) => cv.ty,
                          ty::ConstKind::Alias(_, alias_const) => {
-@@ -590,10 +645,10 @@ fn process_obligation(
+@@ -591,10 +646,10 @@ fn process_obligation(
                          // `<lhs_ty as Add<rhs_ty>>::Output` when this is an `Expr` representing
                          // `lhs + rhs`.
                          ty::ConstKind::Expr(_) => {
@@ -3999,7 +3999,7 @@ index dde9f370..a1d6529d 100644
                          }
                          ty::ConstKind::Placeholder(_) => {
                              bug!("placeholder const {:?} in old solver", ct)
-@@ -635,7 +690,7 @@ fn process_obligation(
+@@ -636,7 +691,7 @@ fn process_obligation(
  
                  ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(term)) => {
                      if term.is_trivially_wf(self.selcx.tcx()) {
@@ -4034,7 +4034,7 @@ index dde9f370..a1d6529d 100644
                                  }
                              }
                          }
-@@ -871,7 +926,8 @@ fn process_obligation(
+@@ -868,7 +923,8 @@ fn process_obligation(
                      }
                  }
              },
@@ -4044,7 +4044,7 @@ index dde9f370..a1d6529d 100644
      }
  
      #[inline(never)]
-@@ -974,6 +1030,7 @@ fn process_trait_obligation(
+@@ -971,6 +1027,7 @@ fn process_trait_obligation(
      ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
          let infcx = self.selcx.infcx;
          if self.selcx.codegen_proof_recorder().is_none()
@@ -4052,7 +4052,7 @@ index dde9f370..a1d6529d 100644
              && obligation.predicate.is_global()
              && !self.selcx.typing_mode().is_coherence()
          {
-@@ -1031,6 +1088,7 @@ fn process_projection_obligation(
+@@ -1028,6 +1085,7 @@ fn process_projection_obligation(
          let tcx = self.selcx.tcx();
          let infcx = self.selcx.infcx;
          if self.selcx.codegen_proof_recorder().is_none()
@@ -4061,7 +4061,7 @@ index dde9f370..a1d6529d 100644
              && !self.selcx.typing_mode().is_coherence()
          {
 diff --git a/compiler/rustc_trait_selection/src/traits/misc.rs b/compiler/rustc_trait_selection/src/traits/misc.rs
-index 97f6e2ed..5e77637f 100644
+index 97f6e2ed0..5e77637f2 100644
 --- a/compiler/rustc_trait_selection/src/traits/misc.rs
 +++ b/compiler/rustc_trait_selection/src/traits/misc.rs
 @@ -6,12 +6,15 @@
@@ -4284,10 +4284,10 @@ index 97f6e2ed..5e77637f 100644
 +    (result, dependencies)
  }
 diff --git a/compiler/rustc_trait_selection/src/traits/mod.rs b/compiler/rustc_trait_selection/src/traits/mod.rs
-index bc929f36..d1b1c957 100644
+index c58bb794f..da5016091 100644
 --- a/compiler/rustc_trait_selection/src/traits/mod.rs
 +++ b/compiler/rustc_trait_selection/src/traits/mod.rs
-@@ -19,6 +19,7 @@
+@@ -20,6 +20,7 @@
  pub mod select;
  pub mod specialize;
  mod structural_normalize;
@@ -4295,7 +4295,7 @@ index bc929f36..d1b1c957 100644
  pub mod util;
  pub mod vtable;
  pub mod wf;
-@@ -64,6 +65,9 @@
+@@ -65,6 +66,9 @@
      OverlapError, specialization_graph, translate_args, translate_args_with_cause,
  };
  pub use self::structural_normalize::StructurallyNormalizeExt;
@@ -4305,7 +4305,7 @@ index bc929f36..d1b1c957 100644
  pub use self::util::{
      BoundVarReplacer, PlaceholderReplacer, elaborate, expand_trait_aliases, impl_item_is_final,
      sizedness_fast_path, supertrait_def_ids, supertraits, transitive_bounds_that_define_assoc_item,
-@@ -206,6 +210,49 @@ pub fn type_known_to_meet_bound_modulo_regions<'tcx>(
+@@ -207,6 +211,49 @@ pub fn type_known_to_meet_bound_modulo_regions<'tcx>(
      pred_known_to_hold_modulo_regions(infcx, param_env, trait_ref)
  }
  
@@ -4355,22 +4355,19 @@ index bc929f36..d1b1c957 100644
  /// FIXME(@lcnr): this function doesn't seem right and shouldn't exist?
  ///
  /// Ping me on zulip if you want to use this method and need help with finding
-@@ -274,7 +321,11 @@ fn do_normalize_clauses<'tcx>(
+@@ -327,7 +374,8 @@ fn do_normalize_clauses<'tcx>(
      cause: ObligationCause<'tcx>,
      elaborated_env: ty::ParamEnv<'tcx>,
      clauses: Vec<ty::Clause<'tcx>>,
--) -> Result<Vec<ty::Clause<'tcx>>, ErrorGuaranteed> {
+-) -> Vec<ty::Clause<'tcx>> {
 +    observe_impl_dependencies: bool,
-+) -> Result<
-+    (Vec<ty::Clause<'tcx>>, Result<Vec<rustc_middle::traits::TypeckImplDependency>, ()>),
-+    ErrorGuaranteed,
-+> {
++) -> (Vec<ty::Clause<'tcx>>, Result<Vec<rustc_middle::traits::TypeckImplDependency>, ()>) {
      // FIXME. We should really... do something with these region
      // obligations. But this call just continues the older
      // behavior (i.e., doesn't cause any new bugs), and it would
-@@ -290,7 +341,14 @@ fn do_normalize_clauses<'tcx>(
+@@ -342,7 +390,14 @@ fn do_normalize_clauses<'tcx>(
+     // them here too, and we will remove this function when
      // we move over to lazy normalization *anyway*.
-     let span = cause.span;
      let infcx = tcx.infer_ctxt().ignoring_regions().build(TypingMode::non_body_analysis());
 -    let ocx = ObligationCtxt::new_with_diagnostics(&infcx);
 +    let recorder = observe_impl_dependencies
@@ -4384,21 +4381,38 @@ index bc929f36..d1b1c957 100644
      // FIXME: `elaborated_env` is not really rigid. We do this to be
      // consistent with the old solver.
      let elaborated_env = if tcx.next_trait_solver_globally()
-@@ -347,7 +405,12 @@ fn do_normalize_clauses<'tcx>(
-     // this more frequently as we entirely ignore outlives clauses with the old solver.
-     let _errors = infcx.resolve_regions(cause.body_def_id, elaborated_env, []);
-     match infcx.fully_resolve(clauses) {
--        Ok(clauses) => Ok(clauses),
+@@ -403,7 +458,12 @@ fn do_normalize_clauses<'tcx>(
+     let normalized_env = ty::ParamEnv::new(tcx.mk_clauses(&clauses));
+     let _errors = infcx.resolve_regions(cause.body_def_id, normalized_env, []);
+     match infcx.fully_resolve(clauses.clone()) {
+-        Ok(clauses) => clauses,
 +        Ok(clauses) => {
 +            let dependencies = recorder
 +                .map(|recorder| recorder.borrow().finish(&infcx))
 +                .unwrap_or_else(|| Ok(Vec::new()));
-+            Ok((clauses, dependencies))
++            (clauses, dependencies)
 +        }
          Err(fixup_err) => {
-             // If we encounter a fixup error, it means that some type
-             // variable wound up unconstrained. That can happen for
-@@ -370,6 +433,23 @@ pub fn normalize_param_env_or_error<'tcx>(
+             // The first folder only replaces infers from normalization failure. We might not have
+             // normalization failure and have unconstrained ty/const vars from ill-formed impls.
+@@ -420,7 +480,15 @@ fn do_normalize_clauses<'tcx>(
+             //
+             // We still need to replace regions because `fully_resolve` eagerly returns `Err` if
+             // it encounters unconstrained ty/const var. Thus region vars might not get replaced.
+-            replace_infer_and_non_rigid_alias_with_error(&infcx, clauses, guar, ReplaceRegions::Yes)
++            (
++                replace_infer_and_non_rigid_alias_with_error(
++                    &infcx,
++                    clauses,
++                    guar,
++                    ReplaceRegions::Yes,
++                ),
++                Err(()),
++            )
+         }
+     }
+ }
+@@ -433,6 +501,23 @@ pub fn normalize_param_env_or_error<'tcx>(
      unnormalized_env: ty::ParamEnv<'tcx>,
      cause: ObligationCause<'tcx>,
  ) -> ty::ParamEnv<'tcx> {
@@ -4422,7 +4436,7 @@ index bc929f36..d1b1c957 100644
      // I'm not wild about reporting errors here; I'd prefer to
      // have the errors get reported at a defined place (e.g.,
      // during typeck). Instead I have all parameter
-@@ -461,7 +541,7 @@ fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
+@@ -524,7 +609,7 @@ fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
  
      let elaborated_env = ty::ParamEnv::new(tcx.mk_clauses(&clauses));
      if !elaborated_env.has_aliases() {
@@ -4431,40 +4445,28 @@ index bc929f36..d1b1c957 100644
      }
  
      // HACK: we are trying to normalize the param-env inside *itself*. The problem is that
-@@ -492,12 +572,16 @@ fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
+@@ -555,7 +640,13 @@ fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
          "normalize_param_env_or_error: clauses=(non-outlives={:?}, outlives={:?})",
          clauses, outlives_clauses
      );
--    let Ok(non_outlives_clauses) =
--        do_normalize_clauses(tcx, cause.clone(), elaborated_env, clauses)
--    else {
-+    let Ok((non_outlives_clauses, mut dependencies)) = do_normalize_clauses(
+-    let non_outlives_clauses = do_normalize_clauses(tcx, cause.clone(), elaborated_env, clauses);
++    let (non_outlives_clauses, mut dependencies) = do_normalize_clauses(
 +        tcx,
 +        cause.clone(),
 +        elaborated_env,
 +        clauses,
 +        observe_impl_dependencies,
-+    ) else {
-         // An unnormalized env is better than nothing.
-         debug!("normalize_param_env_or_error: errored resolving non-outlives clauses");
--        return elaborated_env;
-+        return (elaborated_env, Err(()));
-     };
++    );
  
      debug!("normalize_param_env_or_error: non-outlives clauses={:?}", non_outlives_clauses);
-@@ -507,18 +591,26 @@ fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
+ 
+@@ -564,13 +655,21 @@ fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
      // clauses here anyway. Keeping them here anyway because it seems safer.
      let outlives_env = non_outlives_clauses.iter().chain(&outlives_clauses).cloned();
      let outlives_env = ty::ParamEnv::new(tcx.mk_clauses_from_iter(outlives_env));
--    let Ok(outlives_clauses) = do_normalize_clauses(tcx, cause, outlives_env, outlives_clauses)
-+    let Ok((outlives_clauses, outlives_dependencies)) =
-+        do_normalize_clauses(tcx, cause, outlives_env, outlives_clauses, observe_impl_dependencies)
-     else {
-         // An unnormalized env is better than nothing.
-         debug!("normalize_param_env_or_error: errored resolving outlives clauses");
--        return elaborated_env;
-+        return (elaborated_env, Err(()));
-     };
+-    let outlives_clauses = do_normalize_clauses(tcx, cause, outlives_env, outlives_clauses);
++    let (outlives_clauses, outlives_dependencies) =
++        do_normalize_clauses(tcx, cause, outlives_env, outlives_clauses, observe_impl_dependencies);
      debug!("normalize_param_env_or_error: outlives clauses={:?}", outlives_clauses);
  
      let mut clauses = non_outlives_clauses;
@@ -4483,10 +4485,10 @@ index bc929f36..d1b1c957 100644
  
  #[derive(Debug)]
 diff --git a/compiler/rustc_trait_selection/src/traits/normalize.rs b/compiler/rustc_trait_selection/src/traits/normalize.rs
-index 74908ea5..65115b62 100644
+index f00b300c7..7a2f1eaf5 100644
 --- a/compiler/rustc_trait_selection/src/traits/normalize.rs
 +++ b/compiler/rustc_trait_selection/src/traits/normalize.rs
-@@ -17,7 +17,10 @@
+@@ -16,7 +16,10 @@
  use thin_vec::ThinVec;
  use tracing::{debug, instrument};
  
@@ -4498,7 +4500,7 @@ index 74908ea5..65115b62 100644
  use crate::error_reporting::InferCtxtErrorExt;
  use crate::error_reporting::traits::OverflowCause;
  use crate::solve::NextSolverError;
-@@ -43,6 +46,24 @@ fn normalize<T: TypeFoldable<TyCtxt<'tcx>>>(
+@@ -42,6 +45,24 @@ fn normalize<T: TypeFoldable<TyCtxt<'tcx>>>(
          }
      }
  
@@ -4523,7 +4525,7 @@ index 74908ea5..65115b62 100644
      /// Deeply normalizes `value`, replacing all aliases which can by normalized in
      /// the current environment. In the new solver this errors in case normalization
      /// fails or is ambiguous.
-@@ -64,31 +85,62 @@ fn deeply_normalize<T, E>(
+@@ -63,31 +84,62 @@ fn deeply_normalize<T, E>(
          T: TypeFoldable<TyCtxt<'tcx>>,
          E: FromSolverError<'tcx, NextSolverError<'tcx>>,
      {
@@ -4612,10 +4614,10 @@ index 74908ea5..65115b62 100644
          }
      }
 diff --git a/compiler/rustc_trait_selection/src/traits/project.rs b/compiler/rustc_trait_selection/src/traits/project.rs
-index 5a9f52f0..883ce0d5 100644
+index a7c58ce71..25250611d 100644
 --- a/compiler/rustc_trait_selection/src/traits/project.rs
 +++ b/compiler/rustc_trait_selection/src/traits/project.rs
-@@ -316,6 +316,13 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
+@@ -315,6 +315,13 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
      if let Some(recorder) = selcx.codegen_proof_recorder() {
          recorder.borrow_mut().observe_projection(param_env, projection_term);
      }
@@ -4629,7 +4631,7 @@ index 5a9f52f0..883ce0d5 100644
      let cache_key = ProjectionCacheKey::new(projection_term, param_env);
  
      // FIXME(#20304) For now, I am caching here, which is good, but it
-@@ -325,7 +332,7 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
+@@ -324,7 +331,7 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
      // would not benefit from caching when proving `T: Trait<U=Foo>`
      // bounds. It might be the case that we want two distinct caches,
      // or else another kind of cache entry.
@@ -4638,7 +4640,7 @@ index 5a9f52f0..883ce0d5 100644
      let unobserved_terminal_cache_entry =
          matches!(
              &cache_entry,
-@@ -339,6 +346,23 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
+@@ -338,6 +345,23 @@ pub(super) fn opt_normalize_projection_term<'a, 'b, 'tcx>(
      if unobserved_terminal_cache_entry && let Some(recorder) = selcx.codegen_proof_recorder() {
          recorder.borrow_mut().mark_incomplete();
      }
@@ -4662,7 +4664,7 @@ index 5a9f52f0..883ce0d5 100644
      match cache_entry {
          Ok(()) => debug!("no cache"),
          Err(ProjectionCacheEntry::Ambiguous) => {
-@@ -727,6 +751,10 @@ fn project<'cx, 'tcx>(
+@@ -726,6 +750,10 @@ fn project<'cx, 'tcx>(
      if let Some(recorder) = &proof_recorder {
          recorder.borrow_mut().mute();
      }
@@ -4673,7 +4675,7 @@ index 5a9f52f0..883ce0d5 100644
  
      // Make sure that the following procedures are kept in order. ParamEnv
      // needs to be first because it has highest priority, and Select checks
-@@ -757,6 +785,10 @@ fn project<'cx, 'tcx>(
+@@ -756,6 +784,10 @@ fn project<'cx, 'tcx>(
          }
      }
  
@@ -4684,7 +4686,7 @@ index 5a9f52f0..883ce0d5 100644
      match candidates {
          ProjectionCandidateSet::Single(candidate) => {
              if matches!(candidate, ProjectionCandidate::Select(_))
-@@ -772,12 +804,42 @@ fn project<'cx, 'tcx>(
+@@ -771,12 +803,42 @@ fn project<'cx, 'tcx>(
                      },
                  );
              }
@@ -4727,7 +4729,7 @@ index 5a9f52f0..883ce0d5 100644
              if let Some((recorder, proof_source)) = proof_record {
                  match &result {
                      Ok(Projected::Progress(progress)) => {
-@@ -810,6 +872,11 @@ fn project<'cx, 'tcx>(
+@@ -809,6 +871,11 @@ fn project<'cx, 'tcx>(
          ProjectionCandidateSet::None => {
              let tcx = selcx.tcx();
              let term = obligation.predicate.to_term(tcx, ty::IsRigid::No);
@@ -4740,7 +4742,7 @@ index 5a9f52f0..883ce0d5 100644
                  recorder.borrow_mut().record_projection_no_progress(
                      obligation.param_env,
 diff --git a/compiler/rustc_trait_selection/src/traits/query/evaluate_obligation.rs b/compiler/rustc_trait_selection/src/traits/query/evaluate_obligation.rs
-index d383cdc1..c0b02d7f 100644
+index d383cdc1a..c0b02d7fc 100644
 --- a/compiler/rustc_trait_selection/src/traits/query/evaluate_obligation.rs
 +++ b/compiler/rustc_trait_selection/src/traits/query/evaluate_obligation.rs
 @@ -1,5 +1,6 @@
@@ -4833,10 +4835,10 @@ index d383cdc1..c0b02d7f 100644
      fn evaluate_obligation(
          &self,
 diff --git a/compiler/rustc_trait_selection/src/traits/query/normalize.rs b/compiler/rustc_trait_selection/src/traits/query/normalize.rs
-index fb15ed8a..cc5c3fc7 100644
+index 489e4f7a9..d0a1df183 100644
 --- a/compiler/rustc_trait_selection/src/traits/query/normalize.rs
 +++ b/compiler/rustc_trait_selection/src/traits/query/normalize.rs
-@@ -7,6 +7,7 @@
+@@ -6,6 +6,7 @@
  use rustc_infer::traits::PredicateObligations;
  use rustc_macros::extension;
  pub use rustc_middle::traits::query::NormalizationResult;
@@ -4844,7 +4846,7 @@ index fb15ed8a..cc5c3fc7 100644
  use rustc_middle::ty::{
      self, FallibleTypeFolder, Flags, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable,
      TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, TypingMode, Unnormalized,
-@@ -46,6 +47,33 @@ impl<'a, 'tcx> At<'a, 'tcx> {
+@@ -45,6 +46,33 @@ impl<'a, 'tcx> At<'a, 'tcx> {
      /// likely be removed as trait solver operations are already cached by the query
      /// system making this redundant.
      fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
@@ -4878,7 +4880,7 @@ index fb15ed8a..cc5c3fc7 100644
      where
          T: TypeFoldable<TyCtxt<'tcx>>,
      {
-@@ -83,7 +111,15 @@ fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
+@@ -82,7 +110,15 @@ fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
                  universes,
              ) {
                  Ok(value) => {
@@ -4895,7 +4897,7 @@ index fb15ed8a..cc5c3fc7 100644
                  }
                  Err(_errors) => {
                      return Err(NoSolution);
-@@ -92,7 +128,10 @@ fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
+@@ -91,7 +127,10 @@ fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
          }
  
          if !needs_normalization(self.infcx, &value) {
@@ -4907,7 +4909,7 @@ index fb15ed8a..cc5c3fc7 100644
          }
  
          let mut normalizer = QueryNormalizer {
-@@ -103,6 +142,14 @@ fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
+@@ -102,6 +141,14 @@ fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
              cache: SsoHashMap::new(),
              anon_depth: 0,
              universes,
@@ -4922,7 +4924,7 @@ index fb15ed8a..cc5c3fc7 100644
          };
  
          let result = value.try_fold_with(&mut normalizer);
-@@ -117,7 +164,12 @@ fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
+@@ -116,7 +163,12 @@ fn query_normalize<T>(self, value: T) -> Result<Normalized<'tcx, T>, NoSolution>
              std::any::type_name::<T>(),
              normalizer.obligations,
          );
@@ -4936,7 +4938,7 @@ index fb15ed8a..cc5c3fc7 100644
      }
  }
  
-@@ -174,6 +226,38 @@ struct QueryNormalizer<'a, 'tcx> {
+@@ -173,6 +225,38 @@ struct QueryNormalizer<'a, 'tcx> {
      cache: SsoHashMap<Ty<'tcx>, Ty<'tcx>>,
      anon_depth: usize,
      universes: Vec<Option<ty::UniverseIndex>>,
@@ -4975,7 +4977,7 @@ index fb15ed8a..cc5c3fc7 100644
  }
  
  impl<'a, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'a, 'tcx> {
-@@ -278,12 +362,53 @@ fn try_fold_const(
+@@ -277,12 +361,53 @@ fn try_fold_const(
          };
  
          let constant = match alias_const.kind {
@@ -5035,7 +5037,7 @@ index fb15ed8a..cc5c3fc7 100644
              _ => self.try_fold_free_or_assoc(alias_const.into())?.expect_const(),
          };
          debug!(?constant, ?self.param_env);
-@@ -327,12 +452,28 @@ fn try_fold_free_or_assoc(
+@@ -326,12 +451,28 @@ fn try_fold_free_or_assoc(
          debug!("QueryNormalizer: orig_values = {:#?}", orig_values);
          let result = match term.kind {
              ty::AliasTermKind::ProjectionTy { .. } | ty::AliasTermKind::ProjectionConst { .. } => {
@@ -5066,10 +5068,10 @@ index fb15ed8a..cc5c3fc7 100644
              }
              kind @ (ty::AliasTermKind::OpaqueTy { .. } | ty::AliasTermKind::AnonConst { .. }) => {
 diff --git a/compiler/rustc_trait_selection/src/traits/select/mod.rs b/compiler/rustc_trait_selection/src/traits/select/mod.rs
-index 392bb969..37c1ddb5 100644
+index a003721f0..946c7e7a4 100644
 --- a/compiler/rustc_trait_selection/src/traits/select/mod.rs
 +++ b/compiler/rustc_trait_selection/src/traits/select/mod.rs
-@@ -41,6 +41,7 @@
+@@ -40,6 +40,7 @@
  use super::codegen_proof::SharedCodegenProofRecorder;
  use super::coherence::{self, Conflict};
  use super::project::ProjectionTermObligation;
@@ -5077,7 +5079,7 @@ index 392bb969..37c1ddb5 100644
  use super::util::closure_trait_ref_and_return_type;
  use super::{
      ImplDerivedCause, Normalized, Obligation, ObligationCause, ObligationCauseCode,
-@@ -127,6 +128,9 @@ pub struct SelectionContext<'cx, 'tcx> {
+@@ -126,6 +127,9 @@ pub struct SelectionContext<'cx, 'tcx> {
  
      /// Query-local observer used only by the codegen selection proof query.
      codegen_proof_recorder: Option<SharedCodegenProofRecorder<'tcx>>,
@@ -5087,7 +5089,7 @@ index 392bb969..37c1ddb5 100644
  }
  
  // A stack that walks back up the stack frame.
-@@ -203,6 +207,7 @@ pub fn new(infcx: &'cx InferCtxt<'tcx>) -> SelectionContext<'cx, 'tcx> {
+@@ -202,6 +206,7 @@ pub fn new(infcx: &'cx InferCtxt<'tcx>) -> SelectionContext<'cx, 'tcx> {
              intercrate_ambiguity_causes: None,
              query_mode: TraitQueryMode::Standard,
              codegen_proof_recorder: None,
@@ -5095,7 +5097,7 @@ index 392bb969..37c1ddb5 100644
          }
      }
  
-@@ -217,6 +222,40 @@ pub(crate) fn codegen_proof_recorder(&self) -> Option<&SharedCodegenProofRecorde
+@@ -216,6 +221,40 @@ pub(crate) fn codegen_proof_recorder(&self) -> Option<&SharedCodegenProofRecorde
          self.codegen_proof_recorder.as_ref()
      }
  
@@ -5136,7 +5138,7 @@ index 392bb969..37c1ddb5 100644
      pub fn typing_mode(&self) -> TypingMode<'tcx, CantBeErased> {
          self.infcx.typing_mode_raw().assert_not_erased()
      }
-@@ -278,14 +317,19 @@ pub fn poly_select(
+@@ -277,14 +316,19 @@ pub fn poly_select(
      ) -> SelectionResult<'tcx, Selection<'tcx>> {
          assert!(!self.infcx.next_trait_solver());
  
@@ -5162,7 +5164,7 @@ index 392bb969..37c1ddb5 100644
  
          let candidate = match candidate_result {
              Err(SelectionError::Overflow(OverflowError::Canonical)) => {
-@@ -333,6 +377,12 @@ pub fn poly_select(
+@@ -332,6 +376,12 @@ pub fn poly_select(
              Ok(candidate) => Ok(Some(candidate)),
          };
  
@@ -5175,7 +5177,7 @@ index 392bb969..37c1ddb5 100644
          if let Some((recorder, previous_owner)) = proof_scope {
              if let Ok(Some(source)) = &result {
                  let source = source.clone().map(|nested| CodegenProofObligation {
-@@ -573,7 +623,12 @@ pub fn evaluate_root_obligation(
+@@ -572,7 +622,12 @@ pub fn evaluate_root_obligation(
          obligation: &PredicateObligation<'tcx>,
      ) -> Result<EvaluationResult, OverflowError> {
          debug_assert!(!self.infcx.next_trait_solver());
@@ -5189,7 +5191,7 @@ index 392bb969..37c1ddb5 100644
              let goal =
                  this.infcx.resolve_vars_if_possible((obligation.predicate, obligation.param_env));
              let mut result = this.evaluate_predicate_recursively(
-@@ -586,7 +641,14 @@ pub fn evaluate_root_obligation(
+@@ -585,7 +640,14 @@ pub fn evaluate_root_obligation(
                  result = result.max(EvaluatedToAmbig);
              }
              Ok(result)
@@ -5205,7 +5207,7 @@ index 392bb969..37c1ddb5 100644
      }
  
      /// Computes the evaluation result of `op`, discarding any constraints.
-@@ -1108,7 +1170,9 @@ fn evaluate_trait_predicate_recursively<'o>(
+@@ -1086,7 +1148,9 @@ fn evaluate_trait_predicate_recursively<'o>(
              return Ok(result);
          }
  
@@ -5216,7 +5218,7 @@ index 392bb969..37c1ddb5 100644
              debug!("PROVISIONAL CACHE HIT");
              stack.update_reached_depth(result.reached_depth);
              return Ok(result.result);
-@@ -1195,7 +1259,14 @@ fn evaluate_trait_predicate_recursively<'o>(
+@@ -1173,7 +1237,14 @@ fn evaluate_trait_predicate_recursively<'o>(
                  fresh_trait_pred, stack.depth, reached_depth,
              );
  
@@ -5232,7 +5234,7 @@ index 392bb969..37c1ddb5 100644
          }
  
          Ok(result)
-@@ -1305,7 +1376,14 @@ fn evaluate_stack<'o>(
+@@ -1283,7 +1354,14 @@ fn evaluate_stack<'o>(
              return Ok(EvaluatedToAmbigStackDependent);
          }
  
@@ -5248,7 +5250,7 @@ index 392bb969..37c1ddb5 100644
              Ok(Some(c)) => self.evaluate_candidate(stack, &c),
              Ok(None) => Ok(EvaluatedToAmbig),
              Err(SelectionError::Overflow(OverflowError::Canonical)) => {
-@@ -1355,8 +1433,14 @@ fn evaluate_candidate<'o>(
+@@ -1333,8 +1411,14 @@ fn evaluate_candidate<'o>(
          stack: &TraitObligationStack<'o, 'tcx>,
          candidate: &SelectionCandidate<'tcx>,
      ) -> Result<EvaluationResult, OverflowError> {
@@ -5265,7 +5267,7 @@ index 392bb969..37c1ddb5 100644
                  Ok(selection) => {
                      debug!(?selection);
                      if let ImplSource::Builtin(..) = selection
-@@ -1364,14 +1448,35 @@ fn evaluate_candidate<'o>(
+@@ -1342,14 +1426,35 @@ fn evaluate_candidate<'o>(
                      {
                          return Ok(EvaluatedToErr);
                      }
@@ -5302,7 +5304,7 @@ index 392bb969..37c1ddb5 100644
  
          // If we erased any lifetimes, then we want to use
          // `EvaluatedToOkModuloRegions` instead of `EvaluatedToOk`
-@@ -1385,6 +1490,12 @@ fn evaluate_candidate<'o>(
+@@ -1363,6 +1468,12 @@ fn evaluate_candidate<'o>(
              result = result.max(EvaluatedToOkModuloRegions);
          }
  
@@ -5315,7 +5317,7 @@ index 392bb969..37c1ddb5 100644
          Ok(result)
      }
  
-@@ -1395,8 +1506,8 @@ fn check_evaluation_cache(
+@@ -1373,8 +1484,8 @@ fn check_evaluation_cache(
      ) -> Option<EvaluationResult> {
          let infcx = self.infcx;
          let tcx = infcx.tcx;
@@ -5326,7 +5328,7 @@ index 392bb969..37c1ddb5 100644
          }
          if self.can_use_global_caches(param_env, trait_pred) {
              let key = (infcx.typing_env(param_env), trait_pred);
-@@ -1426,8 +1537,7 @@ fn insert_evaluation_cache(
+@@ -1404,8 +1515,7 @@ fn insert_evaluation_cache(
  
          let infcx = self.infcx;
          let tcx = infcx.tcx;
@@ -5336,7 +5338,7 @@ index 392bb969..37c1ddb5 100644
              return;
          }
          if self.can_use_global_caches(param_env, trait_pred) {
-@@ -1633,8 +1743,8 @@ fn check_candidate_cache(
+@@ -1611,8 +1721,8 @@ fn check_candidate_cache(
          let tcx = infcx.tcx;
          let pred = cache_fresh_trait_pred.skip_binder();
  
@@ -5347,7 +5349,7 @@ index 392bb969..37c1ddb5 100644
          }
  
          if self.can_use_global_caches(param_env, cache_fresh_trait_pred) {
-@@ -1697,8 +1807,7 @@ fn insert_candidate_cache(
+@@ -1675,8 +1785,7 @@ fn insert_candidate_cache(
              return;
          }
  
@@ -5359,7 +5361,7 @@ index 392bb969..37c1ddb5 100644
  
 diff --git a/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs b/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs
 new file mode 100644
-index 00000000..36fb2f6b
+index 000000000..36fb2f6b4
 --- /dev/null
 +++ b/compiler/rustc_trait_selection/src/traits/typeck_impl_dependencies.rs
 @@ -0,0 +1,509 @@
@@ -5873,7 +5875,7 @@ index 00000000..36fb2f6b
 +    }
 +}
 diff --git a/compiler/rustc_traits/Cargo.toml b/compiler/rustc_traits/Cargo.toml
-index 9f40f4d5..04aef4e7 100644
+index 9f40f4d5c..04aef4e7b 100644
 --- a/compiler/rustc_traits/Cargo.toml
 +++ b/compiler/rustc_traits/Cargo.toml
 @@ -6,6 +6,7 @@ edition = "2024"
@@ -5885,7 +5887,7 @@ index 9f40f4d5..04aef4e7 100644
  rustc_middle = { path = "../rustc_middle" }
  rustc_span = { path = "../rustc_span" }
 diff --git a/compiler/rustc_traits/src/evaluate_obligation.rs b/compiler/rustc_traits/src/evaluate_obligation.rs
-index 6bc6543a..9c92b92e 100644
+index 6bc6543a0..9c92b92ed 100644
 --- a/compiler/rustc_traits/src/evaluate_obligation.rs
 +++ b/compiler/rustc_traits/src/evaluate_obligation.rs
 @@ -1,16 +1,57 @@
@@ -5950,7 +5952,7 @@ index 6bc6543a..9c92b92e 100644
  
  fn evaluate_obligation<'tcx>(
 diff --git a/compiler/rustc_traits/src/lib.rs b/compiler/rustc_traits/src/lib.rs
-index 875fbab3..07671595 100644
+index 875fbab35..076715954 100644
 --- a/compiler/rustc_traits/src/lib.rs
 +++ b/compiler/rustc_traits/src/lib.rs
 @@ -12,6 +12,7 @@
@@ -5969,7 +5971,7 @@ index 875fbab3..07671595 100644
      p.coroutine_hidden_types = coroutine_witnesses::coroutine_hidden_types;
  }
 diff --git a/compiler/rustc_traits/src/normalize_erasing_regions.rs b/compiler/rustc_traits/src/normalize_erasing_regions.rs
-index 1ba385e8..360ce603 100644
+index 1ba385e86..360ce603f 100644
 --- a/compiler/rustc_traits/src/normalize_erasing_regions.rs
 +++ b/compiler/rustc_traits/src/normalize_erasing_regions.rs
 @@ -1,7 +1,10 @@
@@ -6029,7 +6031,7 @@ index 1ba385e8..360ce603 100644
      tcx: TyCtxt<'tcx>,
      goal: PseudoCanonicalInput<'tcx, T>,
 diff --git a/compiler/rustc_traits/src/normalize_projection_ty.rs b/compiler/rustc_traits/src/normalize_projection_ty.rs
-index 66f5ab39..209b8b99 100644
+index 66f5ab39a..209b8b994 100644
 --- a/compiler/rustc_traits/src/normalize_projection_ty.rs
 +++ b/compiler/rustc_traits/src/normalize_projection_ty.rs
 @@ -2,16 +2,22 @@
@@ -6129,7 +6131,7 @@ index 66f5ab39..209b8b99 100644
      key: PseudoCanonicalInput<'tcx, ty::AliasTerm<'tcx>>,
 diff --git a/compiler/rustc_traits/src/typeck_impl_dependencies.rs b/compiler/rustc_traits/src/typeck_impl_dependencies.rs
 new file mode 100644
-index 00000000..dd2929f4
+index 000000000..dd2929f45
 --- /dev/null
 +++ b/compiler/rustc_traits/src/typeck_impl_dependencies.rs
 @@ -0,0 +1,260 @@
@@ -6395,7 +6397,7 @@ index 00000000..dd2929f4
 +}
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-copy-coherence-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-copy-coherence-input.rs
 new file mode 100644
-index 00000000..115f2fb6
+index 000000000..115f2fb66
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-copy-coherence-input.rs
 @@ -0,0 +1,23 @@
@@ -6424,7 +6426,7 @@ index 00000000..115f2fb6
 +fn main() {}
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-copy-use-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-copy-use-input.rs
 new file mode 100644
-index 00000000..9668a0c0
+index 000000000..9668a0c07
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-copy-use-input.rs
 @@ -0,0 +1,54 @@
@@ -6484,7 +6486,7 @@ index 00000000..9668a0c0
 +}
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-coroutine-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-coroutine-input.rs
 new file mode 100644
-index 00000000..400cbfce
+index 000000000..400cbfce3
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-coroutine-input.rs
 @@ -0,0 +1,9 @@
@@ -6499,7 +6501,7 @@ index 00000000..400cbfce
 +fn main() {}
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-drop-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-drop-input.rs
 new file mode 100644
-index 00000000..9e94398d
+index 000000000..9e94398d7
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-drop-input.rs
 @@ -0,0 +1,11 @@
@@ -6516,7 +6518,7 @@ index 00000000..9e94398d
 +fn main() {}
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-input.rs
 new file mode 100644
-index 00000000..bae9d970
+index 000000000..bae9d9704
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-input.rs
 @@ -0,0 +1,120 @@
@@ -6642,7 +6644,7 @@ index 00000000..bae9d970
 +fn main() {}
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs
 new file mode 100644
-index 00000000..5300de2f
+index 000000000..5300de2f6
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-source-free-origins-input.rs
 @@ -0,0 +1,36 @@
@@ -6684,7 +6686,7 @@ index 00000000..5300de2f
 +}
 diff --git a/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-union-input.rs b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-union-input.rs
 new file mode 100644
-index 00000000..ecd3a12b
+index 000000000..ecd3a12ba
 --- /dev/null
 +++ b/tests/ui-fulldeps/auxiliary/typeck-impl-dependencies-union-input.rs
 @@ -0,0 +1,42 @@
@@ -6732,7 +6734,7 @@ index 00000000..ecd3a12b
 +fn main() {}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-copy-coherence.rs b/tests/ui-fulldeps/typeck-impl-dependencies-copy-coherence.rs
 new file mode 100644
-index 00000000..f5ddcd5d
+index 000000000..f5ddcd5d9
 --- /dev/null
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies-copy-coherence.rs
 @@ -0,0 +1,109 @@
@@ -6847,7 +6849,7 @@ index 00000000..f5ddcd5d
 +}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-copy-use.rs b/tests/ui-fulldeps/typeck-impl-dependencies-copy-use.rs
 new file mode 100644
-index 00000000..90243750
+index 000000000..90243750a
 --- /dev/null
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies-copy-use.rs
 @@ -0,0 +1,190 @@
@@ -7043,7 +7045,7 @@ index 00000000..90243750
 +}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-coroutine.rs b/tests/ui-fulldeps/typeck-impl-dependencies-coroutine.rs
 new file mode 100644
-index 00000000..8ce3c20a
+index 000000000..8ce3c20ab
 --- /dev/null
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies-coroutine.rs
 @@ -0,0 +1,58 @@
@@ -7107,7 +7109,7 @@ index 00000000..8ce3c20a
 +}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-drop.rs b/tests/ui-fulldeps/typeck-impl-dependencies-drop.rs
 new file mode 100644
-index 00000000..a6ed4023
+index 000000000..a6ed4023e
 --- /dev/null
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies-drop.rs
 @@ -0,0 +1,108 @@
@@ -7221,7 +7223,7 @@ index 00000000..a6ed4023
 +}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs b/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs
 new file mode 100644
-index 00000000..e6c339ce
+index 000000000..e6c339ce3
 --- /dev/null
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies-source-free-origins.rs
 @@ -0,0 +1,111 @@
@@ -7338,7 +7340,7 @@ index 00000000..e6c339ce
 +}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies-union.rs b/tests/ui-fulldeps/typeck-impl-dependencies-union.rs
 new file mode 100644
-index 00000000..45b0a513
+index 000000000..45b0a513e
 --- /dev/null
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies-union.rs
 @@ -0,0 +1,139 @@
@@ -7483,7 +7485,7 @@ index 00000000..45b0a513
 +}
 diff --git a/tests/ui-fulldeps/typeck-impl-dependencies.rs b/tests/ui-fulldeps/typeck-impl-dependencies.rs
 new file mode 100644
-index 00000000..7bbb2c62
+index 000000000..7bbb2c626
 --- /dev/null
 +++ b/tests/ui-fulldeps/typeck-impl-dependencies.rs
 @@ -0,0 +1,353 @@
@@ -7840,6 +7842,3 @@ index 00000000..7bbb2c62
 +    assert_eq!(impls.next(), None);
 +    impl_def_id
 +}
--- 
-2.55.0
-

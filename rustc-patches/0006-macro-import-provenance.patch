@@ -1,4 +1,4 @@
-From 145184ae6f1c7e0067c9d0c8c08de84d08a2f399 Mon Sep 17 00:00:00 2001
+From b7b2f37aa5342da36c35d4a0f8b840d79c246d3c Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Tue, 11 Aug 2026 05:40:00 +0900
 Subject: [PATCH] rustc: preserve final macro import provenance
@@ -12,7 +12,7 @@ Subject: [PATCH] rustc: preserve final macro import provenance
  5 files changed, 136 insertions(+), 12 deletions(-)
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 5e0116c0..f218ca65 100644
+index 78a83b92a..0b30329b8 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -25,7 +25,7 @@ index 5e0116c0..f218ca65 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
-index b46955ac..c78f02e5 100644
+index b393a84c6..e2e732748 100644
 --- a/compiler/rustc_middle/src/ty/mod.rs
 +++ b/compiler/rustc_middle/src/ty/mod.rs
 @@ -256,6 +256,32 @@ pub enum MacroImplementationKind {
@@ -71,7 +71,7 @@ index b46955ac..c78f02e5 100644
  
  #[derive(Debug)]
 diff --git a/compiler/rustc_resolve/src/ident.rs b/compiler/rustc_resolve/src/ident.rs
-index c855a43c..b607803b 100644
+index c855a43cf..b607803bf 100644
 --- a/compiler/rustc_resolve/src/ident.rs
 +++ b/compiler/rustc_resolve/src/ident.rs
 @@ -1350,7 +1350,9 @@ fn finalize_module_binding(
@@ -96,7 +96,7 @@ index c855a43c..b607803b 100644
          return Ok(binding);
      }
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index 8a915528..6de5aa2b 100644
+index 8a915528a..6de5aa2bd 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
 @@ -65,9 +65,9 @@
@@ -222,7 +222,7 @@ index 8a915528..6de5aa2b 100644
  
  pub fn provide(providers: &mut Providers) {
 diff --git a/compiler/rustc_resolve/src/macros.rs b/compiler/rustc_resolve/src/macros.rs
-index 78ac5096..47ba9276 100644
+index 78ac50960..47ba9276b 100644
 --- a/compiler/rustc_resolve/src/macros.rs
 +++ b/compiler/rustc_resolve/src/macros.rs
 @@ -379,6 +379,7 @@ fn resolve_macro_invocation(
@@ -333,6 +333,3 @@ index 78ac5096..47ba9276 100644
                      let initial_res = initial_binding.map(|initial_binding| {
                          self.record_use(ident, initial_binding, Used::Other);
                          initial_binding.res()
--- 
-2.55.0
-

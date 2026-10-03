@@ -9,7 +9,7 @@ fn main() {
         .expect("patch-abi must contain a u32");
     assert_eq!(
         rustc_driver::RUST_ITEM_DEPENDENCIES_BASE_REVISION,
-        "969b803cbe1d4499f841ae0a49c637d8c70a0458"
+        include_str!("../../../rustc-patches/base-revision").trim()
     );
     assert_eq!(rustc_driver::RUST_ITEM_DEPENDENCIES_PATCH_ABI, expected_abi);
     assert_eq!(

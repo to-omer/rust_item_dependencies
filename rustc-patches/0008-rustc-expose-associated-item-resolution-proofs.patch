@@ -1,7 +1,7 @@
-From 16b37d339cce8577962f16e292577a79684d876c Mon Sep 17 00:00:00 2001
+From afd73d5a6a09097e46d2ceaf3ad5d9ec758c7dff Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Tue, 11 Aug 2026 10:04:56 +0900
-Subject: [PATCH 8/9] rustc: expose associated item resolution proofs
+Subject: [PATCH] rustc: expose associated item resolution proofs
 
 ---
  compiler/rustc_driver_impl/src/lib.rs      |   2 +-
@@ -15,7 +15,7 @@ Subject: [PATCH 8/9] rustc: expose associated item resolution proofs
  create mode 100644 tests/ui-fulldeps/associated-item-proof.rs
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 9c92bd5e..def7099f 100644
+index 1ee272d9f..0ed478d8c 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -28,10 +28,10 @@ index 9c92bd5e..def7099f 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_middle/src/arena.rs b/compiler/rustc_middle/src/arena.rs
-index 06369bdc..c4e79341 100644
+index be8b9b89b..c59f1a48e 100644
 --- a/compiler/rustc_middle/src/arena.rs
 +++ b/compiler/rustc_middle/src/arena.rs
-@@ -113,6 +113,7 @@
+@@ -119,6 +119,7 @@
      used_trait_imports: rustc_data_structures::unord::UnordSet<rustc_hir::def_id::LocalDefId>,
      is_late_bound_map: rustc_data_structures::fx::FxIndexSet<rustc_hir::ItemLocalId>,
      impl_source: rustc_middle::traits::ImplSource<'tcx, ()>,
@@ -40,11 +40,11 @@ index 06369bdc..c4e79341 100644
      codegen_selection_proof: rustc_middle::traits::CodegenSelectionProof<'tcx>,
  
 diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
-index e7391774..60ac76f9 100644
+index 9dd9bb95b..8f3af1867 100644
 --- a/compiler/rustc_middle/src/queries.rs
 +++ b/compiler/rustc_middle/src/queries.rs
 @@ -107,9 +107,10 @@
-     OutlivesBound,
+     NormalizationResult, OutlivesBound,
  };
  use crate::traits::{
 -    CodegenObligationError, CodegenProjectionProof, CodegenProjectionProofError,
@@ -57,7 +57,7 @@ index e7391774..60ac76f9 100644
  };
  use crate::ty::fast_reject::SimplifiedType;
  use crate::ty::layout::ValidityRequirement;
-@@ -2692,6 +2693,12 @@
+@@ -2701,6 +2702,12 @@
          desc { "resolving instance `{}`", ty::Instance::new_raw(key.value.0, key.value.1) }
      }
  
@@ -71,7 +71,7 @@ index e7391774..60ac76f9 100644
          desc { "revealing opaque types in `{:?}`", key }
      }
 diff --git a/compiler/rustc_middle/src/query/erase.rs b/compiler/rustc_middle/src/query/erase.rs
-index 08892529..a7877b18 100644
+index ba1e7a236..b77079cff 100644
 --- a/compiler/rustc_middle/src/query/erase.rs
 +++ b/compiler/rustc_middle/src/query/erase.rs
 @@ -199,6 +199,10 @@ impl Erasable for $ty {
@@ -86,7 +86,7 @@ index 08892529..a7877b18 100644
      Result<&'_ traits::CodegenProjectionProof<'_>, traits::CodegenProjectionProofError>,
      Result<&'_ traits::CodegenSelectionProof<'_>, traits::CodegenSelectionProofError>,
 diff --git a/compiler/rustc_middle/src/traits/mod.rs b/compiler/rustc_middle/src/traits/mod.rs
-index ca11c181..186d7180 100644
+index f874735f1..f9301356d 100644
 --- a/compiler/rustc_middle/src/traits/mod.rs
 +++ b/compiler/rustc_middle/src/traits/mod.rs
 @@ -1138,3 +1138,37 @@ fn from(error: CodegenObligationError) -> Self {
@@ -128,7 +128,7 @@ index ca11c181..186d7180 100644
 +    IncompleteObservation,
 +}
 diff --git a/compiler/rustc_ty_utils/src/instance.rs b/compiler/rustc_ty_utils/src/instance.rs
-index c0f476a7..ff866fb4 100644
+index c0f476a7f..ff866fb4f 100644
 --- a/compiler/rustc_ty_utils/src/instance.rs
 +++ b/compiler/rustc_ty_utils/src/instance.rs
 @@ -5,7 +5,10 @@
@@ -250,7 +250,7 @@ index c0f476a7..ff866fb4 100644
  }
 diff --git a/tests/ui-fulldeps/associated-item-proof.rs b/tests/ui-fulldeps/associated-item-proof.rs
 new file mode 100644
-index 00000000..e6c70cef
+index 000000000..e6c70cef1
 --- /dev/null
 +++ b/tests/ui-fulldeps/associated-item-proof.rs
 @@ -0,0 +1,196 @@
@@ -450,6 +450,3 @@ index 00000000..e6c70cef
 +        })
 +        .unwrap()
 +}
--- 
-2.55.0
-

@@ -1,4 +1,4 @@
-From 9aa0524375d54cb6be87b19f96c49f3729069aeb Mon Sep 17 00:00:00 2001
+From c6b9f4345a1f04f6db166ddf7ace35ab735e2efa Mon Sep 17 00:00:00 2001
 From: to-omer <48119218+to-omer@users.noreply.github.com>
 Date: Fri, 14 Aug 2026 12:01:40 +0900
 Subject: [PATCH] Ignore unresolved imported path provenance
@@ -12,7 +12,7 @@ Subject: [PATCH] Ignore unresolved imported path provenance
  create mode 100644 tests/ui/resolve/error-recovery-import-observer.stderr
 
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index 9b108340..f044c189 100644
+index 9b108340e..f044c1893 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
 @@ -2349,12 +2349,18 @@ fn record_import_use(
@@ -38,7 +38,7 @@ index 9b108340..f044c189 100644
      }
 diff --git a/tests/ui/resolve/error-recovery-import-observer.rs b/tests/ui/resolve/error-recovery-import-observer.rs
 new file mode 100644
-index 00000000..2d6139b8
+index 000000000..2d6139b88
 --- /dev/null
 +++ b/tests/ui/resolve/error-recovery-import-observer.rs
 @@ -0,0 +1,10 @@
@@ -54,7 +54,7 @@ index 00000000..2d6139b8
 +fn main() {}
 diff --git a/tests/ui/resolve/error-recovery-import-observer.stderr b/tests/ui/resolve/error-recovery-import-observer.stderr
 new file mode 100644
-index 00000000..da3134bf
+index 000000000..da3134bf0
 --- /dev/null
 +++ b/tests/ui/resolve/error-recovery-import-observer.stderr
 @@ -0,0 +1,14 @@
@@ -72,6 +72,3 @@ index 00000000..da3134bf
 +error: aborting due to 1 previous error
 +
 +For more information about this error, try `rustc --explain E0432`.
--- 
-2.55.0
-

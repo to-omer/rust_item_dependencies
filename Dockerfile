@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 cmake ninja-build clang lld \
     g++-x86-64-linux-gnu g++-aarch64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
-RUN rustup toolchain install nightly-2026-08-10 --profile minimal --component rustc-dev --component rust-src
+RUN rustup toolchain install nightly-2026-08-20 --profile minimal --component rustc-dev --component rust-src --component llvm-tools
 
 WORKDIR /opt/rid
 COPY rust-toolchain.toml ./
@@ -14,11 +14,11 @@ COPY src/target_libraries.rs src/target_libraries.rs
 COPY rustc-patches rustc-patches
 COPY docker/compiler.toml docker/compiler.toml
 RUN mkdir -p target/rid/rustc \
-    && cp docker/compiler.toml target/rid/rustc/config.toml \
+    && cp docker/compiler.toml target/rid/rustc/bootstrap.toml \
     && cargo run --locked --release --manifest-path tools/Cargo.toml --target-dir target/rid/launcher -- rustc -Vv
 
 FROM compiler AS application
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock build.rs rust-toolchain-revision ./
 COPY .cargo .cargo
 COPY src src
 COPY tests/fixtures/compiler/patch_abi.rs tests/fixtures/compiler/patch_abi.rs

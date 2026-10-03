@@ -65,6 +65,70 @@ fn success(output: Output) -> Output {
     output
 }
 
+#[test]
+fn stable_borrow_checking_defaults_preserve_rejected_project_source() {
+    let project = Project::new();
+    let source = include_str!("fixtures/retention/stable_borrow_checking_error.input.rs");
+    project.write(
+        "Cargo.toml",
+        "[package]\nname='stable-borrow-checking'\nversion='0.1.0'\nedition='2024'\n",
+    );
+    project.write("src/main.rs", source);
+
+    let output = project.reduce().output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cannot assign to `z` because it is borrowed")
+    );
+    assert_eq!(project.read("src/main.rs"), source);
+}
+
+#[test]
+fn stable_1_99_debug_profile_and_inherited_feature_overrides_are_preserved() {
+    let project = Project::new();
+    project.write("Cargo.toml", "[workspace]\nmembers=['app', 'helper']\ndefault-members=['app']\nresolver='3'\n[workspace.dependencies]\nhelper={path='helper', default-features=true}\n");
+    project.write("app/Cargo.toml", "[package]\nname='stable-199'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nhelper={workspace=true, default-features=false}\n");
+    project.write("helper/Cargo.toml", "[package]\nname='helper'\nversion='0.1.0'\nedition='2024'\n[features]\ndefault=['selected']\nselected=[]\n");
+    project.write("helper/src/lib.rs", "#[cfg(feature=\"selected\")] compile_error!(\"inherited default feature was not disabled\");\npub fn answer() -> u32 { 42 }\n");
+    project.write("app/src/main.rs", "#[cfg(not(debug_assertions))] compile_error!(\"debug profile was not preserved\");\nfn unused() {}\nfn main() { println!(\"{}\", helper::answer()); }\n");
+
+    let before = success(
+        project
+            .cargo()
+            .args(["run", "--offline", "--profile", "debug"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(before.stdout, b"42\n");
+    success(
+        project
+            .reduce()
+            .args(["--profile", "debug"])
+            .output()
+            .unwrap(),
+    );
+    let reduced = project.read("app/src/main.rs");
+    assert!(!reduced.contains("fn unused"));
+    assert!(reduced.contains("helper::answer()"));
+    let after = success(
+        project
+            .cargo()
+            .args(["run", "--offline", "--profile", "debug"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(after.stdout, before.stdout);
+    success(
+        project
+            .reduce()
+            .args(["--profile", "debug"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(project.read("app/src/main.rs"), reduced);
+}
+
 fn fixture() -> Project {
     let project = Project::new();
     project.write(

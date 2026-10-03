@@ -1,4 +1,4 @@
-From fadf30423059884f13acf1029e4837192e8910e0 Mon Sep 17 00:00:00 2001
+From 8883bbc82321d7cdf2107c110c3248ac957912e7 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Sun, 30 Aug 2026 18:00:00 +0900
 Subject: [PATCH] rustc: expose discarded declarative output ranges
@@ -60,7 +60,7 @@ index 6e1ca64ab..f21df7021 100644
  /// relative to that node's first token. Distinct from `ParserRange` so the two
  /// kinds of range can't be mixed up.
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 575ac1160..9f6bbe0e5 100644
+index 65422a695..00f136d90 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -73,10 +73,10 @@ index 575ac1160..9f6bbe0e5 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_expand/src/base.rs b/compiler/rustc_expand/src/base.rs
-index 513ef347d..0b30ca373 100644
+index 0c8b43195..c98944692 100644
 --- a/compiler/rustc_expand/src/base.rs
 +++ b/compiler/rustc_expand/src/base.rs
-@@ -1131,6 +1131,12 @@ fn record_macro_expansion_output_structure(
+@@ -1130,6 +1130,12 @@ fn record_macro_expansion_output_structure(
  
      fn mark_declarative_macro_output_census_incomplete(&mut self, invocation_id: LocalExpnId);
  
@@ -90,7 +90,7 @@ index 513ef347d..0b30ca373 100644
          &mut self,
          invocation_id: LocalExpnId,
 diff --git a/compiler/rustc_expand/src/expand.rs b/compiler/rustc_expand/src/expand.rs
-index 9501bcef2..b7b7c0865 100644
+index cb158b763..53c3c7f6c 100644
 --- a/compiler/rustc_expand/src/expand.rs
 +++ b/compiler/rustc_expand/src/expand.rs
 @@ -4,7 +4,9 @@
@@ -104,7 +104,7 @@ index 9501bcef2..b7b7c0865 100644
  use rustc_ast::visit::{AssocCtxt, Visitor, VisitorResult, try_visit, walk_list};
  use rustc_ast::{
      self as ast, AssocItemKind, AstNodeWrapper, AttrArgs, AttrKind, AttrStyle, AttrVec,
-@@ -710,6 +712,10 @@ fn collect_invocations(
+@@ -709,6 +711,10 @@ fn collect_invocations(
          self.cx.resolver.resolve_dollar_crates();
  
          let invocations = {
@@ -115,7 +115,7 @@ index 9501bcef2..b7b7c0865 100644
              let mut collector = InvocationCollector {
                  // Non-derive macro invocations cannot see the results of cfg expansion - they
                  // will either be removed along with the item, or invoked before the cfg/cfg_attr
-@@ -721,6 +727,8 @@ fn collect_invocations(
+@@ -720,6 +726,8 @@ fn collect_invocations(
                  monotonic: self.monotonic,
                  inherited_macro_range: root_macro_range.clone(),
                  macro_range_indices: FxHashMap::default(),
@@ -124,7 +124,7 @@ index 9501bcef2..b7b7c0865 100644
                  owner_product_role: initial_owner_product_role(&fragment),
                  owner_child_roles: observe_owner_output.then(|| {
                      extra_placeholders
-@@ -2529,10 +2537,101 @@ struct InvocationCollector<'a, 'b> {
+@@ -2528,10 +2536,101 @@ struct InvocationCollector<'a, 'b> {
      monotonic: bool,
      inherited_macro_range: Option<rustc_ast::tokenstream::MacroParserRange>,
      macro_range_indices: FxHashMap<u32, usize>,
@@ -226,7 +226,7 @@ index 9501bcef2..b7b7c0865 100644
  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
  enum MacroOwnerProductRole {
      Dependent,
-@@ -2540,6 +2639,15 @@ enum MacroOwnerProductRole {
+@@ -2539,6 +2638,15 @@ enum MacroOwnerProductRole {
  }
  
  impl<'a, 'b> InvocationCollector<'a, 'b> {
@@ -242,7 +242,7 @@ index 9501bcef2..b7b7c0865 100644
      fn cfg(&self) -> StripUnconfigured<'_> {
          StripUnconfigured {
              sess: self.cx.sess,
-@@ -2600,6 +2708,7 @@ fn next_bang_macro_range(&mut self) -> Option<rustc_ast::tokenstream::MacroParse
+@@ -2599,6 +2707,7 @@ fn next_bang_macro_range(&mut self) -> Option<rustc_ast::tokenstream::MacroParse
              complete: range.complete,
              use_trees: Vec::new(),
              macro_calls: Vec::new(),
@@ -250,7 +250,7 @@ index 9501bcef2..b7b7c0865 100644
          })
      }
  
-@@ -2688,6 +2797,32 @@ fn take_first_attr(
+@@ -2687,6 +2796,32 @@ fn take_first_attr(
          attr
      }
  
@@ -283,7 +283,7 @@ index 9501bcef2..b7b7c0865 100644
      // Detect use of feature-gated or invalid attributes on macro invocations
      // since they will not be detected after macro expansion.
      fn check_attributes(&self, attrs: &[ast::Attribute], call: &ast::MacCall) {
-@@ -2786,11 +2921,20 @@ fn expand_cfg_true(
+@@ -2789,11 +2924,20 @@ fn expand_cfg_true(
          res
      }
  
@@ -306,7 +306,7 @@ index 9501bcef2..b7b7c0865 100644
                  attrs.insert(pos, cfg)
              }
          });
-@@ -2800,11 +2944,11 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
+@@ -2803,11 +2947,11 @@ fn flat_map_node<Node: InvocationCollectorNode<OutputTy: Default>>(
          &mut self,
          node: Node,
      ) -> Node::OutputTy {
@@ -322,7 +322,7 @@ index 9501bcef2..b7b7c0865 100644
          output
      }
  
-@@ -2816,10 +2960,16 @@ fn flat_map_node_inner<Node: InvocationCollectorNode<OutputTy: Default>>(
+@@ -2819,10 +2963,16 @@ fn flat_map_node_inner<Node: InvocationCollectorNode<OutputTy: Default>>(
              return match self.take_first_attr(&mut node) {
                  Some((attr, pos, derives)) => match attr.name() {
                      Some(sym::cfg) => {
@@ -339,7 +339,7 @@ index 9501bcef2..b7b7c0865 100644
                                  for ident in node.declared_idents() {
                                      self.cx.resolver.append_stripped_cfg_item(
                                          self.cx.current_expansion.lint_node_id,
-@@ -2929,11 +3079,11 @@ fn visit_node<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode
+@@ -2932,11 +3082,11 @@ fn visit_node<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode
          &mut self,
          node: &mut Node,
      ) {
@@ -355,7 +355,7 @@ index 9501bcef2..b7b7c0865 100644
      }
  
      fn visit_node_inner<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyAstNode>(
-@@ -2949,6 +3099,12 @@ fn visit_node_inner<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyA
+@@ -2952,6 +3102,12 @@ fn visit_node_inner<Node: InvocationCollectorNode<OutputTy: Into<Node>> + DummyA
                              continue;
                          }
  
@@ -368,7 +368,7 @@ index 9501bcef2..b7b7c0865 100644
                          node.expand_cfg_false(self, pos, span);
                          continue;
                      }
-@@ -3223,3 +3379,125 @@ pub fn default(crate_name: Symbol, features: &Features) -> ExpansionConfig<'_> {
+@@ -3226,3 +3382,125 @@ pub fn default(crate_name: Symbol, features: &Features) -> ExpansionConfig<'_> {
          }
      }
  }
@@ -560,7 +560,7 @@ index d341f2925..8e8fd63b4 100644
                                          complete: false,
                                          intrinsic: true,
 diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
-index da9551d83..d72ffed78 100644
+index 789a713a3..beda4fa1a 100644
 --- a/compiler/rustc_middle/src/ty/mod.rs
 +++ b/compiler/rustc_middle/src/ty/mod.rs
 @@ -467,6 +467,8 @@ pub struct MacroDeclarativeExpansion {
@@ -1413,6 +1413,3 @@ index 3097a328d..65dee4a15 100644
  
          let (_, deep_repetition_origin) = invocation(deep_repetition, 0);
          let deep_repetition_expansion =
--- 
-2.55.0
-

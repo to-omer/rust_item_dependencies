@@ -1,14 +1,14 @@
-From b777ce5638cac5f582f03b704441a3315985887a Mon Sep 17 00:00:00 2001
+From 349d50c4b52d835c55743f775d295d1eb6549a93 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Fri, 14 Aug 2026 06:50:00 +0900
-Subject: [PATCH 14/14] rustc: ignore unresolved macro import provenance
+Subject: [PATCH] rustc: ignore unresolved macro import provenance
 
 ---
  compiler/rustc_resolve/src/lib.rs | 10 +++++++---
  1 file changed, 7 insertions(+), 3 deletions(-)
 
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index a03cf47d..9b108340 100644
+index a03cf47d3..9b108340e 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
 @@ -2387,6 +2387,11 @@ fn record_macro_import_use(
@@ -37,6 +37,3 @@ index a03cf47d..9b108340 100644
              import_chain,
          });
      }
--- 
-2.55.0
-

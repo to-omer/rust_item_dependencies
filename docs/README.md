@@ -14,6 +14,8 @@ cargo install --path tools --locked
 
 インストール先の`bin`を`PATH`に含めてください。初回は、このツールが利用するRustコンパイラを取得してビルドします。2回目以降は同じコンパイラを再利用します。実行時にもこのリポジトリと`target/`配下の専用コンパイラを使うため、checkoutを移動・削除せずに保持します。
 
+リポジトリを更新したら、同じインストールコマンドでランチャーも更新します。必要な専用コンパイラの更新は、次の実行時に自動で行います。ビルド設定は保持し、ソースやサブモジュールに手元の変更がある場合は更新を停止します。
+
 ## Dockerで使う
 
 Docker版では、専用コンパイラとLinux x86_64・arm64向けの標準ライブラリを同梱したイメージを使います。ホスト側でファイルのアクセス権を保持して更新するため、軽量な`cargo-rid`ランチャーも必要です。専用コンパイラを利用者がビルドする必要はありません。
@@ -21,8 +23,8 @@ Docker版では、専用コンパイラとLinux x86_64・arm64向けの標準ラ
 RustとDocker（Buildxを含む）を用意し、ランチャーをインストールします。リポジトリのチェックアウトは不要です。
 
 ```console
-rustup toolchain install nightly-2026-08-10 --profile minimal
-cargo +nightly-2026-08-10 install --git https://github.com/to-omer/rust_item_dependencies cargo-rid --locked
+rustup toolchain install nightly-2026-08-20 --profile minimal --component llvm-tools
+cargo +nightly-2026-08-20 install --git https://github.com/to-omer/rust_item_dependencies cargo-rid --locked
 ```
 
 対象のCargoプロジェクトで実行します。Linux・macOS・Windowsで同じコマンドを使います。
