@@ -1,4 +1,4 @@
-From 45593a1970a92832b91e597c3b2efec60a0775c6 Mon Sep 17 00:00:00 2001
+From 91d1bd577aa0225213815bff54064ed225a2308c Mon Sep 17 00:00:00 2001
 From: to-omer <48119218+to-omer@users.noreply.github.com>
 Date: Sat, 29 Aug 2026 02:39:13 +0900
 Subject: [PATCH] Preserve associated selections across MIR inlining
@@ -16,7 +16,7 @@ Subject: [PATCH] Preserve associated selections across MIR inlining
  9 files changed, 356 insertions(+), 33 deletions(-)
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index f5b0938be..416094a2e 100644
+index 626444c08..5bb156972 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -191,10 +191,10 @@ index 0561c04bc..629a996d3 100644
      // We don't pass any passes here, we just force a phase change to `Optimized`.
      // Otherwise this bit of MIR will trigger assertions trying to detect MIR with an invalid phase.
 diff --git a/compiler/rustc_monomorphize/src/collector.rs b/compiler/rustc_monomorphize/src/collector.rs
-index aa45b4380..1cf189dbf 100644
+index 9282fb57b..9ff8226f1 100644
 --- a/compiler/rustc_monomorphize/src/collector.rs
 +++ b/compiler/rustc_monomorphize/src/collector.rs
-@@ -2066,39 +2066,93 @@ fn collect_associated_const_uses<'tcx>(
+@@ -2077,39 +2077,93 @@ fn collect_associated_const_uses<'tcx>(
      Ok(uses)
  }
  
@@ -317,7 +317,7 @@ index aa45b4380..1cf189dbf 100644
  
      let (used, mut facts, mut proof_uses) = used_items.into_observation_parts()?;
      let (mentioned, mentioned_facts, mentioned_proof_uses) =
-@@ -2111,6 +2165,9 @@ fn mono_successors<'tcx>(
+@@ -2122,6 +2176,9 @@ fn mono_successors<'tcx>(
          mentioned: tcx.arena.alloc_from_iter(mentioned),
          facts: tcx.arena.alloc_from_iter(facts),
          associated_consts: tcx.arena.alloc_from_iter(associated_consts),
@@ -556,6 +556,3 @@ index 87778c116..7492b727f 100644
  fn check_proof_uses<'tcx>(tcx: TyCtxt<'tcx>) {
      let object_trait = named_def(tcx, "ObjectTrait", DefKind::Trait);
      let concrete = named_def(tcx, "Concrete", DefKind::Struct);
--- 
-2.55.0
-

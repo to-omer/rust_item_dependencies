@@ -6,6 +6,7 @@
 !Cargo.lock
 !build.rs
 !rust-toolchain.toml
+!rust-toolchain-revision
 !src
 !src/**
 !tools

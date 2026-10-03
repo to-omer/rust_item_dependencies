@@ -8,9 +8,8 @@ fn main() {
     println!("cargo:rerun-if-changed=rustc-patches/queue-digest");
     println!("cargo:rustc-check-cfg=cfg(rust_item_dependencies_patched)");
 
-    let expected_revision = std::fs::read_to_string("rustc-patches/base-revision")
-        .expect("rustc-patches/base-revision must be readable");
-    let expected_revision = expected_revision.trim();
+    let expected_revision = include_str!("rust-toolchain-revision").trim();
+    println!("cargo:rerun-if-changed=rust-toolchain-revision");
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
 
     let version = rustc_output(&rustc, &["-Vv"]);

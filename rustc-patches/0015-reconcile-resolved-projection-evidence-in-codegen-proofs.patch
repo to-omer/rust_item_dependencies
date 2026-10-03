@@ -1,8 +1,7 @@
-From eb86416ced4906f48ea5df2e8117af0d5cbf2087 Mon Sep 17 00:00:00 2001
+From 1f780541e721be872bed98424c0ca1a9d2f95ded Mon Sep 17 00:00:00 2001
 From: to-omer <48119218+to-omer@users.noreply.github.com>
 Date: Fri, 14 Aug 2026 08:12:25 +0900
-Subject: [PATCH 15/16] Reconcile resolved projection evidence in codegen
- proofs
+Subject: [PATCH] Reconcile resolved projection evidence in codegen proofs
 
 ---
  .../src/traits/codegen_proof.rs               | 41 ++++++++----
@@ -11,7 +10,7 @@ Subject: [PATCH 15/16] Reconcile resolved projection evidence in codegen
  3 files changed, 112 insertions(+), 13 deletions(-)
 
 diff --git a/compiler/rustc_trait_selection/src/traits/codegen_proof.rs b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
-index 59ecf0f6..d8faa22a 100644
+index 59ecf0f63..d8faa22a8 100644
 --- a/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
 +++ b/compiler/rustc_trait_selection/src/traits/codegen_proof.rs
 @@ -314,22 +314,37 @@ pub fn finish(
@@ -66,7 +65,7 @@ index 59ecf0f6..d8faa22a 100644
              root: self.root,
              obligations: self.obligations.clone(),
 diff --git a/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
-index 72918153..d5fc6d93 100644
+index 729181530..d5fc6d93b 100644
 --- a/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
 +++ b/tests/ui-fulldeps/auxiliary/selection-proof-trace-input.rs
 @@ -21,6 +21,24 @@ trait Supply {
@@ -95,7 +94,7 @@ index 72918153..d5fc6d93 100644
      type X = Value;
  }
 diff --git a/tests/ui-fulldeps/selection-proof-trace.rs b/tests/ui-fulldeps/selection-proof-trace.rs
-index 2fe8b0dc..683c7c69 100644
+index 2fe8b0dc6..683c7c693 100644
 --- a/tests/ui-fulldeps/selection-proof-trace.rs
 +++ b/tests/ui-fulldeps/selection-proof-trace.rs
 @@ -303,6 +303,72 @@ fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> C
@@ -171,6 +170,3 @@ index 2fe8b0dc..683c7c69 100644
          // The selected HeaderOnly impl has a projection in its header. This inner projection must
          // come from the original committed rematch, not from speculative candidate search.
          let header = named_def(tcx, "Header", DefKind::Trait);
--- 
-2.55.0
-

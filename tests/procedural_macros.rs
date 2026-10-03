@@ -538,6 +538,29 @@ mod patched {
     }
 
     #[test]
+    fn attribute_macro_bodies_reject_out_of_line_modules() {
+        let artifacts = ProcMacroArtifacts::build();
+        let child = artifacts.directory().join("child.rs");
+        fs::write(&child, "pub fn answer() -> u32 { 42 }\n").unwrap();
+        let source = format!(
+            "#[proc_fixture::passthrough] fn main() {{ #[path = {child:?}] mod child; println!(\"{{}}\", child::answer()); }}",
+            child = child.to_str().unwrap(),
+        );
+        let compiled = compile_and_run(&source, &artifacts, "attribute_external_module", false);
+        assert!(compiled.status.success());
+        assert_eq!(compiled.stdout, b"42\n");
+
+        let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();
+        assert!(matches!(
+            analyzer.reduce(&input(&source)),
+            Err(AnalysisError::UnsupportedInput {
+                reason: UnsupportedReason::AdditionalSourceFile,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn procedural_derive_targets_preserve_cfg_token_punctuation_and_spacing() {
         let artifacts = ProcMacroArtifacts::build();
         let analyzer = Analyzer::new_with_options(artifacts.direct_options()).unwrap();

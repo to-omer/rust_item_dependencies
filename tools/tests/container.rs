@@ -206,6 +206,73 @@ fn launcher_reduces_without_image_metadata_warnings() {
 
 #[test]
 #[ignore = "runs the distribution image using Docker"]
+fn image_reduces_stable_1_99_cargo_binaries() {
+    let fixture = Fixture::new();
+    fixture.write("Cargo.toml", "[package]\nname='stable-199'\nversion='0.1.0'\nedition='2024'\nrust-version='1.99'\n[workspace]\n");
+    for (source, required, stdout) in [
+        (
+            include_str!("../../tests/fixtures/retention/c_variadic.input.rs"),
+            "unsafe fn consume",
+            b"42\n".as_slice(),
+        ),
+        (
+            include_str!("../../tests/fixtures/retention/stable_1_99_apis.input.rs"),
+            "fn round_trip",
+            b"ok:42\n".as_slice(),
+        ),
+    ] {
+        fixture.write("src/main.rs", source);
+        let before = success(fixture.cargo(&["run", "--offline", "--quiet"]));
+        assert_eq!(before.stdout, stdout);
+        success(fixture.run(["--offline"]));
+        let reduced = fixture.read("src/main.rs");
+        assert!(!reduced.contains("fn unused"));
+        assert!(reduced.contains(required));
+        let after = success(fixture.cargo(&["run", "--offline", "--quiet"]));
+        assert_eq!(after.stdout, before.stdout);
+        success(fixture.run(["--offline"]));
+        assert_eq!(fixture.read("src/main.rs"), reduced);
+    }
+}
+
+#[test]
+#[ignore = "runs the distribution image using Docker"]
+fn image_preserves_naked_variadic_assembly_dependencies() {
+    let fixture = Fixture::new();
+    let source = include_str!("../../tests/fixtures/retention/naked_variadic.input.rs");
+    fixture.write("Cargo.toml", "[package]\nname='naked-variadic'\nversion='0.1.0'\nedition='2024'\nrust-version='1.99'\n[workspace]\n");
+    fixture.write("src/main.rs", source);
+    let before = success(fixture.cargo(&["run", "--offline", "--quiet"]));
+    assert_eq!(before.stdout, b"42\n");
+    success(fixture.run(["--offline"]));
+    let reduced = fixture.read("src/main.rs");
+    for required in ["fn unused", "fn sum", "fn naked_sum", "naked_asm!"] {
+        assert!(reduced.contains(required), "{required}");
+    }
+    let after = success(fixture.cargo(&["run", "--offline", "--quiet"]));
+    assert_eq!(after.stdout, before.stdout);
+    success(fixture.run(["--offline"]));
+    assert_eq!(fixture.read("src/main.rs"), reduced);
+}
+
+#[test]
+#[ignore = "runs the distribution image using Docker"]
+fn image_preserves_stable_borrow_checking_defaults() {
+    let fixture = Fixture::new();
+    let source =
+        include_str!("../../tests/fixtures/retention/stable_borrow_checking_error.input.rs");
+    fixture.write("input.rs", source);
+    let output = fixture.run(["input.rs"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("cannot assign to `z` because it is borrowed")
+    );
+    assert_eq!(fixture.read("input.rs"), source);
+}
+
+#[test]
+#[ignore = "runs the distribution image using Docker"]
 fn image_reduces_nested_macros_in_cargo_binaries() {
     let fixture = Fixture::new();
     fixture.write("Cargo.toml", "[package]\nname='nested-macros'\nversion='0.1.0'\nedition='2024'\n[workspace]\n[[bin]]\nname='at'\npath='src/main.rs'\n");

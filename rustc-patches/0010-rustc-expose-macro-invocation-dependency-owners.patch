@@ -1,7 +1,7 @@
-From 94dba1159f2ae46ca0511effcd1a7ca706532a79 Mon Sep 17 00:00:00 2001
+From 0e16dfeac245241058b63ff95489c7d40038477a Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Thu, 13 Aug 2026 01:50:00 +0900
-Subject: [PATCH 10/10] rustc: expose macro invocation dependency owners
+Subject: [PATCH] rustc: expose macro invocation dependency owners
 
 ---
  compiler/rustc_driver_impl/src/lib.rs       |  2 +-
@@ -12,7 +12,7 @@ Subject: [PATCH 10/10] rustc: expose macro invocation dependency owners
  5 files changed, 21 insertions(+), 4 deletions(-)
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 4e6b454e..dd25bd0e 100644
+index a65d33347..78388bf5a 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -25,7 +25,7 @@ index 4e6b454e..dd25bd0e 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
-index c78f02e5..726b06df 100644
+index e2e732748..242eed4f1 100644
 --- a/compiler/rustc_middle/src/ty/mod.rs
 +++ b/compiler/rustc_middle/src/ty/mod.rs
 @@ -286,6 +286,8 @@ pub struct MacroResolvedImportUse {
@@ -38,7 +38,7 @@ index c78f02e5..726b06df 100644
      ///
      /// For a written statement or item macro this includes its trailing semicolon.
 diff --git a/compiler/rustc_resolve/src/def_collector.rs b/compiler/rustc_resolve/src/def_collector.rs
-index 97ca994c..32453a62 100644
+index 97ca994c3..32453a629 100644
 --- a/compiler/rustc_resolve/src/def_collector.rs
 +++ b/compiler/rustc_resolve/src/def_collector.rs
 @@ -68,10 +68,20 @@ pub(super) fn create_def(
@@ -85,7 +85,7 @@ index 97ca994c..32453a62 100644
      }
  
 diff --git a/compiler/rustc_resolve/src/lib.rs b/compiler/rustc_resolve/src/lib.rs
-index 6de5aa2b..a03cf47d 100644
+index 6de5aa2bd..a03cf47d3 100644
 --- a/compiler/rustc_resolve/src/lib.rs
 +++ b/compiler/rustc_resolve/src/lib.rs
 @@ -189,6 +189,7 @@ fn module(module: LocalModule<'ra>, arenas: &'ra ResolverArenas<'ra>) -> ParentS
@@ -105,7 +105,7 @@ index 6de5aa2b..a03cf47d 100644
          in_attr: false,
          owner: CRATE_NODE_ID,
 diff --git a/compiler/rustc_resolve/src/macros.rs b/compiler/rustc_resolve/src/macros.rs
-index 47ba9276..9bb58b4a 100644
+index 47ba9276b..9bb58b4a4 100644
 --- a/compiler/rustc_resolve/src/macros.rs
 +++ b/compiler/rustc_resolve/src/macros.rs
 @@ -405,6 +405,7 @@ fn resolve_macro_invocation(
@@ -116,6 +116,3 @@ index 47ba9276..9bb58b4a 100644
              invocation_node_span: invoc.node_span(),
              target_span: invoc.target_span(),
              fragment_kind: macro_invocation_fragment_kind(invoc.fragment_kind),
--- 
-2.55.0
-

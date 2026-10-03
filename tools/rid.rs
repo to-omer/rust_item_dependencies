@@ -28,11 +28,12 @@ const SNAPSHOT_OWNER_ENV: &str = "RUST_ITEM_DEPENDENCIES_SNAPSHOT_OWNER";
 const PROCESS_OWNER_PREFIX: &str = ".rust-item-dependencies-owner-";
 const PROCESS_ROOT_PREFIX: &str = "rust-item-dependencies-process-";
 const SNAPSHOT_OWNER_ATTEMPTS: u64 = 1_024;
-const COMPILER_BUILD_IDENTITY_FILE: &str = ".rust-item-dependencies-build-identity-v2";
+const COMPILER_BUILD_IDENTITY_FILE: &str = ".rust-item-dependencies-build-identity-v3";
 #[cfg(windows)]
 const SNAPSHOT_PARENT_LOCK_FILE: &str = ".rust-item-dependencies-parent-lock";
 const RUSTC_PRIVATE_CRATES: &[&str] = &[
     "rustc_ast",
+    "rustc_crate_store",
     "rustc_data_structures",
     "rustc_errors",
     "rustc_expand",
@@ -515,6 +516,11 @@ fn prepare_target_metadata(
             target,
             "rid-target-metadata",
         ])
+        // Metadata needs Rust definitions, without building target C implementations.
+        .args([
+            "--set",
+            &format!("target.{target}.optimized-compiler-builtins=false"),
+        ])
         .stdin(Stdio::null());
     run_command(&mut command, &format!("prepare Rust metadata for {target}"))
 }
@@ -526,6 +532,7 @@ fn bootstrap_command(repository_root: &Path, rust_source: &Path) -> Result<Comma
     command
         .args(prefix_arguments)
         .arg(rust_source.join("x.py"))
+        .args(["--set", "rust.channel=auto-detect"])
         .current_dir(rust_source)
         .env("RUST_ITEM_DEPENDENCIES_PATCH_QUEUE_DIGEST", queue_digest)
         .env_remove("CARGOFLAGS")
@@ -1044,6 +1051,27 @@ mod target_tests {
                 b"intermediate output"
             );
         }
+    }
+
+    #[test]
+    fn legacy_compiler_defaults_require_a_fresh_build() {
+        let (directory, rust_source) = compiler_cache_fixture();
+        fs::rename(
+            rust_source.join("build").join(COMPILER_BUILD_IDENTITY_FILE),
+            rust_source.join("build/.rust-item-dependencies-build-identity-v2"),
+        )
+        .unwrap();
+        assert!(!compiler_build_identity_matches(directory.path(), &rust_source).unwrap());
+        assert!(rust_source.join("build/host/stage2/bin").is_dir());
+
+        let error = prepare_compiler(directory.path(), &rust_source, "host").unwrap_err();
+
+        assert!(
+            error.contains("cannot build the patched Rust compiler"),
+            "{error}"
+        );
+        assert!(!rust_source.join("build").exists());
+        assert!(rust_source.is_dir());
     }
 
     #[test]

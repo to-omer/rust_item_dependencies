@@ -1,4 +1,4 @@
-From 080c5b17c85b6f890e6f341d99f4b0360453b69e Mon Sep 17 00:00:00 2001
+From aed8356036521bce28d84debfc1420c9ba96e2f3 Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Sat, 22 Aug 2026 09:12:25 +0900
 Subject: [PATCH] rustc_span: distinguish imported source hydration
@@ -10,7 +10,7 @@ Subject: [PATCH] rustc_span: distinguish imported source hydration
  3 files changed, 99 insertions(+), 2 deletions(-)
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index 2381668e..2bee8f8b 100644
+index 3be4893fb..7e90253ca 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -23,7 +23,7 @@ index 2381668e..2bee8f8b 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_span/src/source_map.rs b/compiler/rustc_span/src/source_map.rs
-index 80d1bae7..c8fbd9d2 100644
+index 80d1bae71..c8fbd9d2f 100644
 --- a/compiler/rustc_span/src/source_map.rs
 +++ b/compiler/rustc_span/src/source_map.rs
 @@ -87,6 +87,14 @@ pub trait FileLoader {
@@ -51,7 +51,7 @@ index 80d1bae7..c8fbd9d2 100644
      }
  
 diff --git a/compiler/rustc_span/src/source_map/tests.rs b/compiler/rustc_span/src/source_map/tests.rs
-index 4cc24366..36ca61c3 100644
+index 4cc243667..36ca61c3e 100644
 --- a/compiler/rustc_span/src/source_map/tests.rs
 +++ b/compiler/rustc_span/src/source_map/tests.rs
 @@ -1,5 +1,35 @@
@@ -156,6 +156,3 @@ index 4cc24366..36ca61c3 100644
  // Takes a unix-style path and returns a platform specific path.
  fn path(p: &str) -> PathBuf {
      path_str(p).into()
--- 
-2.55.0
-

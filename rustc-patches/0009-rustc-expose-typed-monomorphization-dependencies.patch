@@ -1,7 +1,7 @@
-From 3c6395d443f7f81fd0aad46b2d82755a9b469de1 Mon Sep 17 00:00:00 2001
+From bd10656c02a81a1bb9b8484c65f6aa85290d628a Mon Sep 17 00:00:00 2001
 From: rust-item-dependencies <rust-item-dependencies@invalid.example>
 Date: Tue, 11 Aug 2026 11:20:00 +0900
-Subject: [PATCH 9/9] rustc: expose typed monomorphization dependencies
+Subject: [PATCH] rustc: expose typed monomorphization dependencies
 
 ---
  compiler/rustc_driver_impl/src/lib.rs         |    2 +-
@@ -14,14 +14,14 @@ Subject: [PATCH 9/9] rustc: expose typed monomorphization dependencies
  compiler/rustc_middle/src/traits/mod.rs       |   15 +
  compiler/rustc_mir_transform/src/inline.rs    |    7 +-
  .../src/mentioned_items.rs                    |   24 +-
- compiler/rustc_monomorphize/src/collector.rs  |  929 ++++++++-
+ compiler/rustc_monomorphize/src/collector.rs  |  938 ++++++++-
  .../src/traits/vtable.rs                      |  124 +-
  tests/ui-fulldeps/typed-mono-successors.rs    | 1757 +++++++++++++++++
- 13 files changed, 2882 insertions(+), 150 deletions(-)
+ 13 files changed, 2890 insertions(+), 151 deletions(-)
  create mode 100644 tests/ui-fulldeps/typed-mono-successors.rs
 
 diff --git a/compiler/rustc_driver_impl/src/lib.rs b/compiler/rustc_driver_impl/src/lib.rs
-index def7099f..4e6b454e 100644
+index 0ed478d8c..a65d33347 100644
 --- a/compiler/rustc_driver_impl/src/lib.rs
 +++ b/compiler/rustc_driver_impl/src/lib.rs
 @@ -120,7 +120,7 @@ pub(super) fn install() {}
@@ -34,10 +34,10 @@ index def7099f..4e6b454e 100644
  /// Digest of the ordered patch queue used to build this compiler.
  ///
 diff --git a/compiler/rustc_middle/src/arena.rs b/compiler/rustc_middle/src/arena.rs
-index c4e79341..8d02eb36 100644
+index c59f1a48e..ae89a27ee 100644
 --- a/compiler/rustc_middle/src/arena.rs
 +++ b/compiler/rustc_middle/src/arena.rs
-@@ -116,6 +116,7 @@
+@@ -122,6 +122,7 @@
      codegen_associated_item_proof: rustc_middle::traits::CodegenAssociatedItemProof<'tcx>,
      codegen_projection_proof: rustc_middle::traits::CodegenProjectionProof<'tcx>,
      codegen_selection_proof: rustc_middle::traits::CodegenSelectionProof<'tcx>,
@@ -46,7 +46,7 @@ index c4e79341..8d02eb36 100644
      dep_kind_vtable: rustc_middle::dep_graph::DepKindVTable<'tcx>,
  
 diff --git a/compiler/rustc_middle/src/mir/mod.rs b/compiler/rustc_middle/src/mir/mod.rs
-index 9fa577eb..e6437327 100644
+index 9fa577ebd..e6437327e 100644
 --- a/compiler/rustc_middle/src/mir/mod.rs
 +++ b/compiler/rustc_middle/src/mir/mod.rs
 @@ -186,13 +186,22 @@ pub fn initial(
@@ -74,7 +74,7 @@ index 9fa577eb..e6437327 100644
      Drop(Ty<'tcx>),
      /// Unsizing casts might require vtables, so we have to record them.
 diff --git a/compiler/rustc_middle/src/mono.rs b/compiler/rustc_middle/src/mono.rs
-index dc9a94f7..96dcb732 100644
+index dc9a94f79..96dcb7328 100644
 --- a/compiler/rustc_middle/src/mono.rs
 +++ b/compiler/rustc_middle/src/mono.rs
 @@ -22,7 +22,10 @@
@@ -219,7 +219,7 @@ index dc9a94f7..96dcb732 100644
      // Non-ADTs can't have a Drop impl. This case is mostly hit by closures whose captures require
      // dropping.
 diff --git a/compiler/rustc_middle/src/queries.rs b/compiler/rustc_middle/src/queries.rs
-index 60ac76f9..02200c67 100644
+index 8f3af1867..0a807f54d 100644
 --- a/compiler/rustc_middle/src/queries.rs
 +++ b/compiler/rustc_middle/src/queries.rs
 @@ -95,7 +95,8 @@
@@ -256,7 +256,7 @@ index 60ac76f9..02200c67 100644
      query first_method_vtable_slot(key: ty::TraitRef<'tcx>) -> usize {
          desc { "finding the slot within the vtable of `{}` for the implementation of `{}`", key.self_ty(), key.print_only_trait_name() }
      }
-@@ -2790,6 +2797,10 @@
+@@ -2799,6 +2806,10 @@
          cache_on_disk
      }
  
@@ -268,7 +268,7 @@ index 60ac76f9..02200c67 100644
          desc { "estimating codegen size of `{}`", key }
          cache_on_disk
 diff --git a/compiler/rustc_middle/src/query/erase.rs b/compiler/rustc_middle/src/query/erase.rs
-index a7877b18..febbf075 100644
+index b77079cff..2f7e3f319 100644
 --- a/compiler/rustc_middle/src/query/erase.rs
 +++ b/compiler/rustc_middle/src/query/erase.rs
 @@ -16,7 +16,7 @@
@@ -299,7 +299,7 @@ index a7877b18..febbf075 100644
      Result<Option<ty::EarlyBinder<'_, ty::Const<'_>>>, ErrorGuaranteed>,
      Result<Option<ty::Instance<'_>>, ErrorGuaranteed>,
 diff --git a/compiler/rustc_middle/src/query/keys.rs b/compiler/rustc_middle/src/query/keys.rs
-index 8c4447a3..2e8e0ecc 100644
+index 8c4447a38..2e8e0ecc0 100644
 --- a/compiler/rustc_middle/src/query/keys.rs
 +++ b/compiler/rustc_middle/src/query/keys.rs
 @@ -14,7 +14,7 @@
@@ -328,7 +328,7 @@ index 8c4447a3..2e8e0ecc 100644
  ///
  /// Visited set is needed to avoid full iteration over
 diff --git a/compiler/rustc_middle/src/traits/mod.rs b/compiler/rustc_middle/src/traits/mod.rs
-index 186d7180..159483bb 100644
+index f9301356d..b62295ab2 100644
 --- a/compiler/rustc_middle/src/traits/mod.rs
 +++ b/compiler/rustc_middle/src/traits/mod.rs
 @@ -1172,3 +1172,18 @@ pub enum CodegenAssociatedItemProofError {
@@ -351,7 +351,7 @@ index 186d7180..159483bb 100644
 +    IncompleteObservation,
 +}
 diff --git a/compiler/rustc_mir_transform/src/inline.rs b/compiler/rustc_mir_transform/src/inline.rs
-index 47df95a3..abf18176 100644
+index 47df95a37..abf181763 100644
 --- a/compiler/rustc_mir_transform/src/inline.rs
 +++ b/compiler/rustc_mir_transform/src/inline.rs
 @@ -1027,9 +1027,12 @@ fn dest_needs_borrow(place: Place<'_>) -> bool {
@@ -370,7 +370,7 @@ index 47df95a3..abf18176 100644
          caller_mentioned_items.remove(idx);
          caller_mentioned_items.extend(callee_body.mentioned_items());
 diff --git a/compiler/rustc_mir_transform/src/mentioned_items.rs b/compiler/rustc_mir_transform/src/mentioned_items.rs
-index 89146f5c..9e1e0891 100644
+index 89146f5ce..9e1e08918 100644
 --- a/compiler/rustc_mir_transform/src/mentioned_items.rs
 +++ b/compiler/rustc_mir_transform/src/mentioned_items.rs
 @@ -1,5 +1,5 @@
@@ -424,7 +424,7 @@ index 89146f5c..9e1e0891 100644
              _ => {}
          }
 diff --git a/compiler/rustc_monomorphize/src/collector.rs b/compiler/rustc_monomorphize/src/collector.rs
-index 105c8e0e..e8e042d3 100644
+index 5d7820df6..6c08fb36c 100644
 --- a/compiler/rustc_monomorphize/src/collector.rs
 +++ b/compiler/rustc_monomorphize/src/collector.rs
 @@ -209,7 +209,7 @@
@@ -805,7 +805,7 @@ index 105c8e0e..e8e042d3 100644
          }
          MonoItem::Fn(instance) => {
              // Sanity check whether this ended up being collected accidentally
-@@ -506,7 +752,7 @@ fn collect_items_rec<'tcx>(
+@@ -504,7 +750,7 @@ fn collect_items_rec<'tcx>(
                          hir::InlineAsmOperand::Const { anon_const } => {
                              match tcx.const_eval_poly(anon_const.def_id.to_def_id()) {
                                  Ok(val) => {
@@ -814,7 +814,7 @@ index 105c8e0e..e8e042d3 100644
                                  }
                                  Err(ErrorHandled::TooGeneric(..)) => {
                                      span_bug!(*op_sp, "asm const cannot be resolved; too generic")
-@@ -518,7 +764,14 @@ fn collect_items_rec<'tcx>(
+@@ -516,7 +762,14 @@ fn collect_items_rec<'tcx>(
                          }
                          hir::InlineAsmOperand::SymFn { expr } => {
                              let fn_ty = tcx.typeck(item_id.owner_id).expr_ty(expr);
@@ -830,7 +830,7 @@ index 105c8e0e..e8e042d3 100644
                          }
                          hir::InlineAsmOperand::SymStatic { path: _, def_id } => {
                              let instance = Instance::mono(tcx, def_id);
-@@ -692,10 +945,29 @@ struct MirUsedCollector<'a, 'tcx> {
+@@ -690,10 +943,29 @@ struct MirUsedCollector<'a, 'tcx> {
      used_items: &'a mut MonoItems<'tcx>,
      /// See the comment in `collect_items_of_instance` for the purpose of this set.
      /// Note that this contains *not-monomorphized* items!
@@ -861,7 +861,7 @@ index 105c8e0e..e8e042d3 100644
  impl<'a, 'tcx> MirUsedCollector<'a, 'tcx> {
      fn monomorphize<T>(&self, value: T) -> T
      where
-@@ -749,7 +1021,7 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+@@ -747,7 +1019,7 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
                  let source_ty = operand.ty(self.body, self.tcx);
                  // *Before* monomorphizing, record that we already handled this mention.
                  self.used_mentioned_items
@@ -870,7 +870,7 @@ index 105c8e0e..e8e042d3 100644
                  let target_ty = self.monomorphize(target_ty);
                  let source_ty = self.monomorphize(source_ty);
                  let (source_ty, target_ty) =
-@@ -774,9 +1046,16 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+@@ -772,9 +1044,16 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
              ) => {
                  let fn_ty = operand.ty(self.body, self.tcx);
                  // *Before* monomorphizing, record that we already handled this mention.
@@ -889,7 +889,7 @@ index 105c8e0e..e8e042d3 100644
              }
              mir::Rvalue::Cast(
                  mir::CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(_), _),
-@@ -785,13 +1064,17 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+@@ -783,13 +1062,17 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
              ) => {
                  let source_ty = operand.ty(self.body, self.tcx);
                  // *Before* monomorphizing, record that we already handled this mention.
@@ -909,7 +909,7 @@ index 105c8e0e..e8e042d3 100644
                      }
                  } else {
                      bug!()
-@@ -802,7 +1085,11 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+@@ -800,7 +1083,11 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
                  let instance = Instance::mono(self.tcx, def_id);
                  if self.tcx.should_codegen_locally(instance) {
                      trace!("collecting thread-local static {:?}", def_id);
@@ -922,7 +922,7 @@ index 105c8e0e..e8e042d3 100644
                  }
              }
              _ => { /* not interesting */ }
-@@ -817,7 +1104,7 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+@@ -815,7 +1102,7 @@ fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
      fn visit_const_operand(&mut self, constant: &mir::ConstOperand<'tcx>, _location: Location) {
          // No `super_constant` as we don't care about `visit_ty`/`visit_ty_const`.
          let Some(val) = self.eval_constant(constant) else { return };
@@ -931,7 +931,7 @@ index 105c8e0e..e8e042d3 100644
      }
  
      fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Location) {
-@@ -828,7 +1115,11 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+@@ -826,7 +1113,11 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
          let push_mono_lang_item = |this: &mut Self, lang_item: LangItem| {
              let instance = Instance::mono(tcx, tcx.require_lang_item(lang_item, source));
              if tcx.should_codegen_locally(instance) {
@@ -944,8 +944,8 @@ index 105c8e0e..e8e042d3 100644
              }
          };
  
-@@ -837,7 +1128,7 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
-             | mir::TerminatorKind::TailCall { ref func, .. } => {
+@@ -835,7 +1126,7 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+             | mir::TerminatorKind::TailCall { ref func, ref args, .. } => {
                  let callee_ty = func.ty(self.body, tcx);
                  // *Before* monomorphizing, record that we already handled this mention.
 -                self.used_mentioned_items.insert(MentionedItem::Fn(callee_ty));
@@ -953,13 +953,28 @@ index 105c8e0e..e8e042d3 100644
                  let callee_ty = self.monomorphize(callee_ty);
  
                  // HACK(explicit_tail_calls): collect tail calls to `#[track_caller]` functions as indirect,
-@@ -866,13 +1157,14 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+@@ -864,6 +1155,7 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
                      callee_ty,
                      !force_indirect_call,
                      source,
 +                    MonoUseCause::DirectCall,
                      &mut self.used_items,
-                 )
+                 );
+ 
+@@ -873,13 +1165,20 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+                 {
+                     let kernel_ty = kernel.node.ty(self.body, self.tcx);
+                     let kernel_ty = self.monomorphize(kernel_ty);
+-                    visit_fn_use(self.tcx, kernel_ty, false, source, &mut self.used_items);
++                    visit_fn_use(
++                        self.tcx,
++                        kernel_ty,
++                        false,
++                        source,
++                        MonoUseCause::DirectCall,
++                        &mut self.used_items,
++                    );
+                 }
              }
              mir::TerminatorKind::Drop { ref place, .. } => {
                  let ty = place.ty(self.body, self.tcx).ty;
@@ -969,7 +984,7 @@ index 105c8e0e..e8e042d3 100644
                  let ty = self.monomorphize(ty);
                  visit_drop_use(self.tcx, ty, true, source, self.used_items);
              }
-@@ -882,15 +1174,26 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
+@@ -889,15 +1188,26 @@ fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Loc
                          mir::InlineAsmOperand::SymFn { ref value } => {
                              let fn_ty = value.const_.ty();
                              // *Before* monomorphizing, record that we already handled this mention.
@@ -999,7 +1014,7 @@ index 105c8e0e..e8e042d3 100644
                              }
                          }
                          _ => {}
-@@ -947,7 +1250,16 @@ fn visit_drop_use<'tcx>(
+@@ -954,7 +1264,16 @@ fn visit_drop_use<'tcx>(
      output: &mut MonoItems<'tcx>,
  ) {
      let instance = Instance::resolve_drop_glue(tcx, ty);
@@ -1017,7 +1032,7 @@ index 105c8e0e..e8e042d3 100644
  }
  
  /// For every call of this function in the visitor, make sure there is a matching call in the
-@@ -957,10 +1269,22 @@ fn visit_fn_use<'tcx>(
+@@ -964,10 +1283,22 @@ fn visit_fn_use<'tcx>(
      ty: Ty<'tcx>,
      is_direct_call: bool,
      source: Span,
@@ -1040,7 +1055,7 @@ index 105c8e0e..e8e042d3 100644
          let instance = if is_direct_call {
              ty::Instance::expect_resolve(
                  tcx,
-@@ -980,7 +1304,29 @@ fn visit_fn_use<'tcx>(
+@@ -987,7 +1318,29 @@ fn visit_fn_use<'tcx>(
                  _ => bug!("failed to resolve instance for {ty}"),
              }
          };
@@ -1071,7 +1086,7 @@ index 105c8e0e..e8e042d3 100644
      }
  }
  
-@@ -989,6 +1335,9 @@ fn visit_instance_use<'tcx>(
+@@ -996,6 +1349,9 @@ fn visit_instance_use<'tcx>(
      instance: ty::Instance<'tcx>,
      is_direct_call: bool,
      source: Span,
@@ -1081,7 +1096,7 @@ index 105c8e0e..e8e042d3 100644
      output: &mut MonoItems<'tcx>,
  ) {
      debug!("visit_item_use({:?}, is_direct_call={:?})", instance, is_direct_call);
-@@ -1004,7 +1353,12 @@ fn visit_instance_use<'tcx>(
+@@ -1011,7 +1367,12 @@ fn visit_instance_use<'tcx>(
              let def_id = tcx.require_lang_item(LangItem::PanicNounwind, source);
              let panic_instance = Instance::mono(tcx, def_id);
              if tcx.should_codegen_locally(panic_instance) {
@@ -1095,7 +1110,7 @@ index 105c8e0e..e8e042d3 100644
              }
          } else if !intrinsic.must_be_overridden
              && (tcx.sess.opts.unstable_opts.force_intrinsic_fallback
-@@ -1021,7 +1375,12 @@ fn visit_instance_use<'tcx>(
+@@ -1028,7 +1389,12 @@ fn visit_instance_use<'tcx>(
              // the fallback body.
              let instance = ty::Instance::new_raw(instance.def_id(), instance.args);
              if tcx.should_codegen_locally(instance) {
@@ -1109,7 +1124,7 @@ index 105c8e0e..e8e042d3 100644
              }
          }
      }
-@@ -1043,7 +1402,12 @@ fn visit_instance_use<'tcx>(
+@@ -1050,7 +1416,12 @@ fn visit_instance_use<'tcx>(
              // Note that we also optimize away the call to visit_instance_use in vtable construction
              // (see create_mono_items_for_vtable_methods).
              if !is_direct_call {
@@ -1123,7 +1138,7 @@ index 105c8e0e..e8e042d3 100644
              }
          }
          ty::InstanceKind::Item(..)
-@@ -1058,7 +1422,7 @@ fn visit_instance_use<'tcx>(
+@@ -1065,7 +1436,7 @@ fn visit_instance_use<'tcx>(
          | ty::InstanceKind::Shim(ty::ShimKind::FnPtr(..))
          | ty::InstanceKind::Shim(ty::ShimKind::Clone(..))
          | ty::InstanceKind::Shim(ty::ShimKind::FnPtrAddr(..)) => {
@@ -1132,7 +1147,7 @@ index 105c8e0e..e8e042d3 100644
          }
      }
  }
-@@ -1238,31 +1602,113 @@ fn create_mono_items_for_vtable_methods<'tcx>(
+@@ -1245,31 +1616,113 @@ fn create_mono_items_for_vtable_methods<'tcx>(
      let ty::Dynamic(trait_ty, ..) = trait_ty.kind() else {
          bug!("create_mono_items_for_vtable_methods: {trait_ty:?} not a trait type");
      };
@@ -1260,7 +1275,7 @@ index 105c8e0e..e8e042d3 100644
      }
  
      // Also add the destructor, if it's necessary.
-@@ -1270,19 +1716,60 @@ fn create_mono_items_for_vtable_methods<'tcx>(
+@@ -1277,44 +1730,129 @@ fn create_mono_items_for_vtable_methods<'tcx>(
      // This matches the check in vtable_allocation_provider in middle/ty/vtable.rs,
      // if we don't need drop we're not adding an actual pointer to the vtable.
      if impl_ty.needs_drop(tcx, ty::TypingEnv::fully_monomorphized()) {
@@ -1324,25 +1339,23 @@ index 105c8e0e..e8e042d3 100644
              }
          }
          GlobalAlloc::Memory(alloc) => {
-@@ -1291,8 +1778,15 @@ fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoIt
-             // avoid `ensure_sufficient_stack` in the common case of "no pointers"
+             trace!("collecting {:?} with {:#?}", alloc_id, alloc);
+             let ptrs = alloc.inner().provenance().ptrs();
              if !ptrs.is_empty() {
-                 rustc_data_structures::stack::ensure_sufficient_stack(move || {
--                    for &prov in ptrs.values() {
--                        collect_alloc(tcx, prov.alloc_id(), output);
-+                    for &(offset, prov) in ptrs.iter() {
-+                        collect_alloc_from(
-+                            tcx,
-+                            TraceFrom::Node(allocation),
-+                            prov.alloc_id(),
-+                            MonoUseCause::AllocationReference,
-+                            MonoTraceSite::AllocationOffset(offset.bytes()),
-+                            output,
-+                        );
-                     }
-                 });
+-                for &prov in ptrs.values() {
+-                    collect_alloc(tcx, prov.alloc_id(), output);
++                for &(offset, prov) in ptrs.iter() {
++                    collect_alloc_from(
++                        tcx,
++                        TraceFrom::Node(allocation),
++                        prov.alloc_id(),
++                        MonoUseCause::AllocationReference,
++                        MonoTraceSite::AllocationOffset(offset.bytes()),
++                        output,
++                    );
+                 }
              }
-@@ -1300,17 +1794,54 @@ fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoIt
+         }
          GlobalAlloc::Function { instance, .. } => {
              if tcx.should_codegen_locally(instance) {
                  trace!("collecting {:?} with {:#?}", alloc_id, instance);
@@ -1399,7 +1412,7 @@ index 105c8e0e..e8e042d3 100644
          }
          GlobalAlloc::TypeId { .. } => {}
      }
-@@ -1319,11 +1850,75 @@ fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoIt
+@@ -1323,11 +1861,75 @@ fn collect_alloc<'tcx>(tcx: TyCtxt<'tcx>, alloc_id: AllocId, output: &mut MonoIt
  /// Scans the MIR in order to find function calls, closures, and drop-glue.
  ///
  /// Anything that's found is added to `output`. Furthermore the "mentioned items" of the MIR are returned.
@@ -1475,7 +1488,7 @@ index 105c8e0e..e8e042d3 100644
  ) -> Result<(MonoItems<'tcx>, MonoItems<'tcx>), NormalizationErrorInMono> {
      // This item is getting monomorphized, do mono-time checks.
      let body = tcx.instance_mir(instance.def);
-@@ -1343,8 +1938,17 @@ fn collect_items_of_instance<'tcx>(
+@@ -1347,8 +1949,17 @@ fn collect_items_of_instance<'tcx>(
      // mentioned item. So instead we collect all pre-monomorphized `MentionedItem` that were already
      // added to `used_items` in a hash set, which can efficiently query in the
      // `body.mentioned_items` loop below without even having to monomorphize the item.
@@ -1495,7 +1508,7 @@ index 105c8e0e..e8e042d3 100644
      let mut used_mentioned_items = Default::default();
      let mut collector = MirUsedCollector {
          tcx,
-@@ -1369,14 +1973,14 @@ fn collect_items_of_instance<'tcx>(
+@@ -1373,14 +1984,14 @@ fn collect_items_of_instance<'tcx>(
      // them errors.
      for const_op in body.required_consts() {
          if let Some(val) = collector.eval_constant(const_op) {
@@ -1512,7 +1525,7 @@ index 105c8e0e..e8e042d3 100644
              let item_mono = collector.monomorphize(item.node);
              visit_mentioned_item(tcx, &item_mono, item.span, &mut mentioned_items);
          }
-@@ -1392,12 +1996,93 @@ fn items_of_instance<'tcx>(
+@@ -1396,12 +2007,93 @@ fn items_of_instance<'tcx>(
      (&'tcx [Spanned<MonoItem<'tcx>>], &'tcx [Spanned<MonoItem<'tcx>>]),
      NormalizationErrorInMono,
  > {
@@ -1610,7 +1623,7 @@ index 105c8e0e..e8e042d3 100644
  }
  
  /// `item` must be already monomorphized.
-@@ -1409,9 +2094,20 @@ fn visit_mentioned_item<'tcx>(
+@@ -1413,9 +2105,20 @@ fn visit_mentioned_item<'tcx>(
      output: &mut MonoItems<'tcx>,
  ) {
      match *item {
@@ -1632,7 +1645,7 @@ index 105c8e0e..e8e042d3 100644
                  let instance = Instance::expect_resolve(
                      tcx,
                      ty::TypingEnv::fully_monomorphized(),
-@@ -1419,11 +2115,38 @@ fn visit_mentioned_item<'tcx>(
+@@ -1423,11 +2126,38 @@ fn visit_mentioned_item<'tcx>(
                      args,
                      span,
                  );
@@ -1672,7 +1685,7 @@ index 105c8e0e..e8e042d3 100644
              }
          }
          MentionedItem::Drop(ty) => {
-@@ -1444,7 +2167,11 @@ fn visit_mentioned_item<'tcx>(
+@@ -1448,7 +2178,11 @@ fn visit_mentioned_item<'tcx>(
                  let instance =
                      Instance::resolve_closure(tcx, def_id, args, ty::ClosureKind::FnOnce);
                  if tcx.should_codegen_locally(instance) {
@@ -1685,7 +1698,7 @@ index 105c8e0e..e8e042d3 100644
                  }
              } else {
                  bug!()
-@@ -1457,14 +2184,17 @@ fn visit_mentioned_item<'tcx>(
+@@ -1461,14 +2195,17 @@ fn visit_mentioned_item<'tcx>(
  fn collect_const_value<'tcx>(
      tcx: TyCtxt<'tcx>,
      value: mir::ConstValue,
@@ -1705,7 +1718,7 @@ index 105c8e0e..e8e042d3 100644
          _ => {}
      }
  }
-@@ -1598,7 +2328,7 @@ fn process_item(&mut self, id: hir::ItemId) {
+@@ -1674,7 +2411,7 @@ fn process_item(&mut self, id: hir::ItemId) {
                      let Ok(val) = self.tcx.const_eval_poly(def_id) else {
                          return;
                      };
@@ -1714,14 +1727,14 @@ index 105c8e0e..e8e042d3 100644
                  }
              }
              DefKind::Impl { of_trait: true } => {
-@@ -1872,4 +2602,5 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
+@@ -1959,4 +2696,5 @@ pub(crate) fn collect_crate_mono_items<'tcx>(
  pub(crate) fn provide(providers: &mut Providers) {
      providers.hooks.should_codegen_locally = should_codegen_locally;
      providers.queries.items_of_instance = items_of_instance;
 +    providers.queries.mono_successors = mono_successors;
  }
 diff --git a/compiler/rustc_trait_selection/src/traits/vtable.rs b/compiler/rustc_trait_selection/src/traits/vtable.rs
-index 77d7a39a..6eaf027b 100644
+index 77d7a39a6..6eaf027b9 100644
 --- a/compiler/rustc_trait_selection/src/traits/vtable.rs
 +++ b/compiler/rustc_trait_selection/src/traits/vtable.rs
 @@ -5,6 +5,7 @@
@@ -1887,7 +1900,7 @@ index 77d7a39a..6eaf027b 100644
          ..*providers
 diff --git a/tests/ui-fulldeps/typed-mono-successors.rs b/tests/ui-fulldeps/typed-mono-successors.rs
 new file mode 100644
-index 00000000..d1c4c9fd
+index 000000000..d1c4c9fdc
 --- /dev/null
 +++ b/tests/ui-fulldeps/typed-mono-successors.rs
 @@ -0,0 +1,1757 @@
@@ -3648,6 +3661,3 @@ index 00000000..d1c4c9fd
 +    mentioned.retain(|item| !used.contains(item));
 +    Classes { used, mentioned }
 +}
--- 
-2.55.0
-

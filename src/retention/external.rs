@@ -216,10 +216,10 @@ pub(super) fn collect_external_crate_facts(
     definition_units: &[SourceUnitId],
     external_artifact_directories: &[PathBuf],
 ) -> Result<ExternalCrateFacts, RetentionError> {
+    use rustc_crate_store::CrateDepKind;
     use rustc_hir::attrs::LangItem;
     use rustc_hir::{ItemKind, find_attr};
     use rustc_middle::ty::{CompilerMetadataProvider, CompilerMetadataRequirement};
-    use rustc_session::cstore::CrateDepKind;
     use rustc_span::kw;
 
     let source_sites = SourceSiteOwnerIndex::new(source)?;
